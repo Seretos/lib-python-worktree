@@ -1,24 +1,91 @@
 """lib-python-worktree -- git-worktree lifecycle + contract engine.
 
-The reusable engine being extracted from the `agent-worktree` MCP plugin:
+The reusable engine extracted from the `agent-worktree` MCP plugin:
 git-worktree lifecycle (create/list/remove), the `.seretos/` YAML setup
-contract (schema + loader), port allocation, the setup-script runner, and
-the pluggable state store.
+contract (schema + loader), the setup-script runner, and the pluggable
+state store. Port allocation, process lifecycle, and full teardown semantics
+hook in around these seams in later phases.
 
-This is the initial empty frame. The engine modules and their public
-re-exports land here in a follow-up migration; until then the package
-exposes only its version.
+Primary entry point for consumers:
 
-    >>> import lib_python_worktree
-    >>> lib_python_worktree.__version__
-    '0.1.0'
+    >>> from lib_python_worktree import WorktreeManager
+    >>> m = WorktreeManager()
+    >>> rec = m.create("/path/to/repo", "feature/x", base="main")
+    >>> m.list()
+    >>> m.remove(rec.id)
 
-The `agent-worktree` plugin is a separate repo that wraps this engine as
-`@mcp.tool()`s -- behaviour and the data model live here, the MCP/stdio
-glue lives in the plugin.
+The package is **MCP-agnostic**: no `mcp` import belongs here. The
+`agent-worktree` plugin is a separate repo that wraps `WorktreeManager` (and
+the contract/setup pieces) as `@mcp.tool()`s -- behaviour and the data model
+live here, the MCP/stdio glue lives in the plugin.
 """
 from __future__ import annotations
 
+from .contract import (
+    CONTRACT_FILENAME,
+    ContractError,
+    ContractValidationError,
+    Isolation,
+    PortSlot,
+    Step,
+    WorktreeContract,
+    load,
+    load_text,
+)
+from .core.manager import (
+    BranchAlreadyCheckedOutError,
+    BranchNotFoundError,
+    DuplicateWorktreeError,
+    GitCommandError,
+    GitTimeoutError,
+    ManagerConfig,
+    WorktreeError,
+    WorktreeManager,
+    WorktreeNotFoundError,
+)
+from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
+from .setup import (
+    SetupFailedError,
+    SetupResult,
+    SetupRunner,
+    SetupStep,
+    SetupStepResult,
+    log_dir_for,
+)
+
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+__all__ = [
+    # core / manager
+    "WorktreeManager",
+    "ManagerConfig",
+    "WorktreeError",
+    "BranchNotFoundError",
+    "BranchAlreadyCheckedOutError",
+    "DuplicateWorktreeError",
+    "WorktreeNotFoundError",
+    "GitCommandError",
+    "GitTimeoutError",
+    # state
+    "WorktreeRecord",
+    "StateStore",
+    "InMemoryStateStore",
+    # contract
+    "WorktreeContract",
+    "Step",
+    "PortSlot",
+    "Isolation",
+    "load",
+    "load_text",
+    "CONTRACT_FILENAME",
+    "ContractError",
+    "ContractValidationError",
+    # setup runner
+    "SetupRunner",
+    "SetupResult",
+    "SetupStep",
+    "SetupStepResult",
+    "SetupFailedError",
+    "log_dir_for",
+    "__version__",
+]
