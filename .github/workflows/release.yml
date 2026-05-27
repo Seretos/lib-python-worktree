@@ -1,0 +1,178 @@
+name: release
+
+# Manual lib-release flow. Analogous to the plugin's release.yml but
+# without the binary build (libs ship as Python source distributions
+# pulled by downstream consumers via `git+https://.../@vX.Y.Z` or
+# `@release/Nx`). Topology:
+#
+#   stamp+publish (ubuntu-22.04) -> validates semver, fails on
+#                                   duplicate tag, stamps pyproject.toml
+#                                   with the requested version on a
+#                                   fresh release branch built off main,
+#                                   tags the stamp commit as vX.Y.Z,
+#                                   force-pushes release/Nx (the
+#                                   floating branch downstream consumers
+#                                   pin to), and creates the GitHub
+#                                   Release. `main` is never touched --
+#                                   the bot commit lives only on the
+#                                   release/Nx branch.
+#
+# Release-branch policy:
+#   release/0.x  -- all 0.x.y releases.   Force-pushed each release.
+#   release/1.x  -- all 1.x.y releases.   Created the first time a 1.x.y
+#                   release is published; force-pushed each release after.
+#   release/Nx   -- analogous.
+#
+# Past tags remain reachable via `git+https://.../@vX.Y.Z` even after
+# a force-push because the commit they point to is preserved by git as
+# long as the tag exists.
+#
+# The downstream consumer is the agent-worktree MCP plugin, which wraps
+# this engine. A release here opens a dependency-update ticket there.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (semver, no leading v) e.g. 0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate version is semver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])."
+            exit 1
+          fi
+
+      - name: Check tag does not yet exist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Delete it first or pick a new version."
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute release-branch name
+        id: branch
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          MAJOR=$(echo "$V" | cut -d. -f1)
+          BRANCH="release/${MAJOR}.x"
+          echo "name=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Will publish to ${BRANCH}"
+
+      - name: Stamp pyproject.toml, commit, tag, force-push release branch
+        # Stamp via sed (POSIX, no extra tools), anchored to start of
+        # line to avoid touching nested versions in tool tables. The
+        # stamp commit lives only on the release/Nx branch -- main
+        # stays at whatever HEAD it was before this workflow ran.
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          TAG="v${V}"
+          BRANCH="${{ steps.branch.outputs.name }}"
+
+          sed -i -E 's/^(version[[:space:]]*=[[:space:]]*")[^"]*(")/\1'"$V"'\2/' pyproject.toml
+          grep -E "^version[[:space:]]*=[[:space:]]*\"$V\"" pyproject.toml \
+            || { echo "::error::pyproject.toml stamp failed"; exit 1; }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Build the release branch fresh from main HEAD each time.
+          # Past tags pin past commits -- they are independent of where
+          # the release/Nx pointer currently sits.
+          git checkout -B "$BRANCH"
+          git add pyproject.toml
+          git commit -m "release: ${TAG}"
+
+          git tag -a "$TAG" -m "${TAG}"
+
+          git push origin "$BRANCH" --force
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          PRE_FLAG=""
+          if [[ "${{ inputs.version }}" == *-* ]]; then
+            PRE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes \
+            $PRE_FLAG
+
+      - name: Open dependency-update ticket in consumers
+        # continue-on-error: a missing/invalid WORKTREE_TICKET_TOKEN must
+        # never fail the release itself.
+        continue-on-error: true
+        shell: bash
+        # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
+        # column 0 dedents out of the YAML block scalar and breaks the file.
+        # A YAML block scalar holds the markdown verbatim and ${{ }} still
+        # expands. Bash just references "$TITLE"/"$BODY".
+        env:
+          GH_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
+          TITLE: "chore(deps): bump lib-python-worktree to v${{ inputs.version }}"
+          BODY: |
+            ## Dependency update
+
+            A new release of **lib-python-worktree** has been published: `v${{ inputs.version }}`.
+
+            ### Action required
+
+            1. Update the pin in `pyproject.toml` to:
+               ```
+               lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v${{ inputs.version }}
+               ```
+            2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
+            3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+            4. Commit and open a PR.
+        run: |
+          CONSUMER="Seretos/agent-worktree"
+
+          # Idempotency: skip if an open issue with this exact title already exists.
+          # --paginate follows all pages; jq filter excludes pull requests.
+          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
+          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+            echo "Issue already exists in ${CONSUMER}, skipping."
+          else
+            # Attempt creation with the 'dependencies' label; fall back
+            # without it if the label does not exist in the consumer repo.
+            gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label dependencies \
+            || gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY"
+          fi

@@ -1,0 +1,16 @@
+version: 1
+
+projects:
+  - id: lib-python-worktree
+    description: ""
+    provider: github
+    path: Seretos/lib-python-worktree
+    token_env: GITHUB_TOKEN
+    permissions:
+      issues:
+        create: true
+        modify: true
+      pulls:
+        create: true
+        modify: true
+        merge: false

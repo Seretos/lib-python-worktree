@@ -1,0 +1,7 @@
+{
+  "enabledPlugins": {
+    "agent-project-issues@agent-marketplace": true,
+    "agent-worktree@agent-marketplace": true,
+    "agent-python-developer-ticket-workflow@agent-marketplace": true
+  }
+}

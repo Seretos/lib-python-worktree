@@ -1,0 +1,48 @@
+name: lint
+
+# Workflow-definition linter. Catches invalid `.github/workflows/*.yml`
+# BEFORE merge -- closing the gap that let release.yml / ticket.yml ship
+# broken YAML (see PR fixing the column-0 heredoc):
+#
+#   * pytest (test.yml) is green and never parses the workflow files, so a
+#     broken workflow is invisible to it.
+#   * release.yml / ticket.yml are workflow_dispatch-only, so they are never
+#     triggered by a PR -- there is no run that could fail in CI.
+#   * GitHub's "Invalid workflow file" annotation is NOT a blocking status
+#     check, so it doesn't stop a merge; it only surfaces on the Actions tab
+#     after the push lands on main.
+#
+# actionlint validates the YAML, the ${{ }} expressions and referenced
+# contexts (e.g. inputs.*), and action versions for every workflow -- so the
+# next column-0 heredoc (or any other malformed workflow) fails the PR
+# instead of main. Add this as a required status check in branch protection
+# to make the gate enforcing rather than advisory.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install actionlint
+        id: actionlint
+        shell: bash
+        # Pinned to a release (script + binary). Bump the version as needed.
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+
+      - name: Lint workflow files
+        shell: bash
+        # -shellcheck= disables the shellcheck pass, so the gate fails only on
+        # real workflow / YAML / expression errors -- not bash style nits.
+        # Drop the flag if you also want run-script linting.
+        run: ${{ steps.actionlint.outputs.executable }} -color -shellcheck=
