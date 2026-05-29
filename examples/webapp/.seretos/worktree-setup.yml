@@ -1,0 +1,20 @@
+version: 1
+isolation: full
+
+setup:
+  - name: start services
+    run: docker compose up -d
+  - name: install deps
+    run: pnpm install
+  - name: run migrations
+    run: pnpm prisma migrate dev
+
+teardown:
+  - name: stop services
+    run: docker compose down
+  - name: remove containers
+    run: docker compose rm -f
+
+ports:
+  - name: app
+  - name: chrome
