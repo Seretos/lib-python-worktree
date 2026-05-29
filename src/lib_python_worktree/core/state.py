@@ -26,6 +26,7 @@ class WorktreeRecord:
     path: str
     status: str = "created"
     ports: Dict[str, int] = field(default_factory=dict)
+    branch_created_by_us: bool = False
 
 
 class StateStore(Protocol):
