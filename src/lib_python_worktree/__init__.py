@@ -44,6 +44,7 @@ from .core.manager import (
     WorktreeNotFoundError,
 )
 from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
+from .core.yaml_store import ReconcileReport, YamlStateStore, reconcile
 from .setup import (
     SetupFailedError,
     SetupResult,
@@ -70,6 +71,10 @@ __all__ = [
     "WorktreeRecord",
     "StateStore",
     "InMemoryStateStore",
+    # yaml state store (W7)
+    "YamlStateStore",
+    "ReconcileReport",
+    "reconcile",
     # contract
     "WorktreeContract",
     "Step",

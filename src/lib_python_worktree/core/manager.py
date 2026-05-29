@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .state import InMemoryStateStore, StateStore, WorktreeRecord
+from .yaml_store import YamlStateStore, reconcile
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
@@ -299,9 +300,14 @@ class WorktreeManager:
         self,
         config: Optional[ManagerConfig] = None,
         state: Optional[StateStore] = None,
+        *,
+        reconcile_on_init: bool = True,
     ) -> None:
         self.config = config or ManagerConfig.from_env()
-        self.state: StateStore = state or InMemoryStateStore()
+        resolved_state: StateStore = state if state is not None else YamlStateStore()
+        self.state = resolved_state
+        if reconcile_on_init and isinstance(resolved_state, YamlStateStore):
+            reconcile(resolved_state)
 
     # ---- public API used by the FastMCP tools ----
 
