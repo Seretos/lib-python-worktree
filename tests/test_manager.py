@@ -23,10 +23,16 @@ from lib_python_worktree.core.manager import (
     GitTimeoutError,
     ManagerConfig,
     WorktreeManager,
+    GitCommandError,
     WorktreeNotFoundError,
     _run_git,
 )
-from lib_python_worktree.core.state import InMemoryStateStore
+from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+
+
+def _git(*args: str, cwd: Path) -> None:
+    """Run a git command that must succeed (used to set up worktree state)."""
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
 # ---------------------------------------------------------------------------
