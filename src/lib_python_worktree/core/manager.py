@@ -369,6 +369,7 @@ class WorktreeManager:
             repo_root=str(repo_path),
             branch=branch,
             path=str(target_path),
+            branch_created_by_us=not branch_exists,
         )
         self.state.add(record)
         return record
@@ -382,18 +383,31 @@ class WorktreeManager:
             raise WorktreeNotFoundError(
                 f"No worktree tracked with id '{worktree_id}'"
             )
+        # Phase 1: remove the git worktree checkout.  If this raises the
+        # directory still exists, so we keep the state record and propagate.
         self._teardown(record, force=force)
+        # Phase 2: the worktree directory is now gone.  Remove the state record
+        # *before* the branch-delete step so that a branch-delete failure
+        # (e.g. ``git branch -d`` refusing an unmerged branch when force=False)
+        # does not leave a stale orphaned record in the state store.
         removed = self.state.remove(worktree_id)
         assert removed is not None  # state.get returned record above
+        # Phase 3: delete the owned branch (if any).  May raise GitCommandError
+        # (e.g. unmerged + force=False); the record is already gone from state.
+        self._delete_owned_branch(record, force=force)
         return removed
 
     # ---- seams for later phases ----
 
     def _teardown(self, record: WorktreeRecord, *, force: bool) -> None:
-        """Tear down a worktree.
+        """Remove the git worktree checkout directory.
 
         W8 will hook in here (process termination, contract ``teardown:``
         steps, port release). W2 only calls ``git worktree remove``.
+
+        Branch deletion is intentionally *not* done here — it happens in
+        ``remove()`` after the state record has been cleaned up, so that a
+        branch-delete failure cannot leave a stale orphaned state entry.
         """
 
         args = ["worktree", "remove"]
@@ -404,6 +418,32 @@ class WorktreeManager:
         if proc.returncode != 0:
             raise GitCommandError(
                 ["git", *args], proc.returncode, proc.stderr
+            )
+
+    def _delete_owned_branch(self, record: WorktreeRecord, *, force: bool) -> None:
+        """Delete the branch if we created it (``git worktree add -b``).
+
+        Branches that pre-existed (reuse path, no ``base`` supplied) are left
+        untouched. A future ``keep_branch`` parameter on ``remove`` is the
+        intended per-call opt-out hook — deferred to a follow-up ticket.
+
+        Raises ``GitCommandError`` if the branch exists but deletion fails
+        (e.g. ``git branch -d`` refuses an unmerged branch with force=False).
+        Skips silently if the branch is already gone (idempotent).
+        """
+
+        if not record.branch_created_by_us:
+            return
+        repo_path = Path(record.repo_root)
+        if not self._branch_exists(repo_path, record.branch):
+            # Already gone — skip silently (idempotent).
+            return
+        delete_flag = "-D" if force else "-d"
+        del_args = ["branch", delete_flag, record.branch]
+        del_proc = _run_git(del_args, cwd=repo_path)
+        if del_proc.returncode != 0:
+            raise GitCommandError(
+                ["git", *del_args], del_proc.returncode, del_proc.stderr
             )
 
     # ---- helpers ----

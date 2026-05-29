@@ -304,3 +304,125 @@ def test_run_git_closes_stdin(monkeypatch):
     monkeypatch.setattr(manager_module.subprocess, "Popen", _RecordingPopen)
     _run_git(["--version"])
     assert captured_kwargs.get("stdin") is subprocess.DEVNULL
+
+
+# ---------------------------------------------------------------------------
+# Ticket #1: worktree_remove must delete the branch it created
+# ---------------------------------------------------------------------------
+
+
+def test_worktree_record_branch_created_by_us_default_false():
+    """Pure dataclass test: WorktreeRecord.branch_created_by_us defaults to False."""
+    rec = WorktreeRecord(id="x", repo_root="/r", branch="b", path="/p")
+    assert rec.branch_created_by_us is False
+
+
+@pytest.mark.requires_git
+def test_remove_deletes_branch_created_by_worktree_create(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Regression: branch created by 'git worktree add -b' must be deleted on remove."""
+    rec = manager.create(str(git_repo), "feature/new", base="main")
+    assert rec.branch_created_by_us is True
+
+    manager.remove(rec.id)
+
+    branch_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/heads/feature/new"],
+        cwd=git_repo,
+        capture_output=True,
+    )
+    assert branch_check.returncode != 0, (
+        "branch created by worktree_create must be deleted after worktree_remove"
+    )
+
+
+@pytest.mark.requires_git
+def test_remove_does_not_delete_preexisting_branch(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Reuse path: a branch that pre-existed before create must survive remove."""
+    # feature/alpha is created by the git_repo fixture (pre-existing).
+    rec = manager.create(str(git_repo), "feature/alpha")
+    assert rec.branch_created_by_us is False
+
+    manager.remove(rec.id)
+
+    branch_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/heads/feature/alpha"],
+        cwd=git_repo,
+        capture_output=True,
+    )
+    assert branch_check.returncode == 0, "pre-existing branch must survive remove"
+
+
+@pytest.mark.requires_git
+def test_remove_force_deletes_branch_with_unmerged_commits(
+    manager: WorktreeManager, git_repo: Path
+):
+    """force=True must use 'git branch -D' to delete a branch with unmerged commits."""
+    rec = manager.create(str(git_repo), "feature/unmerged", base="main")
+    assert rec.branch_created_by_us is True
+
+    # Commit something inside the worktree so the branch has unmerged commits.
+    wt_path = Path(rec.path)
+    (wt_path / "new_file.txt").write_text("unmerged\n", encoding="utf-8")
+    _git("add", "-A", cwd=wt_path)
+    _git("commit", "-q", "-m", "unmerged commit", cwd=wt_path)
+
+    manager.remove(rec.id, force=True)
+
+    assert not wt_path.exists(), "worktree path must be gone after remove"
+
+    branch_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/heads/feature/unmerged"],
+        cwd=git_repo,
+        capture_output=True,
+    )
+    assert branch_check.returncode != 0, (
+        "branch with unmerged commits must be deleted when force=True"
+    )
+
+
+@pytest.mark.requires_git
+def test_remove_tolerates_already_deleted_branch(
+    manager: WorktreeManager, git_repo: Path
+):
+    """remove must be idempotent when the owned branch was already deleted."""
+    rec = manager.create(str(git_repo), "feature/gone", base="main")
+    assert rec.branch_created_by_us is True
+
+    # ``git branch -D`` refuses a branch checked out in another worktree, so
+    # detach the worktree HEAD first, then delete the branch for real.
+    _git("checkout", "--detach", cwd=Path(rec.path))
+    _git("branch", "-D", "feature/gone", cwd=git_repo)
+
+    # manager.remove must not raise even though the branch is already gone.
+    removed = manager.remove(rec.id)
+    assert removed.id == rec.id
+    assert manager.list() == []
+
+
+@pytest.mark.requires_git
+def test_remove_unmerged_branch_without_force_cleans_state_and_raises(
+    manager: WorktreeManager, git_repo: Path
+):
+    """force=False on an unmerged owned branch raises, but the state record is
+    still cleaned up (the worktree dir was already removed)."""
+    rec = manager.create(str(git_repo), "feature/leak-test", base="main")
+    assert rec.branch_created_by_us is True
+
+    # Add an unmerged commit so ``git branch -d`` will refuse.
+    wt_path = Path(rec.path)
+    (wt_path / "leak_file.txt").write_text("unmerged\n", encoding="utf-8")
+    _git("add", "-A", cwd=wt_path)
+    _git("commit", "-q", "-m", "unmerged commit", cwd=wt_path)
+
+    with pytest.raises(GitCommandError):
+        manager.remove(rec.id, force=False)
+
+    # The state record must be gone despite the exception (no stale entry).
+    remaining_ids = [r.id for r in manager.list()]
+    assert rec.id not in remaining_ids, (
+        "State record must be removed even when branch-delete raises"
+    )
