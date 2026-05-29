@@ -18,8 +18,10 @@ from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
     DuplicateWorktreeError,
+    GitCommandError,
     GitTimeoutError,
     ManagerConfig,
+    WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
     _run_git,
@@ -54,6 +56,7 @@ def manager(tmp_path: Path) -> WorktreeManager:
     )
 
 
+@pytest.mark.requires_git
 def test_create_list_remove_roundtrip(manager: WorktreeManager, temp_repo: Path):
     rec = manager.create(str(temp_repo), "feature/alpha")
     assert rec.id.startswith("src-repo-feature-alpha-")
@@ -71,6 +74,7 @@ def test_create_list_remove_roundtrip(manager: WorktreeManager, temp_repo: Path)
     assert manager.list() == []
 
 
+@pytest.mark.requires_git
 def test_create_unknown_branch_without_base(
     manager: WorktreeManager, temp_repo: Path
 ):
@@ -78,6 +82,7 @@ def test_create_unknown_branch_without_base(
         manager.create(str(temp_repo), "feature/does-not-exist")
 
 
+@pytest.mark.requires_git
 def test_create_unknown_branch_with_base(
     manager: WorktreeManager, temp_repo: Path
 ):
@@ -94,6 +99,7 @@ def test_create_unknown_branch_with_base(
     assert proc.stdout.strip() == "feature/new"
 
 
+@pytest.mark.requires_git
 def test_duplicate_create_same_branch_fails(
     manager: WorktreeManager, temp_repo: Path
 ):
@@ -121,6 +127,7 @@ def test_store_root_default(monkeypatch):
     assert cfg.store_root.is_absolute()
 
 
+@pytest.mark.requires_git
 def test_worktree_paths_under_store_root(
     manager: WorktreeManager, temp_repo: Path, tmp_path: Path
 ):
@@ -133,6 +140,7 @@ def test_worktree_paths_under_store_root(
 # ---- Ticket #19: _run_git timeout + stdin handling ----
 
 
+@pytest.mark.requires_git
 def test_run_git_smoke_version_completes_quickly():
     """Sanity check: ``git --version`` finishes well under 1 s with the new
     Popen-based plumbing. Catches pipe/handle plumbing regressions on every
@@ -230,6 +238,7 @@ def test_run_git_closes_stdin(monkeypatch):
 # ---- Ticket #18: structured error for "branch already checked out elsewhere" ----
 
 
+@pytest.mark.requires_git
 def test_create_branch_already_checked_out_elsewhere(
     manager: WorktreeManager, temp_repo: Path, tmp_path: Path
 ):
@@ -266,6 +275,7 @@ def test_create_branch_already_checked_out_elsewhere(
     assert "git worktree prune" in msg
 
 
+@pytest.mark.requires_git
 def test_already_checked_out_reports_prunable_after_dir_removed(
     manager: WorktreeManager, temp_repo: Path, tmp_path: Path
 ):
@@ -292,3 +302,53 @@ def test_already_checked_out_reports_prunable_after_dir_removed(
     assert err.branch == "feature/alpha"
     assert err.prunable is True
     assert "prunable=True" in str(err)
+
+
+# ---- New real-git tests using shared conftest fixtures ----
+
+
+@pytest.mark.requires_git
+def test_force_remove_worktree_with_uncommitted_changes(
+    manager_factory, git_repo: Path
+):
+    """Regression: remove(force=False) must refuse when the worktree has
+    uncommitted changes; remove(force=True) must succeed and delete the path.
+    """
+    mgr = manager_factory()
+    rec = mgr.create(str(git_repo), "feature/dirty", base="main")
+    wt_path = Path(rec.path)
+
+    # Write an uncommitted file inside the worktree.
+    (wt_path / "dirty.txt").write_text("not committed\n", encoding="utf-8")
+
+    # Non-forced removal must fail with a GitCommandError (git refuses).
+    with pytest.raises(GitCommandError):
+        mgr.remove(rec.id, force=False)
+
+    # Forced removal must succeed and the directory must be gone.
+    removed = mgr.remove(rec.id, force=True)
+    assert removed.id == rec.id
+    assert not wt_path.exists()
+    assert mgr.list() == []
+
+
+@pytest.mark.requires_git
+def test_validate_repo_with_non_git_directory(manager_factory, tmp_path: Path):
+    """Creating a worktree against a directory that has no .git must raise
+    WorktreeError (specifically the "Not a git repository" path).
+    """
+    not_a_repo = tmp_path / "plain-dir"
+    not_a_repo.mkdir()
+    mgr = manager_factory()
+    with pytest.raises(WorktreeError):
+        mgr.create(str(not_a_repo), "some-branch")
+
+
+@pytest.mark.requires_git
+def test_create_with_empty_branch_raises(manager_factory, git_repo: Path):
+    """Passing an empty (or whitespace-only) branch name must raise WorktreeError.
+    (_validate_repo runs git rev-parse first; the branch guard fires after that.)
+    """
+    mgr = manager_factory()
+    with pytest.raises(WorktreeError, match="branch must be a non-empty string"):
+        mgr.create(str(git_repo), "")

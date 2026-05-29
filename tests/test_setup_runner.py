@@ -14,6 +14,7 @@ from lib_python_worktree.setup.runner import (
     DEFAULT_LOG_ROOT,
     LOG_ROOT_ENV,
     SetupFailedError,
+    SetupResult,
     SetupRunner,
     _PlainStep,
     _resolve_shell,
@@ -237,3 +238,42 @@ def test_failed_step_marks_aborted_at(tmp_path: Path):
             branch="main",
         )
     assert exc_info.value.returncode == 7
+
+
+# ---- SetupResult.ok property ----
+
+
+def test_setup_result_ok_when_no_aborted_at():
+    """SetupResult.ok is True when aborted_at is None (success)."""
+    result = SetupResult(worktree_id="wt-ok")
+    assert result.ok is True
+
+
+def test_setup_result_not_ok_when_aborted_at_set():
+    """SetupResult.ok is False when aborted_at is set to a step index."""
+    result = SetupResult(worktree_id="wt-fail", aborted_at=2)
+    assert result.ok is False
+
+
+def test_setup_result_ok_false_at_step_zero():
+    """aborted_at=0 (first step failed) must still give ok=False."""
+    result = SetupResult(worktree_id="wt-zero", aborted_at=0)
+    assert result.ok is False
+
+
+# ---- _PlainStep construction ----
+
+
+def test_plain_step_minimal():
+    """_PlainStep can be created with run= only; name and shell default to None."""
+    step = _PlainStep(run="echo hello")
+    assert step.run == "echo hello"
+    assert step.name is None
+    assert step.shell is None
+
+
+def test_plain_step_with_all_fields():
+    step = _PlainStep(run="pwsh -c foo", name="install", shell="pwsh")
+    assert step.run == "pwsh -c foo"
+    assert step.name == "install"
+    assert step.shell == "pwsh"

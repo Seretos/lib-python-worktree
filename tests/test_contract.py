@@ -167,3 +167,28 @@ def test_shell_override_invalid_value_rejected():
             "version: 1\nisolation: full\nsetup:\n"
             "  - run: 'x'\n    shell: zsh\n"
         )
+
+
+def test_load_unreadable_file_raises_contract_error(
+    tmp_path: Path, monkeypatch
+):
+    """``load()`` on a file that exists but raises OSError on read must
+    raise ``ContractError`` (not the subtype ``ContractValidationError``).
+    """
+    p = tmp_path / "unreadable.yml"
+    p.write_text("", encoding="utf-8")
+
+    # Monkeypatch Path.read_text to simulate a permission / IO error.
+    original_read_text = Path.read_text
+
+    def _failing_read_text(self, *args, **kwargs):
+        if self == p:
+            raise OSError("permission denied (simulated)")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _failing_read_text)
+
+    with pytest.raises(ContractError) as exc_info:
+        load(p)
+    # Must be a plain ContractError, not a validation subtype.
+    assert type(exc_info.value) is ContractError
