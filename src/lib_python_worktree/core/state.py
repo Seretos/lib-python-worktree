@@ -16,8 +16,9 @@ from typing import Dict, Iterable, List, Optional, Protocol
 class WorktreeRecord:
     """A single tracked worktree.
 
-    Fields ``ports`` and ``status`` exist for forward compatibility with W4/W5
-    and are populated by later phases. W2 leaves them at their defaults.
+    Fields ``ports``, ``pids``, and ``status`` exist for forward compatibility
+    with W4/W5/W6 and are populated by later phases. W2 leaves them at their
+    defaults.
     """
 
     id: str
@@ -26,6 +27,7 @@ class WorktreeRecord:
     path: str
     status: str = "created"
     ports: Dict[str, int] = field(default_factory=dict)
+    pids: Dict[str, int] = field(default_factory=dict)
     branch_created_by_us: bool = False
 
 
@@ -43,6 +45,8 @@ class StateStore(Protocol):
     def find_by_branch(
         self, repo_root: str, branch: str
     ) -> Optional[WorktreeRecord]: ...
+
+    def update(self, record: WorktreeRecord) -> None: ...
 
 
 class InMemoryStateStore:
@@ -72,6 +76,11 @@ class InMemoryStateStore:
             if rec.repo_root == repo_root and rec.branch == branch:
                 return rec
         return None
+
+    def update(self, record: WorktreeRecord) -> None:
+        if record.id not in self._records:
+            raise KeyError(f"Worktree id not tracked: {record.id}")
+        self._records[record.id] = record
 
 
 __all__: Iterable[str] = (

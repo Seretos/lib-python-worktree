@@ -140,3 +140,31 @@ def test_find_by_branch_no_match_wrong_repo_root():
 def test_find_by_branch_empty_store_returns_none():
     store = InMemoryStateStore()
     assert store.find_by_branch("/repos/myrepo", "main") is None
+
+
+# ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+def test_update_replaces_record():
+    store = InMemoryStateStore()
+    rec = _make_record(id="upd-001")
+    store.add(rec)
+    updated = WorktreeRecord(
+        id="upd-001",
+        repo_root="/repos/myrepo",
+        branch="main",
+        path="/store/myrepo/upd-001",
+        status="stopped",
+    )
+    store.update(updated)
+    retrieved = store.get("upd-001")
+    assert retrieved is updated
+    assert retrieved.status == "stopped"
+
+
+def test_update_missing_raises_key_error():
+    store = InMemoryStateStore()
+    rec = _make_record(id="ghost")
+    with pytest.raises(KeyError):
+        store.update(rec)

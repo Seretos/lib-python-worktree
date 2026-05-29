@@ -11,6 +11,7 @@ authors = [{ name = "Arne von Appen" }]
 dependencies = [
   "pydantic>=2.6",
   "PyYAML>=6.0",
+  "portalocker>=2.7",
 ]
 
 [project.optional-dependencies]
