@@ -104,7 +104,7 @@ def test_worktree_paths_under_store_root(
 
 
 @pytest.mark.requires_git
-def test_run_git_smoke_version_completes_quickly():
+def test_run_git_smoke_version_completes_quickly(skip_if_no_git):  # noqa: ARG001
     """Sanity check: ``git --version`` finishes well under 1 s with the new
     Popen-based plumbing. Catches pipe/handle plumbing regressions on every
     platform (Linux, Windows, packaged exe).
