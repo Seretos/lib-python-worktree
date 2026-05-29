@@ -2,6 +2,8 @@
 
 These exercise real ``git worktree`` operations against a temporary repo, as
 required by the planning comment's Verifikation section.
+
+Fixtures ``git_repo``, ``manager``, and ``manager_factory`` come from conftest.py.
 """
 
 from __future__ import annotations
@@ -9,7 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
-from typing import Iterator
+from typing import Callable
 
 import pytest
 
@@ -27,36 +29,14 @@ from lib_python_worktree.core.manager import (
 from lib_python_worktree.core.state import InMemoryStateStore
 
 
-def _git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+# ---------------------------------------------------------------------------
+# Tests that touch real git
+# ---------------------------------------------------------------------------
 
-
-@pytest.fixture
-def temp_repo(tmp_path: Path) -> Iterator[Path]:
-    repo = tmp_path / "src-repo"
-    repo.mkdir()
-    _git("init", "-q", "-b", "main", cwd=repo)
-    _git("config", "user.email", "test@example.com", cwd=repo)
-    _git("config", "user.name", "Test", cwd=repo)
-    (repo / "README.md").write_text("hello\n", encoding="utf-8")
-    _git("add", "-A", cwd=repo)
-    _git("commit", "-q", "-m", "init", cwd=repo)
-    _git("branch", "feature/alpha", cwd=repo)
-    yield repo
-
-
-@pytest.fixture
-def manager(tmp_path: Path) -> WorktreeManager:
-    store_root = tmp_path / "store"
-    return WorktreeManager(
-        config=ManagerConfig(store_root=store_root),
-        state=InMemoryStateStore(),
-    )
-
-
-def test_create_list_remove_roundtrip(manager: WorktreeManager, temp_repo: Path):
-    rec = manager.create(str(temp_repo), "feature/alpha")
-    assert rec.id.startswith("src-repo-feature-alpha-")
+@pytest.mark.requires_git
+def test_create_list_remove_roundtrip(manager: WorktreeManager, git_repo: Path):
+    rec = manager.create(str(git_repo), "feature/alpha")
+    assert rec.id.startswith("repo-feature-alpha-")
     assert rec.branch == "feature/alpha"
     assert Path(rec.path).exists()
     assert Path(rec.path).is_dir()
@@ -71,17 +51,19 @@ def test_create_list_remove_roundtrip(manager: WorktreeManager, temp_repo: Path)
     assert manager.list() == []
 
 
+@pytest.mark.requires_git
 def test_create_unknown_branch_without_base(
-    manager: WorktreeManager, temp_repo: Path
+    manager: WorktreeManager, git_repo: Path
 ):
     with pytest.raises(BranchNotFoundError):
-        manager.create(str(temp_repo), "feature/does-not-exist")
+        manager.create(str(git_repo), "feature/does-not-exist")
 
 
+@pytest.mark.requires_git
 def test_create_unknown_branch_with_base(
-    manager: WorktreeManager, temp_repo: Path
+    manager: WorktreeManager, git_repo: Path
 ):
-    rec = manager.create(str(temp_repo), "feature/new", base="main")
+    rec = manager.create(str(git_repo), "feature/new", base="main")
     assert rec.branch == "feature/new"
     assert Path(rec.path).exists()
     proc = subprocess.run(
@@ -94,45 +76,34 @@ def test_create_unknown_branch_with_base(
     assert proc.stdout.strip() == "feature/new"
 
 
+@pytest.mark.requires_git
 def test_duplicate_create_same_branch_fails(
-    manager: WorktreeManager, temp_repo: Path
+    manager: WorktreeManager, git_repo: Path
 ):
-    manager.create(str(temp_repo), "feature/alpha")
+    manager.create(str(git_repo), "feature/alpha")
     with pytest.raises(DuplicateWorktreeError):
-        manager.create(str(temp_repo), "feature/alpha")
+        manager.create(str(git_repo), "feature/alpha")
 
 
+@pytest.mark.requires_git
 def test_remove_unknown_id_fails(manager: WorktreeManager):
     with pytest.raises(WorktreeNotFoundError):
         manager.remove("nope-nope-12345678")
 
 
-def test_store_root_from_env(tmp_path: Path, monkeypatch):
-    target = tmp_path / "custom-store"
-    monkeypatch.setenv("WORKTREE_STORE_ROOT", str(target))
-    cfg = ManagerConfig.from_env()
-    assert cfg.store_root == target.resolve()
-
-
-def test_store_root_default(monkeypatch):
-    monkeypatch.delenv("WORKTREE_STORE_ROOT", raising=False)
-    cfg = ManagerConfig.from_env()
-    assert cfg.store_root.name == "agent-worktree-store"
-    assert cfg.store_root.is_absolute()
-
-
+@pytest.mark.requires_git
 def test_worktree_paths_under_store_root(
-    manager: WorktreeManager, temp_repo: Path, tmp_path: Path
+    manager: WorktreeManager, git_repo: Path, tmp_path: Path
 ):
-    rec = manager.create(str(temp_repo), "feature/alpha")
+    rec = manager.create(str(git_repo), "feature/alpha")
+    # The manager fixture uses store-1 inside tmp_path.
+    wt_path = Path(rec.path)
     # store_root / repo_slug / id
-    assert Path(rec.path).parent.parent == (tmp_path / "store").resolve()
-    assert Path(rec.path).parent.name == "src-repo"
+    assert wt_path.parent.name == "repo"
+    assert wt_path.parent.parent.name.startswith("store-")
 
 
-# ---- Ticket #19: _run_git timeout + stdin handling ----
-
-
+@pytest.mark.requires_git
 def test_run_git_smoke_version_completes_quickly():
     """Sanity check: ``git --version`` finishes well under 1 s with the new
     Popen-based plumbing. Catches pipe/handle plumbing regressions on every
@@ -148,6 +119,114 @@ def test_run_git_smoke_version_completes_quickly():
     assert proc.stdout.startswith("git version")
     assert elapsed < 1.0, f"_run_git(['--version']) took {elapsed:.2f}s"
 
+
+@pytest.mark.requires_git
+def test_create_branch_already_checked_out_elsewhere(
+    manager_factory: Callable[..., WorktreeManager],
+    git_repo: Path,
+    tmp_path: Path,
+):
+    """Creating a worktree for a branch that is already checked out in
+    another worktree (tracked by a different state store, so the in-memory
+    duplicate-check shortcut at manager.py:133 doesn't fire) must surface as
+    a structured ``BranchAlreadyCheckedOutError`` with branch + path attrs.
+    """
+
+    first_manager = manager_factory()
+    first = first_manager.create(str(git_repo), "feature/alpha")
+    assert Path(first.path).exists()
+
+    # Fresh manager + fresh state store simulates a second client session
+    # that doesn't know about worktree A yet -- now the duplicate-check
+    # falls through and we reach the actual `git worktree add`.
+    other = manager_factory()
+
+    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
+        other.create(str(git_repo), "feature/alpha")
+
+    err = excinfo.value
+    assert err.branch == "feature/alpha"
+    assert Path(err.path).resolve() == Path(first.path).resolve()
+    # Existing dir -> not prunable.
+    assert err.prunable is False
+    # Message contract matches the format used by tools/worktree.py callers.
+    msg = str(err)
+    assert "branch_already_checked_out" in msg
+    assert "'feature/alpha'" in msg
+    assert "git worktree prune" in msg
+
+
+@pytest.mark.requires_git
+def test_already_checked_out_reports_prunable_after_dir_removed(
+    manager_factory: Callable[..., WorktreeManager],
+    git_repo: Path,
+    tmp_path: Path,
+):
+    """If the worktree directory is gone but git still has the registration,
+    the structured error must report ``prunable is True`` so the caller can
+    suggest ``git worktree prune``.
+    """
+
+    import shutil
+
+    first_manager = manager_factory()
+    first = first_manager.create(str(git_repo), "feature/alpha")
+    # Wipe the worktree dir behind git's back so its registration goes stale.
+    shutil.rmtree(first.path)
+
+    other = manager_factory()
+
+    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
+        other.create(str(git_repo), "feature/alpha")
+
+    err = excinfo.value
+    assert err.branch == "feature/alpha"
+    assert err.prunable is True
+    assert "prunable=True" in str(err)
+
+
+@pytest.mark.requires_git
+def test_remove_with_force_flag(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Removing a worktree with force=True must succeed even when the
+    worktree has uncommitted changes (covers the _teardown --force branch).
+    """
+    rec = manager.create(str(git_repo), "feature/alpha")
+    wt_path = Path(rec.path)
+    assert wt_path.exists()
+
+    # Dirty the worktree with an untracked file so git would normally refuse.
+    (wt_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    # force=True must not raise and must remove the directory.
+    removed = manager.remove(rec.id, force=True)
+    assert removed.id == rec.id
+    assert not wt_path.exists()
+    assert manager.list() == []
+
+
+# ---------------------------------------------------------------------------
+# Pure-environment tests — no git binary needed, no marker
+# ---------------------------------------------------------------------------
+
+def test_store_root_from_env(tmp_path: Path, monkeypatch):
+    target = tmp_path / "custom-store"
+    monkeypatch.setenv("WORKTREE_STORE_ROOT", str(target))
+    cfg = ManagerConfig.from_env()
+    assert cfg.store_root == target.resolve()
+
+
+def test_store_root_default(monkeypatch):
+    monkeypatch.delenv("WORKTREE_STORE_ROOT", raising=False)
+    cfg = ManagerConfig.from_env()
+    assert cfg.store_root.name == "agent-worktree-store"
+    assert cfg.store_root.is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# Monkeypatch-only tests — no real git, no marker
+# ---------------------------------------------------------------------------
 
 def test_run_git_raises_timeout_when_subprocess_hangs(monkeypatch):
     """Simulate a hanging git via a fake Popen, confirm GitTimeoutError fires
@@ -225,70 +304,3 @@ def test_run_git_closes_stdin(monkeypatch):
     monkeypatch.setattr(manager_module.subprocess, "Popen", _RecordingPopen)
     _run_git(["--version"])
     assert captured_kwargs.get("stdin") is subprocess.DEVNULL
-
-
-# ---- Ticket #18: structured error for "branch already checked out elsewhere" ----
-
-
-def test_create_branch_already_checked_out_elsewhere(
-    manager: WorktreeManager, temp_repo: Path, tmp_path: Path
-):
-    """Creating a worktree for a branch that is already checked out in
-    another worktree (tracked by a different state store, so the in-memory
-    duplicate-check shortcut at manager.py:133 doesn't fire) must surface as
-    a structured ``BranchAlreadyCheckedOutError`` with branch + path attrs.
-    """
-
-    # First state store creates worktree A for feature/alpha.
-    first = manager.create(str(temp_repo), "feature/alpha")
-    assert Path(first.path).exists()
-
-    # Fresh manager + fresh state store simulates a second client session
-    # that doesn't know about worktree A yet -- now the duplicate-check at
-    # manager.py:133 falls through and we reach the actual `git worktree add`.
-    other = WorktreeManager(
-        config=ManagerConfig(store_root=tmp_path / "store2"),
-        state=InMemoryStateStore(),
-    )
-
-    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
-        other.create(str(temp_repo), "feature/alpha")
-
-    err = excinfo.value
-    assert err.branch == "feature/alpha"
-    assert Path(err.path).resolve() == Path(first.path).resolve()
-    # Existing dir -> not prunable.
-    assert err.prunable is False
-    # Message contract matches the format used by tools/worktree.py callers.
-    msg = str(err)
-    assert "branch_already_checked_out" in msg
-    assert "'feature/alpha'" in msg
-    assert "git worktree prune" in msg
-
-
-def test_already_checked_out_reports_prunable_after_dir_removed(
-    manager: WorktreeManager, temp_repo: Path, tmp_path: Path
-):
-    """If the worktree directory is gone but git still has the registration,
-    the structured error must report ``prunable is True`` so the caller can
-    suggest ``git worktree prune``.
-    """
-
-    import shutil
-
-    first = manager.create(str(temp_repo), "feature/alpha")
-    # Wipe the worktree dir behind git's back so its registration goes stale.
-    shutil.rmtree(first.path)
-
-    other = WorktreeManager(
-        config=ManagerConfig(store_root=tmp_path / "store2"),
-        state=InMemoryStateStore(),
-    )
-
-    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
-        other.create(str(temp_repo), "feature/alpha")
-
-    err = excinfo.value
-    assert err.branch == "feature/alpha"
-    assert err.prunable is True
-    assert "prunable=True" in str(err)

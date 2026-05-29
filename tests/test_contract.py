@@ -167,3 +167,32 @@ def test_shell_override_invalid_value_rejected():
             "version: 1\nisolation: full\nsetup:\n"
             "  - run: 'x'\n    shell: zsh\n"
         )
+
+
+def test_load_read_failure_raises_contract_error_not_validation(
+    tmp_path: Path, monkeypatch
+):
+    """If the contract file exists but reading it raises OSError, ``load``
+    must re-raise as ``ContractError`` (NOT a ``ContractValidationError`` —
+    that is reserved for schema faults, not I/O failures).  The message must
+    indicate a read failure.
+    """
+    p = tmp_path / "worktree-setup.yml"
+    p.write_text("version: 1\nisolation: full\n", encoding="utf-8")
+
+    # Monkeypatch Path.read_text to raise OSError for this path.
+    original_read_text = Path.read_text
+
+    def _fail_read(self, *args, **kwargs):
+        if self == p:
+            raise OSError("permission denied (simulated)")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _fail_read)
+
+    with pytest.raises(ContractError) as exc_info:
+        load(p)
+
+    # Must be ContractError but NOT the validation subclass.
+    assert not isinstance(exc_info.value, ContractValidationError)
+    assert "could not read" in str(exc_info.value).lower() or "read" in str(exc_info.value).lower()

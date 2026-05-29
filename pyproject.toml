@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=8",
+  "pytest-cov>=4",
 ]
 
 [tool.setuptools]
@@ -27,4 +28,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers --cov=lib_python_worktree --cov-report=term-missing --cov-fail-under=80"
+markers = [
+  "requires_git: marks tests that invoke real git subprocesses (skipped if git is absent)",
+]
