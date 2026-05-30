@@ -37,7 +37,26 @@ class GitTimeoutError(WorktreeError):
         self.elapsed = elapsed
 
 
+class DirtyWorktreeError(WorktreeError):
+    """Raised when ``git worktree remove`` refuses because the worktree has
+    uncommitted changes and ``force=False`` was passed.
+
+    The message names only the engine-level parameter (``force=True``) and
+    the worktree id — no raw git command text, absolute paths, or exit codes
+    are surfaced so that callers can react programmatically without parsing
+    implementation details.
+    """
+
+    def __init__(self, worktree_id: str) -> None:
+        super().__init__(
+            f"worktree '{worktree_id}' has uncommitted changes. "
+            f"Pass force=True to remove it anyway."
+        )
+        self.worktree_id = worktree_id
+
+
 __all__ = [
+    "DirtyWorktreeError",
     "GitTimeoutError",
     "WorktreeError",
 ]

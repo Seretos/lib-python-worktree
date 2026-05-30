@@ -445,21 +445,55 @@ class TestTeardownForceExit128:
         ), patch("lib_python_worktree.core.manager.shutil"):
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
 
-    def test_exit128_without_force_still_raises(self, tmp_path):
-        """exit 128 with force=False must still raise GitCommandError."""
-        from lib_python_worktree.core.manager import GitCommandError
+    def test_exit128_without_force_raises_dirty_error(self, tmp_path):
+        """exit 128 with force=False must raise DirtyWorktreeError (not a bare
+        GitCommandError), and the message must contain 'force=True' but not
+        '--force' or the raw exit code '128'."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
 
         manager = _make_manager(tmp_path)
-        record = _make_record("wt-128-no-force")
+        record = _make_record("wt-dirty-no-force")
         manager.state.add(record)
 
         mock_lifecycle = MagicMock()
 
         def _git_exit128(args, cwd=None, **kwargs):
+            return MagicMock(
+                returncode=128,
+                stderr=(
+                    "fatal: 'some/path' contains modified or untracked files,"
+                    " use --force to delete it"
+                ),
+            )
+
+        with pytest.raises(DirtyWorktreeError) as excinfo, patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=_git_exit128,
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        msg = str(excinfo.value)
+        assert "force=True" in msg
+        assert "--force" not in msg
+        assert "128" not in msg
+
+    def test_exit128_without_force_non_dirty_stderr_raises_git_error(self, tmp_path):
+        """exit 128 with force=False but a non-dirty stderr (e.g. 'not a git
+        repo') must raise GitCommandError, not DirtyWorktreeError, so the
+        caller sees the real failure reason."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-128-non-dirty")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_not_a_repo(args, cwd=None, **kwargs):
             return MagicMock(returncode=128, stderr="fatal: not a git repo")
 
         with pytest.raises(GitCommandError), patch(
             "lib_python_worktree.core.manager._run_git",
-            side_effect=_git_exit128,
+            side_effect=_git_not_a_repo,
         ), patch("lib_python_worktree.core.manager.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)

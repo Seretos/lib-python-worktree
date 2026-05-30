@@ -21,6 +21,7 @@ from lib_python_worktree.core import _git_utils as git_utils_module
 from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
+    DirtyWorktreeError,
     DuplicateWorktreeError,
     GitTimeoutError,
     ManagerConfig,
@@ -213,6 +214,7 @@ def test_remove_with_force_flag(
     # force=True must not raise and must remove the directory.
     removed = manager.remove(rec.id, force=True)
     assert removed.id == rec.id
+    assert removed.status == "removed"
     assert not wt_path.exists()
     assert manager.list() == []
 
@@ -716,3 +718,90 @@ def test_manager_prune_raises_git_command_error_v2(
 
     with pytest.raises(GitCommandError, match="simulated prune failure"):
         mgr.prune(str(git_repo))
+
+
+# ---------------------------------------------------------------------------
+# Ticket #2: remove() contract — status="removed" and DirtyWorktreeError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+def test_remove_success_return_status(
+    manager: WorktreeManager, git_repo: Path
+):
+    """remove() must return a record with status='removed' and the correct id."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+    result = manager.remove(rec.id)
+    assert result.status == "removed"
+    assert result.id == rec.id
+
+
+@pytest.mark.requires_git
+def test_remove_dirty_no_force_raises_dirty_error(
+    manager: WorktreeManager, git_repo: Path
+):
+    """remove(force=False) on a dirty worktree must raise DirtyWorktreeError
+    with 'force=True' in the message and no raw '--force' git flag exposed."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+    wt_path = Path(rec.path)
+
+    # Dirty the worktree so git refuses without --force.
+    (wt_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(DirtyWorktreeError) as excinfo:
+        manager.remove(rec.id, force=False)
+
+    msg = str(excinfo.value)
+    assert "force=True" in msg
+    assert "--force" not in msg
+
+
+def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
+    """DirtyWorktreeError message must contain 'force=True' and must not
+    contain '--force' or '128' (no git internals leaked).
+
+    Uses a fake _run_git that returns returncode=128 with a realistic git
+    stderr so the test does not need a real git binary.
+    """
+    from lib_python_worktree.core.state import WorktreeRecord
+
+    fake_record = WorktreeRecord(
+        id="test-wt-deadbeef",
+        repo_root="/fake/repo",
+        branch="feature/test",
+        path="/fake/repo-store/test-wt-deadbeef",
+    )
+
+    real_git_stderr = (
+        "fatal: '/fake/repo-store/test-wt-deadbeef' contains modified or "
+        "untracked files, use --force to delete it"
+    )
+
+    def _fake_run_git(args, cwd=None, **kwargs):
+        if args[:2] == ["worktree", "remove"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout="",
+                stderr=real_git_stderr,
+            )
+        # Any other git call (e.g. lifecycle stop) returns success.
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("/fake/store")),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+
+    with pytest.raises(DirtyWorktreeError) as excinfo:
+        mgr._teardown(fake_record, force=False)
+
+    msg = str(excinfo.value)
+    assert "force=True" in msg
+    assert "--force" not in msg
+    assert "128" not in msg

@@ -22,7 +22,7 @@ from typing import List, Optional
 # module even though _run_git now lives in _git_utils.
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
-from ._exceptions import GitTimeoutError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import DirtyWorktreeError, GitTimeoutError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
@@ -374,6 +374,7 @@ class WorktreeManager:
         # does not leave a stale orphaned record in the state store.
         removed = self.state.remove(worktree_id)
         assert removed is not None  # state.get returned record above
+        removed.status = "removed"
         # Phase 3: delete the owned branch (if any).  May raise GitCommandError
         # (e.g. unmerged + force=False); the record is already gone from state.
         self._delete_owned_branch(record, force=force)
@@ -534,6 +535,15 @@ class WorktreeManager:
                     cwd=Path(record.repo_root),
                 )
                 # Fall through to step 4.
+            elif (
+                proc.returncode == 128
+                and not force
+                and "contains modified or untracked files" in proc.stderr
+            ):
+                # git refused because the worktree has uncommitted changes.
+                # Surface a structured error naming only the engine parameter
+                # (force=True), not the raw git command, path, or exit code.
+                raise DirtyWorktreeError(record.id)
             else:
                 raise GitCommandError(
                     ["git", *args], proc.returncode, proc.stderr
@@ -595,6 +605,7 @@ class WorktreeManager:
 __all__ = (
     "BranchAlreadyCheckedOutError",
     "BranchNotFoundError",
+    "DirtyWorktreeError",
     "DuplicateWorktreeError",
     "GitCommandError",
     "GitTimeoutError",
