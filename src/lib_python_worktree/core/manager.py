@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
+from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .state import InMemoryStateStore, StateStore, WorktreeRecord
 from .yaml_store import YamlStateStore, reconcile
 
@@ -27,6 +29,8 @@ _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
 _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _GIT_TIMEOUT_ENV = "WORKTREE_GIT_TIMEOUT_SEC"
 _GIT_TIMEOUT_DEFAULT = 30.0
+_PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
+_PORT_RANGE_DEFAULT = (30000, 40000)
 
 # Stable since git 2.5 (builtin/worktree.c). Captures branch + path from
 # the two variants git emits when refusing `worktree add` on a conflict:
@@ -114,9 +118,14 @@ class ManagerConfig:
     ``store_root`` is the directory under which per-repo worktree checkouts
     live (decision D2, Option B). Resolved from ``WORKTREE_STORE_ROOT`` if
     unset on construction, falling back to ``~/agent-worktree-store``.
+
+    ``port_range`` is the inclusive ``(low, high)`` range from which the port
+    allocator draws ports. Resolved from ``WORKTREE_PORT_RANGE`` (format
+    ``"30000-40000"``), falling back to ``(30000, 40000)``.
     """
 
     store_root: Path
+    port_range: tuple = _PORT_RANGE_DEFAULT  # type: ignore[assignment]
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "ManagerConfig":
@@ -126,7 +135,17 @@ class ManagerConfig:
             root = Path(raw).expanduser().resolve()
         else:
             root = (Path.home() / _DEFAULT_STORE_DIR_NAME).resolve()
-        return cls(store_root=root)
+
+        port_range: tuple[int, int] = _PORT_RANGE_DEFAULT
+        raw_range = environ.get(_PORT_RANGE_ENV)
+        if raw_range:
+            try:
+                low_s, high_s = raw_range.split("-", 1)
+                port_range = (int(low_s.strip()), int(high_s.strip()))
+            except (ValueError, TypeError):
+                port_range = _PORT_RANGE_DEFAULT
+
+        return cls(store_root=root, port_range=port_range)
 
 
 def _slug(value: str, *, max_len: int = 40) -> str:
@@ -309,6 +328,18 @@ class WorktreeManager:
         if reconcile_on_init and isinstance(resolved_state, YamlStateStore):
             reconcile(resolved_state)
 
+        # Construct the port allocator.  When the state store is file-backed
+        # (YamlStateStore) we use the real allocator backed by its _PortsFile.
+        # For InMemoryStateStore (unit tests) we use a no-op stub so that
+        # tests never touch the filesystem.
+        if isinstance(resolved_state, YamlStateStore):
+            self._allocator: object = PortAllocator(
+                resolved_state._ports,
+                port_range=self.config.port_range,
+            )
+        else:
+            self._allocator = _NoOpPortAllocator()
+
     # ---- public API used by the FastMCP tools ----
 
     def create(
@@ -370,14 +401,53 @@ class WorktreeManager:
                 )
             raise GitCommandError(["git", *git_args], proc.returncode, proc.stderr)
 
-        record = WorktreeRecord(
-            id=worktree_id,
-            repo_root=str(repo_path),
-            branch=branch,
-            path=str(target_path),
-            branch_created_by_us=not branch_exists,
-        )
-        self.state.add(record)
+        # Load the contract, allocate ports, and persist the state record.
+        # All three steps are inside the same try/except so that ANY failure
+        # (ContractError, PortAllocationError, state.add failure) triggers the
+        # same git-worktree rollback.  A missing contract file is silently
+        # treated as an implicit isolation:none contract with no ports.
+        port_mapping: dict = {}
+        try:
+            contract_path = repo_path / CONTRACT_FILENAME
+            contract = _load_contract(contract_path)
+
+            if contract.ports:
+                slot_names = [slot.name for slot in contract.ports]
+                port_mapping = self._allocator.allocate(slot_names, worktree_id)
+
+            record = WorktreeRecord(
+                id=worktree_id,
+                repo_root=str(repo_path),
+                branch=branch,
+                path=str(target_path),
+                branch_created_by_us=not branch_exists,
+                ports=port_mapping,
+            )
+            self.state.add(record)
+        except Exception:
+            # Roll back: remove the git worktree we just created (--force
+            # because the checkout may be empty / partially written), release
+            # any ports already written by allocate(), then delete the branch
+            # if this manager created it.  Failures in the rollback itself are
+            # swallowed so we always re-raise the original exception.
+            try:
+                _run_git(
+                    ["worktree", "remove", "--force", str(target_path)],
+                    cwd=repo_path,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._allocator.release(worktree_id)
+            except Exception:  # noqa: BLE001
+                pass
+            if not branch_exists:
+                try:
+                    _run_git(["branch", "-D", branch], cwd=repo_path)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+
         return record
 
     def list(self) -> List[WorktreeRecord]:
@@ -409,7 +479,9 @@ class WorktreeManager:
         """Remove the git worktree checkout directory.
 
         W8 will hook in here (process termination, contract ``teardown:``
-        steps, port release). W2 only calls ``git worktree remove``.
+        steps). W4 port release happens AFTER the git worktree remove
+        succeeds, so that ports are never freed while the service is still
+        bound to them.
 
         Branch deletion is intentionally *not* done here — it happens in
         ``remove()`` after the state record has been cleaned up, so that a
@@ -425,6 +497,12 @@ class WorktreeManager:
             raise GitCommandError(
                 ["git", *args], proc.returncode, proc.stderr
             )
+
+        # Release allocated ports only after the git worktree remove has
+        # succeeded.  Freeing ports before the remove would allow a
+        # concurrent allocate() to reissue the same ports while the original
+        # service is still bound to them.
+        self._allocator.release(record.id)
 
     def _delete_owned_branch(self, record: WorktreeRecord, *, force: bool) -> None:
         """Delete the branch if we created it (``git worktree add -b``).
@@ -483,4 +561,5 @@ __all__ = (
     "WorktreeError",
     "WorktreeManager",
     "WorktreeNotFoundError",
+    "PortAllocationError",
 )
