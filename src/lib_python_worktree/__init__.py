@@ -44,6 +44,11 @@ from .core.manager import (
     WorktreeManager,
     WorktreeNotFoundError,
 )
+from .core.process_lifecycle import (
+    ProcessAlreadyRunningError,
+    ProcessLifecycleError,
+    ProcessNotRunningError,
+)
 from .core.port_allocator import PortAllocator
 from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
 from .core.yaml_store import ReconcileReport, YamlStateStore, reconcile
@@ -69,6 +74,10 @@ __all__ = [
     "WorktreeNotFoundError",
     "GitCommandError",
     "GitTimeoutError",
+    # process lifecycle
+    "ProcessLifecycleError",
+    "ProcessAlreadyRunningError",
+    "ProcessNotRunningError",
     # port allocator
     "PortAllocator",
     "PortAllocationError",
