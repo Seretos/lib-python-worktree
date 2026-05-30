@@ -14,3 +14,17 @@ projects:
         create: true
         modify: true
         merge: false
+
+  - id: agent-python-developer-ticket-workflow
+    description: ""
+    provider: github
+    path: Seretos/agent-python-developer-ticket-workflow
+    token_env: GITHUB_TOKEN
+    permissions:
+      issues:
+        create: true
+        modify: true
+      pulls:
+        create: false
+        modify: false
+        merge: false
