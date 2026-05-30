@@ -35,6 +35,7 @@ from .contract import (
 from .core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
+    DirtyWorktreeError,
     DuplicateWorktreeError,
     GitCommandError,
     GitTimeoutError,
@@ -70,6 +71,7 @@ __all__ = [
     "WorktreeError",
     "BranchNotFoundError",
     "BranchAlreadyCheckedOutError",
+    "DirtyWorktreeError",
     "DuplicateWorktreeError",
     "WorktreeNotFoundError",
     "GitCommandError",
