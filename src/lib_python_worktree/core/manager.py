@@ -21,6 +21,13 @@ from typing import List, Optional
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
+from .process_lifecycle import (
+    ProcessAlreadyRunningError,
+    ProcessLifecycleError,
+    ProcessNotRunningError,
+    start as _lifecycle_start,
+    stop as _lifecycle_stop,
+)
 from .state import InMemoryStateStore, StateStore, WorktreeRecord
 from .yaml_store import YamlStateStore, reconcile
 
@@ -473,21 +480,110 @@ class WorktreeManager:
         self._delete_owned_branch(record, force=force)
         return removed
 
+    def start(
+        self,
+        worktree_id: str,
+        cmd: List[str],
+        *,
+        role: str = "main",
+        env: Optional[dict] = None,
+        cwd: Optional[str] = None,
+    ) -> WorktreeRecord:
+        """Spawn a detached process for *worktree_id* and record its PID.
+
+        Delegates to ``process_lifecycle.start`` with ``store=self.state``.
+        """
+        return _lifecycle_start(
+            worktree_id,
+            cmd,
+            store=self.state,
+            role=role,
+            env=env,
+            cwd=cwd,
+        )
+
+    def stop(
+        self,
+        worktree_id: str,
+        *,
+        role: str = "main",
+        timeout: float = 10.0,
+    ) -> WorktreeRecord:
+        """Stop the process recorded under *role* for *worktree_id*.
+
+        Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
+        """
+        return _lifecycle_stop(
+            worktree_id,
+            store=self.state,
+            role=role,
+            timeout=timeout,
+        )
+
     # ---- seams for later phases ----
 
-    def _teardown(self, record: WorktreeRecord, *, force: bool) -> None:
+    def _teardown(
+        self,
+        record: WorktreeRecord,
+        *,
+        force: bool,
+        _lifecycle_module=None,
+    ) -> None:
         """Remove the git worktree checkout directory.
 
-        W8 will hook in here (process termination, contract ``teardown:``
-        steps). W4 port release happens AFTER the git worktree remove
-        succeeds, so that ports are never freed while the service is still
-        bound to them.
+        Sequence (W8):
+        1. Stop any tracked processes (process lifecycle).
+        2. Run any contract ``teardown:`` steps via ``SetupRunner``.
+        3. Remove the git worktree checkout.
+        4. Release allocated ports (only after step 3 succeeds).
 
         Branch deletion is intentionally *not* done here — it happens in
         ``remove()`` after the state record has been cleaned up, so that a
         branch-delete failure cannot leave a stale orphaned state entry.
-        """
 
+        ``_lifecycle_module`` is an injection seam for tests; callers should
+        leave it as ``None`` (the real ``process_lifecycle`` module is used).
+        """
+        lifecycle = _lifecycle_module
+        if lifecycle is None:
+            from . import process_lifecycle as lifecycle  # type: ignore[assignment]
+
+        # Step 1: stop any tracked processes before removing the worktree dir.
+        if record.pids:
+            for role in list(record.pids.keys()):
+                try:
+                    lifecycle.stop(record.id, store=self.state, role=role)
+                except ProcessNotRunningError:
+                    pass
+                except ProcessLifecycleError:
+                    # Best-effort: log-worthy but don't block the removal.
+                    pass
+
+        # Step 2: run contract teardown: steps.
+        # A missing contract is treated as isolation:none (no teardown steps).
+        try:
+            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract = _load_contract(contract_path)
+            if contract.teardown:
+                from ..setup.runner import SetupRunner
+                runner = SetupRunner()
+                try:
+                    runner.run(
+                        setup=contract.teardown,
+                        worktree_id=record.id,
+                        worktree_path=Path(record.path),
+                        branch=record.branch,
+                        port_mapping=record.ports,
+                    )
+                except Exception:  # noqa: BLE001
+                    # Teardown step failure must not block git worktree remove.
+                    pass
+        except Exception:  # noqa: BLE001
+            # Any contract load failure is silently skipped — same pattern as
+            # create().
+            pass
+
+        # Step 3: remove the git worktree checkout directory.
         args = ["worktree", "remove"]
         if force:
             args.append("--force")
@@ -498,8 +594,8 @@ class WorktreeManager:
                 ["git", *args], proc.returncode, proc.stderr
             )
 
-        # Release allocated ports only after the git worktree remove has
-        # succeeded.  Freeing ports before the remove would allow a
+        # Step 4: release allocated ports only after the git worktree remove
+        # has succeeded.  Freeing ports before the remove would allow a
         # concurrent allocate() to reissue the same ports while the original
         # service is still bound to them.
         self._allocator.release(record.id)
@@ -562,4 +658,7 @@ __all__ = (
     "WorktreeManager",
     "WorktreeNotFoundError",
     "PortAllocationError",
+    "ProcessAlreadyRunningError",
+    "ProcessLifecycleError",
+    "ProcessNotRunningError",
 )
