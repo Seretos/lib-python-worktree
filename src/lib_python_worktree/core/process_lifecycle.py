@@ -171,26 +171,73 @@ def _force_kill(pid: int) -> None:
             pass
 
 
+def _reap(pid: int) -> bool:
+    """Best-effort reap of our own child *pid* (POSIX only).
+
+    A process we spawned that has exited but has not been waited on lingers
+    as a *zombie*: ``os.kill(pid, 0)`` (used by ``_pid_alive``) still
+    succeeds for it, so the process reads as "alive" forever.  Reaping it
+    with a non-blocking ``waitpid`` removes the zombie so liveness checks
+    report the truth.
+
+    Returns ``True`` only when *pid* was actually reaped (it is now gone).
+    Returns ``False`` when the process is still running, or when ``waitpid``
+    cannot reap it (e.g. ``ECHILD`` — not our child, already reaped by init
+    after an MCP restart); in that case callers fall back to ``_pid_alive``.
+
+    No-op on Windows, which has no zombies — a process object disappears
+    once the last handle to it is closed.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        # ECHILD (not our child) or similar — we cannot reap it here.
+        return False
+    return waited == pid
+
+
+def _reap_until_gone(pid: int, attempts: int = 50) -> None:
+    """Briefly poll-reap a just-force-killed child so it does not linger.
+
+    After ``_force_kill`` the child dies imminently but may not be a
+    reapable zombie for a few milliseconds.  Poll a short while so that, by
+    the time we return, ``_pid_alive`` reflects the death.  No-op on Windows.
+    """
+    if sys.platform == "win32":
+        return
+    for _ in range(attempts):
+        if _reap(pid) or not _pid_alive(pid):
+            return
+        time.sleep(0.01)
+
+
 def _wait_or_kill(pid: int, timeout: float) -> None:
     """Wait up to *timeout* seconds for *pid* to die; force-kill if it doesn't.
 
     Uses a polling loop (0.1 s sleep) so there is no hard dependency on
-    psutil or OS-specific wait APIs.  ``timeout <= 0`` goes straight to
+    psutil or OS-specific wait APIs.  Each poll reaps *pid* if it has become
+    a zombie child of ours, so a graceful exit is detected promptly instead
+    of reading as "alive" indefinitely.  ``timeout <= 0`` goes straight to
     force-kill.
     """
     if timeout <= 0:
         _force_kill(pid)
+        _reap_until_gone(pid)
         return
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _pid_alive(pid):
+        if _reap(pid) or not _pid_alive(pid):
             return
         time.sleep(0.1)
 
-    # Still alive after the timeout — escalate to force-kill.
-    if _pid_alive(pid):
+    # Still alive after the timeout — escalate to force-kill, then reap so
+    # the killed child does not linger as a zombie.
+    if not _reap(pid) and _pid_alive(pid):
         _force_kill(pid)
+        _reap_until_gone(pid)
 
 
 # ---------------------------------------------------------------------------
