@@ -13,14 +13,17 @@ import os
 import re
 import shutil
 import subprocess
-import sys
-import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+# `subprocess` is kept for CompletedProcess / DEVNULL references inside this
+# module even though _run_git now lives in _git_utils.
+
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
+from ._exceptions import GitTimeoutError, WorktreeError  # noqa: F401 — re-exported
+from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
     ProcessAlreadyRunningError,
@@ -30,13 +33,11 @@ from .process_lifecycle import (
     stop as _lifecycle_stop,
 )
 from .state import InMemoryStateStore, StateStore, WorktreeRecord
-from .yaml_store import YamlStateStore, reconcile
+from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
 _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
-_GIT_TIMEOUT_ENV = "WORKTREE_GIT_TIMEOUT_SEC"
-_GIT_TIMEOUT_DEFAULT = 30.0
 _PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
 _PORT_RANGE_DEFAULT = (30000, 40000)
 
@@ -49,10 +50,6 @@ _PORT_RANGE_DEFAULT = (30000, 40000)
 _ALREADY_CHECKED_OUT_RE = re.compile(
     r"fatal: '([^']+)' is already (?:checked out|used by worktree) at '([^']+)'"
 )
-
-
-class WorktreeError(RuntimeError):
-    """Base class for ``WorktreeManager`` errors surfaced to MCP clients."""
 
 
 class BranchNotFoundError(WorktreeError):
@@ -99,24 +96,6 @@ class GitCommandError(WorktreeError):
         self.command = command
         self.returncode = returncode
         self.stderr = stderr
-
-
-class GitTimeoutError(WorktreeError):
-    """Raised when a ``git`` subprocess exceeds the configured timeout.
-
-    Ticket #19: the Windows PyInstaller binary was hanging because the spawned
-    ``git`` inherited the MCP client's stdin pipe and waited forever for input.
-    ``_run_git`` now closes stdin, runs via ``Popen.communicate(timeout=...)``,
-    and raises this on overrun so the MCP tool can surface a real error rather
-    than blocking the client forever.
-    """
-
-    def __init__(self, command: List[str], elapsed: float) -> None:
-        super().__init__(
-            f"git command timed out after {elapsed:.1f}s: {' '.join(command)}"
-        )
-        self.command = command
-        self.elapsed = elapsed
 
 
 @dataclass
@@ -169,87 +148,6 @@ def _short_uuid() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def _resolve_git_timeout(explicit: Optional[float]) -> Optional[float]:
-    """Resolve the timeout for a single ``_run_git`` call.
-
-    Precedence: explicit kwarg > ``WORKTREE_GIT_TIMEOUT_SEC`` env > built-in
-    default of 30.0 s. ``None`` (either as kwarg or env value ``""``) disables
-    the timeout entirely; that path exists for diagnostics, not normal use.
-
-    Env is read on every call so that test fixtures and operators can change
-    the value without re-importing the module.
-    """
-
-    if explicit is not None:
-        return explicit
-    raw = os.environ.get(_GIT_TIMEOUT_ENV)
-    if raw is None:
-        return _GIT_TIMEOUT_DEFAULT
-    raw = raw.strip()
-    if not raw:
-        # Empty string is "no timeout", matching the explicit-None semantics.
-        return None
-    try:
-        value = float(raw)
-    except ValueError:
-        return _GIT_TIMEOUT_DEFAULT
-    return value if value > 0 else None
-
-
-def _run_git(
-    args: List[str],
-    cwd: Optional[Path] = None,
-    *,
-    timeout: Optional[float] = None,
-) -> subprocess.CompletedProcess:
-    """Run ``git <args>`` and return a ``CompletedProcess``.
-
-    Ticket #19 hardenings:
-    * ``stdin=DEVNULL`` so ``git`` can never inherit the MCP client's stdin
-      pipe and wedge waiting on input -- this was the Windows-exe hang root
-      cause.
-    * Explicit ``stdout=PIPE, stderr=PIPE`` (rather than ``capture_output``)
-      because we now drive a ``Popen`` directly to keep a clean kill path.
-    * On Windows: ``creationflags=CREATE_NO_WINDOW`` so packaged-exe runs
-      don't briefly flash a console window per git call.
-    * ``timeout`` defaults from ``WORKTREE_GIT_TIMEOUT_SEC`` (30 s if unset);
-      on overrun the process is killed and ``GitTimeoutError`` is raised.
-    """
-
-    effective_timeout = _resolve_git_timeout(timeout)
-
-    popen_kwargs: dict = {
-        "cwd": str(cwd) if cwd else None,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-    }
-    if sys.platform == "win32":
-        # Suppress the brief console-window flash when the packaged worktree.exe
-        # spawns git from a GUI MCP host.
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-
-    cmd = ["git", *args]
-    start = time.monotonic()
-    proc = subprocess.Popen(cmd, **popen_kwargs)
-    try:
-        stdout, stderr = proc.communicate(timeout=effective_timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        # Drain the pipes after kill so the child fully reaps; ignore output.
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        elapsed = time.monotonic() - start
-        raise GitTimeoutError(cmd, elapsed) from None
-
-    return subprocess.CompletedProcess(
-        args=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr
-    )
-
-
 def _parse_already_checked_out(stderr: str) -> Optional[tuple[str, str]]:
     """Return ``(branch, path)`` if stderr matches the git "already checked
     out" error, else ``None``.
@@ -298,7 +196,7 @@ def _is_path_prunable(repo_path: Path, target_path: str) -> Optional[bool]:
         if current_path.replace("\\", "/").lower() == target_norm:
             found = current_prunable
 
-    for raw_line in proc.stdout.splitlines():
+    for raw_line in (proc.stdout or "").splitlines():
         line = raw_line.rstrip()
         if not line:
             _flush()
@@ -480,6 +378,39 @@ class WorktreeManager:
         # (e.g. unmerged + force=False); the record is already gone from state.
         self._delete_owned_branch(record, force=force)
         return removed
+
+    def adopt(self, repo_root: str) -> "AdoptReport":
+        """Discover git worktrees that exist on-disk but are not in the store.
+
+        Calls ``git worktree list --porcelain`` against ``repo_root`` and
+        imports any unknown worktrees as ``WorktreeRecord`` entries with
+        ``status="adopted"`` and ``branch_created_by_us=False``.
+
+        Only available when the state store is a file-backed ``YamlStateStore``.
+        Raises ``WorktreeError`` for any other store type.
+        """
+        if not isinstance(self.state, YamlStateStore):
+            raise WorktreeError("adopt() requires a file-backed YamlStateStore")
+        repo_path = self._validate_repo(repo_root)
+        return _yaml_adopt(self.state, repo_path)
+
+    def prune(self, repo_root: str) -> None:
+        """Run ``git worktree prune --expire=now`` against ``repo_root``.
+
+        Removes stale worktree registrations from git's internal metadata (the
+        ``.git/worktrees/`` directory).  ``--expire=now`` overrides git's default
+        3-month grace period (``gc.worktreePruneExpire``) so that worktrees whose
+        directory was deleted moments ago are pruned immediately rather than being
+        kept as "recently used".  Raises ``GitCommandError`` on non-zero returncode.
+        """
+        repo_path = self._validate_repo(repo_root)
+        proc = _run_git(["worktree", "prune", "--expire=now"], cwd=repo_path)
+        if proc.returncode != 0:
+            raise GitCommandError(
+                ["git", "worktree", "prune", "--expire=now"],
+                proc.returncode,
+                proc.stderr,
+            )
 
     def start(
         self,

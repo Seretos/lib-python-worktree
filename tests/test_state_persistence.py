@@ -24,11 +24,15 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+import subprocess
+
 from lib_python_worktree.core.state import WorktreeRecord
 from lib_python_worktree.core.yaml_store import (
+    AdoptReport,
     ReconcileReport,
     YamlStateStore,
     _pid_alive,
+    adopt,
     reconcile,
 )
 
@@ -539,3 +543,344 @@ def test_state_yaml_not_corrupted_on_exception_during_write(
     data = yaml.safe_load(current_text)
     assert data is not None
     assert "worktrees" in data
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10: adopt() unit tests (monkeypatch _run_git in yaml_store)
+# ---------------------------------------------------------------------------
+
+# Helpers for constructing fake porcelain output
+# Real git format (example):
+#   worktree /path/to/main
+#   HEAD abc1234
+#   branch refs/heads/main
+#
+#   worktree /path/to/wt
+#   HEAD def5678
+#   branch refs/heads/feature/x
+#
+
+def _porcelain(*blocks: list[str]) -> str:
+    """Join porcelain blocks, each block being a list of lines."""
+    return "\n".join("\n".join(block) for block in blocks) + "\n"
+
+
+def _main_block(path: str = "/repos/myrepo") -> list[str]:
+    return [f"worktree {path}", "HEAD abc1234abc1234", "branch refs/heads/main", ""]
+
+
+def _wt_block(path: str, branch: str = "feature/x") -> list[str]:
+    return [f"worktree {path}", "HEAD def5678def5678", f"branch refs/heads/{branch}", ""]
+
+
+def _detached_block(path: str = "/store/wt-detached") -> list[str]:
+    return [f"worktree {path}", "HEAD aaa1234aaa1234", "detached", ""]
+
+
+def _prunable_block(path: str, branch: str = "feature/stale") -> list[str]:
+    """A block that has a branch but is marked prunable (directory deleted)."""
+    return [
+        f"worktree {path}",
+        "HEAD bbb5678bbb5678",
+        f"branch refs/heads/{branch}",
+        "prunable gitdir file points to non-existent location",
+        "",
+    ]
+
+
+import lib_python_worktree.core.yaml_store as yaml_store_module
+
+
+@pytest.fixture
+def ys(state_dir: Path) -> YamlStateStore:
+    return YamlStateStore(state_dir=state_dir)
+
+
+def _fake_run_git_ok(output: str):
+    """Return a _run_git patcher that yields 'output' with returncode=0."""
+    def _patched(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=["git", "worktree", "list", "--porcelain"],
+            returncode=0,
+            stdout=output,
+            stderr="",
+        )
+    return _patched
+
+
+def test_adopt_imports_out_of_band_worktree(state_dir: Path, monkeypatch):
+    """adopt() must import one extra worktree found by git as status='adopted'."""
+    repo_path = Path("/repos/myrepo")
+    extra_path = "/store/myrepo/wt-001"
+    output = _porcelain(_main_block(str(repo_path)), _wt_block(extra_path, "feature/x"))
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert len(report.adopted) == 1
+    records = store.list()
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.status == "adopted"
+    assert rec.branch_created_by_us is False
+    assert rec.branch == "feature/x"
+    assert rec.ports == {}
+    assert rec.pids == {}
+
+
+def test_adopt_idempotent_same_path(state_dir: Path, monkeypatch):
+    """adopt() must skip a worktree whose path is already in the store."""
+    repo_path = Path("/repos/myrepo")
+    extra_path = "/store/myrepo/wt-001"
+    output = _porcelain(_main_block(str(repo_path)), _wt_block(extra_path, "feature/x"))
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    # Pre-add a record with the same path.
+    store.add(_make_record(
+        id="pre-existing",
+        repo_root=str(repo_path.resolve()),
+        branch="feature/x",
+        path=str(Path(extra_path).resolve()),
+    ))
+
+    report = adopt(store, repo_path)
+    assert report.adopted == []
+    assert len(store.list()) == 1  # no duplicate
+
+
+def test_adopt_idempotent_same_branch(state_dir: Path, monkeypatch):
+    """adopt() must skip a worktree whose (repo_root, branch) pair is already tracked."""
+    repo_path = Path("/repos/myrepo")
+    extra_path = "/store/myrepo/wt-001"
+    output = _porcelain(_main_block(str(repo_path)), _wt_block(extra_path, "feature/x"))
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    # Same branch, different path — idempotent by branch key.
+    store.add(_make_record(
+        id="pre-existing",
+        repo_root=str(repo_path.resolve()),
+        branch="feature/x",
+        path="/some/other/path",
+    ))
+
+    report = adopt(store, repo_path)
+    assert report.adopted == []
+
+
+def test_adopt_skips_main_worktree_block(state_dir: Path, monkeypatch):
+    """adopt() must skip the first block (the main worktree)."""
+    repo_path = Path("/repos/myrepo")
+    output = _porcelain(_main_block(str(repo_path)))
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert report.adopted == []
+    assert store.list() == []
+
+
+def test_adopt_skips_detached_head_block(state_dir: Path, monkeypatch):
+    """adopt() must skip detached-HEAD blocks and count them in skipped_detached."""
+    repo_path = Path("/repos/myrepo")
+    output = _porcelain(
+        _main_block(str(repo_path)),
+        _detached_block("/store/myrepo/wt-detached"),
+    )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert report.adopted == []
+    assert report.skipped_detached == 1
+
+
+def test_adopt_git_failure_returns_empty_report(state_dir: Path, monkeypatch):
+    """adopt() must return an empty AdoptReport when git returns non-zero, not raise."""
+    def _fail(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=["git", "worktree", "list", "--porcelain"],
+            returncode=1,
+            stdout="",
+            stderr="fatal: not a git repository",
+        )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fail)
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, Path("/not/a/repo"))
+
+    assert report.adopted == []
+    assert report.skipped_detached == 0
+
+
+def test_adopt_git_raises_worktree_error(state_dir: Path, monkeypatch):
+    """adopt() must return an empty AdoptReport when _run_git raises, not propagate."""
+    def _raise(*args, **kwargs):
+        raise OSError("simulated git execution error")
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _raise)
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, Path("/not/a/repo"))
+
+    assert report.adopted == []
+
+
+def test_adopt_report_contains_adopted_ids(state_dir: Path, monkeypatch):
+    """report.adopted must contain the id string of the newly-imported record."""
+    repo_path = Path("/repos/myrepo")
+    extra_path = "/store/myrepo/wt-x"
+    output = _porcelain(_main_block(str(repo_path)), _wt_block(extra_path, "feature/y"))
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert len(report.adopted) == 1
+    adopted_id = report.adopted[0]
+    assert isinstance(adopted_id, str)
+    assert len(adopted_id) > 0
+    # The record must be findable by id.
+    rec = store.get(adopted_id)
+    assert rec is not None
+    assert rec.branch == "feature/y"
+
+
+def test_adopt_zero_extra_worktrees(state_dir: Path, monkeypatch):
+    """adopt() with only the main worktree block must return empty report."""
+    repo_path = Path("/repos/myrepo")
+    output = _porcelain(_main_block(str(repo_path)))
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert report.adopted == []
+    assert report.skipped_detached == 0
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10 blocking A — skip by path match, not block order
+# ---------------------------------------------------------------------------
+
+def test_adopt_skips_repo_path_when_not_first_block(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """adopt() must skip BOTH the primary checkout (blocks[0]) AND the passed-in
+    repo_path when repo_path is a linked worktree (not blocks[0]).
+
+    Scenario: adopt() is called from a linked worktree.
+      primary = <tmp>/primary  (blocks[0] — always the primary checkout)
+      linked  = <tmp>/linked   (blocks[1] — this is repo_path passed to adopt())
+      extra   = <tmp>/extra    (blocks[2] — an unrelated linked worktree)
+
+    Expected:
+      - primary is NOT adopted (it is the real repo dir; adopting it would be
+        catastrophic since remove(force=True) would shutil.rmtree it).
+      - linked is NOT adopted (it is repo_path itself, the caller's worktree).
+      - extra IS adopted (it is a distinct, legitimate linked worktree).
+
+    Uses real tmp_path subdirectories so Path.resolve() is unambiguous on Windows.
+    """
+    primary_path = tmp_path / "primary"
+    linked_path = tmp_path / "linked"   # the repo_path we pass to adopt()
+    extra_path = tmp_path / "extra"
+
+    # Porcelain: primary block first (as git always emits), then linked, then extra.
+    output = _porcelain(
+        _main_block(str(primary_path)),                    # blocks[0] — primary
+        _wt_block(str(linked_path), "feature/linked"),     # blocks[1] — repo_path
+        _wt_block(str(extra_path), "feature/extra"),       # blocks[2] — adopt this
+    )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, linked_path)
+
+    adopted_paths = {store.get(wid).path for wid in report.adopted}
+
+    # Only 'extra' should have been adopted.
+    assert len(report.adopted) == 1, (
+        f"expected 1 adoption, got {len(report.adopted)}: {report.adopted}"
+    )
+    assert str(extra_path.resolve()) in adopted_paths, "extra must be adopted"
+
+    # Primary checkout must NOT be adopted (it is the repo itself).
+    primary_path_str = str(primary_path.resolve())
+    assert primary_path_str not in adopted_paths, (
+        "primary checkout must NOT be adopted"
+    )
+
+    # Linked (repo_path) must NOT be adopted.
+    linked_path_str = str(linked_path.resolve())
+    assert linked_path_str not in adopted_paths, (
+        "linked (repo_path) must NOT be adopted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10 blocking B — prunable blocks are skipped, not adopted
+# ---------------------------------------------------------------------------
+
+def test_adopt_skips_prunable_block(state_dir: Path, tmp_path: Path, monkeypatch):
+    """adopt() must NOT import a worktree whose block contains a 'prunable' line.
+
+    A prunable worktree has had its directory deleted; it does not exist on-disk
+    and should be cleaned up via prune(), not recorded as adopted.
+
+    Uses tmp_path for the repo so path resolution is consistent on Windows.
+    The prunable path is a fake string — it doesn't need to exist.
+    """
+    repo_path = tmp_path / "myrepo"
+    stale_path = str(tmp_path / "wt-stale")
+    output = _porcelain(
+        _main_block(str(repo_path)),
+        _prunable_block(stale_path, "feature/stale"),
+    )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert report.adopted == []
+    assert report.skipped_prunable == 1
+    assert store.list() == []
+
+
+def test_adopt_prunable_and_valid_block_together(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A mix of prunable and valid blocks: only the valid one is adopted."""
+    repo_path = tmp_path / "myrepo"
+    stale_path = str(tmp_path / "wt-stale")
+    good_path = str(tmp_path / "wt-good")
+    output = _porcelain(
+        _main_block(str(repo_path)),
+        _prunable_block(stale_path, "feature/stale"),
+        _wt_block(good_path, "feature/good"),
+    )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert len(report.adopted) == 1
+    assert report.skipped_prunable == 1
+    records = store.list()
+    assert len(records) == 1
+    assert records[0].branch == "feature/good"

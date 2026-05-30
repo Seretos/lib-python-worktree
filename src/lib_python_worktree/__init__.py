@@ -51,7 +51,7 @@ from .core.process_lifecycle import (
 )
 from .core.port_allocator import PortAllocator
 from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
-from .core.yaml_store import ReconcileReport, YamlStateStore, reconcile
+from .core.yaml_store import AdoptReport, ReconcileReport, YamlStateStore, adopt, reconcile
 from .setup import (
     SetupFailedError,
     SetupResult,
@@ -89,6 +89,8 @@ __all__ = [
     "YamlStateStore",
     "ReconcileReport",
     "reconcile",
+    "AdoptReport",
+    "adopt",
     # contract
     "WorktreeContract",
     "Step",

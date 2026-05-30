@@ -9,6 +9,7 @@ Fixtures ``git_repo``, ``manager``, and ``manager_factory`` come from conftest.p
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -16,18 +17,22 @@ from typing import Callable
 import pytest
 
 from lib_python_worktree.core import manager as manager_module
+from lib_python_worktree.core import _git_utils as git_utils_module
 from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
     DuplicateWorktreeError,
     GitTimeoutError,
     ManagerConfig,
+    WorktreeError,
     WorktreeManager,
     GitCommandError,
     WorktreeNotFoundError,
+    _is_path_prunable,
     _run_git,
 )
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+from lib_python_worktree.core.yaml_store import YamlStateStore
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -253,7 +258,7 @@ def test_run_git_raises_timeout_when_subprocess_hangs(monkeypatch):
             killed["value"] = True
             self.returncode = -9
 
-    monkeypatch.setattr(manager_module.subprocess, "Popen", _HangingPopen)
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _HangingPopen)
 
     with pytest.raises(GitTimeoutError) as excinfo:
         _run_git(["status"], timeout=0.05)
@@ -282,7 +287,7 @@ def test_run_git_timeout_respects_env_override(monkeypatch):
             pass
 
     monkeypatch.setenv("WORKTREE_GIT_TIMEOUT_SEC", "7.5")
-    monkeypatch.setattr(manager_module.subprocess, "Popen", _CapturingPopen)
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _CapturingPopen)
 
     _run_git(["--version"])
     assert captured["timeout"] == 7.5
@@ -307,7 +312,7 @@ def test_run_git_closes_stdin(monkeypatch):
         def kill(self):  # pragma: no cover - not reached in this test
             pass
 
-    monkeypatch.setattr(manager_module.subprocess, "Popen", _RecordingPopen)
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _RecordingPopen)
     _run_git(["--version"])
     assert captured_kwargs.get("stdin") is subprocess.DEVNULL
 
@@ -432,3 +437,282 @@ def test_remove_unmerged_branch_without_force_cleans_state_and_raises(
     assert rec.id not in remaining_ids, (
         "State record must be removed even when branch-delete raises"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10: _is_path_prunable crash when proc.stdout is None
+# ---------------------------------------------------------------------------
+
+def test_is_path_prunable_returns_none_when_stdout_is_none(monkeypatch):
+    """Regression: _is_path_prunable must not raise AttributeError when
+    _run_git returns a CompletedProcess with stdout=None."""
+    monkeypatch.setattr(
+        manager_module,
+        "_run_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=None, stderr=""
+        ),
+    )
+    result = _is_path_prunable(Path("/fake/repo"), "/some/path")
+    assert result is None
+
+
+def test_is_path_prunable_empty_stdout_returns_none(monkeypatch):
+    """_is_path_prunable with empty stdout must return None without raising."""
+    monkeypatch.setattr(
+        manager_module,
+        "_run_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        ),
+    )
+    result = _is_path_prunable(Path("/fake/repo"), "/some/path")
+    assert result is None
+
+
+def test_is_path_prunable_swallows_git_timeout_error(monkeypatch):
+    """Regression: a GitTimeoutError raised during the _is_path_prunable probe
+    must be swallowed (returns None) and must NOT escape create() as a bare
+    GitTimeoutError replacing the intended BranchAlreadyCheckedOutError.
+
+    This required GitTimeoutError to be a WorktreeError subclass so that the
+    `except WorktreeError: return None` guard in _is_path_prunable catches it.
+    """
+    def _raise_timeout(*args, **kwargs):
+        raise GitTimeoutError(["git", "worktree", "list", "--porcelain"], 30.0)
+
+    monkeypatch.setattr(manager_module, "_run_git", _raise_timeout)
+
+    result = _is_path_prunable(Path("/fake/repo"), "/some/path")
+    assert result is None, (
+        "GitTimeoutError inside _is_path_prunable must be swallowed (return None)"
+    )
+
+    # Also confirm the class hierarchy is intact.
+    assert issubclass(GitTimeoutError, WorktreeError), (
+        "GitTimeoutError must be a WorktreeError subclass"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10: already-checked-out on an out-of-band worktree raises structured error
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_create_raises_structured_error_for_out_of_band_worktree(
+    manager_factory: Callable,
+    git_repo: Path,
+    tmp_path: Path,
+):
+    """Creating a worktree for a branch that is checked out out-of-band
+    (not via the manager) must raise BranchAlreadyCheckedOutError, not
+    a bare AttributeError. Regression for stdout=None crash path."""
+    # Create the worktree out-of-band via subprocess so no manager knows about it.
+    oot_path = tmp_path / "out-of-band-wt"
+    subprocess.run(
+        ["git", "worktree", "add", str(oot_path), "feature/alpha"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # A fresh manager with an empty store — won't hit the duplicate-check shortcut.
+    fresh_manager = manager_factory()
+    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
+        fresh_manager.create(str(git_repo), "feature/alpha")
+
+    err = excinfo.value
+    assert err.branch == "feature/alpha"
+    assert "branch_already_checked_out" in str(err)
+
+    # Clean up the out-of-band worktree.
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(oot_path)],
+        cwd=git_repo,
+        capture_output=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10: WorktreeManager.adopt()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_manager_adopt_discovers_out_of_band_worktree(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """adopt() must import a worktree that was created out-of-band (not via the
+    manager) into the store with status='adopted' and branch_created_by_us=False."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    # Create the worktree out-of-band via subprocess.
+    oot_path = tmp_path / "oot-wt"
+    subprocess.run(
+        ["git", "worktree", "add", str(oot_path), "feature/alpha"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        report = mgr.adopt(str(git_repo))
+
+        assert len(report.adopted) == 1
+        records = mgr.list()
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.status == "adopted"
+        assert rec.branch_created_by_us is False
+        assert rec.branch == "feature/alpha"
+        assert rec.ports == {}
+        assert rec.pids == {}
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(oot_path)],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+
+@pytest.mark.requires_git
+def test_manager_adopt_idempotent(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Calling adopt() twice must not raise and must not duplicate records."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    oot_path = tmp_path / "oot-wt-idem"
+    subprocess.run(
+        ["git", "worktree", "add", str(oot_path), "feature/alpha"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        report1 = mgr.adopt(str(git_repo))
+        report2 = mgr.adopt(str(git_repo))
+
+        assert len(report1.adopted) == 1
+        assert len(report2.adopted) == 0  # second call: nothing new to import
+        assert len(mgr.list()) == 1
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(oot_path)],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+
+def test_manager_adopt_raises_for_non_yaml_store(tmp_path: Path):
+    """adopt() must raise WorktreeError when the store is not a YamlStateStore."""
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+    with pytest.raises(WorktreeError, match="YamlStateStore"):
+        mgr.adopt("/any/path")
+
+
+# ---------------------------------------------------------------------------
+# Ticket #10: WorktreeManager.prune()
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_manager_prune_smoke(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """prune() must remove the stale git registration after a worktree dir is
+    wiped externally.  Verifies both no-raise AND that the stale entry is gone
+    from ``git worktree list --porcelain`` afterwards.
+
+    Uses ``--expire=now`` internally so the 3-month gc.worktreePruneExpire grace
+    period does not prevent immediate removal of a freshly-deleted directory.
+    """
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    # Create via manager then wipe dir without informing git, leaving a stale reg.
+    rec = mgr.create(str(git_repo), "feature/alpha")
+    stale_path = rec.path
+    shutil.rmtree(stale_path)
+
+    # Normalise path separators for comparison: git uses forward slashes on
+    # all platforms in --porcelain output, but rec.path may use backslashes on
+    # Windows.
+    stale_path_fwd = stale_path.replace("\\", "/")
+
+    # Confirm the stale registration exists BEFORE prune.
+    before = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert stale_path_fwd in before.stdout, (
+        "stale worktree path must appear in git worktree list before prune"
+    )
+
+    # prune() must succeed and clear the stale entry immediately.
+    mgr.prune(str(git_repo))
+
+    after = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert stale_path_fwd not in after.stdout, (
+        "stale worktree path must be absent from git worktree list after prune"
+    )
+
+
+@pytest.mark.requires_git
+def test_manager_prune_raises_git_command_error_v2(
+    tmp_path: Path, git_repo: Path, skip_if_no_git, monkeypatch  # noqa: ARG001
+):
+    """prune() raises GitCommandError when git worktree prune returns non-zero."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    original_run_git = manager_module._run_git
+
+    def _fake_run_git(args, cwd=None, **kwargs):
+        if args[:2] == ["worktree", "prune"]:
+            return subprocess.CompletedProcess(
+                args=["git", "worktree", "prune", "--expire=now"],
+                returncode=1,
+                stdout="",
+                stderr="fatal: simulated prune failure",
+            )
+        return original_run_git(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+
+    with pytest.raises(GitCommandError, match="simulated prune failure"):
+        mgr.prune(str(git_repo))
