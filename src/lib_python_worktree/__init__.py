@@ -39,10 +39,12 @@ from .core.manager import (
     GitCommandError,
     GitTimeoutError,
     ManagerConfig,
+    PortAllocationError,
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
 )
+from .core.port_allocator import PortAllocator
 from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
 from .core.yaml_store import ReconcileReport, YamlStateStore, reconcile
 from .setup import (
@@ -67,6 +69,9 @@ __all__ = [
     "WorktreeNotFoundError",
     "GitCommandError",
     "GitTimeoutError",
+    # port allocator
+    "PortAllocator",
+    "PortAllocationError",
     # state
     "WorktreeRecord",
     "StateStore",
