@@ -277,3 +277,189 @@ class TestTeardownContractSteps:
             "worktree" in str(args) and "remove" in str(args)
             for args in git_calls
         ), "git worktree remove must be called even when teardown step fails"
+
+
+# ---------------------------------------------------------------------------
+# TestTeardownForceExit128 -- ticket #5 / #11 regression tests
+# ---------------------------------------------------------------------------
+
+class TestTeardownForceExit128:
+    """Verify the exit-128 fallback path in _teardown(force=True).
+
+    When 'git worktree remove --force' exits 128 (the .git link is already
+    gone), _teardown must NOT raise; instead it falls back to shutil.rmtree +
+    git worktree prune, then continues to port release.
+    """
+
+    # --- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _make_mock_git_128():
+        """Return a _run_git mock whose first call returns returncode=128."""
+        def _side_effect(args, cwd=None, **kwargs):
+            # The first call is 'worktree remove --force <path>' → exit 128.
+            # Subsequent calls (worktree prune) succeed.
+            if "remove" in args:
+                return MagicMock(returncode=128, stderr="fatal: not a git repo")
+            return MagicMock(returncode=0, stderr="")
+        return _side_effect
+
+    # --- tests -------------------------------------------------------------
+
+    def test_force_exit128_does_not_raise(self, tmp_path):
+        """Regression: exit 128 with force=True must not raise GitCommandError."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-128")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=self._make_mock_git_128(),
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            # Should complete without raising.
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+
+    def test_force_exit128_calls_rmtree(self, tmp_path):
+        """shutil.rmtree must be called with record.path and ignore_errors=True."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-rmtree", path="/fake/store/wt-rmtree")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=self._make_mock_git_128(),
+        ), patch(
+            "lib_python_worktree.core.manager.shutil"
+        ) as mock_shutil:
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+
+        mock_shutil.rmtree.assert_called_once_with(
+            record.path, ignore_errors=True
+        )
+
+    def test_force_exit128_calls_worktree_prune(self, tmp_path):
+        """git worktree prune must be called on the repo root after rmtree."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-prune", repo_root="/fake/repo")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        git_calls = []
+
+        def _tracking_git(args, cwd=None, **kwargs):
+            git_calls.append((list(args), cwd))
+            if "remove" in args:
+                return MagicMock(returncode=128, stderr="fatal: not a git repo")
+            return MagicMock(returncode=0, stderr="")
+
+        with patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=_tracking_git,
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+
+        prune_calls = [
+            (args, cwd) for (args, cwd) in git_calls
+            if args[:2] == ["worktree", "prune"]
+        ]
+        assert prune_calls, "git worktree prune was not called"
+        _, prune_cwd = prune_calls[0]
+        assert prune_cwd == Path(record.repo_root), (
+            f"prune cwd should be Path(record.repo_root)={Path(record.repo_root)!r}, "
+            f"got {prune_cwd!r}"
+        )
+
+    def test_force_exit128_releases_ports(self, tmp_path):
+        """Ports must be released even when the exit-128 fallback path is taken."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-ports-128")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        # Replace the real (no-op) allocator with a spy.
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        with patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=self._make_mock_git_128(),
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+
+        mock_allocator.release.assert_called_once_with(record.id)
+
+    def test_force_exit128_state_removed_after_remove(self, tmp_path):
+        """Full remove() must leave state.list() empty after exit-128 fallback."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-state-128",
+            branch_created_by_us=False,  # skip branch-delete step
+        )
+        manager.state.add(record)
+
+        # Verify the record is present before removal.
+        assert len(manager.state.list()) == 1
+
+        mock_lifecycle = MagicMock()
+
+        with patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=self._make_mock_git_128(),
+        ), patch(
+            "lib_python_worktree.core.manager.shutil"
+        ), patch.object(
+            manager, "_teardown", wraps=lambda rec, force, **kw: (
+                # Call the real _teardown but inject the mock lifecycle.
+                WorktreeManager._teardown(
+                    manager, rec, force=force, _lifecycle_module=mock_lifecycle
+                )
+            )
+        ):
+            manager.remove(record.id, force=True)
+
+        assert manager.state.list() == [], "state should be empty after remove()"
+
+    def test_non128_error_still_raises(self, tmp_path):
+        """exit 1 with force=True must still raise GitCommandError."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-non128")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_exit1(args, cwd=None, **kwargs):
+            if "remove" in args:
+                return MagicMock(returncode=1, stderr="fatal: other error")
+            return MagicMock(returncode=0, stderr="")
+
+        with pytest.raises(GitCommandError), patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=_git_exit1,
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+
+    def test_exit128_without_force_still_raises(self, tmp_path):
+        """exit 128 with force=False must still raise GitCommandError."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-128-no-force")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_exit128(args, cwd=None, **kwargs):
+            return MagicMock(returncode=128, stderr="fatal: not a git repo")
+
+        with pytest.raises(GitCommandError), patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=_git_exit128,
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)

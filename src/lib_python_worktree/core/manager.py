@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -590,9 +591,22 @@ class WorktreeManager:
         args.append(record.path)
         proc = _run_git(args, cwd=Path(record.repo_root))
         if proc.returncode != 0:
-            raise GitCommandError(
-                ["git", *args], proc.returncode, proc.stderr
-            )
+            if proc.returncode == 128 and force:
+                # The .git link is already gone (worktree dir was wiped
+                # externally).  Fall back: delete the directory ourselves,
+                # then prune the stale git metadata.  Both steps are
+                # best-effort so that port release and state removal still
+                # occur even in a degraded state.
+                shutil.rmtree(record.path, ignore_errors=True)
+                _run_git(
+                    ["worktree", "prune"],
+                    cwd=Path(record.repo_root),
+                )
+                # Fall through to step 4.
+            else:
+                raise GitCommandError(
+                    ["git", *args], proc.returncode, proc.stderr
+                )
 
         # Step 4: release allocated ports only after the git worktree remove
         # has succeeded.  Freeing ports before the remove would allow a
