@@ -143,6 +143,48 @@ def test_find_by_branch_yaml(yaml_store: YamlStateStore):
     assert yaml_store.find_by_branch("/repos/myrepo", "other") is None
 
 
+def test_find_by_branch_normalizes_backslash_paths_on_load(state_dir: Path):
+    """Regression (#23): records written with Windows backslash repo_root/path
+    must be found by a forward-slash key after a YAML round-trip.
+
+    Before the _record_from_dict fix, a state.yaml produced by a pre-fix build
+    on Windows stored backslash strings.  After re-loading, find_by_branch was
+    called with a forward-slash key (from repo_path.as_posix()) that never
+    matched the stored backslash string, silently suppressing DuplicateWorktreeError
+    and making adopt()'s idempotency checks fail.
+
+    This test must FAIL without the Path(...).as_posix() normalisation in
+    _record_from_dict and PASS with it.
+    """
+    store = YamlStateStore(state_dir=state_dir)
+
+    # Simulate a record that was persisted by a pre-fix Windows build.
+    # We write it with raw backslash strings directly, bypassing add() so that
+    # the normalization in _record_from_dict is what we're testing on the
+    # *read* path, not just what add() received.
+    backslash_record = _make_record(
+        id="wt-backslash",
+        repo_root=r"C:\repos\myrepo",
+        branch="feature/x",
+        path=r"C:\store\wt-001",
+    )
+    store.add(backslash_record)
+
+    # Reload from a fresh instance so _record_from_dict runs on the persisted data.
+    store2 = YamlStateStore(state_dir=state_dir)
+
+    # Forward-slash key — this is what create() and adopt() pass after the fix.
+    found = store2.find_by_branch("C:/repos/myrepo", "feature/x")
+    assert found is not None, (
+        "find_by_branch with a forward-slash key must find a record that was "
+        "stored with backslash paths — _record_from_dict must normalize on load"
+    )
+    assert found.id == "wt-backslash"
+    # The loaded record's fields must also be forward-slash.
+    assert found.repo_root == "C:/repos/myrepo"
+    assert found.path == "C:/store/wt-001"
+
+
 def test_add_duplicate_raises_yaml(yaml_store: YamlStateStore):
     yaml_store.add(_make_record(id="dup"))
     with pytest.raises(ValueError, match="dup"):
@@ -639,12 +681,13 @@ def test_adopt_idempotent_same_path(state_dir: Path, monkeypatch):
     monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
 
     store = YamlStateStore(state_dir=state_dir)
-    # Pre-add a record with the same path.
+    # Pre-add a record with the same path — keys must be forward-slash to match
+    # what adopt() now stores via Path.as_posix().
     store.add(_make_record(
         id="pre-existing",
-        repo_root=str(repo_path.resolve()),
+        repo_root=repo_path.resolve().as_posix(),
         branch="feature/x",
-        path=str(Path(extra_path).resolve()),
+        path=Path(extra_path).resolve().as_posix(),
     ))
 
     report = adopt(store, repo_path)
@@ -662,9 +705,10 @@ def test_adopt_idempotent_same_branch(state_dir: Path, monkeypatch):
 
     store = YamlStateStore(state_dir=state_dir)
     # Same branch, different path — idempotent by branch key.
+    # repo_root must be forward-slash to match what adopt() now stores via as_posix().
     store.add(_make_record(
         id="pre-existing",
-        repo_root=str(repo_path.resolve()),
+        repo_root=repo_path.resolve().as_posix(),
         branch="feature/x",
         path="/some/other/path",
     ))
@@ -816,17 +860,17 @@ def test_adopt_skips_repo_path_when_not_first_block(
     assert len(report.adopted) == 1, (
         f"expected 1 adoption, got {len(report.adopted)}: {report.adopted}"
     )
-    assert str(extra_path.resolve()) in adopted_paths, "extra must be adopted"
+    assert extra_path.resolve().as_posix() in adopted_paths, "extra must be adopted"
 
     # Primary checkout must NOT be adopted (it is the repo itself).
-    primary_path_str = str(primary_path.resolve())
-    assert primary_path_str not in adopted_paths, (
+    primary_path_fwd = primary_path.resolve().as_posix()
+    assert primary_path_fwd not in adopted_paths, (
         "primary checkout must NOT be adopted"
     )
 
     # Linked (repo_path) must NOT be adopted.
-    linked_path_str = str(linked_path.resolve())
-    assert linked_path_str not in adopted_paths, (
+    linked_path_fwd = linked_path.resolve().as_posix()
+    assert linked_path_fwd not in adopted_paths, (
         "linked (repo_path) must NOT be adopted"
     )
 
@@ -884,3 +928,49 @@ def test_adopt_prunable_and_valid_block_together(
     records = store.list()
     assert len(records) == 1
     assert records[0].branch == "feature/good"
+
+
+# ---------------------------------------------------------------------------
+# Ticket #23: adopt() must store paths as forward slashes on all platforms
+# ---------------------------------------------------------------------------
+
+
+def test_adopt_record_paths_use_forward_slashes(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Regression: adopt() must store repo_root and path with forward slashes.
+
+    On Windows, Path.resolve() returns backslash-separated strings by default.
+    The fix uses Path.as_posix() so the stored strings are always forward-slash,
+    making them safe for cross-platform consumers and equality checks.
+
+    Uses monkeypatched _run_git so no real git binary is required.
+    """
+    repo_path = tmp_path / "myrepo"
+    wt_path = tmp_path / "wt-fwdslash"
+
+    # Build fake porcelain output using the real tmp_path values so that
+    # Path(wt_path_raw).resolve() returns an absolute Path that as_posix()
+    # will normalise to forward slashes.
+    output = _porcelain(
+        _main_block(str(repo_path)),
+        _wt_block(str(wt_path), "feature/fwdslash"),
+    )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(output))
+
+    store = YamlStateStore(state_dir=state_dir)
+    report = adopt(store, repo_path)
+
+    assert len(report.adopted) == 1, (
+        f"expected 1 adoption, got {len(report.adopted)}"
+    )
+    rec = store.get(report.adopted[0])
+    assert rec is not None
+
+    assert "\\" not in rec.repo_root, (
+        f"repo_root must use forward slashes, got: {rec.repo_root!r}"
+    )
+    assert "\\" not in rec.path, (
+        f"path must use forward slashes, got: {rec.path!r}"
+    )

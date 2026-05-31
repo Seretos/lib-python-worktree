@@ -805,3 +805,48 @@ def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
     assert "force=True" in msg
     assert "--force" not in msg
     assert "128" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Ticket #23: WorktreeRecord paths must use forward slashes on all platforms
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+def test_create_record_paths_use_forward_slashes(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Regression: create() must store repo_root and path with forward slashes.
+
+    On Windows, Path.resolve() returns backslash-separated strings by default.
+    The fix uses Path.as_posix() so the stored strings are always forward-slash,
+    making them safe for cross-platform consumers and equality checks.
+    """
+    rec = manager.create(str(git_repo), "feature/alpha")
+    assert "\\" not in rec.repo_root, (
+        f"repo_root must use forward slashes, got: {rec.repo_root!r}"
+    )
+    assert "\\" not in rec.path, (
+        f"path must use forward slashes, got: {rec.path!r}"
+    )
+
+
+@pytest.mark.requires_git
+def test_find_by_branch_matches_after_create_forward_slash_input(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Regression: find_by_branch must find the record created by create().
+
+    Before the fix, create() stored repo_root as a native-backslash string on
+    Windows but the duplicate-check also used a backslash string, so it matched
+    incidentally.  After the fix both sides use as_posix(), so a caller passing
+    the forward-slash key should also find the record.
+    """
+    rec = manager.create(str(git_repo), "feature/alpha")
+    # The key must match the stored forward-slash value.
+    forward_slash_root = Path(str(git_repo)).resolve().as_posix()
+    found = manager.state.find_by_branch(forward_slash_root, "feature/alpha")
+    assert found is not None, (
+        "find_by_branch must return the record when queried with a forward-slash key"
+    )
+    assert found.id == rec.id

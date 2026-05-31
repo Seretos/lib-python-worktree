@@ -127,11 +127,19 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
 
 
 def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
+    # Normalize repo_root and path to forward slashes on load so that records
+    # written by a pre-fix version of the engine (which used str(Path(...)) and
+    # therefore produced OS-native backslashes on Windows) are self-healing the
+    # first time they are read back.  str.replace is used rather than
+    # Path(...).as_posix() because on Linux/macOS PosixPath treats backslash as
+    # an ordinary filename character and would leave legacy backslash strings
+    # unchanged.  A plain replace("\\", "/") is platform-independent and is a
+    # no-op for strings that are already forward-slash.
     return WorktreeRecord(
         id=d["id"],
-        repo_root=d["repo_root"],
+        repo_root=d["repo_root"].replace("\\", "/"),
         branch=d["branch"],
-        path=d["path"],
+        path=d["path"].replace("\\", "/"),
         status=d.get("status", "created"),
         ports=dict(d.get("ports") or {}),
         pids=dict(d.get("pids") or {}),
@@ -550,7 +558,7 @@ def adopt(
         return report
 
     main_path = repo_path.resolve()
-    repo_root_str = str(main_path)
+    repo_root_str = main_path.as_posix()
 
     # --- Phase 2: parse porcelain output (CPU only, no I/O) ---
     # Format (one block per worktree, blank line between blocks):
@@ -635,7 +643,7 @@ def adopt(
             continue
 
         candidates.append(
-            (str(Path(wt_path_raw).resolve()), block["branch"])
+            (Path(wt_path_raw).resolve().as_posix(), block["branch"])
         )
 
     if not candidates:

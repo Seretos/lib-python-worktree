@@ -262,7 +262,7 @@ class WorktreeManager:
 
         repo_slug = _slug(repo_path.name)
 
-        if self.state.find_by_branch(str(repo_path), branch) is not None:
+        if self.state.find_by_branch(repo_path.as_posix(), branch) is not None:
             raise DuplicateWorktreeError(
                 f"A worktree for branch '{branch}' already exists in {repo_path}"
             )
@@ -323,9 +323,9 @@ class WorktreeManager:
 
             record = WorktreeRecord(
                 id=worktree_id,
-                repo_root=str(repo_path),
+                repo_root=repo_path.as_posix(),
                 branch=branch,
-                path=str(target_path),
+                path=target_path.as_posix(),
                 branch_created_by_us=not branch_exists,
                 ports=port_mapping,
             )
