@@ -67,6 +67,8 @@ class WorktreeContract(_StrictModel):
     setup: List[Step] = Field(default_factory=list)
     teardown: List[Step] = Field(default_factory=list)
     ports: List[PortSlot] = Field(default_factory=list)
+    start: List[Step] = Field(default_factory=list)
+    stop: List[Step] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _isolation_none_forbids_lists(self) -> "WorktreeContract":
@@ -78,6 +80,10 @@ class WorktreeContract(_StrictModel):
                 offenders.append("teardown")
             if self.ports:
                 offenders.append("ports")
+            if self.start:
+                offenders.append("start")
+            if self.stop:
+                offenders.append("stop")
             if offenders:
                 raise ValueError(
                     f"isolation: none forbids fields: {', '.join(offenders)}"
