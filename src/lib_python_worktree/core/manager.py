@@ -416,16 +416,42 @@ class WorktreeManager:
     def start(
         self,
         worktree_id: str,
-        cmd: List[str],
         *,
         role: str = "main",
         env: Optional[dict] = None,
         cwd: Optional[str] = None,
     ) -> WorktreeRecord:
-        """Spawn a detached process for *worktree_id* and record its PID.
+        """Spawn a detached process for *worktree_id* using the contract's
+        ``start:`` step, and record its PID.
+
+        The command is read from the ``start:`` field of the worktree contract
+        at ``<repo_root>/.seretos/worktree-setup.yml``.  Exactly one step must
+        be present; zero or multiple steps raise ``WorktreeError``.
 
         Delegates to ``process_lifecycle.start`` with ``store=self.state``.
         """
+        record = self.state.get(worktree_id)
+        if record is None:
+            raise WorktreeNotFoundError(
+                f"No worktree tracked with id '{worktree_id}'"
+            )
+
+        contract = _load_contract(Path(record.repo_root) / CONTRACT_FILENAME)
+
+        if not contract.start:
+            raise WorktreeError(
+                f"no start: command configured in contract for worktree '{worktree_id}'"
+            )
+        if len(contract.start) != 1:
+            raise WorktreeError(
+                f"contract start: must contain exactly one step "
+                f"(got {len(contract.start)})"
+            )
+
+        from ..setup.runner import _resolve_shell
+        step = contract.start[0]
+        cmd = [*_resolve_shell(step.shell), step.run]
+
         return _lifecycle_start(
             worktree_id,
             cmd,
@@ -444,8 +470,38 @@ class WorktreeManager:
     ) -> WorktreeRecord:
         """Stop the process recorded under *role* for *worktree_id*.
 
+        If the contract defines ``stop:`` steps, they are run (best-effort,
+        errors are swallowed) before sending the stop signal.
+
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         """
+        record = self.state.get(worktree_id)
+        if record is None:
+            raise WorktreeNotFoundError(
+                f"No worktree tracked with id '{worktree_id}'"
+            )
+
+        # Run contract stop: steps (best-effort — a failure must not prevent
+        # the SIGTERM from being sent).
+        try:
+            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract = _load_contract(contract_path)
+            if contract.stop:
+                from ..setup.runner import SetupRunner
+                runner = SetupRunner()
+                try:
+                    runner.run(
+                        setup=contract.stop,
+                        worktree_id=record.id,
+                        worktree_path=Path(record.path),
+                        branch=record.branch,
+                        port_mapping=record.ports,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
         return _lifecycle_stop(
             worktree_id,
             store=self.state,

@@ -169,6 +169,102 @@ def test_shell_override_invalid_value_rejected():
         )
 
 
+# ---------------------------------------------------------------------------
+# Ticket #25: start: and stop: fields on WorktreeContract
+# ---------------------------------------------------------------------------
+
+
+def test_start_stop_fields_default_to_empty_list():
+    """start: and stop: default to [] when absent from the contract."""
+    c = load_text("version: 1\nisolation: full\n")
+    assert c.start == []
+    assert c.stop == []
+
+
+def test_start_field_parses_step():
+    """start: accepts a list with one step; run and name are accessible."""
+    c = load_text(
+        "version: 1\nisolation: full\nstart:\n  - run: 'npm run start'\n"
+    )
+    assert len(c.start) == 1
+    assert c.start[0].run == "npm run start"
+    assert c.start[0].name is None
+
+
+def test_stop_field_parses_step():
+    """stop: accepts a list with one step; run and name are accessible."""
+    c = load_text(
+        "version: 1\nisolation: full\nstop:\n  - run: 'npm run stop'\n"
+    )
+    assert len(c.stop) == 1
+    assert c.stop[0].run == "npm run stop"
+    assert c.stop[0].name is None
+
+
+def test_start_step_accepts_shell_override():
+    """start: step honours an explicit shell: field."""
+    c = load_text(
+        "version: 1\nisolation: full\nstart:\n  - run: 'x'\n    shell: bash\n"
+    )
+    assert c.start[0].shell == "bash"
+
+
+def test_start_step_rejects_invalid_shell():
+    """start: step with an unsupported shell: value raises ContractValidationError."""
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nstart:\n  - run: 'x'\n    shell: zsh\n"
+        )
+
+
+def test_start_step_rejects_empty_run():
+    """start: step with run: '' raises ContractValidationError (min_length=1)."""
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nstart:\n  - run: ''\n"
+        )
+
+
+def test_start_step_rejects_extra_field():
+    """start: step with an unknown field raises ContractValidationError."""
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nstart:\n  - run: 'x'\n    bogus: 1\n"
+        )
+
+
+def test_isolation_none_forbids_start():
+    """isolation: none + non-empty start: raises ContractValidationError."""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(
+            "version: 1\nisolation: none\nstart:\n  - run: 'npm run start'\n"
+        )
+    assert "isolation: none" in str(exc_info.value)
+
+
+def test_isolation_none_forbids_stop():
+    """isolation: none + non-empty stop: raises ContractValidationError."""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(
+            "version: 1\nisolation: none\nstop:\n  - run: 'npm run stop'\n"
+        )
+    assert "isolation: none" in str(exc_info.value)
+
+
+def test_isolation_none_forbids_start_and_stop_together():
+    """isolation: none + both start: and stop: reports both in the error."""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(
+            "version: 1\nisolation: none\n"
+            "start:\n  - run: 'npm run start'\n"
+            "stop:\n  - run: 'npm run stop'\n"
+        )
+    msg = str(exc_info.value)
+    assert "start" in msg
+    assert "stop" in msg
+    assert "isolation: none" in msg
+
+
 def test_load_read_failure_raises_contract_error_not_validation(
     tmp_path: Path, monkeypatch
 ):

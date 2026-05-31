@@ -850,3 +850,216 @@ def test_find_by_branch_matches_after_create_forward_slash_input(
         "find_by_branch must return the record when queried with a forward-slash key"
     )
     assert found.id == rec.id
+
+
+# ---------------------------------------------------------------------------
+# Ticket #25: WorktreeManager.start reads cmd from contract; stop runs steps
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock, call, patch  # noqa: E402 – after sys-level imports
+
+from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: E402
+from lib_python_worktree.setup.runner import _resolve_shell  # noqa: E402
+
+
+def _make_mgr_in_memory(tmp_path: Path) -> WorktreeManager:
+    return WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+
+
+def _make_wt_record(wt_id: str = "wt-abc12345", **kwargs) -> "WorktreeRecord":
+    defaults = dict(
+        id=wt_id,
+        repo_root="/fake/repo",
+        branch="feature/x",
+        path="/fake/store/wt-abc12345",
+    )
+    defaults.update(kwargs)
+    return WorktreeRecord(**defaults)
+
+
+def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
+    """start() builds the cmd from contract.start[0] and passes it to _lifecycle_start."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+    expected_shell = _resolve_shell(None)  # platform-appropriate prefix
+    expected_cmd = [*expected_shell, "python server.py"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    mock_start.assert_called_once_with(
+        record.id,
+        expected_cmd,
+        store=mgr.state,
+        role="main",
+        env=None,
+        cwd=None,
+    )
+
+
+def test_manager_start_empty_contract_raises_worktree_error(tmp_path: Path):
+    """start() raises WorktreeError when contract.start is empty."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", start=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(WorktreeError) as exc_info,
+    ):
+        mgr.start(record.id)
+
+    assert "no start" in str(exc_info.value)
+
+
+def test_manager_start_multi_step_raises_worktree_error(tmp_path: Path):
+    """start() raises WorktreeError when contract.start has more than one step."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1"), Step(run="cmd2")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(WorktreeError) as exc_info,
+    ):
+        mgr.start(record.id)
+
+    assert "exactly one step" in str(exc_info.value)
+
+
+def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):
+    """start() raises WorktreeNotFoundError when the worktree id is not in the store."""
+    mgr = _make_mgr_in_memory(tmp_path)
+
+    with pytest.raises(WorktreeNotFoundError):
+        mgr.start("nonexistent-id-12345678")
+
+
+def test_manager_start_cmd_argument_removed(tmp_path: Path):
+    """start() no longer accepts a positional cmd argument; passing one raises TypeError."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    with pytest.raises(TypeError):
+        mgr.start(record.id, ["python", "x"])  # type: ignore[call-arg]
+
+
+def test_manager_stop_unknown_worktree_raises_not_found(tmp_path: Path):
+    """stop() raises WorktreeNotFoundError when the worktree id is not in the store."""
+    mgr = _make_mgr_in_memory(tmp_path)
+
+    with pytest.raises(WorktreeNotFoundError):
+        mgr.stop("nonexistent-id-12345678")
+
+
+def test_manager_stop_runs_stop_steps_before_sigterm(tmp_path: Path):
+    """stop() runs contract.stop steps via SetupRunner before calling _lifecycle_stop."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(pids={"main": 12345})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        stop=[Step(run="docker compose stop")],
+    )
+
+    call_order: list = []
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.side_effect = lambda **kw: call_order.append("runner.run")
+
+    mock_lifecycle_stop = MagicMock()
+    mock_lifecycle_stop.return_value = record
+    mock_lifecycle_stop.side_effect = lambda *a, **kw: (
+        call_order.append("_lifecycle_stop"),
+        record,
+    )[1]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+        patch("lib_python_worktree.core.manager._lifecycle_stop", mock_lifecycle_stop),
+    ):
+        mgr.stop(record.id)
+
+    assert call_order == ["runner.run", "_lifecycle_stop"], (
+        f"Expected runner.run before _lifecycle_stop, got: {call_order}"
+    )
+
+
+def test_manager_stop_without_stop_steps_skips_setup_runner(tmp_path: Path):
+    """stop() does not invoke SetupRunner when contract.stop is empty."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(pids={"main": 12345})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    mock_runner_instance = MagicMock()
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        mock_lc_stop.return_value = record
+        mgr.stop(record.id)
+
+    mock_runner_instance.run.assert_not_called()
+    mock_lc_stop.assert_called_once()
+
+
+def test_manager_stop_steps_failure_does_not_block_sigterm(tmp_path: Path):
+    """stop() calls _lifecycle_stop even when SetupRunner.run raises."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(pids={"main": 12345})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        stop=[Step(run="will fail")],
+    )
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.side_effect = RuntimeError("step exploded")
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        mock_lc_stop.return_value = record
+        mgr.stop(record.id)  # must not raise
+
+    mock_lc_stop.assert_called_once_with(
+        record.id,
+        store=mgr.state,
+        role="main",
+        timeout=10.0,
+    )
