@@ -1063,3 +1063,91 @@ def test_manager_stop_steps_failure_does_not_block_sigterm(tmp_path: Path):
         role="main",
         timeout=10.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #27: Consistent error contract — InvalidRepoError / InvalidBranchError
+# ---------------------------------------------------------------------------
+
+from lib_python_worktree.core.manager import InvalidBranchError, InvalidRepoError  # noqa: E402
+
+
+def test_invalid_repo_error_is_worktree_error_subclass():
+    """InvalidRepoError must be a WorktreeError subclass so existing
+    ``except WorktreeError`` catch-alls continue to work."""
+    assert issubclass(InvalidRepoError, WorktreeError), (
+        "InvalidRepoError must be a subclass of WorktreeError"
+    )
+
+
+def test_invalid_branch_error_is_worktree_error_subclass():
+    """InvalidBranchError must be a WorktreeError subclass."""
+    assert issubclass(InvalidBranchError, WorktreeError), (
+        "InvalidBranchError must be a subclass of WorktreeError"
+    )
+
+
+def test_create_invalid_repo_root_empty_string(manager: WorktreeManager):
+    """create() with an empty repo_root must raise InvalidRepoError, not
+    the bare WorktreeError base class."""
+    with pytest.raises(InvalidRepoError):
+        manager.create("", "feature/x")
+
+
+def test_create_invalid_repo_root_nonexistent(manager: WorktreeManager):
+    """create() with a non-existent path must raise InvalidRepoError."""
+    with pytest.raises(InvalidRepoError):
+        manager.create("/no/such/path/xyzzy_does_not_exist", "feature/x")
+
+
+@pytest.mark.requires_git
+def test_create_invalid_repo_root_not_a_git_repo(
+    manager: WorktreeManager, tmp_path: Path
+):
+    """create() given a real directory that is NOT a git repo must raise
+    InvalidRepoError (git rev-parse non-zero path)."""
+    plain_dir = tmp_path / "not_a_git_repo"
+    plain_dir.mkdir()
+    with pytest.raises(InvalidRepoError):
+        manager.create(str(plain_dir), "feature/x")
+
+
+@pytest.mark.requires_git
+def test_create_invalid_branch_empty_string(
+    manager: WorktreeManager, git_repo: Path
+):
+    """create() with an empty branch string must raise InvalidBranchError,
+    not the bare WorktreeError base class."""
+    with pytest.raises(InvalidBranchError):
+        manager.create(str(git_repo), "")
+
+
+@pytest.mark.requires_git
+def test_create_invalid_branch_whitespace_only(
+    manager: WorktreeManager, git_repo: Path
+):
+    """create() with a whitespace-only branch string must raise
+    InvalidBranchError (branch.strip() is empty)."""
+    with pytest.raises(InvalidBranchError):
+        manager.create(str(git_repo), "   ")
+
+
+def test_invalid_repo_error_attributes():
+    """InvalidRepoError exposes repo_root and reason as attributes."""
+    err = InvalidRepoError("/some/path", "path does not exist")
+    assert err.repo_root == "/some/path"
+    assert err.reason == "path does not exist"
+    assert "/some/path" in str(err)
+    assert "path does not exist" in str(err)
+
+
+def test_invalid_repo_error_public_import():
+    """InvalidRepoError must be importable from the public package surface."""
+    from lib_python_worktree import InvalidRepoError as PublicInvalidRepoError  # noqa: PLC0415
+    assert PublicInvalidRepoError is InvalidRepoError
+
+
+def test_invalid_branch_error_public_import():
+    """InvalidBranchError must be importable from the public package surface."""
+    from lib_python_worktree import InvalidBranchError as PublicInvalidBranchError  # noqa: PLC0415
+    assert PublicInvalidBranchError is InvalidBranchError

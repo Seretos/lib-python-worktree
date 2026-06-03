@@ -22,7 +22,7 @@ from typing import List, Optional
 # module even though _run_git now lives in _git_utils.
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
-from ._exceptions import DirtyWorktreeError, GitTimeoutError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
@@ -53,6 +53,12 @@ _ALREADY_CHECKED_OUT_RE = re.compile(
 
 
 class BranchNotFoundError(WorktreeError):
+    pass
+
+
+class InvalidBranchError(WorktreeError):
+    """Raised when ``branch`` is an empty or whitespace-only string."""
+
     pass
 
 
@@ -258,7 +264,7 @@ class WorktreeManager:
 
         branch = branch.strip()
         if not branch:
-            raise WorktreeError("branch must be a non-empty string")
+            raise InvalidBranchError("branch must be a non-empty string")
 
         repo_slug = _slug(repo_path.name)
 
@@ -641,13 +647,13 @@ class WorktreeManager:
 
     def _validate_repo(self, repo_root: str) -> Path:
         if not repo_root:
-            raise WorktreeError("repo_root must be a non-empty path")
+            raise InvalidRepoError(repo_root, "repo_root must be a non-empty path")
         path = Path(repo_root).expanduser().resolve()
         if not path.exists():
-            raise WorktreeError(f"repo_root does not exist: {path}")
+            raise InvalidRepoError(repo_root, f"repo_root does not exist: {path}")
         proc = _run_git(["rev-parse", "--show-toplevel"], cwd=path)
         if proc.returncode != 0:
-            raise WorktreeError(f"Not a git repository: {path}")
+            raise InvalidRepoError(repo_root, f"not a git repository: {path}")
         return Path(proc.stdout.strip()).resolve()
 
     def _branch_exists(self, repo_path: Path, branch: str) -> bool:
@@ -665,6 +671,8 @@ __all__ = (
     "DuplicateWorktreeError",
     "GitCommandError",
     "GitTimeoutError",
+    "InvalidBranchError",
+    "InvalidRepoError",
     "ManagerConfig",
     "WorktreeError",
     "WorktreeManager",
