@@ -55,8 +55,28 @@ class DirtyWorktreeError(WorktreeError):
         self.worktree_id = worktree_id
 
 
+class InvalidRepoError(WorktreeError):
+    """Raised when ``repo_root`` is not a valid git repository.
+
+    Covers three distinct failure modes surfaced by ``_validate_repo``:
+    - empty string passed as ``repo_root``
+    - path does not exist on the filesystem
+    - path exists but is not a git repository (``git rev-parse`` non-zero)
+
+    Both ``repo_root`` (the raw value passed by the caller) and a ``reason``
+    string describing the failure are stored as attributes so callers can
+    react programmatically without parsing the message text.
+    """
+
+    def __init__(self, repo_root: str, reason: str) -> None:
+        super().__init__(f"invalid repo_root {repo_root!r}: {reason}")
+        self.repo_root = repo_root
+        self.reason = reason
+
+
 __all__ = [
     "DirtyWorktreeError",
     "GitTimeoutError",
+    "InvalidRepoError",
     "WorktreeError",
 ]
