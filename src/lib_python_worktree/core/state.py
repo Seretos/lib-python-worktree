@@ -9,7 +9,10 @@ operations the W2 tools need are exposed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Protocol
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Protocol
+
+if TYPE_CHECKING:
+    from .process_lifecycle import KilledProcessInfo
 
 
 @dataclass
@@ -29,6 +32,7 @@ class WorktreeRecord:
     ports: Dict[str, int] = field(default_factory=dict)
     pids: Dict[str, int] = field(default_factory=dict)
     branch_created_by_us: bool = False
+    killed_pids: List["KilledProcessInfo"] = field(default_factory=list)
 
 
 class StateStore(Protocol):

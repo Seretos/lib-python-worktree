@@ -20,10 +20,13 @@ import pytest
 
 from lib_python_worktree.core.process_lifecycle import (
     DEFAULT_ROLE,
+    KilledProcessInfo,
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    _find_blocking_processes,
     _force_kill,
+    _kill_blocking_processes,
     _pid_alive,
     _send_graceful_signal,
     _spawn_detached,
@@ -423,3 +426,278 @@ class TestWaitOrKill:
             _wait_or_kill(99999, timeout=0.1)
 
         mock_kill.assert_called_once_with(99999)
+
+
+# ---------------------------------------------------------------------------
+# _find_blocking_processes unit tests  (ticket #29)
+# ---------------------------------------------------------------------------
+
+def _make_fake_proc(pid: int, name: str, cmdline: list, cwd: str):
+    """Build a fake psutil.Process-like object for _find_blocking_processes tests."""
+    proc = MagicMock()
+    proc.info = {"pid": pid, "name": name, "cmdline": cmdline}
+    proc.cwd.return_value = cwd
+    return proc
+
+
+class TestFindBlockingProcesses:
+    """Unit tests for _find_blocking_processes (psutil mocked)."""
+
+    def test_matching_process_returned(self):
+        """A process whose cwd is exactly the target path is returned."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_match = _make_fake_proc(9001, "node", ["node", "server.js"], target)
+        proc_other = _make_fake_proc(9002, "python", ["python"], "/other/path")
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_match, proc_other]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].pid == 9001
+        assert result[0].name == "node"
+        assert result[0].cmdline == ["node", "server.js"]
+
+    def test_subprocess_cwd_is_returned(self):
+        """A process whose cwd is a subdirectory of the target path is returned."""
+        import psutil
+
+        target = "/fake/worktree"
+        sub_cwd = "/fake/worktree/subdir"
+        host_pid = os.getpid()
+
+        proc_sub = _make_fake_proc(9003, "bash", ["bash"], sub_cwd)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_sub]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].pid == 9003
+
+    def test_non_matching_process_excluded(self):
+        """Processes with unrelated cwd are not included."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_other = _make_fake_proc(9004, "vim", ["vim"], "/home/user")
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_other]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == []
+
+    def test_host_pid_excluded(self):
+        """The host process itself is never included even if its cwd matches."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_host = _make_fake_proc(host_pid, "python", ["python"], target)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_host]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == []
+
+    def test_ancestor_pid_excluded(self):
+        """Ancestors of the host process are never included."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+        ancestor_pid = 1001
+
+        proc_ancestor = _make_fake_proc(ancestor_pid, "init", ["init"], target)
+        proc_blocker = _make_fake_proc(9005, "node", ["node"], target)
+
+        ancestor_mock = MagicMock()
+        ancestor_mock.pid = ancestor_pid
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_ancestor, proc_blocker]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = [ancestor_mock]
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].pid == 9005
+
+    def test_access_denied_cwd_skipped(self):
+        """A process whose cwd() raises AccessDenied is silently skipped."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_denied = MagicMock()
+        proc_denied.info = {"pid": 9006, "name": "sshd", "cmdline": ["sshd"]}
+        proc_denied.cwd.side_effect = psutil.AccessDenied(9006)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_denied]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == []
+
+    def test_empty_process_list_returns_empty(self):
+        """Empty process list yields empty result."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == []
+
+    def test_sibling_path_not_matched(self):
+        """Regression: a cwd that is a string-prefix of the target path but is
+        NOT under it (e.g. /fake/worktree-sibling vs /fake/worktree) must NOT
+        be returned.  Covers exact-match and genuine-subdir positive cases
+        alongside the sibling negative case."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        # Negative: string-prefix sibling — must NOT match.
+        proc_sibling = _make_fake_proc(9010, "vim", ["vim"], "/fake/worktree-sibling")
+        # Positive: exact cwd match — must match.
+        proc_exact = _make_fake_proc(9011, "node", ["node"], "/fake/worktree")
+        # Positive: genuine subdirectory — must match.
+        proc_sub = _make_fake_proc(9012, "bash", ["bash"], "/fake/worktree/src")
+
+        with (
+            patch.object(
+                psutil,
+                "process_iter",
+                return_value=[proc_sibling, proc_exact, proc_sub],
+            ),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        returned_pids = {r.pid for r in result}
+        assert 9010 not in returned_pids, (
+            "/fake/worktree-sibling must not match target /fake/worktree"
+        )
+        assert 9011 in returned_pids, "exact cwd match must be included"
+        assert 9012 in returned_pids, "genuine subdirectory must be included"
+
+
+# ---------------------------------------------------------------------------
+# _kill_blocking_processes unit tests  (ticket #29)
+# ---------------------------------------------------------------------------
+
+class TestKillBlockingProcesses:
+    """Unit tests for _kill_blocking_processes."""
+
+    def test_kills_each_found_process(self):
+        """_kill_blocking_processes calls graceful signal then wait_or_kill per process."""
+        target = "/fake/worktree"
+        fake_found = [
+            KilledProcessInfo(pid=1010, name="node", cmdline=["node"]),
+            KilledProcessInfo(pid=2020, name="python", cmdline=["python", "app.py"]),
+        ]
+
+        graceful_calls = []
+        wait_calls = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_found,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                side_effect=lambda pid: graceful_calls.append(pid),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=lambda pid, timeout: wait_calls.append((pid, timeout)),
+            ),
+        ):
+            result = _kill_blocking_processes(target)
+
+        assert result == fake_found
+        assert graceful_calls == [1010, 2020]
+        assert all(t == 5.0 for (_, t) in wait_calls)
+        assert [p for (p, _) in wait_calls] == [1010, 2020]
+
+    def test_no_blockers_returns_empty_no_kills(self):
+        """_kill_blocking_processes returns [] and makes no kill calls when no blockers."""
+        target = "/fake/worktree"
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ) as mock_graceful,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+            ) as mock_wait,
+        ):
+            result = _kill_blocking_processes(target)
+
+        assert result == []
+        mock_graceful.assert_not_called()
+        mock_wait.assert_not_called()

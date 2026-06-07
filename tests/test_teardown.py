@@ -497,3 +497,413 @@ class TestTeardownForceExit128:
             side_effect=_git_not_a_repo,
         ), patch("lib_python_worktree.core.manager.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+
+# ---------------------------------------------------------------------------
+# TestKillBlockingProcesses* -- ticket #29
+# ---------------------------------------------------------------------------
+
+class TestKillBlockingProcessesWindows:
+    """Windows path: rc=255 + 'Permission denied' triggers kill+retry."""
+
+    def test_kill_and_retry_succeeds_no_raise(self, tmp_path):
+        """First git call returns 255/'Permission denied'; second returns 0.
+        kill helper called once; no exception raised; record.killed_pids set."""
+        import sys
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-win-kill", path="/fake/store/wt-win-kill")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=1234, name="node.exe", cmdline=["node"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_kill.assert_called_once_with(record.path)
+        assert record.killed_pids == fake_killed
+        assert call_count["n"] == 2
+
+    def test_kill_and_retry_flag_off_raises_git_error(self, tmp_path):
+        """With kill_blocking_processes=False (default), rc=255/'Permission denied'
+        must raise GitCommandError and the kill helper must never be called."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-win-flagoff")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_perm_denied(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_perm_denied),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(GitCommandError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+
+    def test_still_locked_after_retry_raises_dir_locked_error(self, tmp_path):
+        """Both git calls fail; WorktreeDirLockedError raised with killed list."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-win-locked", path="/fake/store/wt-win-locked")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=5678, name="claude", cmdline=["claude", "--bg"])]
+
+        def _git_always_fail(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_always_fail),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as exc_info:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = exc_info.value
+        assert err.worktree_id == "wt-win-locked"
+        assert err.killed == fake_killed
+        assert record.killed_pids == fake_killed
+
+
+class TestKillBlockingProcessesPosix:
+    """POSIX path: 'locked' in stderr with flag triggers kill+retry."""
+
+    def test_posix_locked_stderr_kill_and_retry_succeeds(self, tmp_path):
+        """POSIX: stderr containing 'locked' with kill_blocking_processes=True
+        triggers kill+retry and succeeds on the second call."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-posix-kill", path="/fake/store/wt-posix-kill")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=9999, name="codex-broker", cmdline=["codex"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=128, stderr="error: unable to lock worktree")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_kill.assert_called_once_with(record.path)
+        assert record.killed_pids == fake_killed
+        assert call_count["n"] == 2
+
+    def test_posix_locked_stderr_case_insensitive(self, tmp_path):
+        """POSIX: 'Locked' (capital L) — i.e. the 'lock' substring is present
+        case-insensitively — in stderr also triggers kill+retry."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-posix-lock-ci", path="/fake/store/wt-posix-lock-ci")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=8888, name="sh", cmdline=["sh"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=1, stderr="fatal: worktree is Locked")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_kill.assert_called_once_with(record.path)
+        assert call_count["n"] == 2
+
+    def test_posix_still_locked_raises_dir_locked_error(self, tmp_path):
+        """POSIX: both calls fail with lock stderr; WorktreeDirLockedError raised."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-posix-locked")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=7777, name="sh", cmdline=["sh"])]
+
+        def _git_always_fail(args, cwd=None, **kwargs):
+            return MagicMock(returncode=128, stderr="error: cannot lock worktree")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_always_fail),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            with pytest.raises(WorktreeDirLockedError) as exc_info:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert exc_info.value.worktree_id == record.id
+        assert exc_info.value.killed == fake_killed
+
+    def test_posix_non_lock_stderr_raises_git_command_error(self, tmp_path):
+        """POSIX: flag on but stderr has NO 'locked' pattern → GitCommandError,
+        kill helper never called.  Covers broken-repo / network-FS error paths."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-posix-non-lock")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_broken_repo(args, cwd=None, **kwargs):
+            return MagicMock(returncode=128, stderr="fatal: not a git repository")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_broken_repo),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            with pytest.raises(GitCommandError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+
+
+class TestKillBlockingFlagOff:
+    """When kill_blocking_processes=False (the default), behaviour is unchanged."""
+
+    def test_flag_off_rc1_still_raises_git_command_error(self, tmp_path):
+        """Default (flag=False): rc=1 raises GitCommandError, kill not called."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-flagoff-posix")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_rc1(args, cwd=None, **kwargs):
+            return MagicMock(returncode=1, stderr="some error")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_rc1),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+        ):
+            with pytest.raises(GitCommandError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+
+    def test_remove_default_flag_off(self, tmp_path):
+        """remove() default call (no kill_blocking_processes) raises GitCommandError
+        on exit 255/'Permission denied', confirming the default is unchanged."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-remove-default", branch_created_by_us=False)
+        manager.state.add(record)
+
+        def _git_perm_denied(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_perm_denied),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(GitCommandError):
+                manager.remove(record.id)
+
+
+class TestKillBlockingRecordKilledPids:
+    """Verify record.killed_pids is populated and returned by remove()."""
+
+    def test_remove_returns_record_with_killed_pids(self, tmp_path):
+        """remove(kill_blocking_processes=True) returns record.killed_pids on success."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-ret-killed",
+            path="/fake/store/wt-ret-killed",
+            branch_created_by_us=False,
+        )
+        manager.state.add(record)
+
+        fake_killed = [KilledProcessInfo(pid=1111, name="node", cmdline=["node", "server.js"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1 and "remove" in args:
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            removed = manager.remove(record.id, kill_blocking_processes=True)
+
+        assert removed.killed_pids == fake_killed
+
+    def test_yaml_store_remove_returns_killed_pids(self, tmp_path):
+        """Regression for blocking #2: YamlStateStore.remove() returns a freshly
+        deserialized object; killed_pids must be explicitly copied onto it so
+        the caller sees the list even when using the file-backed store."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+        from lib_python_worktree.core.yaml_store import YamlStateStore
+
+        yaml_store = YamlStateStore(state_dir=tmp_path / "state")
+        manager = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=yaml_store,
+            reconcile_on_init=False,
+        )
+
+        record = _make_record(
+            "wt-yaml-killed",
+            path="/fake/store/wt-yaml-killed",
+            branch_created_by_us=False,
+        )
+        yaml_store.add(record)
+
+        fake_killed = [KilledProcessInfo(pid=2222, name="node", cmdline=["node"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1 and "remove" in args:
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            removed = manager.remove(record.id, kill_blocking_processes=True)
+
+        # The critical assertion: YamlStateStore deserializes a fresh object,
+        # so without the explicit copy in remove() this would be [].
+        assert removed.killed_pids == fake_killed, (
+            "killed_pids must survive YamlStateStore round-trip via remove()"
+        )
