@@ -33,6 +33,8 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from .state import StateStore, WorktreeRecord
@@ -241,6 +243,83 @@ def _wait_or_kill(pid: int, timeout: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Blocking-process detection and kill helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KilledProcessInfo:
+    """Information about a process that was killed to unblock worktree removal."""
+
+    pid: int
+    name: str
+    cmdline: List[str] = field(default_factory=list)
+
+
+def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo]:
+    """Return processes whose cwd is under *path*, excluding the host and its ancestors.
+
+    Parameters
+    ----------
+    path:
+        The worktree directory path; processes with cwd equal to or under this
+        path are considered blocking.
+    host_pid:
+        The PID of the current (MCP host) process; it and all its OS-level
+        ancestors are always excluded from the returned list.
+    """
+    import psutil
+
+    normalized = os.path.normcase(os.path.normpath(path))
+
+    # Build the set of PIDs to exclude: the host process and all its ancestors.
+    excluded_pids: set[int] = {host_pid}
+    try:
+        for ancestor in psutil.Process(host_pid).parents():
+            excluded_pids.add(ancestor.pid)
+    except (psutil.AccessDenied, psutil.NoSuchProcess):
+        pass
+
+    result: List[KilledProcessInfo] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = proc.info["pid"]
+            if pid in excluded_pids:
+                continue
+            try:
+                cwd = proc.cwd()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                continue
+            norm_cwd = os.path.normcase(os.path.normpath(cwd))
+            # Match if the process cwd equals the target path or is under it.
+            if norm_cwd == normalized or norm_cwd.startswith(normalized + os.sep):
+                result.append(
+                    KilledProcessInfo(
+                        pid=pid,
+                        name=proc.info["name"] or "",
+                        cmdline=proc.info["cmdline"] or [],
+                    )
+                )
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+
+    return result
+
+
+def _kill_blocking_processes(path: str) -> List[KilledProcessInfo]:
+    """Kill all processes whose cwd is under *path* and return their info.
+
+    Sends the graceful signal first, waits up to 5 seconds, then force-kills
+    any survivors.  The MCP host process and its ancestors are never killed.
+    Returns an empty list when no blocking processes are found.
+    """
+    found = _find_blocking_processes(path, os.getpid())
+    for info in found:
+        _send_graceful_signal(info.pid)
+        _wait_or_kill(info.pid, timeout=5.0)
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -372,6 +451,7 @@ def stop(
 
 __all__ = (
     "DEFAULT_ROLE",
+    "KilledProcessInfo",
     "ProcessAlreadyRunningError",
     "ProcessLifecycleError",
     "ProcessNotRunningError",

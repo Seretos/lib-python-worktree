@@ -12,7 +12,10 @@ Import hierarchy:
 
 from __future__ import annotations
 
-from typing import List
+from typing import TYPE_CHECKING, List
+
+if TYPE_CHECKING:
+    from .process_lifecycle import KilledProcessInfo
 
 
 class WorktreeError(RuntimeError):
@@ -74,9 +77,29 @@ class InvalidRepoError(WorktreeError):
         self.reason = reason
 
 
+class WorktreeDirLockedError(WorktreeError):
+    """Raised when ``git worktree remove`` still fails after killing blocking
+    processes.
+
+    The message names only the worktree id and how many processes were killed —
+    no raw paths, exit codes, or git command text are surfaced so that callers
+    can react programmatically without parsing implementation details.
+    """
+
+    def __init__(self, worktree_id: str, killed: "List[KilledProcessInfo]") -> None:
+        n = len(killed)
+        super().__init__(
+            f"worktree '{worktree_id}' directory is still locked after killing"
+            f" {n} blocking process(es)."
+        )
+        self.worktree_id = worktree_id
+        self.killed = killed
+
+
 __all__ = [
     "DirtyWorktreeError",
     "GitTimeoutError",
     "InvalidRepoError",
+    "WorktreeDirLockedError",
     "WorktreeError",
 ]

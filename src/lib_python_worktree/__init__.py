@@ -43,11 +43,13 @@ from .core.manager import (
     InvalidRepoError,
     ManagerConfig,
     PortAllocationError,
+    WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
 )
 from .core.process_lifecycle import (
+    KilledProcessInfo,
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
@@ -80,7 +82,9 @@ __all__ = [
     "WorktreeNotFoundError",
     "GitCommandError",
     "GitTimeoutError",
+    "WorktreeDirLockedError",
     # process lifecycle
+    "KilledProcessInfo",
     "ProcessLifecycleError",
     "ProcessAlreadyRunningError",
     "ProcessNotRunningError",

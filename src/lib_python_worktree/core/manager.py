@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,13 +23,14 @@ from typing import List, Optional
 # module even though _run_git now lives in _git_utils.
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
-from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    _kill_blocking_processes,
     start as _lifecycle_start,
     stop as _lifecycle_stop,
 )
@@ -365,7 +367,12 @@ class WorktreeManager:
     def list(self) -> List[WorktreeRecord]:
         return self.state.list()
 
-    def remove(self, worktree_id: str, force: bool = False) -> WorktreeRecord:
+    def remove(
+        self,
+        worktree_id: str,
+        force: bool = False,
+        kill_blocking_processes: bool = False,
+    ) -> WorktreeRecord:
         record = self.state.get(worktree_id)
         if record is None:
             raise WorktreeNotFoundError(
@@ -373,7 +380,7 @@ class WorktreeManager:
             )
         # Phase 1: remove the git worktree checkout.  If this raises the
         # directory still exists, so we keep the state record and propagate.
-        self._teardown(record, force=force)
+        self._teardown(record, force=force, kill_blocking_processes=kill_blocking_processes)
         # Phase 2: the worktree directory is now gone.  Remove the state record
         # *before* the branch-delete step so that a branch-delete failure
         # (e.g. ``git branch -d`` refusing an unmerged branch when force=False)
@@ -381,6 +388,11 @@ class WorktreeManager:
         removed = self.state.remove(worktree_id)
         assert removed is not None  # state.get returned record above
         removed.status = "removed"
+        # Copy killed_pids from the in-memory record: YamlStateStore.remove()
+        # returns a freshly-deserialized object that never carries killed_pids
+        # (the field is transient and not written to state.yaml), so we must
+        # propagate it explicitly from the object _teardown mutated.
+        removed.killed_pids = record.killed_pids
         # Phase 3: delete the owned branch (if any).  May raise GitCommandError
         # (e.g. unmerged + force=False); the record is already gone from state.
         self._delete_owned_branch(record, force=force)
@@ -522,6 +534,7 @@ class WorktreeManager:
         record: WorktreeRecord,
         *,
         force: bool,
+        kill_blocking_processes: bool = False,
         _lifecycle_module=None,
     ) -> None:
         """Remove the git worktree checkout directory.
@@ -607,9 +620,34 @@ class WorktreeManager:
                 # (force=True), not the raw git command, path, or exit code.
                 raise DirtyWorktreeError(record.id)
             else:
-                raise GitCommandError(
-                    ["git", *args], proc.returncode, proc.stderr
+                # Determine whether this exit qualifies as a directory-lock
+                # signal that the kill_blocking_processes path should handle.
+                # Windows: exit 255 + "Permission denied" in stderr.
+                # POSIX: "lock" in stderr (case-insensitive) — git worktree
+                #   reports a held directory as "locked" / "unable to lock" /
+                #   "cannot lock" / "worktree is locked".  All variants contain
+                #   the substring "lock".  Unrelated git failures (broken
+                #   metadata, network FS errors, "not a git repository", etc.)
+                #   do not, so they fall through to GitCommandError unchanged.
+                _is_lock_signal = (
+                    sys.platform == "win32"
+                    and proc.returncode == 255
+                    and "Permission denied" in proc.stderr
+                ) or (
+                    sys.platform != "win32"
+                    and "lock" in proc.stderr.lower()
                 )
+                if kill_blocking_processes and _is_lock_signal:
+                    killed = _kill_blocking_processes(record.path)
+                    record.killed_pids = killed
+                    retry = _run_git(args, cwd=Path(record.repo_root))
+                    if retry.returncode != 0:
+                        raise WorktreeDirLockedError(record.id, killed=killed)
+                    # Retry succeeded — fall through to step 4.
+                else:
+                    raise GitCommandError(
+                        ["git", *args], proc.returncode, proc.stderr
+                    )
 
         # Step 4: release allocated ports only after the git worktree remove
         # has succeeded.  Freeing ports before the remove would allow a
@@ -674,6 +712,7 @@ __all__ = (
     "InvalidBranchError",
     "InvalidRepoError",
     "ManagerConfig",
+    "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeManager",
     "WorktreeNotFoundError",
