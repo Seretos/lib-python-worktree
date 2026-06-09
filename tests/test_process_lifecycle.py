@@ -640,6 +640,113 @@ class TestFindBlockingProcesses:
         assert 9011 in returned_pids, "exact cwd match must be included"
         assert 9012 in returned_pids, "genuine subdirectory must be included"
 
+    def test_open_file_handle_under_path_returned(self):
+        """A process whose open_files() contains a file under the target path
+        is included even when its cwd is outside the path (gap 1 fix)."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        # This process's cwd is OUTSIDE target, so the CWD pass won't catch it.
+        proc_daemon = MagicMock()
+        proc_daemon.info = {"pid": 9020, "name": "unity", "cmdline": ["unity"]}
+        proc_daemon.cwd.return_value = "/other/path"
+        # But it holds an open file handle inside target.
+        file_info = MagicMock()
+        file_info.path = "/fake/worktree/Assets/scene.unity"
+        proc_daemon.open_files.return_value = [file_info]
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_daemon]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].pid == 9020
+        assert result[0].name == "unity"
+
+    def test_open_files_access_denied_skipped(self):
+        """A process whose open_files() raises AccessDenied is silently skipped."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_denied = MagicMock()
+        proc_denied.info = {"pid": 9021, "name": "system", "cmdline": ["system"]}
+        proc_denied.cwd.return_value = "/other/path"
+        proc_denied.open_files.side_effect = psutil.AccessDenied(9021)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_denied]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == []
+
+    def test_open_files_empty_list_no_spurious_additions(self):
+        """A process with an empty open_files() list is not added."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc = MagicMock()
+        proc.info = {"pid": 9022, "name": "idle", "cmdline": ["idle"]}
+        proc.cwd.return_value = "/other/path"
+        proc.open_files.return_value = []
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == []
+
+    def test_cwd_match_not_duplicated_by_open_files(self):
+        """A process already matched by CWD must not be returned twice even if
+        it also has open file handles inside the target path."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc = MagicMock()
+        proc.info = {"pid": 9023, "name": "node", "cmdline": ["node"]}
+        proc.cwd.return_value = "/fake/worktree"  # matches CWD pass
+        file_info = MagicMock()
+        file_info.path = "/fake/worktree/index.js"
+        proc.open_files.return_value = [file_info]
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1, "process must appear exactly once even with both CWD and open-file match"
+        assert result[0].pid == 9023
+
 
 # ---------------------------------------------------------------------------
 # _kill_blocking_processes unit tests  (ticket #29)

@@ -907,3 +907,404 @@ class TestKillBlockingRecordKilledPids:
         assert removed.killed_pids == fake_killed, (
             "killed_pids must survive YamlStateStore round-trip via remove()"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTeardownContractStopSteps -- ticket #31 gap 1
+# ---------------------------------------------------------------------------
+
+class TestTeardownContractStopSteps:
+    """Verify that contract stop: steps are run inside _teardown before
+    kill_blocking_processes, and that failures are swallowed."""
+
+    def test_stop_steps_run_before_teardown_and_before_kill(self, tmp_path):
+        """Regression #31: when a contract has stop: steps, SetupRunner.run is
+        called with setup=contract.stop before _kill_blocking_processes.
+
+        Sequence verified:
+          1. SetupRunner.run(setup=contract.stop, ...)
+          2. git worktree remove  → returns 255/'Permission denied'
+          3. _kill_blocking_processes
+          4. git worktree remove  → returns 0
+        """
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-stop-steps",
+            path="/fake/store/wt-stop-steps",
+            ports={"web": 30001},
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='echo stop', name="stop-svc")],
+        )
+
+        call_order: list[str] = []
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = lambda **kw: call_order.append("stop_runner")
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=5050, name="daemon", cmdline=["daemon"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        def _mock_kill(path):
+            call_order.append("kill")
+            return fake_killed
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                side_effect=_mock_kill,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        # stop_runner must appear before kill
+        assert "stop_runner" in call_order
+        assert "kill" in call_order
+        assert call_order.index("stop_runner") < call_order.index("kill"), (
+            "contract stop: steps must run before _kill_blocking_processes"
+        )
+        # Verify port_mapping is forwarded
+        runner_kw = mock_runner_instance.run.call_args_list[0][1]
+        assert runner_kw["worktree_id"] == "wt-stop-steps"
+        assert runner_kw["setup"] == fake_contract.stop
+        assert runner_kw["port_mapping"] == {"web": 30001}
+
+    def test_stop_steps_swallow_runner_exception(self, tmp_path):
+        """SetupFailedError from SetupRunner.run must not propagate out of _teardown."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.setup.runner import SetupFailedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-stop-swallow")
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='exit 1', name="boom")],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = SetupFailedError(
+            worktree_id="wt-stop-swallow",
+            step_index=0,
+            step_name="boom",
+            log_path=Path("/tmp/fake.log"),
+            returncode=1,
+        )
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            # Must not raise despite SetupFailedError from stop runner
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+    def test_stop_steps_skipped_when_no_stop_field(self, tmp_path):
+        """When contract.stop is empty, SetupRunner is never constructed for stop:."""
+        from lib_python_worktree.contract.schema import WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-no-stop-field")
+        manager.state.add(record)
+
+        # Contract with no stop steps
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        runner_stop_calls: list = []
+
+        mock_runner_instance = MagicMock()
+        # Track whether run is ever called with a stop setup
+        original_run = mock_runner_instance.run
+        mock_runner_instance.run.side_effect = lambda **kw: runner_stop_calls.append(kw["setup"])
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        # No call should have been made with setup=[] (stop field empty)
+        for setup_arg in runner_stop_calls:
+            assert setup_arg != [], (
+                "SetupRunner.run must not be called with empty stop: list"
+            )
+
+
+# ---------------------------------------------------------------------------
+# TestKillBlockingProcessesWindowsInvalidArg -- ticket #31 gap 2
+# ---------------------------------------------------------------------------
+
+class TestKillBlockingProcessesWindowsInvalidArg:
+    """Windows path: rc=255 + 'Invalid argument' also triggers kill+retry."""
+
+    def test_invalid_argument_triggers_kill_and_retry(self, tmp_path):
+        """Regression #31 gap 2: 'Invalid argument' must trigger the same
+        kill-and-retry path as 'Permission denied' on Windows."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-win-invarg", path="/fake/store/wt-win-invarg")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=7070, name="unity.exe", cmdline=["unity"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=255, stderr="Invalid argument")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must not raise — currently fails because "Invalid argument" was
+            # not in the heuristic before this fix.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_kill.assert_called_once_with(record.path)
+        assert record.killed_pids == fake_killed
+        assert call_count["n"] == 2
+
+    def test_permission_denied_still_triggers_kill(self, tmp_path):
+        """'Permission denied' must still trigger kill+retry after the heuristic
+        change (regression guard)."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-win-perm-guard", path="/fake/store/wt-win-perm-guard")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=8080, name="code.exe", cmdline=["code"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_kill.assert_called_once_with(record.path)
+        assert call_count["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# TestLongPathFallback -- ticket #31 gap 3
+# ---------------------------------------------------------------------------
+
+class TestLongPathFallback:
+    """Verify the long-path post-delete fallback in _teardown."""
+
+    def test_directory_still_exists_after_git_remove_triggers_longpath_deletion(
+        self, tmp_path
+    ):
+        """Regression #31 gap 3: when git worktree remove returns 0 but the
+        directory still exists on win32, shutil.rmtree is called with the
+        extended-length path prefix."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-longpath-win",
+            path="C:\\fake\\store\\wt-longpath-win",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        rmtree_calls: list = []
+
+        def _mock_rmtree(path, **kwargs):
+            rmtree_calls.append(path)
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        # The extended-length path must have been passed to shutil.rmtree
+        extended = "\\\\\\\\" + "?\\\\" + os.path.abspath(record.path)
+        # Accept any call that starts with \\?\
+        extended_calls = [c for c in rmtree_calls if c.startswith("\\\\?\\")]
+        assert extended_calls, (
+            f"Expected shutil.rmtree call with \\\\?\\ prefix, got: {rmtree_calls}"
+        )
+
+    def test_longpath_fallback_skipped_on_posix(self, tmp_path):
+        r"""On non-Windows, the \\?\-prefixed rmtree variant must never be called."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-longpath-posix", path="/fake/store/wt-longpath-posix")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        rmtree_calls: list = []
+
+        def _mock_rmtree(path, **kwargs):
+            rmtree_calls.append(path)
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "linux"
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        # Must not use \\?\ prefix on POSIX
+        extended_calls = [c for c in rmtree_calls if c.startswith("\\\\?\\")]
+        assert not extended_calls, (
+            f"\\\\?\\ prefix must not be used on POSIX, got: {rmtree_calls}"
+        )
+        # But a plain rmtree must still be called
+        assert rmtree_calls, "shutil.rmtree must be called on POSIX fallback"
+
+    def test_robocopy_fallback_used_when_first_rmtree_fails(self, tmp_path):
+        """When the extended-path shutil.rmtree raises OSError, robocopy is
+        attempted as the second fallback."""
+        import subprocess as subprocess_module
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-robocopy",
+            path="C:\\fake\\store\\wt-robocopy",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        robocopy_calls: list = []
+
+        def _mock_rmtree(path, **kwargs):
+            if path.startswith("\\\\?\\"):
+                raise OSError("path too long")
+            # Second call (after robocopy) succeeds silently
+
+        def _mock_subprocess_run(cmd, **kwargs):
+            robocopy_calls.append(cmd)
+            return MagicMock(returncode=1)  # robocopy exits 1 on success-with-copies
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must not raise even if robocopy path is taken
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert robocopy_calls, "robocopy must be called when extended-path rmtree fails"
+        assert robocopy_calls[0][0] == "robocopy", (
+            f"first element of robocopy cmd must be 'robocopy', got {robocopy_calls[0]}"
+        )
+        assert record.path in robocopy_calls[0], (
+            "record.path must be in robocopy args"
+        )
+
+    def test_longpath_fallback_no_rmtree_when_dir_gone(self, tmp_path):
+        """When git worktree remove succeeds and the directory is gone,
+        no fallback rmtree is called."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-no-fallback", path="/fake/store/wt-no-fallback")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        rmtree_calls: list = []
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=lambda *a, **kw: rmtree_calls.append(a)),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert not rmtree_calls, "shutil.rmtree must not be called when dir is already gone"

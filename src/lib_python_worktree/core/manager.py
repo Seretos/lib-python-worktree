@@ -566,6 +566,9 @@ class WorktreeManager:
 
         Sequence (W8):
         1. Stop any tracked processes (process lifecycle).
+        1b. Run contract ``stop:`` steps via ``SetupRunner`` (best-effort,
+            before any FS delete so that daemons with PID files can release
+            file handles gracefully).
         2. Run any contract ``teardown:`` steps via ``SetupRunner``.
         3. Remove the git worktree checkout.
         4. Release allocated ports (only after step 3 succeeds).
@@ -591,6 +594,30 @@ class WorktreeManager:
                 except ProcessLifecycleError:
                     # Best-effort: log-worthy but don't block the removal.
                     pass
+
+        # Step 1b: run contract stop: steps before FS deletion so that daemons
+        # (e.g. Unity Editor) that write PID files / hold handles have a chance
+        # to release them before git worktree remove is attempted.
+        try:
+            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract = _load_contract(contract_path)
+            if contract.stop:
+                from ..setup.runner import SetupRunner
+                runner = SetupRunner()
+                try:
+                    runner.run(
+                        setup=contract.stop,
+                        worktree_id=record.id,
+                        worktree_path=Path(record.path),
+                        branch=record.branch,
+                        port_mapping=record.ports,
+                    )
+                except Exception:  # noqa: BLE001
+                    # A stop-step failure must not block the rest of teardown.
+                    pass
+        except Exception:  # noqa: BLE001
+            # Any contract load failure is silently skipped.
+            pass
 
         # Step 2: run contract teardown: steps.
         # A missing contract is treated as isolation:none (no teardown steps).
@@ -647,7 +674,8 @@ class WorktreeManager:
             else:
                 # Determine whether this exit qualifies as a directory-lock
                 # signal that the kill_blocking_processes path should handle.
-                # Windows: exit 255 + "Permission denied" in stderr.
+                # Windows: exit 255 + "Permission denied" or "Invalid argument"
+                #   in stderr (both are NTFS/Win32 delete-failure strings).
                 # POSIX: "lock" in stderr (case-insensitive) — git worktree
                 #   reports a held directory as "locked" / "unable to lock" /
                 #   "cannot lock" / "worktree is locked".  All variants contain
@@ -657,7 +685,10 @@ class WorktreeManager:
                 _is_lock_signal = (
                     sys.platform == "win32"
                     and proc.returncode == 255
-                    and "Permission denied" in proc.stderr
+                    and (
+                        "Permission denied" in proc.stderr
+                        or "Invalid argument" in proc.stderr
+                    )
                 ) or (
                     sys.platform != "win32"
                     and "lock" in proc.stderr.lower()
@@ -668,11 +699,36 @@ class WorktreeManager:
                     retry = _run_git(args, cwd=Path(record.repo_root))
                     if retry.returncode != 0:
                         raise WorktreeDirLockedError(record.id, killed=killed)
-                    # Retry succeeded — fall through to step 4.
+                    # Retry succeeded — fall through to long-path check then step 4.
                 else:
                     raise GitCommandError(
                         ["git", *args], proc.returncode, proc.stderr
                     )
+
+        # Long-path fallback: on Windows, 'git worktree remove' can succeed
+        # (exit 0) but leave the directory behind when paths exceed MAX_PATH.
+        # In that case attempt \\?\ prefixed deletion; if that also fails, try
+        # the robocopy empty-mirror trick.  On POSIX, shutil.rmtree is the
+        # simple fallback.
+        if os.path.exists(record.path):
+            if sys.platform == "win32":
+                extended_path = "\\\\?\\" + os.path.abspath(record.path)
+                try:
+                    shutil.rmtree(extended_path)
+                except OSError:
+                    # Extended-path rmtree failed — try robocopy empty-mirror.
+                    import tempfile
+                    try:
+                        with tempfile.TemporaryDirectory() as empty_tmp:
+                            subprocess.run(
+                                ["robocopy", empty_tmp, record.path, "/MIR"],
+                                capture_output=True,
+                            )
+                            shutil.rmtree(record.path, ignore_errors=True)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best-effort: don't block port release.
+            else:
+                shutil.rmtree(record.path, ignore_errors=True)
 
         # Step 4: release allocated ports only after the git worktree remove
         # has succeeded.  Freeing ports before the remove would allow a
