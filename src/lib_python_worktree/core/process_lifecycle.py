@@ -256,13 +256,19 @@ class KilledProcessInfo:
 
 
 def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo]:
-    """Return processes whose cwd is under *path*, excluding the host and its ancestors.
+    """Return processes whose cwd or open file handles are under *path*.
+
+    Two-pass detection:
+    1. CWD match — processes whose working directory is at or under *path*.
+    2. Open-file match — processes holding an open file handle inside *path*.
+
+    Both passes exclude the host process and all its OS-level ancestors.
+    Results are de-duplicated by PID.
 
     Parameters
     ----------
     path:
-        The worktree directory path; processes with cwd equal to or under this
-        path are considered blocking.
+        The worktree directory path.
     host_pid:
         The PID of the current (MCP host) process; it and all its OS-level
         ancestors are always excluded from the returned list.
@@ -279,7 +285,10 @@ def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         pass
 
+    seen_pids: set[int] = set()
     result: List[KilledProcessInfo] = []
+
+    # Pass 1: CWD match.
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             pid = proc.info["pid"]
@@ -292,6 +301,7 @@ def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo
             norm_cwd = os.path.normcase(os.path.normpath(cwd))
             # Match if the process cwd equals the target path or is under it.
             if norm_cwd == normalized or norm_cwd.startswith(normalized + os.sep):
+                seen_pids.add(pid)
                 result.append(
                     KilledProcessInfo(
                         pid=pid,
@@ -299,6 +309,32 @@ def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo
                         cmdline=proc.info["cmdline"] or [],
                     )
                 )
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+
+    # Pass 2: open file handles — catches daemons that have changed their cwd
+    # away from the worktree but still hold file locks inside it.
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = proc.info["pid"]
+            if pid in excluded_pids or pid in seen_pids:
+                continue
+            try:
+                open_files = proc.open_files()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                continue
+            for finfo in open_files:
+                norm_fpath = os.path.normcase(os.path.normpath(finfo.path))
+                if norm_fpath.startswith(normalized + os.sep) or norm_fpath == normalized:
+                    seen_pids.add(pid)
+                    result.append(
+                        KilledProcessInfo(
+                            pid=pid,
+                            name=proc.info["name"] or "",
+                            cmdline=proc.info["cmdline"] or [],
+                        )
+                    )
+                    break
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
 
