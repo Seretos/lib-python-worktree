@@ -902,14 +902,155 @@ def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
         mock_start.return_value = record
         mgr.start(record.id)
 
-    mock_start.assert_called_once_with(
-        record.id,
-        expected_cmd,
-        store=mgr.state,
-        role="main",
-        env=None,
-        cwd=None,
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[0] == record.id
+    assert call_kwargs.args[1] == expected_cmd
+    assert call_kwargs.kwargs["store"] is mgr.state
+    assert call_kwargs.kwargs["role"] == "main"
+    assert call_kwargs.kwargs["cwd"] is None
+    # env must be a dict (built by _build_worktree_env, not None)
+    built_env = call_kwargs.kwargs["env"]
+    assert isinstance(built_env, dict)
+    assert built_env["WORKTREE_ID"] == record.id
+    assert built_env["WORKTREE_PATH"] == record.path
+    assert built_env["WORKTREE_BRANCH"] == record.branch
+
+
+def test_manager_start_injects_worktree_env_vars(tmp_path: Path):
+    """start() injects WORKTREE_ID/PATH/BRANCH and WORKTREE_PORT_* into the child env."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(ports={"web": 8080, "grpc": 50051})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
     )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    built_env = mock_start.call_args.kwargs["env"]
+    assert isinstance(built_env, dict)
+    assert built_env["WORKTREE_ID"] == record.id
+    assert built_env["WORKTREE_PATH"] == record.path
+    assert built_env["WORKTREE_BRANCH"] == record.branch
+    assert built_env["WORKTREE_PORT_WEB"] == "8080"
+    assert built_env["WORKTREE_PORT_GRPC"] == "50051"
+
+
+def test_manager_start_injects_env_empty_ports(tmp_path: Path):
+    """start() with ports={} injects identity vars but no WORKTREE_PORT_* keys."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(ports={})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    built_env = mock_start.call_args.kwargs["env"]
+    assert isinstance(built_env, dict)
+    assert built_env["WORKTREE_ID"] == record.id
+    # no port keys injected
+    port_keys = [k for k in built_env if k.startswith("WORKTREE_PORT_")]
+    assert port_keys == []
+
+
+def test_manager_start_injects_env_uppercase_slot(tmp_path: Path):
+    """start() normalises slot names to upper-case for WORKTREE_PORT_* keys."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(ports={"Web": 9000})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    built_env = mock_start.call_args.kwargs["env"]
+    assert "WORKTREE_PORT_WEB" in built_env
+    assert built_env["WORKTREE_PORT_WEB"] == "9000"
+    assert "WORKTREE_PORT_Web" not in built_env
+
+
+def test_manager_start_caller_env_overrides_worktree_vars(tmp_path: Path):
+    """Caller-supplied env wins on collision; worktree vars and os.environ are still present for non-colliding keys."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(ports={"web": 3000})
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    # MY_VAR is a brand-new key; WORKTREE_ID collides with an injected worktree var.
+    caller_env = {"MY_VAR": "1", "WORKTREE_ID": "overridden-id"}
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, env=caller_env)
+
+    built_env = mock_start.call_args.kwargs["env"]
+    # caller-supplied brand-new key is present
+    assert built_env["MY_VAR"] == "1"
+    # caller wins on collision: its value must overwrite the injected worktree var
+    assert built_env["WORKTREE_ID"] == "overridden-id"
+    # non-colliding worktree var still present
+    assert built_env["WORKTREE_PORT_WEB"] == "3000"
+    # inherited os.environ key (PATH always exists on every platform)
+    assert "PATH" in built_env
+
+
+def test_manager_start_no_caller_env_inherits_os_environ(tmp_path: Path):
+    """When caller passes env=None, os.environ keys (e.g. PATH) are inherited."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)  # env=None by default
+
+    built_env = mock_start.call_args.kwargs["env"]
+    assert "PATH" in built_env
+    assert built_env["WORKTREE_ID"] == record.id
 
 
 def test_manager_start_empty_contract_raises_worktree_error(tmp_path: Path):
