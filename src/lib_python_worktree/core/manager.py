@@ -17,7 +17,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # `subprocess` is kept for CompletedProcess / DEVNULL references inside this
 # module even though _run_git now lives in _git_utils.
@@ -219,6 +219,31 @@ def _is_path_prunable(repo_path: Path, target_path: str) -> Optional[bool]:
             current_prunable = True
     _flush()
     return found
+
+
+def _build_worktree_env(
+    record: "WorktreeRecord",
+    caller_env: "Optional[Dict[str, str]]",
+) -> "Dict[str, str]":
+    """Build the child-process environment for a worktree start call.
+
+    Merge order (rightmost wins per key):
+        os.environ  <--  worktree identity/port vars  <--  caller_env
+
+    Variable names mirror ``SetupRunner._build_env`` in ``setup/runner.py``
+    (the sibling implementation of this convention).  Do NOT extract a shared
+    helper — the two are peers in separate layers; mirroring the few lines
+    here avoids new coupling and circular imports.
+    """
+    env: Dict[str, str] = dict(os.environ)
+    env["WORKTREE_ID"] = record.id
+    env["WORKTREE_PATH"] = record.path
+    env["WORKTREE_BRANCH"] = record.branch
+    for slot, port in record.ports.items():
+        env[f"WORKTREE_PORT_{slot.upper()}"] = str(port)
+    if caller_env is not None:
+        env.update(caller_env)
+    return env
 
 
 class WorktreeManager:
@@ -475,7 +500,7 @@ class WorktreeManager:
             cmd,
             store=self.state,
             role=role,
-            env=env,
+            env=_build_worktree_env(record, env),
             cwd=cwd,
         )
 
