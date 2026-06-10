@@ -428,6 +428,7 @@ def stop(
     store: StateStore,
     role: str = DEFAULT_ROLE,
     timeout: float = 10.0,
+    kill_orphans: bool = False,
 ) -> WorktreeRecord:
     """Stop the process recorded under *role* for *worktree_id*.
 
@@ -436,6 +437,13 @@ def stop(
     ``status="stopped"`` only when no other roles remain in ``pids``.
 
     If the PID is already dead, clears the record gracefully without raising.
+
+    When *kill_orphans* is ``True``, a second pass using
+    :func:`_kill_blocking_processes` is run against ``record.path`` after the
+    primary signal/wait step.  This terminates grandchild processes that were
+    reparented away from the shell wrapper (e.g. via ``CREATE_NEW_PROCESS_GROUP``
+    on Windows or ``start_new_session=True`` on POSIX) and therefore would not
+    be caught by signalling the tracked PID alone.
 
     Parameters
     ----------
@@ -447,6 +455,10 @@ def stop(
         Identifies the process within the worktree.
     timeout:
         Seconds to wait for graceful exit before force-killing.
+    kill_orphans:
+        When ``True``, scan for and kill any orphaned grandchild processes
+        under ``record.path`` after the primary stop signal.  Defaults to
+        ``False`` to preserve backward-compatible behaviour.
 
     Raises
     ------
@@ -471,6 +483,13 @@ def stop(
     if _pid_alive(pid):
         _send_graceful_signal(pid)
         _wait_or_kill(pid, timeout)
+
+    # Orphan scan: kill grandchild processes that survived because the shell
+    # wrapper already exited (they were reparented away from the tracked PID).
+    # Run this whether the shell was alive or dead — it's a no-op when there
+    # are no orphans.
+    if kill_orphans:
+        _kill_blocking_processes(record.path)
 
     # Clear the role regardless of whether the process was alive — the
     # important postcondition is that the record no longer references it.

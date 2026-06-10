@@ -393,6 +393,141 @@ class TestStop:
 
 
 # ---------------------------------------------------------------------------
+# stop() kill_orphans tests  (ticket #36)
+# ---------------------------------------------------------------------------
+
+class TestStopKillOrphans:
+    """Regression tests for ticket #36: orphaned grandchild termination via stop().
+
+    All tests patch _kill_blocking_processes / _send_graceful_signal rather
+    than spawning real grandchildren, following the pattern in
+    TestKillBlockingProcesses.
+    """
+
+    def test_stop_kill_orphans_when_shell_pid_is_dead(self):
+        """Regression #36: when tracked PID is already dead and kill_orphans=True,
+        _kill_blocking_processes is called with record.path and record is cleared."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        record = _make_record("wt-orphan-dead", pids={DEFAULT_ROLE: 99999999})
+        store = _make_store(record)
+
+        kbp_calls = []
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            side_effect=lambda path: kbp_calls.append(path) or [],
+        ):
+            result = stop("wt-orphan-dead", store=store, kill_orphans=True)
+
+        assert kbp_calls == [record.path], (
+            "_kill_blocking_processes must be called with record.path"
+        )
+        assert DEFAULT_ROLE not in result.pids
+        assert result.status == "stopped"
+
+    def test_stop_kill_orphans_false_default_no_orphan_scan(self):
+        """kill_orphans=False (default) must NOT call _kill_blocking_processes,
+        preserving backward-compatible behaviour even when the shell PID is dead."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        record = _make_record("wt-orphan-no-scan", pids={DEFAULT_ROLE: 99999999})
+        store = _make_store(record)
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+        ) as mock_kbp:
+            result = stop("wt-orphan-no-scan", store=store)  # kill_orphans defaults to False
+
+        mock_kbp.assert_not_called()
+        assert DEFAULT_ROLE not in result.pids
+        assert result.status == "stopped"
+
+    def test_stop_kill_orphans_shell_alive_runs_signal_then_orphan_scan(self):
+        """When the shell PID is alive, the graceful signal runs first, then the
+        orphan scan runs as a second pass — both _send_graceful_signal and
+        _kill_blocking_processes are invoked."""
+        fake_pid = 55555
+        record = _make_record("wt-orphan-alive", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        graceful_calls = []
+        kbp_calls = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                side_effect=lambda pid: graceful_calls.append(pid),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                side_effect=lambda path: kbp_calls.append(path) or [],
+            ),
+        ):
+            result = stop("wt-orphan-alive", store=store, kill_orphans=True)
+
+        assert fake_pid in graceful_calls, "_send_graceful_signal must be called on the shell PID"
+        assert kbp_calls == [record.path], (
+            "_kill_blocking_processes must be called as a second pass with record.path"
+        )
+        assert DEFAULT_ROLE not in result.pids
+
+    def test_stop_kill_orphans_no_processes_found_no_error(self):
+        """kill_orphans=True with _find_blocking_processes returning [] must not
+        raise and must still clear the record normally."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        record = _make_record("wt-orphan-empty", pids={DEFAULT_ROLE: 99999999})
+        store = _make_store(record)
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            return_value=[],
+        ):
+            result = stop("wt-orphan-empty", store=store, kill_orphans=True)
+
+        assert DEFAULT_ROLE not in result.pids
+        assert result.status == "stopped"
+
+    def test_stop_kill_orphans_passes_record_path_not_repo_root(self):
+        """_kill_blocking_processes must receive record.path (the worktree checkout
+        directory), not record.repo_root or any other path."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        record = _make_record(
+            "wt-orphan-path",
+            pids={DEFAULT_ROLE: 99999999},
+            # Ensure path and repo_root are clearly different values.
+            path="/fake/store/wt-orphan-path",
+        )
+        store = _make_store(record)
+
+        captured_path = []
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            side_effect=lambda path: captured_path.append(path) or [],
+        ):
+            stop("wt-orphan-path", store=store, kill_orphans=True)
+
+        assert captured_path == ["/fake/store/wt-orphan-path"], (
+            "_kill_blocking_processes must be passed record.path, not repo_root"
+        )
+        assert captured_path[0] != record.repo_root
+
+
+# ---------------------------------------------------------------------------
 # _wait_or_kill unit tests
 # ---------------------------------------------------------------------------
 

@@ -1341,6 +1341,7 @@ def test_manager_stop_steps_failure_does_not_block_sigterm(tmp_path: Path):
         store=mgr.state,
         role="main",
         timeout=10.0,
+        kill_orphans=False,
     )
 
 
