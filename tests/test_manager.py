@@ -1070,8 +1070,146 @@ def test_manager_start_empty_contract_raises_worktree_error(tmp_path: Path):
     assert "no start" in str(exc_info.value)
 
 
-def test_manager_start_multi_step_raises_worktree_error(tmp_path: Path):
-    """start() raises WorktreeError when contract.start has more than one step."""
+def test_manager_start_named_variant_selected(tmp_path: Path):
+    """start(variant="headless") picks the step with name="headless" from a multi-step contract."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    headless_step = Step(run="python server.py --headless", name="headless")
+    gui_step = Step(run="python server.py --gui", name="gui")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[headless_step, gui_step],
+    )
+    expected_shell = _resolve_shell(None)
+    expected_cmd = [*expected_shell, "python server.py --headless"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="headless")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_backward_compat_single_unnamed_step(tmp_path: Path):
+    """start() with no variant still works when there is exactly one unnamed step."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+    expected_shell = _resolve_shell(None)
+    expected_cmd = [*expected_shell, "python server.py"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_named_default_step_selected(tmp_path: Path):
+    """start() with variant="default" picks the step explicitly named "default"."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    default_step = Step(run="python server.py", name="default")
+    other_step = Step(run="python server.py --debug", name="debug")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[default_step, other_step],
+    )
+    expected_shell = _resolve_shell(None)
+    expected_cmd = [*expected_shell, "python server.py"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="default")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_named_default_wins_over_unnamed(tmp_path: Path):
+    """Explicit name="default" step wins over a co-existing unnamed step.
+
+    When the contract has both an unnamed step AND a step explicitly named
+    "default", calling start() (which defaults to variant="default") must
+    invoke _lifecycle_start with the *named* default step's command, not the
+    unnamed step's command.
+    """
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    unnamed_step = Step(run="python unnamed.py")         # no name
+    default_step = Step(run="python default.py", name="default")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[unnamed_step, default_step],
+    )
+    expected_shell = _resolve_shell(None)
+    expected_cmd = [*expected_shell, "python default.py"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)  # variant="default" by default
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd, (
+        "Expected the explicitly named 'default' step to win over the unnamed step"
+    )
+
+
+def test_manager_start_unknown_variant_raises_worktree_error(tmp_path: Path):
+    """start(variant="nonexistent") raises WorktreeError listing available names."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(WorktreeError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nonexistent")
+
+    error_msg = str(exc_info.value)
+    assert "nonexistent" in error_msg
+    assert "headless" in error_msg
+    assert "gui" in error_msg
+
+
+def test_manager_start_multi_unnamed_steps_unknown_default_raises(tmp_path: Path):
+    """start() with variant="default" and multiple unnamed steps raises WorktreeError."""
     mgr = _make_mgr_in_memory(tmp_path)
     record = _make_wt_record()
     mgr.state.add(record)
@@ -1088,7 +1226,7 @@ def test_manager_start_multi_step_raises_worktree_error(tmp_path: Path):
     ):
         mgr.start(record.id)
 
-    assert "exactly one step" in str(exc_info.value)
+    assert "default" in str(exc_info.value)
 
 
 def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):
