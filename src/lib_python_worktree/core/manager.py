@@ -533,11 +533,17 @@ class WorktreeManager:
         *,
         role: str = "main",
         timeout: float = 10.0,
+        kill_orphans: bool = False,
     ) -> WorktreeRecord:
         """Stop the process recorded under *role* for *worktree_id*.
 
         If the contract defines ``stop:`` steps, they are run (best-effort,
         errors are swallowed) before sending the stop signal.
+
+        When *kill_orphans* is ``True``, a cwd/open-file scan is run after
+        the primary signal to terminate any orphaned grandchild processes that
+        survived because the tracked shell wrapper already exited and they were
+        reparented away from it.
 
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         """
@@ -573,6 +579,7 @@ class WorktreeManager:
             store=self.state,
             role=role,
             timeout=timeout,
+            kill_orphans=kill_orphans,
         )
 
     # ---- seams for later phases ----
