@@ -463,13 +463,21 @@ class WorktreeManager:
         role: str = "main",
         env: Optional[dict] = None,
         cwd: Optional[str] = None,
+        variant: str = "default",
     ) -> WorktreeRecord:
         """Spawn a detached process for *worktree_id* using the contract's
         ``start:`` step, and record its PID.
 
         The command is read from the ``start:`` field of the worktree contract
-        at ``<repo_root>/.seretos/worktree-setup.yml``.  Exactly one step must
-        be present; zero or multiple steps raise ``WorktreeError``.
+        at ``<repo_root>/.seretos/worktree-setup.yml``.
+
+        *variant* selects which step to run (default ``"default"``):
+
+        - If *variant* is ``"default"`` and exactly one step has no ``name``
+          set, that step is used (backward-compatibility path).
+        - Otherwise the step whose ``name`` equals *variant* is used.
+        - If no matching step is found, ``WorktreeError`` is raised listing
+          the available named steps.
 
         Delegates to ``process_lifecycle.start`` with ``store=self.state``.
         """
@@ -485,14 +493,29 @@ class WorktreeManager:
             raise WorktreeError(
                 f"no start: command configured in contract for worktree '{worktree_id}'"
             )
-        if len(contract.start) != 1:
+
+        # Step selection
+        # (1) Exact name match wins (covers explicit name: "default" and any named variant)
+        step = None
+        for s in contract.start:
+            if s.name == variant:
+                step = s
+                break
+
+        # (2) Back-compat: variant defaulted and no exact match → use the lone unnamed step
+        if step is None and variant == "default":
+            unnamed_steps = [s for s in contract.start if s.name is None]
+            if len(unnamed_steps) == 1:
+                step = unnamed_steps[0]
+
+        if step is None:
+            available = [s.name for s in contract.start if s.name]
             raise WorktreeError(
-                f"contract start: must contain exactly one step "
-                f"(got {len(contract.start)})"
+                f"no start: step named '{variant}' found in contract "
+                f"(available: {available})"
             )
 
         from ..setup.runner import _resolve_shell
-        step = contract.start[0]
         cmd = [*_resolve_shell(step.shell), step.run]
 
         return _lifecycle_start(

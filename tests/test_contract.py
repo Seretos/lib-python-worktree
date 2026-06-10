@@ -91,6 +91,22 @@ ports:
         load_text(text)
     assert "duplicate" in str(exc_info.value).lower()
 
+def test_duplicate_start_step_name_rejected():
+    text = """
+version: 1
+isolation: full
+start:
+  - run: python server.py
+    name: headless
+  - run: python server.py --gui
+    name: gui
+  - run: python server.py --fast
+    name: headless
+"""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(text)
+    assert "duplicate" in str(exc_info.value).lower()
+
 
 def test_port_name_invalid_format_rejected():
     with pytest.raises(ContractValidationError):

@@ -104,6 +104,22 @@ class WorktreeContract(_StrictModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _start_steps_must_have_unique_names(self) -> "WorktreeContract":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for step in self.start:
+            if step.name is None:
+                continue
+            if step.name in seen:
+                duplicates.append(step.name)
+            seen.add(step.name)
+        if duplicates:
+            raise ValueError(
+                f"duplicate start step names: {', '.join(sorted(set(duplicates)))}"
+            )
+        return self
+
 
 __all__ = (
     "Isolation",
