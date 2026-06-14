@@ -12,13 +12,26 @@ the new worktree path.  The operation is:
 
 - **Best-effort**: the bare ``except`` swallowing lives at the call site in
   ``manager.py``, *not* here.  Explicit early-return guards handle the common
-  no-op cases (missing file, malformed JSON, non-list top-level).
+  no-op cases (missing file, malformed JSON, non-v2-object top-level).
 - **Idempotent**: an entry is skipped if one with the same ``projectPath`` and
   ``installPath`` already exists.
 - **Atomic**: the registry is written via a temp-file + ``os.replace`` so that
   a crash mid-write leaves the original intact.
 - **Removable**: the entire workaround is isolated here.  When Claude fixes the
   upstream bug, delete this file and remove the call in ``manager.py``.
+
+The real Claude plugin registry uses **Schema v2**::
+
+    {
+        "version": 2,
+        "plugins": {
+            "<name>@<marketplace>": [<entry>, ...],
+            ...
+        }
+    }
+
+Any top-level shape other than a dict with ``version == 2`` and a ``plugins``
+dict is treated as an unsupported format and the function returns silently.
 """
 
 from __future__ import annotations
@@ -62,44 +75,72 @@ def seed_plugin_registry(
 
     try:
         raw = registry_path.read_text(encoding="utf-8")
-        entries = json.loads(raw)
+        data = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return
 
-    if not isinstance(entries, list):
+    # Only handle Schema v2: {"version": 2, "plugins": {<name>: [entries...]}}
+    if not (
+        isinstance(data, dict)
+        and data.get("version") == 2
+        and isinstance(data.get("plugins"), dict)
+    ):
         return
+
+    plugins: dict[str, list] = data["plugins"]
 
     # Native-OS form of the destination path (backslashes on Windows).
     dest_path = str(Path(worktree_path))
 
-    # Build a set of (projectPath, installPath) pairs already present so we
-    # can skip duplicates efficiently.
-    existing: set[tuple[str, str]] = {
-        (e.get("projectPath", ""), e.get("installPath", ""))
-        for e in entries
-        if isinstance(e, dict)
-    }
+    # Normalised form of the source repo path for case/separator-insensitive
+    # comparison (os.path.normcase lowercases on Windows, no-op on Linux/macOS).
+    norm_repo = os.path.normcase(str(Path(repo_path)))
 
-    new_entries: list[dict] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("scope") != "project":
-            continue
-        if entry.get("projectPath") != repo_path:
-            continue
-        install_path = entry.get("installPath", "")
-        if (dest_path, install_path) in existing:
-            # Already seeded — skip to stay idempotent.
-            continue
-        cloned = dict(entry)
-        cloned["projectPath"] = dest_path
-        new_entries.append(cloned)
+    # Build a set of (projectPath, installPath) pairs already present across
+    # all per-name lists so we can skip duplicates efficiently.
+    existing: set[tuple[str, str]] = set()
+    for entry_list in plugins.values():
+        if isinstance(entry_list, list):
+            for e in entry_list:
+                if isinstance(e, dict):
+                    existing.add(
+                        (e.get("projectPath", ""), e.get("installPath", ""))
+                    )
 
-    if not new_entries:
+    # For each plugin name, clone matching entries into the same per-name list.
+    any_added = False
+    for plugin_name, entry_list in plugins.items():
+        if not isinstance(entry_list, list):
+            continue
+        clones: list[dict] = []
+        for entry in entry_list:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("scope") != "project":
+                continue
+            project_path = entry.get("projectPath")
+            if not isinstance(project_path, str):
+                # null, missing, or non-string projectPath — skip gracefully.
+                continue
+            norm_entry = os.path.normcase(str(Path(project_path)))
+            if norm_entry != norm_repo:
+                continue
+            install_path = entry.get("installPath", "")
+            if (dest_path, install_path) in existing:
+                # Already seeded — skip to stay idempotent.
+                continue
+            cloned = dict(entry)
+            cloned["projectPath"] = dest_path
+            clones.append(cloned)
+            # Add to existing so a second matching entry in the same list
+            # doesn't produce two identical clones.
+            existing.add((dest_path, install_path))
+        if clones:
+            entry_list.extend(clones)
+            any_added = True
+
+    if not any_added:
         return
-
-    updated = entries + new_entries
 
     # Atomic write: dump to a sibling temp file, then replace.
     tmp_path: Optional[str] = None
@@ -110,7 +151,7 @@ def seed_plugin_registry(
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(updated, fh, indent=2)
+                json.dump(data, fh, indent=2)
                 fh.flush()
         except Exception:
             # fdopen took ownership of fd; if write fails, fd is already
