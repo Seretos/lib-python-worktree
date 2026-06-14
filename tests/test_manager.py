@@ -1053,8 +1053,13 @@ def test_manager_start_no_caller_env_inherits_os_environ(tmp_path: Path):
     assert built_env["WORKTREE_ID"] == record.id
 
 
-def test_manager_start_empty_contract_raises_worktree_error(tmp_path: Path):
-    """start() raises WorktreeError when contract.start is empty."""
+def test_manager_start_empty_contract_is_noop_ready(tmp_path: Path):
+    """start() with no configured start: step is a no-op that marks ready (ticket #41).
+
+    No process is spawned, no WorktreeError is raised, _lifecycle_start is not
+    called, the worktree gains status="ready" and records no PID, and the
+    persisted record reflects the same.
+    """
     mgr = _make_mgr_in_memory(tmp_path)
     record = _make_wt_record()
     mgr.state.add(record)
@@ -1063,11 +1068,34 @@ def test_manager_start_empty_contract_raises_worktree_error(tmp_path: Path):
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
-        pytest.raises(WorktreeError) as exc_info,
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
     ):
-        mgr.start(record.id)
+        result = mgr.start(record.id)
 
-    assert "no start" in str(exc_info.value)
+    mock_start.assert_not_called()
+    assert result.status == "ready"
+    assert result.pids == {}
+    assert mgr.state.get(record.id).status == "ready"
+
+
+def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
+    """start() with a missing contract (implicit isolation:none) is a no-op ready start.
+
+    Exercises the real loader path: no .seretos/worktree-setup.yml exists at
+    repo_root, so load() yields an empty start: list and start() must not raise.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root))
+    mgr.state.add(record)
+
+    with patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start:
+        result = mgr.start(record.id)
+
+    mock_start.assert_not_called()
+    assert result.status == "ready"
+    assert result.pids == {}
 
 
 def test_manager_start_named_variant_selected(tmp_path: Path):
@@ -1343,6 +1371,30 @@ def test_manager_stop_steps_failure_does_not_block_sigterm(tmp_path: Path):
         timeout=10.0,
         kill_orphans=False,
     )
+
+
+def test_manager_stop_without_pid_is_noop(tmp_path: Path):
+    """stop() on a worktree with no recorded PID is a graceful no-op (ticket #41).
+
+    Symmetric with the no-op "ready" start: there is nothing to signal, so
+    _lifecycle_stop (which would raise ProcessNotRunningError) is not called,
+    no error is raised, and the worktree is marked "stopped".
+    """
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(status="ready")  # no pids
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        result = mgr.stop(record.id)  # must not raise
+
+    mock_lc_stop.assert_not_called()
+    assert result.status == "stopped"
+    assert mgr.state.get(record.id).status == "stopped"
 
 
 # ---------------------------------------------------------------------------

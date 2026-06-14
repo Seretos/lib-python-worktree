@@ -479,7 +479,17 @@ class WorktreeManager:
         - If no matching step is found, ``WorktreeError`` is raised listing
           the available named steps.
 
-        Delegates to ``process_lifecycle.start`` with ``store=self.state``.
+        When no ``start:`` step is configured at all (missing
+        ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
+        nothing meaningful to run.  Rather than erroring, this is treated as a
+        **no-op start**: no process is spawned, the worktree is marked
+        ``status="ready"`` (usable, with no managed process), and the record is
+        returned.  This makes "just give me a worktree I can work in" work out
+        of the box for simple repos (e.g. dependency-bump chores).  See
+        ticket #41.
+
+        Delegates to ``process_lifecycle.start`` with ``store=self.state``
+        only when a concrete ``start:`` step is selected.
         """
         record = self.state.get(worktree_id)
         if record is None:
@@ -490,9 +500,12 @@ class WorktreeManager:
         contract = _load_contract(Path(record.repo_root) / CONTRACT_FILENAME)
 
         if not contract.start:
-            raise WorktreeError(
-                f"no start: command configured in contract for worktree '{worktree_id}'"
-            )
+            # No start: step configured — nothing to run.  Treat as a no-op
+            # start so worktree creation + start works without a contract:
+            # mark the worktree usable and return without spawning a process.
+            record.status = "ready"
+            self.state.update(record)
+            return record
 
         # Step selection
         # (1) Exact name match wins (covers explicit name: "default" and any named variant)
@@ -545,6 +558,12 @@ class WorktreeManager:
         survived because the tracked shell wrapper already exited and they were
         reparented away from it.
 
+        When no process is recorded for *role* (e.g. after a no-op ``"ready"``
+        start with no ``start:`` step — ticket #41), stopping is a graceful
+        no-op: contract ``stop:`` steps are still run best-effort, but no
+        signal is sent and ``ProcessNotRunningError`` is *not* raised.  The
+        worktree is marked ``"stopped"`` when no other roles remain.
+
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         """
         record = self.state.get(worktree_id)
@@ -573,6 +592,15 @@ class WorktreeManager:
                     pass
         except Exception:  # noqa: BLE001
             pass
+
+        # No process recorded for this role → graceful no-op (symmetric with
+        # the no-op "ready" start).  Avoid delegating to _lifecycle_stop, which
+        # would raise ProcessNotRunningError.
+        if role not in record.pids:
+            if not record.pids:
+                record.status = "stopped"
+            self.state.update(record)
+            return record
 
         return _lifecycle_stop(
             worktree_id,
