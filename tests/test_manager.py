@@ -1528,23 +1528,28 @@ def test_create_seeds_plugin_registry(
         "installPath": "/path/to/my-plugin",
         "version": "3.1.4",
     }
-    registry_path.write_text(json.dumps([original_entry]), encoding="utf-8")
+    # Write Schema v2 registry (the real format used by Claude Code).
+    registry_path.write_text(
+        json.dumps({"version": 2, "plugins": {"my-plugin@marketplace": [original_entry]}}),
+        encoding="utf-8",
+    )
 
     mgr = manager_factory()
     mgr._plugin_seed_config_dir = config_dir
 
     rec = mgr.create(str(git_repo), "feature/alpha")
 
-    entries = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert isinstance(entries, list)
+    data = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert data["version"] == 2
+    plugin_list = data["plugins"]["my-plugin@marketplace"]
 
     # The original must still be there.
-    src = [e for e in entries if e.get("projectPath") == repo_root_posix]
+    src = [e for e in plugin_list if e.get("projectPath") == repo_root_posix]
     assert len(src) == 1
 
     # A clone for the worktree must have been added.
     expected_dest = str(Path(rec.path))
-    cloned = [e for e in entries if e.get("projectPath") == expected_dest]
+    cloned = [e for e in plugin_list if e.get("projectPath") == expected_dest]
     assert len(cloned) == 1, (
         f"Expected exactly one cloned registry entry with projectPath={expected_dest!r}, "
         f"got {cloned!r}"
