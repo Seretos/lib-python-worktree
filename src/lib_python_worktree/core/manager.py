@@ -260,10 +260,12 @@ class WorktreeManager:
         state: Optional[StateStore] = None,
         *,
         reconcile_on_init: bool = True,
+        _plugin_seed_config_dir: Optional[Path] = None,
     ) -> None:
         self.config = config or ManagerConfig.from_env()
         resolved_state: StateStore = state if state is not None else YamlStateStore()
         self.state = resolved_state
+        self._plugin_seed_config_dir = _plugin_seed_config_dir
         if reconcile_on_init and isinstance(resolved_state, YamlStateStore):
             reconcile(resolved_state)
 
@@ -386,6 +388,19 @@ class WorktreeManager:
                 except Exception:  # noqa: BLE001
                     pass
             raise
+
+        # Seed the Claude plugin registry so that project-scoped plugins are
+        # active in the new worktree without a manual /reload-plugins.
+        # Workaround for anthropics/claude-code#61866 — best-effort, non-fatal.
+        try:
+            from .plugin_seed import seed_plugin_registry  # noqa: PLC0415
+            seed_plugin_registry(
+                record.repo_root,
+                record.path,
+                config_dir=self._plugin_seed_config_dir,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         return record
 

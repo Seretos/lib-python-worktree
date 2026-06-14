@@ -1431,3 +1431,129 @@ def test_invalid_branch_error_public_import():
     """InvalidBranchError must be importable from the public package surface."""
     from lib_python_worktree import InvalidBranchError as PublicInvalidBranchError  # noqa: PLC0415
     assert PublicInvalidBranchError is InvalidBranchError
+
+
+# ---------------------------------------------------------------------------
+# Ticket #39: plugin registry seeding
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+
+@pytest.mark.requires_git
+def test_create_seeds_plugin_registry(
+    manager_factory: Callable[..., WorktreeManager],
+    git_repo: Path,
+    tmp_path: Path,
+):
+    """create() seeds project-scoped plugin registry entries for the new worktree.
+
+    A fake registry is set up with a project-scoped entry for the parent repo.
+    After create(), the registry must contain a clone of that entry with
+    projectPath set to the new worktree's native-OS path, and installPath /
+    version preserved from the original.
+    """
+    # Build a fake config_dir with a plugin registry entry for the parent repo.
+    config_dir = tmp_path / "fake_claude"
+    plugins_dir = config_dir / "plugins"
+    plugins_dir.mkdir(parents=True)
+
+    # We need the resolved repo path as stored in WorktreeRecord.repo_root
+    # (as_posix()).  Use _validate_repo logic: resolve + as_posix.
+    import subprocess as _subprocess  # noqa: PLC0415
+    result = _subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=str(git_repo),
+        capture_output=True,
+        text=True,
+    )
+    repo_root_posix = Path(result.stdout.strip()).resolve().as_posix()
+
+    registry_path = plugins_dir / "installed_plugins.json"
+    original_entry = {
+        "scope": "project",
+        "projectPath": repo_root_posix,
+        "installPath": "/path/to/my-plugin",
+        "version": "3.1.4",
+    }
+    registry_path.write_text(json.dumps([original_entry]), encoding="utf-8")
+
+    mgr = manager_factory()
+    mgr._plugin_seed_config_dir = config_dir
+
+    rec = mgr.create(str(git_repo), "feature/alpha")
+
+    entries = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert isinstance(entries, list)
+
+    # The original must still be there.
+    src = [e for e in entries if e.get("projectPath") == repo_root_posix]
+    assert len(src) == 1
+
+    # A clone for the worktree must have been added.
+    expected_dest = str(Path(rec.path))
+    cloned = [e for e in entries if e.get("projectPath") == expected_dest]
+    assert len(cloned) == 1, (
+        f"Expected exactly one cloned registry entry with projectPath={expected_dest!r}, "
+        f"got {cloned!r}"
+    )
+    assert cloned[0]["installPath"] == "/path/to/my-plugin"
+    assert cloned[0]["version"] == "3.1.4"
+    assert cloned[0]["scope"] == "project"
+
+
+def test_create_tolerates_seed_failure(monkeypatch):
+    """create() returns normally even when seed_plugin_registry raises.
+
+    Uses InMemoryStateStore (no git, no filesystem worktree).  The seed
+    function is monkeypatched to raise, and we verify that create() swallows
+    the error and still returns the created record.
+    """
+    import lib_python_worktree.core.plugin_seed as _ps_module  # noqa: PLC0415
+
+    monkeypatch.setattr(_ps_module, "seed_plugin_registry", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("simulated seed failure")))
+
+    # Build a manager that uses InMemoryStateStore (no git → create() will
+    # fail at _validate_repo before it ever reaches the seed call, so we need
+    # to patch _validate_repo too).
+    store = InMemoryStateStore()
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("/nonexistent/store")),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    # Patch _validate_repo to bypass git.
+    fake_repo = Path("/fake/repo")
+
+    def _fake_validate(repo_root):  # noqa: ANN001
+        return fake_repo
+
+    monkeypatch.setattr(mgr, "_validate_repo", _fake_validate)
+
+    # Also patch _branch_exists to return True.
+    monkeypatch.setattr(mgr, "_branch_exists", lambda *_a: True)
+
+    # Patch _run_git so that git worktree add succeeds (exit 0, no output).
+    import lib_python_worktree.core.manager as _mgr_module  # noqa: PLC0415
+    import types  # noqa: PLC0415
+
+    fake_proc = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(_mgr_module, "_run_git", lambda *_a, **_kw: fake_proc)
+
+    # Patch the store_root / target_path creation; mkdir is called on
+    # target_path.parent — patch Path.mkdir to be a no-op.
+    original_mkdir = Path.mkdir
+
+    def _noop_mkdir(self, **kwargs):  # noqa: ANN001
+        pass  # don't actually create dirs
+
+    monkeypatch.setattr(Path, "mkdir", _noop_mkdir)
+
+    rec = mgr.create("/fake/repo", "feature/alpha")
+
+    assert rec.branch == "feature/alpha"
+    assert rec.repo_root == fake_repo.as_posix()
+
+    # Restore mkdir for other tests.
+    monkeypatch.setattr(Path, "mkdir", original_mkdir)
