@@ -1559,6 +1559,130 @@ def test_create_seeds_plugin_registry(
     assert cloned[0]["scope"] == "project"
 
 
+# ---------------------------------------------------------------------------
+# Ticket #46: WorktreeManager.run_seed_postprocess()
+# ---------------------------------------------------------------------------
+
+from lib_python_worktree.setup.runner import SetupFailedError, SetupResult  # noqa: E402
+
+
+def test_manager_run_seed_postprocess_unknown_worktree_raises_not_found(tmp_path: Path):
+    """run_seed_postprocess() raises WorktreeNotFoundError when the id is not in the store."""
+    mgr = _make_mgr_in_memory(tmp_path)
+
+    with pytest.raises(WorktreeNotFoundError):
+        mgr.run_seed_postprocess("nonexistent-id-12345678")
+
+
+def test_manager_run_seed_postprocess_empty_contract_is_noop(tmp_path: Path):
+    """run_seed_postprocess() returns an empty SetupResult and never calls SetupRunner when seed_postprocess is empty."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", seed_postprocess=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner") as mock_runner_cls,
+    ):
+        result = mgr.run_seed_postprocess(record.id)
+
+    mock_runner_cls.assert_not_called()
+    assert isinstance(result, SetupResult)
+    assert result.worktree_id == record.id
+    assert result.steps == []
+    assert result.ok is True
+
+
+def test_manager_run_seed_postprocess_delegates_to_setup_runner(tmp_path: Path):
+    """run_seed_postprocess() calls SetupRunner.run with setup=seed_postprocess steps and correct kwargs."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(ports={"db": 5432})
+    mgr.state.add(record)
+
+    step = Step(run="patch-hostnames.sh", name="patch-hostnames")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        seed_postprocess=[step],
+    )
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.return_value = SetupResult(worktree_id=record.id)
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+    ):
+        result = mgr.run_seed_postprocess(record.id)
+
+    mock_runner_instance.run.assert_called_once_with(
+        setup=fake_contract.seed_postprocess,
+        worktree_id=record.id,
+        worktree_path=Path(record.path),
+        branch=record.branch,
+        port_mapping=record.ports,
+    )
+    assert isinstance(result, SetupResult)
+
+
+def test_manager_run_seed_postprocess_port_mapping_forwarded(tmp_path: Path):
+    """run_seed_postprocess() forwards the worktree's port_mapping to SetupRunner.run."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(ports={"web": 8080, "grpc": 50051})
+    mgr.state.add(record)
+
+    step = Step(run="patch-ports.sh")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        seed_postprocess=[step],
+    )
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.return_value = SetupResult(worktree_id=record.id)
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+    ):
+        mgr.run_seed_postprocess(record.id)
+
+    call_kwargs = mock_runner_instance.run.call_args.kwargs
+    assert call_kwargs["port_mapping"] == {"web": 8080, "grpc": 50051}
+
+
+def test_manager_run_seed_postprocess_setup_failed_error_propagates(tmp_path: Path):
+    """run_seed_postprocess() does NOT swallow SetupFailedError — it propagates."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    step = Step(run="will-fail.sh")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        seed_postprocess=[step],
+    )
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.side_effect = SetupFailedError(
+        worktree_id=record.id,
+        step_index=0,
+        step_name="will-fail.sh",
+        log_path=Path("/fake/log.log"),
+        returncode=1,
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+        pytest.raises(SetupFailedError),
+    ):
+        mgr.run_seed_postprocess(record.id)
+
+
 def test_create_tolerates_seed_failure(monkeypatch):
     """create() returns normally even when seed_plugin_registry raises.
 

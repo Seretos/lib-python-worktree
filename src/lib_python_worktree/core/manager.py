@@ -625,6 +625,42 @@ class WorktreeManager:
             kill_orphans=kill_orphans,
         )
 
+    def run_seed_postprocess(self, worktree_id: str) -> "SetupResult":
+        """Run the contract's ``seed_postprocess:`` steps in isolation.
+
+        Loads the contract, builds the same ``WORKTREE_*`` environment as
+        ``setup:``, and delegates to ``SetupRunner``.  Raises
+        ``SetupFailedError`` on the first non-zero step exit.  Raises
+        ``WorktreeNotFoundError`` if ``worktree_id`` is unknown.  Steps are
+        expected to be idempotent (delete-then-insert style) so this can be
+        called repeatedly.
+
+        An empty ``seed_postprocess:`` list is a silent no-op: an empty
+        ``SetupResult`` is returned and ``SetupRunner`` is never invoked.
+        """
+        record = self.state.get(worktree_id)
+        if record is None:
+            raise WorktreeNotFoundError(
+                f"No worktree tracked with id '{worktree_id}'"
+            )
+
+        contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+        contract = _load_contract(contract_path)
+
+        if not contract.seed_postprocess:
+            from ..setup.runner import SetupResult
+            return SetupResult(worktree_id=worktree_id)
+
+        from ..setup.runner import SetupRunner
+        runner = SetupRunner()
+        return runner.run(
+            setup=contract.seed_postprocess,
+            worktree_id=record.id,
+            worktree_path=Path(record.path),
+            branch=record.branch,
+            port_mapping=record.ports,
+        )
+
     # ---- seams for later phases ----
 
     def _teardown(

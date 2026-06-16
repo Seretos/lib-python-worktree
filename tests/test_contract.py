@@ -281,6 +281,93 @@ def test_isolation_none_forbids_start_and_stop_together():
     assert "isolation: none" in msg
 
 
+# ---------------------------------------------------------------------------
+# Ticket #46: seed_postprocess: field on WorktreeContract
+# ---------------------------------------------------------------------------
+
+
+def test_seed_postprocess_defaults_to_empty_list():
+    """seed_postprocess: defaults to [] when absent from the contract."""
+    c = load_text("version: 1\nisolation: full\n")
+    assert c.seed_postprocess == []
+
+
+def test_seed_postprocess_parses_two_steps():
+    """seed_postprocess: accepts a list with two steps; len, .run, .name accessible."""
+    c = load_text(
+        "version: 1\nisolation: full\nseed_postprocess:\n"
+        "  - run: 'patch-hostnames.sh'\n    name: patch-hostnames\n"
+        "  - run: 'patch-csp.sh'\n"
+    )
+    assert len(c.seed_postprocess) == 2
+    assert c.seed_postprocess[0].run == "patch-hostnames.sh"
+    assert c.seed_postprocess[0].name == "patch-hostnames"
+    assert c.seed_postprocess[1].run == "patch-csp.sh"
+    assert c.seed_postprocess[1].name is None
+
+
+def test_seed_postprocess_step_accepts_shell_override():
+    """seed_postprocess: step honours an explicit shell: field."""
+    c = load_text(
+        "version: 1\nisolation: full\nseed_postprocess:\n"
+        "  - run: 'x'\n    shell: pwsh\n"
+    )
+    assert c.seed_postprocess[0].shell == "pwsh"
+
+
+def test_seed_postprocess_step_rejects_invalid_shell():
+    """seed_postprocess: step with an unsupported shell: value raises ContractValidationError."""
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nseed_postprocess:\n"
+            "  - run: 'x'\n    shell: zsh\n"
+        )
+
+
+def test_seed_postprocess_step_rejects_empty_run():
+    """seed_postprocess: step with run: '' raises ContractValidationError (min_length=1)."""
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nseed_postprocess:\n"
+            "  - run: ''\n"
+        )
+
+
+def test_seed_postprocess_step_rejects_extra_field():
+    """seed_postprocess: step with an unknown field raises ContractValidationError."""
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nseed_postprocess:\n"
+            "  - run: 'x'\n    bogus: 1\n"
+        )
+
+
+def test_isolation_none_forbids_seed_postprocess():
+    """isolation: none + non-empty seed_postprocess: raises ContractValidationError."""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(
+            "version: 1\nisolation: none\nseed_postprocess:\n"
+            "  - run: 'patch-hostnames.sh'\n"
+        )
+    msg = str(exc_info.value)
+    assert "isolation: none" in msg
+    assert "seed_postprocess" in msg
+
+
+def test_isolation_none_forbids_setup_and_seed_postprocess_together():
+    """isolation: none + both setup: and seed_postprocess: reports both in the error."""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(
+            "version: 1\nisolation: none\n"
+            "setup:\n  - run: 'init.sh'\n"
+            "seed_postprocess:\n  - run: 'patch-hostnames.sh'\n"
+        )
+    msg = str(exc_info.value)
+    assert "setup" in msg
+    assert "seed_postprocess" in msg
+    assert "isolation: none" in msg
+
+
 def test_load_read_failure_raises_contract_error_not_validation(
     tmp_path: Path, monkeypatch
 ):
