@@ -69,14 +69,20 @@ in `__all__` directly.
 
 `release.yml` (manual dispatch, `version=X.Y.Z`) stamps the version in CI, tags
 `vX.Y.Z`, force-pushes `release/Nx`, publishes a GitHub Release, then opens a
-dependency-update ticket in the consumer (`Seretos/agent-worktree`). Never
-hand-bump `version` in `pyproject.toml`.
+`chore(deps): bump lib-python-worktree to vX.Y.Z` issue in **both**
+`Seretos/agent-worktree` and `Seretos/workboard`. Never hand-bump `version` in
+`pyproject.toml`.
 
-The ticket step authenticates with the **`WORKTREE_TICKET_TOKEN`** repo secret
-(a fine-grained PAT with **Issues: write** on `Seretos/agent-worktree`);
-`GITHUB_TOKEN` cannot open cross-repo issues. The step is
-`continue-on-error: true`, so a missing or invalid token never blocks the
+Each consumer has its own dedicated ticket step with `continue-on-error: true`,
+so a broken or missing token for one consumer never blocks the other or the
 release itself.
+
+- **`WORKTREE_TICKET_TOKEN`** — fine-grained PAT with **Issues: write** on
+  `Seretos/agent-worktree`. Used for the agent-worktree ticket step.
+- **`WORKBOARD_TICKET_TOKEN`** — fine-grained PAT with **Issues: write** on
+  `Seretos/workboard`. Used for the workboard ticket step.
+
+`GITHUB_TOKEN` cannot open cross-repo issues, so both PATs are required.
 
 **If the automatic step was skipped or failed**, re-file manually by running
 the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via "Run
@@ -84,10 +90,16 @@ workflow" in GitHub Actions. Supply:
 
 - `version` -- the semver string (no leading `v`), e.g. `0.2.0`.
 - `consumers` -- space-separated `owner/repo` targets (default:
-  `Seretos/agent-worktree`).
+  `Seretos/agent-worktree Seretos/workboard`).
 
 The workflow is idempotent: it checks for an open issue with the exact same
-title before creating one, so running it twice is safe.
+title before creating one, so running it twice is safe. It selects the correct
+token per consumer automatically and marks the run red if any consumer fails,
+naming the offending consumer in the error output.
 
 **Human prerequisite -- `WORKTREE_TICKET_TOKEN`:** create this repository secret
 (Settings -> Secrets -> Actions) once before the first release.
+
+**Human prerequisite -- `WORKBOARD_TICKET_TOKEN`:** create this repository secret
+(Settings -> Secrets -> Actions) once before the first release. Generate a
+fine-grained PAT scoped to `Seretos/workboard` with **Issues: write** permission.
