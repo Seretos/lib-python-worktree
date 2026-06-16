@@ -17,7 +17,7 @@ on:
         description: "Space-separated list of consumer repos (owner/repo) to file tickets in"
         required: false
         type: string
-        default: "Seretos/agent-worktree"
+        default: "Seretos/agent-worktree Seretos/workboard"
 
 permissions:
   contents: read
@@ -29,13 +29,13 @@ jobs:
 
     steps:
       - name: Open dependency-update ticket in each consumer
+        id: file-tickets
         shell: bash
         # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
         # column 0 dedents out of the YAML block scalar and breaks the file.
         # A YAML block scalar holds the markdown verbatim and ${{ }} still
         # expands. Bash just references "$TITLE"/"$BODY".
         env:
-          GH_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
           CONSUMERS: ${{ inputs.consumers }}
           VERSION: ${{ inputs.version }}
           TITLE: "chore(deps): bump lib-python-worktree to v${{ inputs.version }}"
@@ -53,6 +53,8 @@ jobs:
             2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
             3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
             4. Commit and open a PR.
+          WORKTREE_TICKET_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
+          WORKBOARD_TICKET_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
         run: |
           # Validate version is semver without a leading 'v'.
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
@@ -60,8 +62,18 @@ jobs:
             exit 1
           fi
 
+          FAILED_LIST=""
+
           for CONSUMER in $CONSUMERS; do
             echo "Processing consumer: ${CONSUMER}"
+
+            # Select the correct token per consumer.
+            case "$CONSUMER" in
+              Seretos/agent-worktree) TOKEN="$WORKTREE_TICKET_TOKEN" ;;
+              Seretos/workboard)      TOKEN="$WORKBOARD_TICKET_TOKEN" ;;
+              *) echo "::error::No token configured for consumer ${CONSUMER}"; FAILED_LIST="$FAILED_LIST $CONSUMER"; continue ;;
+            esac
+            export GH_TOKEN="$TOKEN"
 
             # Idempotency: skip if an open issue with this exact title already exists.
             # --paginate follows all pages; jq filter excludes pull requests.
@@ -74,7 +86,7 @@ jobs:
 
             # Attempt creation with the 'dependencies' label; fall back
             # without it if the label does not exist in the consumer repo.
-            gh issue create \
+            if gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
               --body "$BODY" \
@@ -82,7 +94,23 @@ jobs:
             || gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY"
-
-            echo "Ticket opened in ${CONSUMER}."
+              --body "$BODY"; then
+              echo "Ticket opened in ${CONSUMER}."
+            else
+              echo "::error::Failed to open ticket in ${CONSUMER}."
+              FAILED_LIST="$FAILED_LIST $CONSUMER"
+            fi
           done
+
+          echo "failed_consumers=${FAILED_LIST}" >> "$GITHUB_OUTPUT"
+
+      - name: Report per-consumer failures
+        if: always()
+        shell: bash
+        env:
+          FAILED_CONSUMERS: ${{ steps.file-tickets.outputs.failed_consumers }}
+        run: |
+          if [[ -n "${FAILED_CONSUMERS// /}" ]]; then
+            echo "::error::Ticket filing failed for:${FAILED_CONSUMERS}"
+            exit 1
+          fi

@@ -128,7 +128,7 @@ jobs:
             --generate-notes \
             $PRE_FLAG
 
-      - name: Open dependency-update ticket in consumers
+      - name: Open dependency-update ticket in Seretos/agent-worktree
         # continue-on-error: a missing/invalid WORKTREE_TICKET_TOKEN must
         # never fail the release itself.
         continue-on-error: true
@@ -156,6 +156,55 @@ jobs:
             4. Commit and open a PR.
         run: |
           CONSUMER="Seretos/agent-worktree"
+
+          # Idempotency: skip if an open issue with this exact title already exists.
+          # --paginate follows all pages; jq filter excludes pull requests.
+          EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+            --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
+          if echo "$EXISTING" | grep -qxF "$TITLE"; then
+            echo "Issue already exists in ${CONSUMER}, skipping."
+          else
+            # Attempt creation with the 'dependencies' label; fall back
+            # without it if the label does not exist in the consumer repo.
+            gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label dependencies \
+            || gh issue create \
+              --repo "$CONSUMER" \
+              --title "$TITLE" \
+              --body "$BODY"
+          fi
+
+      - name: Open dependency-update ticket in Seretos/workboard
+        # continue-on-error: a missing/invalid WORKBOARD_TICKET_TOKEN must
+        # never fail the release itself.
+        continue-on-error: true
+        shell: bash
+        # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
+        # column 0 dedents out of the YAML block scalar and breaks the file.
+        # A YAML block scalar holds the markdown verbatim and ${{ }} still
+        # expands. Bash just references "$TITLE"/"$BODY".
+        env:
+          GH_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
+          TITLE: "chore(deps): bump lib-python-worktree to v${{ inputs.version }}"
+          BODY: |
+            ## Dependency update
+
+            A new release of **lib-python-worktree** has been published: `v${{ inputs.version }}`.
+
+            ### Action required
+
+            1. Update the pin in `pyproject.toml` to:
+               ```
+               lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v${{ inputs.version }}
+               ```
+            2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
+            3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
+            4. Commit and open a PR.
+        run: |
+          CONSUMER="Seretos/workboard"
 
           # Idempotency: skip if an open issue with this exact title already exists.
           # --paginate follows all pages; jq filter excludes pull requests.
