@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
+from ..core._env_utils import _get_user_profile_env
+
 
 # ---- duck-typed step interface ----------------------------------------------
 
@@ -248,7 +250,13 @@ class SetupRunner:
         branch: str,
         port_mapping: Dict[str, int],
     ) -> Dict[str, str]:
-        env = dict(self._env)
+        # Start from a complete user-profile environment (registry-sourced on
+        # Windows) so that setup steps inherit APPDATA, LOCALAPPDATA, etc.
+        # Then overlay self._env (the test-injection seam) so that callers can
+        # supply a custom base environment (e.g. in unit tests) and it still
+        # wins over the OS-derived base.
+        env = _get_user_profile_env()
+        env.update(self._env)  # test-injection seam: self._env overlays the base
         env["WORKTREE_ID"] = worktree_id
         env["WORKTREE_PATH"] = str(worktree_path)
         env["WORKTREE_BRANCH"] = branch

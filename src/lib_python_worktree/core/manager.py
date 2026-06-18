@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 # module even though _run_git now lives in _git_utils.
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
+from ._env_utils import _get_user_profile_env
 from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
@@ -228,14 +229,20 @@ def _build_worktree_env(
     """Build the child-process environment for a worktree start call.
 
     Merge order (rightmost wins per key):
-        os.environ  <--  worktree identity/port vars  <--  caller_env
+        _get_user_profile_env()  <--  worktree identity/port vars  <--  caller_env
+
+    ``_get_user_profile_env()`` returns a complete user-profile environment
+    (registry-sourced on Windows, ``dict(os.environ)`` elsewhere) so that
+    child processes spawned via the ``start:`` step inherit Windows user-profile
+    vars (``APPDATA``, ``LOCALAPPDATA``, ``USERPROFILE``, etc.) that are absent
+    from a headless MCP server's ``os.environ``.
 
     Variable names mirror ``SetupRunner._build_env`` in ``setup/runner.py``
     (the sibling implementation of this convention).  Do NOT extract a shared
     helper — the two are peers in separate layers; mirroring the few lines
     here avoids new coupling and circular imports.
     """
-    env: Dict[str, str] = dict(os.environ)
+    env: Dict[str, str] = _get_user_profile_env()
     env["WORKTREE_ID"] = record.id
     env["WORKTREE_PATH"] = record.path
     env["WORKTREE_BRANCH"] = record.branch
