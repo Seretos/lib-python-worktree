@@ -401,6 +401,30 @@ class WorktreeManager:
                     pass
             raise
 
+        # Run contract setup: steps right after the record is persisted.
+        # Contract is loaded from repo_path (not worktree_path) because the
+        # plugin layer copies .seretos into the worktree *after* create()
+        # returns.  A missing/empty contract (isolation:none) is a no-op.
+        # On step failure: leave the worktree, ports, and state record intact
+        # for user inspection; update status to "setup_failed" and re-raise
+        # SetupFailedError so the caller knows setup did not complete.
+        _setup_contract = _load_contract(repo_path / CONTRACT_FILENAME)
+        if _setup_contract.setup:
+            from ..setup.runner import SetupRunner  # noqa: PLC0415
+            _setup_runner = SetupRunner()
+            try:
+                _setup_runner.run(
+                    setup=_setup_contract.setup,
+                    worktree_id=record.id,
+                    worktree_path=Path(record.path),
+                    branch=record.branch,
+                    port_mapping=record.ports,
+                )
+            except Exception:  # noqa: BLE001
+                record.status = "setup_failed"
+                self.state.update(record)
+                raise
+
         # Seed the Claude plugin registry so that project-scoped plugins are
         # active in the new worktree without a manual /reload-plugins.
         # Workaround for anthropics/claude-code#61866 — best-effort, non-fatal.

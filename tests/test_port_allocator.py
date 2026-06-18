@@ -243,10 +243,11 @@ def test_manager_create_populates_record_ports(tmp_path: Path):
             "lib_python_worktree.core.manager._load_contract",
         ) as mock_load,
     ):
-        # Contract with two port slots.
+        # Contract with two port slots (no setup steps so SetupRunner is skipped).
         from lib_python_worktree.contract.schema import PortSlot, WorktreeContract
         mock_contract = MagicMock(spec=WorktreeContract)
         mock_contract.ports = [PortSlot(name="web"), PortSlot(name="db")]
+        mock_contract.setup = []  # no setup steps — avoids SetupRunner invocation
         mock_load.return_value = mock_contract
 
         # Patch _validate_repo to return the tmp_path (it's "a git repo").
