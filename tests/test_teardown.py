@@ -601,6 +601,7 @@ class TestKillBlockingProcessesWindows:
                 return_value=fake_killed,
             ),
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.time"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as exc_info:
@@ -721,6 +722,7 @@ class TestKillBlockingProcessesPosix:
                 return_value=fake_killed,
             ),
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.time"),
         ):
             mock_sys.platform = "linux"
             with pytest.raises(WorktreeDirLockedError) as exc_info:
@@ -1308,3 +1310,265 @@ class TestLongPathFallback:
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
         assert not rmtree_calls, "shutil.rmtree must not be called when dir is already gone"
+
+
+# ---------------------------------------------------------------------------
+# TestKillRetryLoop -- ticket #51 (post-kill bounded retry loop)
+# ---------------------------------------------------------------------------
+
+class TestKillRetryLoop:
+    """Verify the bounded post-kill retry loop introduced for ticket #51."""
+
+    def test_kill_retry_loop_succeeds_after_multiple_attempts(self, tmp_path):
+        """Kill fires once; the first 4 post-kill retries return 255/'Permission
+        denied'; the 5th retry returns 0.  Assert: no exception raised; total
+        _run_git calls == 6 (1 initial + 5 retries); time.sleep called 4 times;
+        record.killed_pids is set."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-retry-loop", path="/fake/store/wt-retry-loop")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=4321, name="node.exe", cmdline=["node"])]
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Initial call — returns lock signal (triggers kill + retry loop).
+                return MagicMock(returncode=255, stderr="Permission denied")
+            elif call_count["n"] <= 5:
+                # Post-kill retries 1–4 still fail.
+                return MagicMock(returncode=255, stderr="Permission denied")
+            else:
+                # 5th post-kill retry (6th total call) succeeds.
+                return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.time") as mock_time,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_kill.assert_called_once_with(record.path)
+        assert record.killed_pids == fake_killed
+        # 1 initial + 5 post-kill retry calls.
+        assert call_count["n"] == 6, (
+            f"Expected 6 total _run_git calls, got {call_count['n']}"
+        )
+        # sleep called between retries: 4 times (not after the last successful attempt).
+        assert mock_time.sleep.call_count == 4, (
+            f"Expected 4 time.sleep calls, got {mock_time.sleep.call_count}"
+        )
+
+    def test_kill_retry_phantom_state_mid_loop(self, tmp_path):
+        """Combined path (finding 3): lock-signal on initial call → kill →
+        a retry returns exit 128 'is not a working tree' → no
+        WorktreeDirLockedError raised; phantom-state cleanup (rmtree +
+        worktree prune) runs; teardown completes (ports released).
+
+        Sequence:
+          call 1: returncode=255 / 'Permission denied'  (triggers kill + loop)
+          call 2 (retry 1): returncode=128 / 'is not a working tree'
+            → phantom cleanup fires; loop exits; no raise.
+        """
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-mid-phantom", path="/fake/store/wt-mid-phantom")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=9876, name="code.exe", cmdline=["code"])]
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        call_count = {"n": 0}
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Initial attempt — lock signal.
+                return MagicMock(returncode=255, stderr="Permission denied")
+            if "remove" in args:
+                # First retry — git has now deregistered the worktree.
+                return MagicMock(
+                    returncode=128,
+                    stderr="fatal: '/fake/store/wt-mid-phantom' is not a working tree",
+                )
+            # worktree prune (and any other git call) succeeds.
+            return MagicMock(returncode=0, stderr="")
+
+        rmtree_calls: list = []
+
+        def _mock_rmtree(path, **kwargs):
+            rmtree_calls.append((path, kwargs))
+
+        git_calls: list = []
+
+        def _tracking_git(args, cwd=None, **kwargs):
+            git_calls.append(list(args))
+            return _git_side_effect(args, cwd=cwd, **kwargs)
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_tracking_git),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.time"),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must NOT raise WorktreeDirLockedError.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        # kill was called once.
+        mock_kill.assert_called_once_with(record.path)
+        assert record.killed_pids == fake_killed
+
+        # shutil.rmtree called with record.path and ignore_errors=True
+        # (phantom-state cleanup).
+        assert any(
+            c[0] == record.path and c[1].get("ignore_errors") is True
+            for c in rmtree_calls
+        ), f"Expected rmtree({record.path!r}, ignore_errors=True), got {rmtree_calls}"
+
+        # git worktree prune was called on the repo root.
+        prune_calls = [a for a in git_calls if a[:2] == ["worktree", "prune"]]
+        assert prune_calls, "git worktree prune must be called during phantom cleanup"
+
+        # Port allocator must still release the worktree id.
+        mock_allocator.release.assert_called_once_with(record.id)
+
+
+# ---------------------------------------------------------------------------
+# TestTeardownAlreadyDeregistered -- ticket #51 (phantom-state fix)
+# ---------------------------------------------------------------------------
+
+class TestTeardownAlreadyDeregistered:
+    """Regression tests for the phantom-state scenario described in ticket #51.
+
+    When git has already deregistered a worktree (it returns exit 128 with
+    'is not a working tree' in stderr), _teardown must NOT raise; instead it
+    must clean up the leftover directory, prune stale git metadata, and release
+    ports — so the caller can complete the removal cycle.
+    """
+
+    def test_already_deregistered_force_false_does_not_raise(self, tmp_path):
+        """git exits 128 + 'is not a working tree', force=False: no exception;
+        shutil.rmtree called once with (record.path, ignore_errors=True);
+        git worktree prune called; port allocator .release called with record.id."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-phantom", path="/fake/store/wt-phantom")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        git_calls: list = []
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            git_calls.append(list(args))
+            if "remove" in args:
+                return MagicMock(
+                    returncode=128,
+                    stderr="fatal: '/fake/store/wt-phantom' is not a working tree",
+                )
+            # worktree prune succeeds.
+            return MagicMock(returncode=0, stderr="")
+
+        rmtree_calls: list = []
+
+        def _mock_rmtree(path, **kwargs):
+            rmtree_calls.append((path, kwargs))
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+        ):
+            # Must not raise.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        # shutil.rmtree called once with record.path and ignore_errors=True.
+        assert len(rmtree_calls) == 1, (
+            f"Expected 1 shutil.rmtree call, got {len(rmtree_calls)}: {rmtree_calls}"
+        )
+        assert rmtree_calls[0][0] == record.path, (
+            f"rmtree path mismatch: {rmtree_calls[0][0]!r} != {record.path!r}"
+        )
+        assert rmtree_calls[0][1].get("ignore_errors") is True, (
+            "rmtree must be called with ignore_errors=True"
+        )
+
+        # git worktree prune called on repo root.
+        prune_calls = [a for a in git_calls if a[:2] == ["worktree", "prune"]]
+        assert prune_calls, "git worktree prune must be called"
+
+        # Port allocator must release the worktree id.
+        mock_allocator.release.assert_called_once_with(record.id)
+
+    def test_already_deregistered_second_remove_completes(self, tmp_path):
+        """Regression for ticket #51: full manager.remove(record.id, force=False)
+        where teardown receives 'is not a working tree' from git.
+        After remove() returns, manager.state.list() must be empty."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-phantom-state",
+            branch_created_by_us=False,  # skip branch-delete step
+        )
+        manager.state.add(record)
+
+        # Verify the record is tracked before removal.
+        assert len(manager.state.list()) == 1
+
+        mock_lifecycle = MagicMock()
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            if "remove" in args:
+                return MagicMock(
+                    returncode=128,
+                    stderr="fatal: '{}' is not a working tree".format(record.path),
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.manager.shutil"),
+            patch.object(
+                manager, "_teardown", wraps=lambda rec, force, **kw: (
+                    WorktreeManager._teardown(
+                        manager, rec, force=force, _lifecycle_module=mock_lifecycle
+                    )
+                )
+            ),
+        ):
+            manager.remove(record.id, force=False)
+
+        # The critical regression assertion: state must be empty after remove().
+        assert manager.state.list() == [], (
+            "state must be empty after remove() on a phantom (already-deregistered) worktree"
+        )
