@@ -1738,3 +1738,61 @@ def test_create_tolerates_seed_failure(monkeypatch):
 
     # Restore mkdir for other tests.
     monkeypatch.setattr(Path, "mkdir", original_mkdir)
+
+
+# ---------------------------------------------------------------------------
+# Ticket #49: _build_worktree_env uses _get_user_profile_env as its base
+# ---------------------------------------------------------------------------
+
+from lib_python_worktree.core.manager import _build_worktree_env  # noqa: E402
+
+
+def test_build_worktree_env_uses_get_user_profile_env_as_base(tmp_path: Path):
+    """_build_worktree_env() starts from _get_user_profile_env(), not raw os.environ.
+
+    Patching _get_user_profile_env to return a sentinel dict proves the function
+    is called as the base rather than dict(os.environ).
+    """
+    record = _make_wt_record()
+
+    sentinel_env = {"SENTINEL_FROM_PROFILE": "1"}
+
+    with patch("lib_python_worktree.core.manager._get_user_profile_env", return_value=dict(sentinel_env)):
+        result = _build_worktree_env(record, None)
+
+    assert "SENTINEL_FROM_PROFILE" in result, (
+        "_get_user_profile_env() sentinel key must appear in the built env"
+    )
+    assert result["SENTINEL_FROM_PROFILE"] == "1"
+
+
+def test_build_worktree_env_worktree_vars_overlay_base(tmp_path: Path):
+    """Worktree identity vars (WORKTREE_ID etc.) overlay the base env."""
+    record = _make_wt_record(id="my-wt-deadbeef")
+
+    # Base that already contains WORKTREE_ID with the wrong value.
+    fake_base = {"WORKTREE_ID": "stale-id", "OTHER": "preserved"}
+
+    with patch("lib_python_worktree.core.manager._get_user_profile_env", return_value=dict(fake_base)):
+        result = _build_worktree_env(record, None)
+
+    assert result["WORKTREE_ID"] == record.id, (
+        "Worktree identity var must override the base environment"
+    )
+    assert result["OTHER"] == "preserved", "Non-colliding base keys must survive"
+
+
+def test_build_worktree_env_caller_env_overlays_last(tmp_path: Path):
+    """caller_env is applied last and wins over both base and worktree vars."""
+    record = _make_wt_record(id="wt-abc12345")
+
+    fake_base = {"X": "base"}
+
+    caller_env = {"X": "caller"}
+
+    with patch("lib_python_worktree.core.manager._get_user_profile_env", return_value=dict(fake_base)):
+        result = _build_worktree_env(record, caller_env)
+
+    assert result["X"] == "caller", (
+        "caller_env must win (applied last) over the base and worktree vars"
+    )

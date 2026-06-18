@@ -237,3 +237,91 @@ def test_failed_step_marks_aborted_at(tmp_path: Path):
             branch="main",
         )
     assert exc_info.value.returncode == 7
+
+
+# ---------------------------------------------------------------------------
+# Ticket #49: SetupRunner._build_env uses _get_user_profile_env as its base
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch  # noqa: E402
+
+
+def test_build_env_uses_get_user_profile_env_as_base(tmp_path: Path):
+    """_build_env() starts from _get_user_profile_env(), not raw dict(self._env).
+
+    Patches ``lib_python_worktree.setup.runner._get_user_profile_env`` with a
+    sentinel dict and confirms the sentinel key is present in the env dict
+    actually passed to the subprocess runner invocation.  A regression where
+    _build_env reverts to ``dict(self._env)`` would omit the sentinel key.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    seen_env: List[dict] = []
+
+    def fake_run(cmd, *, cwd, env, capture_output, text, check):
+        seen_env.append(dict(env))
+        return _FakeProc(returncode=0, stdout="", stderr="")
+
+    sentinel_base = {"SENTINEL_PROFILE_VAR": "from_profile_env"}
+
+    import lib_python_worktree.setup.runner as _runner_module  # noqa: PLC0415
+
+    with patch.object(_runner_module, "_get_user_profile_env", return_value=dict(sentinel_base)):
+        runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+        runner.run(
+            setup=[_PlainStep(run="probe", name="probe")],
+            worktree_id="wt-sentinel",
+            worktree_path=wt,
+            branch="main",
+        )
+
+    assert len(seen_env) == 1, "fake_run must have been called exactly once"
+    env = seen_env[0]
+    assert "SENTINEL_PROFILE_VAR" in env, (
+        "_get_user_profile_env() sentinel key must appear in the env passed to the subprocess"
+    )
+    assert env["SENTINEL_PROFILE_VAR"] == "from_profile_env"
+    # Worktree identity vars are still injected on top.
+    assert env["WORKTREE_ID"] == "wt-sentinel"
+    assert env["WORKTREE_BRANCH"] == "main"
+
+
+def test_build_env_self_env_overlays_profile_base(tmp_path: Path):
+    """self._env overlays _get_user_profile_env() so the test-injection seam still works.
+
+    When SetupRunner is constructed with env={"FOO": "from_self_env"} and
+    _get_user_profile_env returns {"FOO": "from_profile"}, the subprocess must
+    see FOO="from_self_env" (self._env wins over the profile base).
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    seen_env: List[dict] = []
+
+    def fake_run(cmd, *, cwd, env, capture_output, text, check):
+        seen_env.append(dict(env))
+        return _FakeProc(returncode=0, stdout="", stderr="")
+
+    profile_base = {"FOO": "from_profile", "ONLY_IN_PROFILE": "yes"}
+    injection_env = {"FOO": "from_self_env"}
+
+    import lib_python_worktree.setup.runner as _runner_module  # noqa: PLC0415
+
+    with patch.object(_runner_module, "_get_user_profile_env", return_value=dict(profile_base)):
+        runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run, env=injection_env)
+        runner.run(
+            setup=[_PlainStep(run="probe", name="probe")],
+            worktree_id="wt-overlay",
+            worktree_path=wt,
+            branch="main",
+        )
+
+    assert len(seen_env) == 1
+    env = seen_env[0]
+    assert env["FOO"] == "from_self_env", (
+        "self._env must overlay _get_user_profile_env() (test-injection seam)"
+    )
+    assert env["ONLY_IN_PROFILE"] == "yes", (
+        "keys only in profile base must still appear when self._env does not override them"
+    )
