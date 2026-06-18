@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,10 @@ _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
 _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
 _PORT_RANGE_DEFAULT = (30000, 40000)
+
+# Retry constants for the post-kill directory-unlock loop (ticket #51).
+_POST_KILL_RETRIES: int = 5      # attempts after kill before giving up
+_POST_KILL_SLEEP: float = 0.5    # seconds to wait between retries
 
 # Stable since git 2.5 (builtin/worktree.c). Captures branch + path from
 # the two variants git emits when refusing `worktree add` on a conflict:
@@ -765,8 +770,27 @@ class WorktreeManager:
             args.append("--force")
         args.append(record.path)
         proc = _run_git(args, cwd=Path(record.repo_root))
+        def _phantom_state_cleanup() -> None:
+            """Remove the leftover directory and prune stale git metadata.
+
+            Called when git reports 'is not a working tree' — meaning it has
+            already deregistered the worktree from its internal registry on a
+            prior attempt, but the directory and YAML state record were never
+            cleaned up.  Both operations are best-effort; errors are swallowed
+            so that port release and state removal still occur.
+            """
+            shutil.rmtree(record.path, ignore_errors=True)
+            _run_git(["worktree", "prune"], cwd=Path(record.repo_root))
+
         if proc.returncode != 0:
-            if proc.returncode == 128 and force:
+            if proc.returncode == 128 and "is not a working tree" in proc.stderr:
+                # git has already deregistered this worktree (phantom-state
+                # scenario from ticket #51).  Treat as already-gone: clean up
+                # the leftover directory and stale metadata, then fall through
+                # to port release.
+                _phantom_state_cleanup()
+                # Fall through to step 4.
+            elif proc.returncode == 128 and force:
                 # The .git link is already gone (worktree dir was wiped
                 # externally).  Fall back: delete the directory ourselves,
                 # then prune the stale git metadata.  Both steps are
@@ -812,10 +836,30 @@ class WorktreeManager:
                 if kill_blocking_processes and _is_lock_signal:
                     killed = _kill_blocking_processes(record.path)
                     record.killed_pids = killed
-                    retry = _run_git(args, cwd=Path(record.repo_root))
-                    if retry.returncode != 0:
+                    retry_result = None
+                    _phantom_on_retry = False
+                    for _attempt in range(_POST_KILL_RETRIES):
+                        retry_result = _run_git(args, cwd=Path(record.repo_root))
+                        if retry_result.returncode == 0:
+                            break
+                        if (
+                            retry_result.returncode == 128
+                            and "is not a working tree" in retry_result.stderr
+                        ):
+                            # git deregistered the worktree between the kill
+                            # and this retry (phantom-state mid-loop).  Treat
+                            # as already-gone and fall through to port release.
+                            _phantom_state_cleanup()
+                            _phantom_on_retry = True
+                            break
+                        if _attempt < _POST_KILL_RETRIES - 1:
+                            time.sleep(_POST_KILL_SLEEP)
+                    if not _phantom_on_retry and (
+                        retry_result is None or retry_result.returncode != 0
+                    ):
                         raise WorktreeDirLockedError(record.id, killed=killed)
-                    # Retry succeeded — fall through to long-path check then step 4.
+                    # Retry succeeded (or phantom-state cleanup ran) —
+                    # fall through to long-path check then step 4.
                 else:
                     raise GitCommandError(
                         ["git", *args], proc.returncode, proc.stderr
