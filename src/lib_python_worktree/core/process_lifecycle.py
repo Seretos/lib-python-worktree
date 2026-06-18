@@ -341,17 +341,47 @@ def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo
     return result
 
 
-def _kill_blocking_processes(path: str) -> List[KilledProcessInfo]:
+def _kill_blocking_processes(
+    path: str,
+    *,
+    timeout: float = 5.0,
+) -> List[KilledProcessInfo]:
     """Kill all processes whose cwd is under *path* and return their info.
 
-    Sends the graceful signal first, waits up to 5 seconds, then force-kills
-    any survivors.  The MCP host process and its ancestors are never killed.
-    Returns an empty list when no blocking processes are found.
+    Sends the graceful signal first, waits, then force-kills any survivors.
+    The MCP host process and its ancestors are never killed.  Returns an empty
+    list when no blocking processes are found.
+
+    The total runtime of this function is bounded by *timeout* seconds.  The
+    budget is distributed evenly across the found orphans; once the deadline has
+    passed any remaining orphans receive only the graceful signal (no wait).
+
+    Parameters
+    ----------
+    path:
+        The worktree directory path.
+    timeout:
+        Maximum seconds to spend waiting across *all* found orphans combined.
+        Defaults to 5.0.  Pass ``0.0`` to send graceful signals without
+        waiting.
     """
     found = _find_blocking_processes(path, os.getpid())
+    if not found:
+        return found
+    deadline = time.monotonic() + timeout
+    n = len(found)
     for info in found:
+        # Always send the graceful signal, even if the budget is exhausted.
+        # This ensures every orphan is notified regardless of how much time
+        # is left.  Only the _wait_or_kill call is gated on remaining budget.
         _send_graceful_signal(info.pid)
-        _wait_or_kill(info.pid, timeout=5.0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Budget exhausted — signal already sent; skip the wait for this
+            # orphan and all subsequent ones (they will also only be signalled).
+            continue
+        per_pid_budget = min(remaining, timeout / n)
+        _wait_or_kill(info.pid, timeout=per_pid_budget)
     return found
 
 
@@ -445,6 +475,11 @@ def stop(
     on Windows or ``start_new_session=True`` on POSIX) and therefore would not
     be caught by signalling the tracked PID alone.
 
+    The *timeout* budget is shared across both the primary signal/wait step and
+    the orphan scan: the orphan scan receives only the time that remains after
+    the primary step completes, so the total operation is always bounded by
+    *timeout* seconds.
+
     Parameters
     ----------
     worktree_id:
@@ -454,7 +489,9 @@ def stop(
     role:
         Identifies the process within the worktree.
     timeout:
-        Seconds to wait for graceful exit before force-killing.
+        Seconds to bound the complete stop operation (primary kill + orphan
+        scan combined).  Graceful exit is attempted first; force-kill is used
+        if the process has not exited by the deadline.
     kill_orphans:
         When ``True``, scan for and kill any orphaned grandchild processes
         under ``record.path`` after the primary stop signal.  Defaults to
@@ -480,16 +517,21 @@ def stop(
 
     pid = record.pids[role]
 
+    # Compute a shared deadline so that the primary kill step and the optional
+    # orphan scan together never exceed the caller-supplied timeout.
+    deadline = time.monotonic() + timeout
+
     if _pid_alive(pid):
         _send_graceful_signal(pid)
-        _wait_or_kill(pid, timeout)
+        _wait_or_kill(pid, max(0.0, deadline - time.monotonic()))
 
     # Orphan scan: kill grandchild processes that survived because the shell
     # wrapper already exited (they were reparented away from the tracked PID).
     # Run this whether the shell was alive or dead — it's a no-op when there
-    # are no orphans.
+    # are no orphans.  Pass remaining budget so the scan is also bounded.
     if kill_orphans:
-        _kill_blocking_processes(record.path)
+        orphan_budget = max(0.0, deadline - time.monotonic())
+        _kill_blocking_processes(record.path, timeout=orphan_budget)
 
     # Clear the role regardless of whether the process was alive — the
     # important postcondition is that the record no longer references it.

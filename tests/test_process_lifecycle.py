@@ -417,7 +417,7 @@ class TestStopKillOrphans:
 
         with patch(
             "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
-            side_effect=lambda path: kbp_calls.append(path) or [],
+            side_effect=lambda path, **kw: kbp_calls.append(path) or [],
         ):
             result = stop("wt-orphan-dead", store=store, kill_orphans=True)
 
@@ -470,7 +470,7 @@ class TestStopKillOrphans:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
-                side_effect=lambda path: kbp_calls.append(path) or [],
+                side_effect=lambda path, **kw: kbp_calls.append(path) or [],
             ),
         ):
             result = stop("wt-orphan-alive", store=store, kill_orphans=True)
@@ -482,7 +482,7 @@ class TestStopKillOrphans:
         assert DEFAULT_ROLE not in result.pids
 
     def test_stop_kill_orphans_no_processes_found_no_error(self):
-        """kill_orphans=True with _find_blocking_processes returning [] must not
+        """kill_orphans=True with _kill_blocking_processes returning [] must not
         raise and must still clear the record normally."""
         if _pid_alive(99999999):
             pytest.skip("PID 99999999 is alive on this machine — skipping")
@@ -517,7 +517,7 @@ class TestStopKillOrphans:
 
         with patch(
             "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
-            side_effect=lambda path: captured_path.append(path) or [],
+            side_effect=lambda path, **kw: captured_path.append(path) or [],
         ):
             stop("wt-orphan-path", store=store, kill_orphans=True)
 
@@ -919,8 +919,14 @@ class TestKillBlockingProcesses:
 
         assert result == fake_found
         assert graceful_calls == [1010, 2020]
-        assert all(t == 5.0 for (_, t) in wait_calls)
         assert [p for (p, _) in wait_calls] == [1010, 2020]
+        # Each per-pid budget must be positive and the total must not exceed the
+        # default 5.0 s budget (plus a tight epsilon — _wait_or_kill is mocked
+        # so there is no real elapsed time; any overshoot indicates a logic bug).
+        assert all(t > 0 for (_, t) in wait_calls), "each per-pid budget must be positive"
+        assert sum(t for (_, t) in wait_calls) <= 5.0 + 1e-3, (
+            "total wait budget must not exceed the requested timeout"
+        )
 
     def test_no_blockers_returns_empty_no_kills(self):
         """_kill_blocking_processes returns [] and makes no kill calls when no blockers."""
@@ -943,3 +949,212 @@ class TestKillBlockingProcesses:
         assert result == []
         mock_graceful.assert_not_called()
         mock_wait.assert_not_called()
+
+    def test_total_time_bounded_by_timeout(self):
+        """Budget distributed across orphans must not exceed the requested timeout."""
+        target = "/fake/worktree"
+        fake_found = [
+            KilledProcessInfo(pid=3001, name="node", cmdline=["node"]),
+            KilledProcessInfo(pid=3002, name="python", cmdline=["python"]),
+            KilledProcessInfo(pid=3003, name="ruby", cmdline=["ruby"]),
+        ]
+
+        wait_calls: List[tuple] = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_found,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=lambda pid, timeout: wait_calls.append((pid, timeout)),
+            ),
+        ):
+            result = _kill_blocking_processes(target, timeout=6.0)
+
+        assert result == fake_found
+        assert len(wait_calls) == 3
+        total = sum(t for (_, t) in wait_calls)
+        assert total <= 6.0 + 0.1, (
+            f"sum of per-pid budgets ({total:.3f}) must not exceed requested timeout (6.0)"
+        )
+
+    def test_timeout_zero_skips_wait_calls(self):
+        """timeout=0.0 sends the graceful signal but skips _wait_or_kill entirely.
+
+        Both orphan PIDs must receive the graceful signal even though no budget
+        is available for waiting (the docstring guarantees this behaviour).
+        """
+        target = "/fake/worktree"
+        fake_found = [
+            KilledProcessInfo(pid=4001, name="node", cmdline=["node"]),
+            KilledProcessInfo(pid=4002, name="python", cmdline=["python"]),
+        ]
+
+        graceful_calls: List[int] = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_found,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                side_effect=lambda pid: graceful_calls.append(pid),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+            ) as mock_wait,
+        ):
+            result = _kill_blocking_processes(target, timeout=0.0)
+
+        assert result == fake_found
+        # _wait_or_kill must not be called — no budget to wait.
+        mock_wait.assert_not_called()
+        # _send_graceful_signal must be called for EVERY orphan, even with
+        # timeout=0.0.  This is the core of the fix for blocking issue #1.
+        assert graceful_calls == [4001, 4002], (
+            f"expected graceful signals for both orphans [4001, 4002], got {graceful_calls}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# stop() timeout-budget regression tests  (ticket #50)
+# ---------------------------------------------------------------------------
+
+class TestStopTimeoutBudget:
+    """Regression tests for ticket #50: stop() total time bounded by timeout.
+
+    The bug: _kill_blocking_processes was called without a timeout, so N orphans
+    each consumed up to 5 s — resulting in up to 5*N seconds for the orphan scan
+    alone, independent of stop()'s own timeout parameter.
+
+    The fix: stop() computes a shared deadline at entry and passes the remaining
+    budget to _kill_blocking_processes(... timeout=orphan_budget).
+    """
+
+    def test_stop_dead_pid_orphan_scan_receives_full_timeout_budget(self):
+        """Primary regression (#50): when the tracked PID is already dead the
+        orphan scan must receive nearly the full timeout budget, not an unbounded
+        hardcoded value."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        record = _make_record("wt-budget-dead", pids={DEFAULT_ROLE: 99999999})
+        store = _make_store(record)
+
+        captured_timeout: List[float] = []
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            side_effect=lambda path, **kw: captured_timeout.append(kw.get("timeout", -1)) or [],
+        ):
+            stop("wt-budget-dead", store=store, kill_orphans=True, timeout=8.0)
+
+        assert len(captured_timeout) == 1
+        # The dead-pid fast-path spends nearly no time, so the orphan scan
+        # must receive close to the full 8.0 s budget.
+        assert captured_timeout[0] >= 7.5, (
+            f"orphan scan received only {captured_timeout[0]:.3f}s of the 8.0s budget"
+        )
+        assert captured_timeout[0] <= 8.0 + 0.1, (
+            "orphan scan must not receive more time than the caller requested"
+        )
+
+    def test_stop_alive_pid_orphan_scan_receives_remaining_budget(self):
+        """When the shell PID is alive the orphan scan receives whatever time
+        remains after the primary _wait_or_kill call completes."""
+        fake_pid = 66666
+        record = _make_record("wt-budget-alive", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_timeout: List[float] = []
+        caller_timeout = 10.0
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                side_effect=lambda path, **kw: captured_timeout.append(kw.get("timeout", -1)) or [],
+            ),
+        ):
+            stop("wt-budget-alive", store=store, kill_orphans=True, timeout=caller_timeout)
+
+        assert len(captured_timeout) == 1
+        orphan_budget = captured_timeout[0]
+        # _wait_or_kill is a no-op here, so nearly the full caller_timeout must
+        # remain for the orphan scan.  Tighten the lower bound accordingly.
+        assert orphan_budget >= caller_timeout - 0.5, (
+            f"orphan budget {orphan_budget:.3f} must be >= caller_timeout - 0.5 ({caller_timeout - 0.5})"
+        )
+        assert orphan_budget <= caller_timeout, (
+            f"orphan budget {orphan_budget:.3f} must be <= caller timeout {caller_timeout}"
+        )
+
+    def test_stop_orphan_scan_bounded_when_many_orphans(self):
+        """Wall-clock smoke test: stop() with 5 fake orphans and a 2-second
+        timeout must return in under 3 seconds total."""
+        fake_pid = 77777
+        record = _make_record("wt-many-orphans", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        fake_found = [
+            KilledProcessInfo(pid=5000 + i, name="proc", cmdline=["proc"])
+            for i in range(5)
+        ]
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_found,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+            ),
+        ):
+            t0 = time.monotonic()
+            stop("wt-many-orphans", store=store, kill_orphans=True, timeout=2.0)
+            elapsed = time.monotonic() - t0
+
+        assert elapsed < 3.0, (
+            f"stop() with 5 orphans took {elapsed:.2f}s — must complete in under 3.0s"
+        )
+
+    def test_stop_dead_pid_no_orphans_returns_fast(self):
+        """stop() with a dead PID and kill_orphans=False must return quickly
+        (no sleeping or waiting)."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        record = _make_record("wt-fast-dead", pids={DEFAULT_ROLE: 99999999})
+        store = _make_store(record)
+
+        t0 = time.monotonic()
+        result = stop("wt-fast-dead", store=store, kill_orphans=False, timeout=10.0)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.0, (
+            f"stop() with a dead PID and no orphan scan took {elapsed:.2f}s — must return in under 1.0s"
+        )
+        assert DEFAULT_ROLE not in result.pids
+        assert result.status == "stopped"
