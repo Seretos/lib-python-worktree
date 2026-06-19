@@ -1158,3 +1158,190 @@ class TestStopTimeoutBudget:
         )
         assert DEFAULT_ROLE not in result.pids
         assert result.status == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# TestFindBlockingProcessesWindows -- ticket #57
+# ---------------------------------------------------------------------------
+
+class TestFindBlockingProcessesWindows:
+    """Regression tests for ticket #57: Windows cmdline token scan (Pass 1b).
+
+    On Windows, proc.cwd() raises AccessDenied for almost all foreign
+    processes, making the Pass 1 CWD match a no-op.  Pass 1b scans cmdline
+    tokens instead: if any token resolves to a path under the worktree
+    directory, the process is treated as blocking.
+    """
+
+    def test_cwd_access_denied_falls_through_to_cmdline(self):
+        """Regression #57: on Windows, when proc.cwd() raises AccessDenied but a
+        cmdline token points under the target path, the process is returned."""
+        import psutil
+
+        # Use a POSIX-style path so os.sep and os.path.normpath work correctly
+        # on Linux CI even though sys.platform is patched to "win32".
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        # Simulate a Windows foreign process: cwd() denied, but cmdline contains
+        # a path inside the target worktree.
+        proc_win = MagicMock()
+        proc_win.info = {
+            "pid": 8801,
+            "name": "code.exe",
+            "cmdline": ["code.exe", "/fake/worktree/src/main.py"],
+        }
+        proc_win.cwd.side_effect = psutil.AccessDenied(8801)
+        proc_win.open_files.side_effect = psutil.AccessDenied(8801)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_win]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1, (
+            f"Expected 1 blocking process via cmdline scan, got {result}"
+        )
+        assert result[0].pid == 8801
+        assert result[0].name == "code.exe"
+
+    def test_no_match_returns_empty(self):
+        """On Windows, when cwd() is denied and cmdline tokens are all unrelated
+        paths, the result is empty."""
+        import psutil
+
+        target = "C:\\fake\\worktree"
+        host_pid = os.getpid()
+
+        proc_unrelated = MagicMock()
+        proc_unrelated.info = {
+            "pid": 8802,
+            "name": "explorer.exe",
+            "cmdline": ["explorer.exe", "C:\\Users\\user\\Documents"],
+        }
+        proc_unrelated.cwd.side_effect = psutil.AccessDenied(8802)
+        proc_unrelated.open_files.side_effect = psutil.AccessDenied(8802)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_unrelated]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == [], (
+            f"Unrelated cmdline tokens must not produce any matches, got {result}"
+        )
+
+    def test_cmdline_scan_skipped_on_non_windows(self):
+        """Pass 1b (cmdline scan) must NOT run on non-Windows platforms.
+        A process whose cwd() is denied but whose cmdline contains the path
+        must NOT appear in the result when platform != 'win32'."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_posix = MagicMock()
+        proc_posix.info = {
+            "pid": 8803,
+            "name": "bash",
+            "cmdline": ["bash", "/fake/worktree/run.sh"],
+        }
+        proc_posix.cwd.side_effect = psutil.AccessDenied(8803)
+        proc_posix.open_files.side_effect = psutil.AccessDenied(8803)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_posix]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == [], (
+            "cmdline token scan must not run on non-Windows; got unexpected matches"
+        )
+
+    def test_cmdline_token_is_exact_match_to_target(self):
+        """A cmdline token equal to the target path (not just under it) is also
+        a valid match on Windows."""
+        import psutil
+
+        target = "C:\\fake\\worktree"
+        host_pid = os.getpid()
+
+        proc_exact = MagicMock()
+        proc_exact.info = {
+            "pid": 8804,
+            "name": "tool.exe",
+            "cmdline": ["tool.exe", "--root", "C:\\fake\\worktree"],
+        }
+        proc_exact.cwd.side_effect = psutil.AccessDenied(8804)
+        proc_exact.open_files.side_effect = psutil.AccessDenied(8804)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_exact]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].pid == 8804
+
+    def test_cmdline_not_duplicated_when_cwd_also_matches(self):
+        """A process matched by CWD (Pass 1) must not be re-added by the
+        cmdline scan (Pass 1b)."""
+        import psutil
+
+        target = "C:\\fake\\worktree"
+        host_pid = os.getpid()
+
+        # This process: cwd succeeds AND cmdline matches
+        proc_both = MagicMock()
+        proc_both.info = {
+            "pid": 8805,
+            "name": "node.exe",
+            "cmdline": ["node.exe", "C:\\fake\\worktree\\index.js"],
+        }
+        proc_both.cwd.return_value = "C:\\fake\\worktree"
+        proc_both.open_files.return_value = []
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_both]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1, (
+            f"Process must appear exactly once, got {len(result)} entries"
+        )
+        assert result[0].pid == 8805

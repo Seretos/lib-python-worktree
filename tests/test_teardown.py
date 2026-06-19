@@ -1196,12 +1196,30 @@ class TestLongPathFallback:
         mock_lifecycle = MagicMock()
         rmtree_calls: list = []
 
+        # In Python 3.14, pathlib.Path.exists() calls os.path.exists() directly.
+        # _teardown calls _load_contract twice (for stop: and teardown: steps),
+        # each of which calls Path.exists() on the contract file — resulting in
+        # 2 calls before the long-path guard at line 897.
+        # We must return False for those contract-file checks and True only for
+        # the actual worktree-path check at line 897.
+        # Strategy: return False for any path that is NOT record.path; return
+        # True for record.path on the first check (line 897) and False on the
+        # second (line 920, the final guard after rmtree succeeds).
+        _path_calls = {"n": 0}
+
+        def _mock_exists(path):
+            if str(path) == record.path:
+                _path_calls["n"] += 1
+                return _path_calls["n"] == 1  # True first, False thereafter
+            # Contract file / other paths → not present.
+            return False
+
         def _mock_rmtree(path, **kwargs):
             rmtree_calls.append(path)
 
         with (
             patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
             patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
@@ -1226,12 +1244,23 @@ class TestLongPathFallback:
         mock_lifecycle = MagicMock()
         rmtree_calls: list = []
 
+        # See explanation in test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
+        # Returns True only for the first check of record.path (line 897),
+        # and False for all other paths and all subsequent checks of record.path.
+        _path_calls = {"n": 0}
+
+        def _mock_exists(path):
+            if str(path) == record.path:
+                _path_calls["n"] += 1
+                return _path_calls["n"] == 1
+            return False
+
         def _mock_rmtree(path, **kwargs):
             rmtree_calls.append(path)
 
         with (
             patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
             patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
@@ -1271,9 +1300,20 @@ class TestLongPathFallback:
             robocopy_calls.append(cmd)
             return MagicMock(returncode=1)  # robocopy exits 1 on success-with-copies
 
+        # See explanation in test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
+        # Returns True only for the first check of record.path (line 897),
+        # and False for all other paths and all subsequent checks of record.path.
+        _path_calls = {"n": 0}
+
+        def _mock_exists(path):
+            if str(path) == record.path:
+                _path_calls["n"] += 1
+                return _path_calls["n"] == 1
+            return False
+
         with (
             patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
             patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
             patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
@@ -1571,4 +1611,76 @@ class TestTeardownAlreadyDeregistered:
         # The critical regression assertion: state must be empty after remove().
         assert manager.state.list() == [], (
             "state must be empty after remove() on a phantom (already-deregistered) worktree"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestLongPathFallbackLockedGuard -- ticket #57 regression tests
+# ---------------------------------------------------------------------------
+
+class TestLongPathFallbackLockedGuard:
+    """Regression tests for ticket #57: the final guard that raises
+    WorktreeDirLockedError when the directory is still present after all
+    deletion attempts.
+
+    Root cause: _teardown's long-path fallback block swallowed OSError
+    silently and fell through to port release + status 'removed' regardless
+    of whether the directory was actually deleted.
+    """
+
+    def test_directory_gone_after_fallback_succeeds(self, tmp_path):
+        """When git exits 0 and os.path.exists returns False (directory gone),
+        _teardown must complete without raising and port release must be called."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-gone-after-fallback", path="/fake/store/wt-gone")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            # Must not raise.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        # Port release must still be called when directory is gone.
+        mock_allocator.release.assert_called_once_with(record.id)
+
+    def test_directory_still_exists_after_fallback_raises(self, tmp_path):
+        """Regression #57: when git exits 0 but the directory still exists
+        (long-path fallback failed silently), _teardown must raise
+        WorktreeDirLockedError instead of returning a false 'removed' status."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-still-locked", path="/fake/store/wt-still-locked")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager.os.path.exists",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.manager.shutil.rmtree",
+                side_effect=OSError("path too long / locked"),
+            ),
+            patch("lib_python_worktree.core.manager.subprocess.run", return_value=MagicMock(returncode=1)),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as exc_info:
+                manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        err = exc_info.value
+        assert err.worktree_id == "wt-still-locked", (
+            f"WorktreeDirLockedError must carry the worktree id, got {err.worktree_id!r}"
         )

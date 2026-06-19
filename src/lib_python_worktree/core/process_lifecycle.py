@@ -312,6 +312,33 @@ def _find_blocking_processes(path: str, host_pid: int) -> List[KilledProcessInfo
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
 
+    # Pass 1b (Windows only): cmdline token scan.
+    # proc.cwd() raises AccessDenied for almost all foreign processes on Windows.
+    # Scan cmdline tokens as a fallback: if any token resolves to a path under
+    # the worktree directory, treat the process as blocking.
+    if sys.platform == "win32":
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                pid = proc.info["pid"]
+                if pid in excluded_pids or pid in seen_pids:
+                    continue
+                cmdline = proc.info["cmdline"] or []
+                for token in cmdline:
+                    try:
+                        norm_token = os.path.normcase(os.path.normpath(token))
+                    except (ValueError, TypeError):
+                        continue
+                    if norm_token == normalized or norm_token.startswith(normalized + os.sep):
+                        seen_pids.add(pid)
+                        result.append(KilledProcessInfo(
+                            pid=pid,
+                            name=proc.info["name"] or "",
+                            cmdline=cmdline,
+                        ))
+                        break
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                continue
+
     # Pass 2: open file handles — catches daemons that have changed their cwd
     # away from the worktree but still hold file locks inside it.
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):

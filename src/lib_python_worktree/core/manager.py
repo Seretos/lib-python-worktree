@@ -914,6 +914,12 @@ class WorktreeManager:
             else:
                 shutil.rmtree(record.path, ignore_errors=True)
 
+        # Final guard: if the directory is still present after all deletion
+        # attempts, the worktree is locked by an external process.  Raise
+        # rather than returning a false status: "removed".
+        if os.path.exists(record.path):
+            raise WorktreeDirLockedError(record.id, killed=record.killed_pids)
+
         # Step 4: release allocated ports only after the git worktree remove
         # has succeeded.  Freeing ports before the remove would allow a
         # concurrent allocate() to reissue the same ports while the original
