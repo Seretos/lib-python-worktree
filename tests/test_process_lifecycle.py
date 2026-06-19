@@ -1178,7 +1178,9 @@ class TestFindBlockingProcessesWindows:
         cmdline token points under the target path, the process is returned."""
         import psutil
 
-        target = "C:\\fake\\worktree"
+        # Use a POSIX-style path so os.sep and os.path.normpath work correctly
+        # on Linux CI even though sys.platform is patched to "win32".
+        target = "/fake/worktree"
         host_pid = os.getpid()
 
         # Simulate a Windows foreign process: cwd() denied, but cmdline contains
@@ -1187,7 +1189,7 @@ class TestFindBlockingProcessesWindows:
         proc_win.info = {
             "pid": 8801,
             "name": "code.exe",
-            "cmdline": ["code.exe", "C:\\fake\\worktree\\src\\main.py"],
+            "cmdline": ["code.exe", "/fake/worktree/src/main.py"],
         }
         proc_win.cwd.side_effect = psutil.AccessDenied(8801)
         proc_win.open_files.side_effect = psutil.AccessDenied(8801)
