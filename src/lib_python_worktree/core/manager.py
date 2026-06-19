@@ -300,6 +300,8 @@ class WorktreeManager:
         repo_root: str,
         branch: str,
         base: Optional[str] = None,
+        *,
+        fetch: bool = True,
     ) -> WorktreeRecord:
         repo_path = self._validate_repo(repo_root)
 
@@ -327,13 +329,28 @@ class WorktreeManager:
                 f"Base branch '{base}' does not exist in {repo_path}."
             )
 
+        # When creating a new branch from a base and fetch=True, fetch the
+        # base branch from origin so the new worktree starts from the latest
+        # remote commit rather than a potentially stale local ref.
+        if not branch_exists and base is not None and fetch:
+            fetch_proc = _run_git(["fetch", "origin", base], cwd=repo_path)
+            if fetch_proc.returncode != 0:
+                raise GitCommandError(
+                    ["git", "fetch", "origin", base],
+                    fetch_proc.returncode,
+                    fetch_proc.stderr,
+                )
+
         worktree_id = f"{repo_slug}-{_slug(branch)}-{_short_uuid()}"
         target_path = self.config.store_root / repo_slug / worktree_id
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         git_args = ["worktree", "add"]
         if not branch_exists:
-            git_args += ["-b", branch, str(target_path), base]  # type: ignore[list-item]
+            # When fetch=True use origin/<base> so the new branch starts from
+            # the freshly-fetched remote tip, not the (possibly stale) local ref.
+            base_ref = f"origin/{base}" if fetch else base
+            git_args += ["-b", branch, str(target_path), base_ref]  # type: ignore[list-item]
         else:
             git_args += [str(target_path), branch]
 
