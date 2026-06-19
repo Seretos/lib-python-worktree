@@ -75,7 +75,7 @@ def test_create_unknown_branch_without_base(
 def test_create_unknown_branch_with_base(
     manager: WorktreeManager, git_repo: Path
 ):
-    rec = manager.create(str(git_repo), "feature/new", base="main")
+    rec = manager.create(str(git_repo), "feature/new", base="main", fetch=False)
     assert rec.branch == "feature/new"
     assert Path(rec.path).exists()
     proc = subprocess.run(
@@ -335,7 +335,7 @@ def test_remove_deletes_branch_created_by_worktree_create(
     manager: WorktreeManager, git_repo: Path
 ):
     """Regression: branch created by 'git worktree add -b' must be deleted on remove."""
-    rec = manager.create(str(git_repo), "feature/new", base="main")
+    rec = manager.create(str(git_repo), "feature/new", base="main", fetch=False)
     assert rec.branch_created_by_us is True
 
     manager.remove(rec.id)
@@ -374,7 +374,7 @@ def test_remove_force_deletes_branch_with_unmerged_commits(
     manager: WorktreeManager, git_repo: Path
 ):
     """force=True must use 'git branch -D' to delete a branch with unmerged commits."""
-    rec = manager.create(str(git_repo), "feature/unmerged", base="main")
+    rec = manager.create(str(git_repo), "feature/unmerged", base="main", fetch=False)
     assert rec.branch_created_by_us is True
 
     # Commit something inside the worktree so the branch has unmerged commits.
@@ -402,7 +402,7 @@ def test_remove_tolerates_already_deleted_branch(
     manager: WorktreeManager, git_repo: Path
 ):
     """remove must be idempotent when the owned branch was already deleted."""
-    rec = manager.create(str(git_repo), "feature/gone", base="main")
+    rec = manager.create(str(git_repo), "feature/gone", base="main", fetch=False)
     assert rec.branch_created_by_us is True
 
     # ``git branch -D`` refuses a branch checked out in another worktree, so
@@ -422,7 +422,7 @@ def test_remove_unmerged_branch_without_force_cleans_state_and_raises(
 ):
     """force=False on an unmerged owned branch raises, but the state record is
     still cleaned up (the worktree dir was already removed)."""
-    rec = manager.create(str(git_repo), "feature/leak-test", base="main")
+    rec = manager.create(str(git_repo), "feature/leak-test", base="main", fetch=False)
     assert rec.branch_created_by_us is True
 
     # Add an unmerged commit so ``git branch -d`` will refuse.
@@ -1795,4 +1795,164 @@ def test_build_worktree_env_caller_env_overlays_last(tmp_path: Path):
 
     assert result["X"] == "caller", (
         "caller_env must win (applied last) over the base and worktree vars"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #59: create() must branch from origin/<base>, not stale local <base>
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+def test_create_fetch_false_uses_local_ref(manager: WorktreeManager, git_repo: Path):
+    """fetch=False (offline path) branches from the local ref and must succeed
+    even when there is no origin remote."""
+    rec = manager.create(str(git_repo), "feature/offline", base="main", fetch=False)
+    assert rec.branch == "feature/offline"
+    assert Path(rec.path).exists()
+    # Confirm the new worktree is on the expected branch.
+    proc = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=rec.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == "feature/offline"
+
+
+@pytest.mark.requires_git
+def test_create_fetch_true_raises_git_command_error_when_no_origin(
+    manager: WorktreeManager, git_repo: Path
+):
+    """With the default fetch=True, create() must raise GitCommandError when
+    the repo has no origin remote (fetch fails).
+
+    This guards that the default path does NOT silently fall back to the
+    local ref — it must surface the network/remote failure instead.
+    """
+    with pytest.raises(GitCommandError):
+        manager.create(str(git_repo), "feature/no-origin", base="main")
+
+
+@pytest.mark.requires_git
+def test_create_fetch_true_branches_from_origin_not_stale_local(
+    tmp_path: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Golden path: fetch=True branches the new worktree from origin/main's tip,
+    not from a stale local main.
+
+    Setup:
+    1. Create an upstream bare repo with one commit.
+    2. Clone it so that local main == upstream commit 1.
+    3. Add a second commit directly to upstream (local main is now stale).
+    4. Call create() with fetch=True (the default).
+    5. Assert the new worktree's HEAD matches the upstream tip (commit 2),
+       not the stale local main (commit 1).
+    """
+    # ---- Setup: upstream bare repo with initial commit ----
+    upstream = tmp_path / "upstream.git"
+    upstream.mkdir()
+    _git("init", "--bare", "-b", "main", cwd=upstream)
+    _git("config", "user.email", "test@example.com", cwd=upstream)
+    _git("config", "user.name", "Test", cwd=upstream)
+
+    # We need a non-bare working copy to create commits and push to upstream.
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _git("init", "-b", "main", cwd=staging)
+    _git("config", "user.email", "test@example.com", cwd=staging)
+    _git("config", "user.name", "Test", cwd=staging)
+    (staging / "README.md").write_text("commit 1\n", encoding="utf-8")
+    _git("add", "-A", cwd=staging)
+    _git("commit", "-q", "-m", "commit 1", cwd=staging)
+    _git("remote", "add", "origin", str(upstream), cwd=staging)
+    _git("push", "-u", "origin", "main", cwd=staging)
+
+    # ---- Clone: local main is at commit 1 ----
+    local = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(upstream), str(local)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=local,
+        check=True,
+        capture_output=True,
+    )
+
+    # Record commit 1 SHA (local main, which will become stale).
+    local_head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=local,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    # ---- Advance upstream: add commit 2 without updating local main ----
+    (staging / "extra.txt").write_text("commit 2\n", encoding="utf-8")
+    _git("add", "-A", cwd=staging)
+    _git("commit", "-q", "-m", "commit 2", cwd=staging)
+    _git("push", "origin", "main", cwd=staging)
+
+    # Record origin's tip (commit 2 SHA).
+    origin_head = subprocess.run(
+        ["git", "rev-parse", "origin/main"],
+        cwd=local,
+        # origin/main is NOT updated yet — fetch hasn't happened.
+        # We need the upstream's HEAD directly.
+        capture_output=True,
+        text=True,
+    )
+    # Get the upstream tip by checking staging's HEAD (which is commit 2).
+    upstream_tip = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=staging,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    # Confirm local is stale: local main != upstream tip.
+    assert local_head_before != upstream_tip, (
+        "Test setup error: local main must be behind upstream"
+    )
+
+    # ---- Call create() with default fetch=True ----
+    store_root = tmp_path / "store"
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=store_root),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+
+    rec = mgr.create(str(local), "feature/from-origin", base="main")
+    assert rec.branch == "feature/from-origin"
+    assert Path(rec.path).exists()
+
+    # ---- Assert: new worktree's HEAD == upstream tip (commit 2), not stale local ----
+    wt_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=rec.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    assert wt_head == upstream_tip, (
+        f"New worktree must start from origin/main (commit 2: {upstream_tip[:8]}), "
+        f"not stale local main (commit 1: {local_head_before[:8]}). "
+        f"Got: {wt_head[:8]}"
+    )
+    assert wt_head != local_head_before, (
+        "New worktree must NOT start from the stale local main"
     )
