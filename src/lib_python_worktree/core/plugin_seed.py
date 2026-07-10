@@ -17,8 +17,13 @@ the new worktree path.  The operation is:
   ``installPath`` already exists.
 - **Atomic**: the registry is written via a temp-file + ``os.replace`` so that
   a crash mid-write leaves the original intact.
-- **Removable**: the entire workaround is isolated here.  When Claude fixes the
-  upstream bug, delete this file and remove the call in ``manager.py``.
+- **Removable**: the entire workaround is isolated here.  Since ticket #62,
+  this is the *fallback* behind ``core.plugin_install.install_enabled_plugins``
+  (the CLI-driven ``claude plugin install --scope project`` mechanism), used
+  only when the ``claude`` CLI cannot be resolved on ``PATH``. Removal is
+  gated on **both** the upstream ``claude-code#61866`` fix landing **and**
+  retiring the CLI-driven primary mechanism — delete this file and the
+  fallback call in ``manager.py`` only once neither is needed.
 
 The real Claude plugin registry uses **Schema v2**::
 

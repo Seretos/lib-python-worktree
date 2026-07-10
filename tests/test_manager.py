@@ -1498,10 +1498,13 @@ def test_create_seeds_plugin_registry(
     git_repo: Path,
     tmp_path: Path,
 ):
-    """create() seeds project-scoped plugin registry entries for the new worktree.
+    """create() falls back to seed_plugin_registry when the claude CLI is unavailable.
 
-    A fake registry is set up with a project-scoped entry for the parent repo.
-    After create(), the registry must contain a clone of that entry with
+    Ticket #62: seed_plugin_registry() is now only invoked as a fallback
+    behind install_enabled_plugins() -- it fires when an enabledPlugins key
+    is declared but the claude CLI cannot be resolved on PATH. A fake
+    registry is set up with a project-scoped entry for the parent repo; after
+    create() the registry must contain a clone of that entry with
     projectPath set to the new worktree's native-OS path, and installPath /
     version preserved from the original.
     """
@@ -1534,8 +1537,20 @@ def test_create_seeds_plugin_registry(
         encoding="utf-8",
     )
 
+    # Declare an enabledPlugins entry so install_enabled_plugins() has
+    # something to act on -- otherwise it no-ops before ever consulting the
+    # claude CLI or falling back to seed_plugin_registry.
+    claude_dir = git_repo / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"my-plugin@marketplace": True}}),
+        encoding="utf-8",
+    )
+
     mgr = manager_factory()
     mgr._plugin_seed_config_dir = config_dir
+    # Force the claude CLI to appear unavailable so the fallback path fires.
+    mgr._plugin_install_which = lambda *_a, **_kw: None
 
     rec = mgr.create(str(git_repo), "feature/alpha")
 
@@ -1557,6 +1572,98 @@ def test_create_seeds_plugin_registry(
     assert cloned[0]["installPath"] == "/path/to/my-plugin"
     assert cloned[0]["version"] == "3.1.4"
     assert cloned[0]["scope"] == "project"
+
+
+# ---------------------------------------------------------------------------
+# Ticket #62: install_enabled_plugins() as the primary mechanism, with
+# seed_plugin_registry() as fallback
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_create_uses_cli_install_and_skips_seed_fallback_when_available(
+    manager_factory: Callable[..., WorktreeManager],
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch,
+):
+    """When the claude CLI is 'available' (fake which resolves), create()
+    installs enabledPlugins via the CLI and never falls back to
+    seed_plugin_registry()."""
+    monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+
+    claude_dir = git_repo / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"my-plugin@marketplace": True}}),
+        encoding="utf-8",
+    )
+
+    import types  # noqa: PLC0415
+
+    calls: list = []
+
+    def _fake_which(name):  # noqa: ANN001
+        return "C:/fake/claude.exe" if name == "claude" else None
+
+    def _fake_runner(cmd, *, cwd, timeout):  # noqa: ANN001
+        calls.append({"cmd": cmd, "cwd": cwd, "timeout": timeout})
+        return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    import lib_python_worktree.core.plugin_seed as _ps_module  # noqa: PLC0415
+    seed_calls: list = []
+    monkeypatch.setattr(
+        _ps_module, "seed_plugin_registry",
+        lambda *a, **kw: seed_calls.append((a, kw)),
+    )
+
+    mgr = manager_factory()
+    mgr._plugin_install_which = _fake_which
+    mgr._plugin_install_runner = _fake_runner
+    # Isolated config_dir so the idempotency check never consults a real
+    # ambient ~/.claude/plugins/installed_plugins.json on the host machine.
+    mgr._plugin_install_config_dir = tmp_path / "claude_install_config"
+
+    rec = mgr.create(str(git_repo), "feature/alpha")
+
+    assert len(calls) == 1
+    assert calls[0]["cmd"] == [
+        "C:/fake/claude.exe", "plugin", "install", "my-plugin@marketplace", "--scope", "project",
+    ]
+    assert calls[0]["cwd"] == rec.path
+    assert seed_calls == [], "seed_plugin_registry must not be called when the CLI is available"
+
+
+@pytest.mark.requires_git
+def test_create_falls_back_to_seed_when_cli_unavailable(
+    manager_factory: Callable[..., WorktreeManager],
+    git_repo: Path,
+    tmp_path: Path,
+    monkeypatch,
+):
+    """When install_enabled_plugins() reports claude_unavailable=True, create()
+    falls back to calling seed_plugin_registry()."""
+    monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+
+    claude_dir = git_repo / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"my-plugin@marketplace": True}}),
+        encoding="utf-8",
+    )
+
+    import lib_python_worktree.core.plugin_seed as _ps_module  # noqa: PLC0415
+    seed_calls: list = []
+    monkeypatch.setattr(
+        _ps_module, "seed_plugin_registry",
+        lambda *a, **kw: seed_calls.append((a, kw)),
+    )
+
+    mgr = manager_factory()
+    mgr._plugin_install_which = lambda *_a, **_kw: None  # simulate CLI absent
+
+    mgr.create(str(git_repo), "feature/alpha")
+
+    assert len(seed_calls) == 1
 
 
 # ---------------------------------------------------------------------------
