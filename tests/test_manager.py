@@ -1493,42 +1493,41 @@ import json  # noqa: E402
 
 
 @pytest.mark.requires_git
-def test_create_seeds_plugin_registry(
+def test_create_clones_plugin_registry_entry_without_cli(
     manager_factory: Callable[..., WorktreeManager],
     git_repo: Path,
     tmp_path: Path,
 ):
-    """create() falls back to seed_plugin_registry when the claude CLI is unavailable.
+    """create() registers enabledPlugins via registry clone even when the
+    claude CLI is unavailable (ticket #64).
 
-    Ticket #62: seed_plugin_registry() is now only invoked as a fallback
-    behind install_enabled_plugins() -- it fires when an enabledPlugins key
-    is declared but the claude CLI cannot be resolved on PATH. A fake
-    registry is set up with a project-scoped entry for the parent repo; after
+    ``seed_plugin_registry`` is no longer wired from ``manager.py`` at all --
+    ``install_enabled_plugins`` is now self-sufficient. A fake registry is
+    set up with a *structurally valid* entry (real on-disk
+    ``.claude-plugin/plugin.json``) for an unrelated project path; after
     create() the registry must contain a clone of that entry with
     projectPath set to the new worktree's native-OS path, and installPath /
-    version preserved from the original.
+    version preserved from the original -- all without the claude CLI ever
+    being resolvable.
     """
-    # Build a fake config_dir with a plugin registry entry for the parent repo.
+    # Build a fake config_dir with a structurally-valid plugin registry entry.
     config_dir = tmp_path / "fake_claude"
     plugins_dir = config_dir / "plugins"
     plugins_dir.mkdir(parents=True)
 
-    # We need the resolved repo path as stored in WorktreeRecord.repo_root
-    # (as_posix()).  Use _validate_repo logic: resolve + as_posix.
-    import subprocess as _subprocess  # noqa: PLC0415
-    result = _subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(git_repo),
-        capture_output=True,
-        text=True,
-    )
-    repo_root_posix = Path(result.stdout.strip()).resolve().as_posix()
+    # A real on-disk install so `_is_structurally_valid` accepts it as a
+    # clone source.
+    install_dir = tmp_path / "cache" / "my-plugin"
+    manifest_dir = install_dir / ".claude-plugin"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "plugin.json").write_text("{}", encoding="utf-8")
+    install_path = str(install_dir)
 
     registry_path = plugins_dir / "installed_plugins.json"
     original_entry = {
         "scope": "project",
-        "projectPath": repo_root_posix,
-        "installPath": "/path/to/my-plugin",
+        "projectPath": "/some/unrelated/project",
+        "installPath": install_path,
         "version": "3.1.4",
     }
     # Write Schema v2 registry (the real format used by Claude Code).
@@ -1538,8 +1537,7 @@ def test_create_seeds_plugin_registry(
     )
 
     # Declare an enabledPlugins entry so install_enabled_plugins() has
-    # something to act on -- otherwise it no-ops before ever consulting the
-    # claude CLI or falling back to seed_plugin_registry.
+    # something to act on.
     claude_dir = git_repo / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "settings.json").write_text(
@@ -1548,8 +1546,8 @@ def test_create_seeds_plugin_registry(
     )
 
     mgr = manager_factory()
-    mgr._plugin_seed_config_dir = config_dir
-    # Force the claude CLI to appear unavailable so the fallback path fires.
+    mgr._plugin_install_config_dir = config_dir
+    # Force the claude CLI to appear unavailable -- clone-first must still work.
     mgr._plugin_install_which = lambda *_a, **_kw: None
 
     rec = mgr.create(str(git_repo), "feature/alpha")
@@ -1559,7 +1557,7 @@ def test_create_seeds_plugin_registry(
     plugin_list = data["plugins"]["my-plugin@marketplace"]
 
     # The original must still be there.
-    src = [e for e in plugin_list if e.get("projectPath") == repo_root_posix]
+    src = [e for e in plugin_list if e.get("projectPath") == "/some/unrelated/project"]
     assert len(src) == 1
 
     # A clone for the worktree must have been added.
@@ -1569,7 +1567,7 @@ def test_create_seeds_plugin_registry(
         f"Expected exactly one cloned registry entry with projectPath={expected_dest!r}, "
         f"got {cloned!r}"
     )
-    assert cloned[0]["installPath"] == "/path/to/my-plugin"
+    assert cloned[0]["installPath"] == install_path
     assert cloned[0]["version"] == "3.1.4"
     assert cloned[0]["scope"] == "project"
 
@@ -1634,14 +1632,16 @@ def test_create_uses_cli_install_and_skips_seed_fallback_when_available(
 
 
 @pytest.mark.requires_git
-def test_create_falls_back_to_seed_when_cli_unavailable(
+def test_create_never_calls_seed_when_cli_unavailable(
     manager_factory: Callable[..., WorktreeManager],
     git_repo: Path,
     tmp_path: Path,
     monkeypatch,
 ):
-    """When install_enabled_plugins() reports claude_unavailable=True, create()
-    falls back to calling seed_plugin_registry()."""
+    """seed_plugin_registry is retired from manager.py (ticket #64): even when
+    install_enabled_plugins() reports claude_unavailable=True (and there is no
+    valid clone source, so the key ends up failed), create() must never call
+    it -- and must still return successfully (best-effort)."""
     monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
 
     claude_dir = git_repo / ".claude"
@@ -1660,10 +1660,14 @@ def test_create_falls_back_to_seed_when_cli_unavailable(
 
     mgr = manager_factory()
     mgr._plugin_install_which = lambda *_a, **_kw: None  # simulate CLI absent
+    # Isolated, empty config_dir -- no clone source exists anywhere, so the
+    # key ends up in `failed`; create() must still succeed (best-effort).
+    mgr._plugin_install_config_dir = tmp_path / "claude_install_config"
 
-    mgr.create(str(git_repo), "feature/alpha")
+    rec = mgr.create(str(git_repo), "feature/alpha")
 
-    assert len(seed_calls) == 1
+    assert rec is not None
+    assert seed_calls == [], "seed_plugin_registry must never be called (retired in #64)"
 
 
 # ---------------------------------------------------------------------------
@@ -1791,11 +1795,14 @@ def test_manager_run_seed_postprocess_setup_failed_error_propagates(tmp_path: Pa
 
 
 def test_create_tolerates_seed_failure(monkeypatch):
-    """create() returns normally even when seed_plugin_registry raises.
+    """create() returns normally even if seed_plugin_registry were to raise.
 
-    Uses InMemoryStateStore (no git, no filesystem worktree).  The seed
-    function is monkeypatched to raise, and we verify that create() swallows
-    the error and still returns the created record.
+    seed_plugin_registry is retired from manager.py's create() as of ticket
+    #64 (superseded by install_enabled_plugins' clone-first mechanism), so
+    this monkeypatch is now inert -- it is kept to document that create()
+    never depends on that module, and would still tolerate a failure there
+    if some caller ever re-wired it. Uses InMemoryStateStore (no git, no
+    filesystem worktree).
     """
     import lib_python_worktree.core.plugin_seed as _ps_module  # noqa: PLC0415
 

@@ -453,15 +453,16 @@ class WorktreeManager:
                 raise
 
         # Install the worktree's enabledPlugins so that project-scoped
-        # plugins are active without a manual /reload-plugins. Primary
-        # mechanism (ticket #62): `claude plugin install --scope project`.
-        # Falls back to the plugin_seed registry-clone workaround (ticket
-        # #39, anthropics/claude-code#61866) only when the claude CLI itself
-        # cannot be resolved on PATH. Both are best-effort — failures here
-        # must never fail create().
+        # plugins are active without a manual /reload-plugins. Clone-first
+        # mechanism (ticket #64): registers each key by cloning an existing,
+        # structurally-valid registry entry under a lock, falling back to
+        # `claude plugin install --scope project` only when no valid clone
+        # source exists. This is now self-sufficient (no `claude` CLI on
+        # PATH required), so the old plugin_seed fallback wiring has been
+        # retired. Best-effort — failures here must never fail create().
         try:
             from .plugin_install import install_enabled_plugins  # noqa: PLC0415
-            _install_result = install_enabled_plugins(
+            install_enabled_plugins(
                 record.repo_root,
                 record.path,
                 worktree_id=record.id,
@@ -469,13 +470,6 @@ class WorktreeManager:
                 which=self._plugin_install_which,
                 runner=self._plugin_install_runner,
             )
-            if _install_result.claude_unavailable:
-                from .plugin_seed import seed_plugin_registry  # noqa: PLC0415
-                seed_plugin_registry(
-                    record.repo_root,
-                    record.path,
-                    config_dir=self._plugin_seed_config_dir,
-                )
         except Exception:  # noqa: BLE001
             pass
 
