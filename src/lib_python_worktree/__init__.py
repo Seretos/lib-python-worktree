@@ -54,6 +54,7 @@ from .core.process_lifecycle import (
     ProcessLifecycleError,
     ProcessNotRunningError,
 )
+from .core.plugin_install import PluginInstallResult, install_enabled_plugins
 from .core.port_allocator import PortAllocator
 from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
 from .core.yaml_store import AdoptReport, ReconcileReport, YamlStateStore, adopt, reconcile
@@ -91,6 +92,9 @@ __all__ = [
     # port allocator
     "PortAllocator",
     "PortAllocationError",
+    # plugin install (ticket #62)
+    "install_enabled_plugins",
+    "PluginInstallResult",
     # state
     "WorktreeRecord",
     "StateStore",

@@ -22,6 +22,7 @@ The engine is fully implemented under `src/lib_python_worktree/`. Key modules:
 - `core/port_allocator.py` — `PortAllocator` (locked, atomic read-modify-write against `ports.yaml`)
 - `core/process_lifecycle.py` — `start` / `stop` (detached process management, cross-platform)
 - `core/_git_utils.py` — `_run_git` (timeout-hardened git subprocess runner)
+- `core/plugin_install.py` — `install_enabled_plugins` (CLI-driven `enabledPlugins` install; primary mechanism, with `plugin_seed` as fallback)
 - `core/_exceptions.py` — `WorktreeError` base hierarchy (`GitTimeoutError`, `DirtyWorktreeError`, etc.)
 - `contract/schema.py` — `WorktreeContract`, `Step`, `PortSlot` (Pydantic v2 models)
 - `contract/loader.py` — `load()`, `load_text()` (missing/empty file → implicit `isolation: none`)
@@ -64,6 +65,7 @@ in `__all__` directly.
 | `WORKTREE_PORT_RANGE` | `30000-40000` | `"<low>-<high>"` | Inclusive TCP port range from which `PortAllocator` draws ports. |
 | `WORKTREE_LOG_ROOT` | `~/.agent-worktree/logs` | filesystem path | Root directory for per-step setup/teardown log files. |
 | `WORKTREE_GIT_TIMEOUT_SEC` | `30.0` | float string or `""` | Seconds before a `git` subprocess is killed and `GitTimeoutError` raised. Empty string disables the timeout. |
+| `WORKTREE_PLUGIN_INSTALL_TIMEOUT_SEC` | `60.0` | float string or `""` | Seconds before a `claude plugin install` subprocess is killed. Empty string disables the timeout. |
 
 ## Release is pipeline-owned
 
