@@ -1,4 +1,9 @@
 {
+  "extraKnownMarketplaces": {
+    "agent-marketplace": {
+      "source": { "source": "github", "repo": "Seretos/agent-marketplace" }
+    }
+  },
   "enabledPlugins": {
     "agent-project-issues@agent-marketplace": true,
     "agent-worktree@agent-marketplace": true,
