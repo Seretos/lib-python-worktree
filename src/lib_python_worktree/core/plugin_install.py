@@ -1,4 +1,4 @@
-"""CLI-driven install of a worktree's ``enabledPlugins`` (ticket #62).
+"""Clone-first install of a worktree's ``enabledPlugins`` (tickets #62, #64).
 
 Since Claude Code v2.1.195, a plugin declared in a project's
 ``.claude/settings.json`` ``enabledPlugins`` block fails to load unless there
@@ -6,17 +6,29 @@ is a registered installation for the *exact* project path in
 ``~/.claude/plugins/installed_plugins.json``.  A freshly-created git worktree
 never has such a registration, so plugins silently fail to load.
 
-This module is the **primary** mechanism for fixing that: for every truthy
-key in the merged ``enabledPlugins`` map (``settings.json`` +
-``settings.local.json``, local wins per-key), it shells out to::
+For every truthy key in the merged ``enabledPlugins`` map (``settings.json``
++ ``settings.local.json``, local wins per-key), this module now:
 
-    claude plugin install <name>@<marketplace> --scope project
+1. Looks for an existing, structurally-valid registry entry for that key
+   (any scope/projectPath — it only needs a real install on disk) and, if
+   found, **clones** it under a lock into a new ``scope: "project"`` entry
+   pointed at the worktree path. This is the **primary** mechanism (ticket
+   #64): it never shells out, so it cannot hit the Windows
+   ``EPERM``/``rm``-style failures that ``claude plugin install`` can trigger
+   against files the CLI itself has open.
+2. Falls back to shelling out to::
 
-with ``cwd`` set to the new worktree, so Claude registers the install against
-the worktree's own path.  ``core.plugin_seed.seed_plugin_registry`` (ticket
-#39, workaround for anthropics/claude-code#61866) remains as the **fallback**
-for when the ``claude`` CLI itself cannot be resolved on ``PATH`` — see that
-module's docstring for the removal conditions of the fallback.
+       claude plugin install <name>@<marketplace> --scope project
+
+   with ``cwd`` set to the new worktree, only when no valid clone source
+   exists. If the CLI invocation itself fails, a **second-chance clone** is
+   attempted before giving up (the CLI may have partially populated the
+   registry with a now-valid source).
+
+``core.plugin_seed.seed_plugin_registry`` (ticket #39, workaround for
+anthropics/claude-code#61866) is no longer wired from ``manager.py`` as of
+#64 — the clone-first mechanism above supersedes it. See that module's
+docstring for removal conditions.
 
 The operation is:
 
@@ -24,9 +36,11 @@ The operation is:
   site in ``manager.py``, *not* here.  This module never raises for expected
   "nothing to do" conditions (missing settings files, malformed JSON, no CLI
   on PATH) — it reports them via the returned ``PluginInstallResult`` instead.
-- **Idempotent**: a plugin key already registered with ``scope: "project"``
-  and a matching ``projectPath`` for this worktree is skipped rather than
-  re-installed.
+- **Idempotent**: a plugin key already registered with ``scope: "project"``,
+  a matching ``projectPath`` for this worktree, and a *structurally valid*
+  ``installPath`` is skipped rather than re-installed. A broken registration
+  (missing/corrupt ``installPath``) is treated as not-yet-installed so it
+  self-repairs.
 - **Batch-resilient**: a failure (nonzero exit, timeout, spawn error) for one
   plugin key never aborts the remaining keys in the batch.
 """
@@ -38,11 +52,15 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+import portalocker
+
 from ..setup.runner import _slug, log_dir_for
+from .yaml_store import _LOCK_FLAGS, _LOCK_TIMEOUT
 
 _INSTALL_TIMEOUT_ENV = "WORKTREE_PLUGIN_INSTALL_TIMEOUT_SEC"
 _INSTALL_TIMEOUT_DEFAULT = 60.0
@@ -164,6 +182,10 @@ def _already_registered(registry_data: dict, key: str, worktree_path: str) -> bo
 
     Uses the same ``Path(...)``/``os.path.normcase`` normalisation approach
     as ``plugin_seed.seed_plugin_registry`` for Windows-safe path comparison.
+    A matching entry only counts as "already registered" if its
+    ``installPath`` is structurally valid (ticket #64) — a registration
+    pointing at a missing/broken install must fall through so the worktree
+    self-repairs instead of staying silently broken.
     """
     plugins = registry_data.get("plugins") if isinstance(registry_data, dict) else None
     if not isinstance(plugins, dict):
@@ -181,9 +203,146 @@ def _already_registered(registry_data: dict, key: str, worktree_path: str) -> bo
         project_path = entry.get("projectPath")
         if not isinstance(project_path, str):
             continue
-        if os.path.normcase(str(Path(project_path))) == norm_wt:
+        if os.path.normcase(str(Path(project_path))) == norm_wt and _is_structurally_valid(
+            entry.get("installPath")
+        ):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Clone-first registration (ticket #64)
+# ---------------------------------------------------------------------------
+
+
+def _is_structurally_valid(install_path: Optional[str]) -> bool:
+    """True if *install_path* points at a real, parseable plugin install.
+
+    Requires ``<install_path>/.claude-plugin/plugin.json`` to exist and
+    parse as JSON. This is the single validity predicate reused by the clone
+    source picker and by :func:`_already_registered`.
+    """
+    if not install_path or not isinstance(install_path, str):
+        return False
+    manifest = Path(install_path) / ".claude-plugin" / "plugin.json"
+    try:
+        json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _find_clone_source(registry_data: dict, key: str) -> Optional[dict]:
+    """Return the best structurally-valid registry entry to clone for *key*.
+
+    Any scope/projectPath is acceptable — it is only used as a read-only
+    template for the ``installPath`` (and version metadata) of an existing,
+    on-disk plugin install. Returns ``None`` when no valid candidate exists.
+
+    Picks the entry with the newest ``(installedAt, resolvedVersion)`` pair;
+    missing fields sort oldest. Ties are broken in favour of the
+    later-listed entry (Python's stable sort + ``max`` keeps the last
+    maximum encountered).
+    """
+    plugins = registry_data.get("plugins") if isinstance(registry_data, dict) else None
+    if not isinstance(plugins, dict):
+        return None
+    entry_list = plugins.get(key)
+    if not isinstance(entry_list, list):
+        return None
+
+    candidates = [
+        entry
+        for entry in entry_list
+        if isinstance(entry, dict) and _is_structurally_valid(entry.get("installPath"))
+    ]
+    if not candidates:
+        return None
+
+    def _sort_key(entry: dict) -> tuple:
+        return (entry.get("installedAt") or "", entry.get("resolvedVersion") or "")
+
+    best = candidates[0]
+    best_key = _sort_key(best)
+    for entry in candidates[1:]:
+        entry_key = _sort_key(entry)
+        if entry_key >= best_key:
+            best = entry
+            best_key = entry_key
+    return best
+
+
+def _clone_entry_to_worktree(
+    config_dir: Path, key: str, source_entry: dict, worktree_path: str
+) -> bool:
+    """Clone *source_entry* into a new project-scoped entry for *worktree_path*.
+
+    Performs the full read-modify-write under an exclusive lock on the
+    registry's lock file so concurrent worktree creations never race each
+    other or lose an update. Returns ``True`` if a new entry was written,
+    ``False`` if nothing was written (already present, or the registry is
+    not a valid Schema-v2 document to write into).
+    """
+    registry_path = config_dir / "plugins" / "installed_plugins.json"
+    lock_path = str(registry_path) + ".lock"
+
+    with portalocker.Lock(lock_path, timeout=_LOCK_TIMEOUT, flags=_LOCK_FLAGS):
+        data = _load_registry(config_dir)
+        if not data:
+            return False
+
+        plugins: Dict[str, list] = data["plugins"]
+        dest = str(Path(worktree_path))
+        norm_dest = os.path.normcase(dest)
+
+        entry_list = plugins.get(key)
+        if not isinstance(entry_list, list):
+            entry_list = []
+            plugins[key] = entry_list
+
+        for entry in entry_list:
+            if not isinstance(entry, dict):
+                continue
+            if (
+                entry.get("scope") == "project"
+                and isinstance(entry.get("projectPath"), str)
+                and os.path.normcase(str(Path(entry["projectPath"]))) == norm_dest
+                and entry.get("installPath") == source_entry.get("installPath")
+            ):
+                return False
+
+        cloned = dict(source_entry)
+        cloned["scope"] = "project"
+        cloned["projectPath"] = dest
+        entry_list.append(cloned)
+
+        tmp_path: Optional[str] = None
+        try:
+            registry_dir = registry_path.parent
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(registry_dir), suffix=".tmp", prefix="installed_plugins_"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2)
+                    fh.flush()
+            except Exception:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp_path, str(registry_path))
+            tmp_path = None
+        except Exception:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -319,15 +478,23 @@ def install_enabled_plugins(
 ) -> PluginInstallResult:
     """Install *repo_root*'s ``enabledPlugins`` into *worktree_path*.
 
-    Primary mechanism for ticket #62: shells out to
-    ``claude plugin install <key> --scope project`` with ``cwd`` set to the
-    worktree, for every enabled plugin key not already project-registered for
-    that worktree. If the ``claude`` CLI cannot be resolved on PATH, returns
-    immediately with ``claude_unavailable=True`` so the caller can fall back
-    to ``plugin_seed.seed_plugin_registry``.
+    Clone-first primary mechanism (ticket #64): for every enabled plugin key
+    not already validly project-registered for this worktree, first tries to
+    register it by cloning an existing, structurally-valid registry entry
+    (any scope) under a lock — this never shells out, so it cannot hit the
+    Windows ``EPERM``-style failures that ``claude plugin install`` can
+    trigger. Only when no valid clone source exists does it fall back to::
 
-    Never raises for expected conditions; per-key subprocess failures are
-    collected into ``failed`` and the batch continues.
+        claude plugin install <key> --scope project
+
+    with ``cwd`` set to the worktree. If the CLI invocation itself fails, one
+    more clone attempt is made (the CLI may have partially populated the
+    registry) before the key is recorded as failed. When the ``claude`` CLI
+    cannot be resolved on PATH at all, ``claude_unavailable=True`` is still
+    set for observability, but clone-first continues to run regardless.
+
+    Never raises for expected conditions; per-key failures are collected
+    into ``failed`` and the batch continues.
     """
     result = PluginInstallResult()
 
@@ -342,7 +509,6 @@ def install_enabled_plugins(
             "claude CLI not found on PATH; cannot install enabledPlugins "
             "via 'claude plugin install --scope project'."
         )
-        return result
 
     resolved_config_dir = config_dir if config_dir is not None else _default_config_dir()
     registry_data = _load_registry(resolved_config_dir)
@@ -358,12 +524,28 @@ def install_enabled_plugins(
         return result
 
     resolved_worktree_id = worktree_id or Path(worktree_path).name
-    log_dir = log_dir_for(resolved_worktree_id)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
     effective_timeout = _resolve_install_timeout(timeout)
+    log_dir: Optional[Path] = None
 
     for key in remaining:
+        source = _find_clone_source(registry_data, key)
+        if source is not None:
+            # Whether newly cloned or already present (idempotent no-op),
+            # the key is now validly registered without touching the CLI.
+            _clone_entry_to_worktree(resolved_config_dir, key, source, worktree_path)
+            result.installed.append(key)
+            continue
+
+        if exe is None:
+            result.failed.append(key)
+            result.warnings.append(
+                f"{key!r}: no structurally-valid clone source and claude CLI unavailable"
+            )
+            continue
+
+        if log_dir is None:
+            log_dir = log_dir_for(resolved_worktree_id)
+            log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"plugin-install-{_slug(key)}.log"
         rc, timed_out = _run_install(
             exe,
@@ -375,13 +557,29 @@ def install_enabled_plugins(
         )
         if rc == 0:
             result.installed.append(key)
-        elif timed_out:
-            result.failed.append(key)
+            continue
+
+        # Second-chance clone: the CLI may have partially populated the
+        # registry with a now-valid source even though the overall install
+        # failed (e.g. the Windows EPERM failure this ticket targets).
+        recovery_source = _find_clone_source(_load_registry(resolved_config_dir), key)
+        if recovery_source is not None:
+            # Whether newly cloned or already present, the key is now
+            # validly registered — same "found a source" semantics as the
+            # primary clone-first attempt above.
+            _clone_entry_to_worktree(resolved_config_dir, key, recovery_source, worktree_path)
+            result.installed.append(key)
+            result.warnings.append(
+                f"{key!r}: CLI install failed (code {rc}); recovered via registry clone"
+            )
+            continue
+
+        result.failed.append(key)
+        if timed_out:
             result.warnings.append(
                 f"plugin install for {key!r} timed out after {effective_timeout}s"
             )
         else:
-            result.failed.append(key)
             result.warnings.append(
                 f"plugin install for {key!r} exited with code {rc}"
             )
