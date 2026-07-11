@@ -16,6 +16,7 @@ from lib_python_worktree.setup.runner import (
     SetupFailedError,
     SetupRunner,
     _PlainStep,
+    _resolve_setup_timeout,
     _resolve_shell,
     log_dir_for,
 )
@@ -23,9 +24,23 @@ from lib_python_worktree.setup.runner import (
 
 @dataclass
 class _FakeProc:
+    """Popen-shaped fake: exposes ``.communicate()`` / ``.kill()``.
+
+    ``self._runner`` is now a ``(cmd, *, cwd, env) -> Popen-like`` seam (see
+    runner.py's ``_invoke``), so fakes must return an object shaped like a
+    ``Popen`` rather than a ``subprocess.run``-style ``CompletedProcess``.
+    """
+
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    kill_called: bool = False
+
+    def communicate(self, timeout=None):
+        return (self.stdout, self.stderr)
+
+    def kill(self):
+        self.kill_called = True
 
 
 def _real_runner(*args, **kwargs):
@@ -134,7 +149,7 @@ def test_env_vars_injected(tmp_path: Path, monkeypatch):
     calls: List[List[str]] = []
     seen_env: List[dict] = []
 
-    def fake_run(cmd, *, cwd, env, capture_output, text, check):
+    def fake_run(cmd, *, cwd, env):
         calls.append(list(cmd))
         seen_env.append(dict(env))
         return _FakeProc(returncode=0, stdout="ok", stderr="")
@@ -259,7 +274,7 @@ def test_build_env_uses_get_user_profile_env_as_base(tmp_path: Path):
 
     seen_env: List[dict] = []
 
-    def fake_run(cmd, *, cwd, env, capture_output, text, check):
+    def fake_run(cmd, *, cwd, env):
         seen_env.append(dict(env))
         return _FakeProc(returncode=0, stdout="", stderr="")
 
@@ -299,7 +314,7 @@ def test_build_env_self_env_overlays_profile_base(tmp_path: Path):
 
     seen_env: List[dict] = []
 
-    def fake_run(cmd, *, cwd, env, capture_output, text, check):
+    def fake_run(cmd, *, cwd, env):
         seen_env.append(dict(env))
         return _FakeProc(returncode=0, stdout="", stderr="")
 
@@ -325,3 +340,241 @@ def test_build_env_self_env_overlays_profile_base(tmp_path: Path):
     assert env["ONLY_IN_PROFILE"] == "yes", (
         "keys only in profile base must still appear when self._env does not override them"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #66: SetupRunner._invoke has no subprocess timeout -- a wedged
+# setup/teardown step must be killed rather than hanging forever.
+# ---------------------------------------------------------------------------
+
+
+class _TimeoutThenDrainProc:
+    """Fake Popen whose first ``communicate()`` call always times out.
+
+    Records whether ``kill()`` was called and how many times ``communicate()``
+    was invoked (so tests can assert the bounded post-kill drain happened).
+    """
+
+    def __init__(self) -> None:
+        self.returncode = -1
+        self.kill_called = False
+        self.communicate_calls: List[Optional[float]] = []
+
+    def communicate(self, timeout=None):
+        self.communicate_calls.append(timeout)
+        raise subprocess.TimeoutExpired(cmd=["fake"], timeout=timeout)
+
+    def kill(self):
+        self.kill_called = True
+
+
+def test_invoke_timeout_raises_setup_failed_error_and_kills_process(tmp_path: Path):
+    """Regression test for ticket #66.
+
+    A step whose ``communicate(timeout=...)`` raises ``TimeoutExpired`` must
+    be killed, have a bounded post-kill drain attempted, get a log file
+    written with a synthetic ``returncode == -1``, and surface as a
+    ``SetupFailedError`` (not an unhandled hang) with a "timed out after"
+    message and the correct step identity.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    procs: List[_TimeoutThenDrainProc] = []
+
+    def fake_runner(cmd, *, cwd, env):
+        proc = _TimeoutThenDrainProc()
+        procs.append(proc)
+        return proc
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_runner)
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run=_native_echo("wedged"), name="wedged-step")],
+            worktree_id="wt-timeout",
+            worktree_path=wt,
+            branch="main",
+            timeout=0.01,
+        )
+
+    err = exc_info.value
+    assert err.returncode == -1
+    assert err.step_index == 0
+    assert err.step_name == "wedged-step"
+    assert err.timeout == 0.01
+    assert "timed out after" in str(err)
+    assert err.log_path.exists()
+
+    assert len(procs) == 1
+    proc = procs[0]
+    assert proc.kill_called, "the wedged process must be killed"
+    # First call is the real (short) timeout; second is the bounded 5s drain.
+    assert len(proc.communicate_calls) == 2
+    assert proc.communicate_calls[0] == 0.01
+    assert proc.communicate_calls[1] == 5
+
+
+def test_invoke_timeout_none_disables_timeout_and_never_kills(tmp_path: Path, monkeypatch):
+    """``timeout=None`` with empty-string env fully disables the timeout.
+
+    Confirms the seam's ``communicate()`` is invoked with ``timeout=None``
+    (nothing passed into the seam) and ``kill()`` is never called for a step
+    that completes normally, when ``WORKTREE_SETUP_TIMEOUT_SEC=""``.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    seen_timeouts: List[Optional[float]] = []
+    procs: List[_FakeProc] = []
+
+    def fake_run(cmd, *, cwd, env):
+        proc = _FakeProc(returncode=0, stdout="ok", stderr="")
+        original_communicate = proc.communicate
+
+        def communicate(timeout=None):
+            seen_timeouts.append(timeout)
+            return original_communicate(timeout=timeout)
+
+        proc.communicate = communicate  # type: ignore[method-assign]
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "")
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    res = runner.run(
+        setup=[_PlainStep(run=_native_echo("no-timeout"), name="probe")],
+        worktree_id="wt-no-timeout",
+        worktree_path=wt,
+        branch="main",
+        timeout=None,
+    )
+    assert res.ok
+    assert seen_timeouts == [None]
+    assert procs[0].kill_called is False
+
+
+def test_real_timeout_kills_wedged_process(tmp_path: Path):
+    """End-to-end: a step that actually sleeps well past its timeout.
+
+    Runs a real subprocess (via the runner's normal shell-resolution path,
+    with the default ``_default_popen`` seam) that sleeps 30s, with
+    ``timeout=0.5``. Asserts control returns promptly (proving the kill path
+    works) rather than after the full 30s sleep.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    code = "import time; time.sleep(30)"
+    if sys.platform == "win32":
+        run_line = f"& '{sys.executable}' -c '{code}'"
+    else:
+        import shlex  # noqa: PLC0415
+
+        run_line = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+    runner = SetupRunner(log_root=tmp_path / "logs")
+
+    import time as _time  # noqa: PLC0415
+
+    start = _time.monotonic()
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run=run_line, name="sleeper")],
+            worktree_id="wt-real-timeout",
+            worktree_path=wt,
+            branch="main",
+            timeout=0.5,
+        )
+    elapsed = _time.monotonic() - start
+
+    assert exc_info.value.returncode == -1
+    assert exc_info.value.timeout == 0.5
+    # Must return well before the 30s sleep would complete.
+    assert elapsed < 15
+
+
+# ---------------------------------------------------------------------------
+# _resolve_setup_timeout precedence (mirrors _resolve_git_timeout /
+# _resolve_install_timeout)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_setup_timeout_explicit_wins(monkeypatch):
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "5")
+    assert _resolve_setup_timeout(12.5) == 12.5
+
+
+def test_resolve_setup_timeout_env_used_when_no_explicit(monkeypatch):
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "5")
+    assert _resolve_setup_timeout(None) == 5.0
+
+
+def test_resolve_setup_timeout_empty_env_disables(monkeypatch):
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "")
+    assert _resolve_setup_timeout(None) is None
+
+
+def test_resolve_setup_timeout_garbage_env_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "not-a-number")
+    assert _resolve_setup_timeout(None) == 300.0
+
+
+def test_resolve_setup_timeout_no_env_uses_default(monkeypatch):
+    monkeypatch.delenv("WORKTREE_SETUP_TIMEOUT_SEC", raising=False)
+    assert _resolve_setup_timeout(None) == 300.0
+
+
+def test_resolve_setup_timeout_zero_or_negative_env_disables(monkeypatch):
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "0")
+    assert _resolve_setup_timeout(None) is None
+    monkeypatch.setenv("WORKTREE_SETUP_TIMEOUT_SEC", "-1")
+    assert _resolve_setup_timeout(None) is None
+
+
+def test_run_timeout_kwarg_overrides_instance_timeout(tmp_path: Path):
+    """``run(timeout=...)`` overrides the instance-level ``self.timeout``."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    seen_timeouts: List[Optional[float]] = []
+
+    def fake_run(cmd, *, cwd, env):
+        proc = _FakeProc(returncode=0, stdout="", stderr="")
+        original_communicate = proc.communicate
+
+        def communicate(timeout=None):
+            seen_timeouts.append(timeout)
+            return original_communicate(timeout=timeout)
+
+        proc.communicate = communicate  # type: ignore[method-assign]
+        return proc
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run, timeout=99.0)
+    runner.run(
+        setup=[_PlainStep(run="probe", name="probe")],
+        worktree_id="wt-override",
+        worktree_path=wt,
+        branch="main",
+        timeout=7.0,
+    )
+    assert seen_timeouts == [7.0]
+
+
+def test_successful_step_still_logs_returncode_zero_with_timeout_plumbing(tmp_path: Path):
+    """Guard: threading timeout support through _invoke must not regress the
+    happy path -- a successful step still logs ``returncode: 0`` and returns
+    normally."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    res = runner.run(
+        setup=[_PlainStep(run=_native_echo("still-fine"), name="probe")],
+        worktree_id="wt-happy",
+        worktree_path=wt,
+        branch="main",
+        timeout=30,
+    )
+    assert res.ok
+    assert res.steps[0].returncode == 0
+    text = res.steps[0].log_path.read_text(encoding="utf-8")
+    assert "# returncode: 0" in text
