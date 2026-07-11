@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -15,7 +18,9 @@ from lib_python_worktree.setup.runner import (
     LOG_ROOT_ENV,
     SetupFailedError,
     SetupRunner,
+    _default_popen,
     _PlainStep,
+    _resolve_lower_priority,
     _resolve_setup_timeout,
     _resolve_shell,
     log_dir_for,
@@ -578,3 +583,228 @@ def test_successful_step_still_logs_returncode_zero_with_timeout_plumbing(tmp_pa
     assert res.steps[0].returncode == 0
     text = res.steps[0].log_path.read_text(encoding="utf-8")
     assert "# returncode: 0" in text
+
+
+# ---------------------------------------------------------------------------
+# Ticket #68: SetupRunner._default_popen lowers OS scheduling/IO priority of
+# setup-step subprocesses so a heavy step (e.g. `npm install`) doesn't starve
+# unrelated concurrent work in the calling application.
+# ---------------------------------------------------------------------------
+
+import lib_python_worktree.setup.runner as _runner_module  # noqa: E402
+
+
+class _RecordingPopen:
+    """Stand-in for ``subprocess.Popen`` that records call args without
+    actually spawning anything."""
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd = cmd
+        self.kwargs = kwargs
+
+
+def _patch_windows_priority_constants(monkeypatch):
+    """Ensure the Windows-only priority constants exist regardless of the OS
+    actually running the test (CI runs this suite on both windows-latest and
+    ubuntu-22.04; these constants only exist natively on the win32 build of
+    ``subprocess``)."""
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000, raising=False)
+
+
+def test_default_popen_windows_lowers_priority_and_keeps_create_no_window(
+    tmp_path: Path, monkeypatch
+):
+    """Toggle enabled (default) on Windows: BELOW_NORMAL_PRIORITY_CLASS is
+    OR'd into creationflags without dropping CREATE_NO_WINDOW (PR #66)."""
+    _patch_windows_priority_constants(monkeypatch)
+    monkeypatch.setattr(_runner_module.sys, "platform", "win32")
+    monkeypatch.delenv("WORKTREE_SETUP_LOWER_PRIORITY", raising=False)
+    monkeypatch.setattr(_runner_module.subprocess, "Popen", _RecordingPopen)
+
+    proc = _default_popen(["echo", "hi"], cwd=str(tmp_path), env={})
+    flags = proc.kwargs["creationflags"]
+    assert flags & subprocess.CREATE_NO_WINDOW
+    assert flags & subprocess.BELOW_NORMAL_PRIORITY_CLASS
+
+
+def test_default_popen_windows_disabled_toggle_keeps_create_no_window_only(
+    tmp_path: Path, monkeypatch
+):
+    """Toggle disabled on Windows: CREATE_NO_WINDOW alone, no priority flag."""
+    _patch_windows_priority_constants(monkeypatch)
+    monkeypatch.setattr(_runner_module.sys, "platform", "win32")
+    monkeypatch.setenv("WORKTREE_SETUP_LOWER_PRIORITY", "0")
+    monkeypatch.setattr(_runner_module.subprocess, "Popen", _RecordingPopen)
+
+    proc = _default_popen(["echo", "hi"], cwd=str(tmp_path), env={})
+    flags = proc.kwargs["creationflags"]
+    assert flags & subprocess.CREATE_NO_WINDOW
+    assert not (flags & subprocess.BELOW_NORMAL_PRIORITY_CLASS)
+
+
+def test_default_popen_posix_nice_and_ionice_prefix(tmp_path: Path, monkeypatch):
+    """Toggle enabled (default) on POSIX with both nice and ionice present:
+    argv is prefixed with ionice -c 3 nice -n 10."""
+    monkeypatch.setattr(_runner_module.sys, "platform", "linux")
+    monkeypatch.delenv("WORKTREE_SETUP_LOWER_PRIORITY", raising=False)
+
+    def fake_which(name):
+        return {"nice": "/usr/bin/nice", "ionice": "/usr/bin/ionice"}.get(name)
+
+    monkeypatch.setattr(_runner_module.shutil, "which", fake_which)
+    monkeypatch.setattr(_runner_module.subprocess, "Popen", _RecordingPopen)
+
+    proc = _default_popen(["npm", "install"], cwd=str(tmp_path), env={})
+    assert proc.cmd == [
+        "/usr/bin/ionice",
+        "-c",
+        "3",
+        "/usr/bin/nice",
+        "-n",
+        "10",
+        "npm",
+        "install",
+    ]
+    assert "creationflags" not in proc.kwargs
+
+
+def test_default_popen_posix_nice_only_when_ionice_absent(tmp_path: Path, monkeypatch):
+    """ionice absent, nice present: argv degrades to nice-only prefix."""
+    monkeypatch.setattr(_runner_module.sys, "platform", "linux")
+    monkeypatch.delenv("WORKTREE_SETUP_LOWER_PRIORITY", raising=False)
+
+    def fake_which(name):
+        return {"nice": "/usr/bin/nice"}.get(name)
+
+    monkeypatch.setattr(_runner_module.shutil, "which", fake_which)
+    monkeypatch.setattr(_runner_module.subprocess, "Popen", _RecordingPopen)
+
+    proc = _default_popen(["npm", "install"], cwd=str(tmp_path), env={})
+    assert proc.cmd == ["/usr/bin/nice", "-n", "10", "npm", "install"]
+
+
+def test_default_popen_posix_no_nice_or_ionice_falls_back_to_plain_cmd(
+    tmp_path: Path, monkeypatch
+):
+    """Neither nice nor ionice available: best-effort fallback to a plain
+    spawn -- must never raise FileNotFoundError or fail the setup step."""
+    monkeypatch.setattr(_runner_module.sys, "platform", "linux")
+    monkeypatch.delenv("WORKTREE_SETUP_LOWER_PRIORITY", raising=False)
+    monkeypatch.setattr(_runner_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_runner_module.subprocess, "Popen", _RecordingPopen)
+
+    proc = _default_popen(["npm", "install"], cwd=str(tmp_path), env={})
+    assert proc.cmd == ["npm", "install"]
+
+
+def test_default_popen_posix_toggle_disabled_skips_nice_prefix(tmp_path: Path, monkeypatch):
+    """Toggle disabled on POSIX: no nice/ionice prefix even when both binaries
+    are available."""
+    monkeypatch.setattr(_runner_module.sys, "platform", "linux")
+    monkeypatch.setenv("WORKTREE_SETUP_LOWER_PRIORITY", "false")
+
+    def fake_which(name):
+        return {"nice": "/usr/bin/nice", "ionice": "/usr/bin/ionice"}.get(name)
+
+    monkeypatch.setattr(_runner_module.shutil, "which", fake_which)
+    monkeypatch.setattr(_runner_module.subprocess, "Popen", _RecordingPopen)
+
+    proc = _default_popen(["npm", "install"], cwd=str(tmp_path), env={})
+    assert proc.cmd == ["npm", "install"]
+
+
+def test_real_subprocess_has_lowered_priority(tmp_path: Path):
+    """Real-subprocess regression (ticket #68): a real, briefly-sleeping child
+    spawned through the actual (non-faked) ``_default_popen`` path really
+    runs at a lowered OS scheduling priority -- not just that the kwargs/argv
+    were assembled correctly (covered by the unit tests above).
+
+    Mirrors ``test_real_timeout_kills_wedged_process`` as the model for a
+    real-subprocess test in this file. Uses ``psutil`` (an existing project
+    dependency, see ``core/process_lifecycle.py``) rather than adding a new
+    dev dependency.
+
+    Polls rather than reading niceness exactly once: on POSIX, ``proc.pid``
+    is shared across the whole ``ionice -> nice -> cmd`` exec chain (exec
+    preserves the pid, there is no fork), and ``nice`` only calls
+    ``setpriority()`` partway through that chain. Reading immediately after
+    ``Popen()`` races the child's own startup and can observe the
+    still-inherited (unlowered) niceness even though the mechanism is
+    working correctly -- confirmed nondeterministic in practice (repeated
+    immediate reads on Linux gave e.g. ``0, 10, 0, 0, 0``). Polling for a
+    short window lets the assertion reflect the settled value instead of a
+    startup snapshot, while still failing (via timeout) if the priority is
+    genuinely never lowered.
+    """
+    import psutil  # noqa: PLC0415
+
+    if sys.platform != "win32" and shutil.which("nice") is None:
+        pytest.skip("nice(1) not available on this system")
+
+    code = "import time; time.sleep(5)"
+    cmd = [sys.executable, "-c", code]
+
+    proc = _default_popen(cmd, cwd=str(tmp_path), env=dict(os.environ))
+    try:
+        ps_proc = psutil.Process(proc.pid)
+
+        if sys.platform == "win32":
+            # Windows sets the priority class atomically at CreateProcess
+            # time (no exec-chain race), but poll defensively for symmetry
+            # and robustness against CI scheduling jitter.
+            expected = psutil.BELOW_NORMAL_PRIORITY_CLASS
+            is_lowered = lambda value: value == expected  # noqa: E731
+        else:
+            baseline = os.getpriority(os.PRIO_PROCESS, 0)
+            is_lowered = lambda value: value > baseline  # noqa: E731
+
+        deadline = time.monotonic() + 2.0
+        nice_value = ps_proc.nice()
+        while not is_lowered(nice_value) and time.monotonic() < deadline:
+            time.sleep(0.02)
+            try:
+                nice_value = ps_proc.nice()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Transient during the exec-chain transition; keep polling
+                # until the deadline instead of failing the test outright.
+                continue
+
+        assert is_lowered(nice_value), (
+            f"priority was never lowered within the poll window "
+            f"(last observed nice_value={nice_value!r})"
+        )
+    finally:
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# _resolve_lower_priority precedence (mirrors _resolve_setup_timeout's
+# malformed/empty-value coverage, but for the boolean env convention this
+# resolver defines)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_lower_priority_unset_defaults_enabled(monkeypatch):
+    monkeypatch.delenv("WORKTREE_SETUP_LOWER_PRIORITY", raising=False)
+    assert _resolve_lower_priority() is True
+
+
+@pytest.mark.parametrize(
+    "value", ["0", "false", "False", "FALSE", "no", "off", "  off  ", ""]
+)
+def test_resolve_lower_priority_disabled_values(monkeypatch, value):
+    monkeypatch.setenv("WORKTREE_SETUP_LOWER_PRIORITY", value)
+    assert _resolve_lower_priority() is False
+
+
+@pytest.mark.parametrize(
+    "value", ["1", "true", "TRUE", "yes", "on", "anything-else", "  1  "]
+)
+def test_resolve_lower_priority_enabled_values(monkeypatch, value):
+    monkeypatch.setenv("WORKTREE_SETUP_LOWER_PRIORITY", value)
+    assert _resolve_lower_priority() is True
