@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -142,6 +143,29 @@ def _resolve_setup_timeout(explicit: Optional[float]) -> Optional[float]:
     return value if value > 0 else None
 
 
+_LOWER_PRIORITY_ENV = "WORKTREE_SETUP_LOWER_PRIORITY"
+_LOWER_PRIORITY_DEFAULT = True
+_LOWER_PRIORITY_DISABLED_VALUES = {"", "0", "false", "no", "off"}
+
+
+def _resolve_lower_priority() -> bool:
+    """Resolve whether setup-step subprocesses spawn at lowered OS priority.
+
+    Precedence: ``WORKTREE_SETUP_LOWER_PRIORITY`` env var; unset -> enabled
+    (built-in default ``True``). When set, the value is ``.strip().lower()``-ed
+    and treated as *disabled* (``False``) for ``""``, ``"0"``, ``"false"``,
+    ``"no"``, or ``"off"``; any other value is *enabled* (``True``). Unlike
+    ``_resolve_setup_timeout`` (float-based), this repo has no existing
+    boolean-env convention, so this resolver defines its own. Env is read on
+    every call so test fixtures can flip it via monkeypatch without
+    re-importing the module.
+    """
+    raw = os.environ.get(_LOWER_PRIORITY_ENV)
+    if raw is None:
+        return _LOWER_PRIORITY_DEFAULT
+    return raw.strip().lower() not in _LOWER_PRIORITY_DISABLED_VALUES
+
+
 def _slug(value: str, max_len: int = 40) -> str:
     s = _SLUG_RE.sub("-", value.lower()).strip("-")
     if not s:
@@ -201,6 +225,31 @@ def _default_popen(cmd: List[str], *, cwd: str, env: Dict[str, str]) -> subproce
     ``stdout=PIPE``/``stderr=PIPE`` (rather than ``capture_output``) because
     ``_invoke`` drives ``communicate()``/kill itself, and
     ``creationflags=CREATE_NO_WINDOW`` on Windows to avoid a console flash.
+
+    Priority lowering (ticket #68): a heavy setup step (e.g. ``npm install``)
+    can starve unrelated concurrent work in the calling application via
+    OS-level scheduling/IO contention. When ``_resolve_lower_priority()``
+    resolves truthy (default: enabled, toggled via
+    ``WORKTREE_SETUP_LOWER_PRIORITY``), the spawned subprocess is given a
+    lowered OS scheduling/IO priority:
+
+    - **Windows**: ``subprocess.BELOW_NORMAL_PRIORITY_CLASS`` is OR'd into
+      ``creationflags`` alongside the existing ``CREATE_NO_WINDOW`` flag.
+      This is deliberately *not* ``PROCESS_MODE_BACKGROUND_BEGIN`` -- that
+      value is a self-only argument to ``SetPriorityClass`` (a process lowers
+      its own priority with it) and is not a valid ``Popen`` creation flag,
+      so it cannot be reliably applied to a spawned child.
+    - **POSIX**: the argv is prefixed with ``nice -n 10`` (resolved via
+      ``shutil.which("nice")``), further prefixed with ``ionice -c 3`` (idle
+      I/O class) when ``shutil.which("ionice")`` also resolves. This is
+      deliberately *not* ``preexec_fn=os.nice`` -- the stdlib documents
+      ``preexec_fn`` as unsafe in a multithreaded process, which is exactly
+      this library's environment (concurrent worktree operations run from a
+      thread pool).
+
+    The mechanism is best-effort: if the toggle is disabled, or ``nice``/
+    ``ionice`` are not found on POSIX, the subprocess is spawned normally --
+    this function never raises over an unavailable priority mechanism.
     """
 
     popen_kwargs: dict = {
@@ -211,8 +260,23 @@ def _default_popen(cmd: List[str], *, cwd: str, env: Dict[str, str]) -> subproce
         "stderr": subprocess.PIPE,
         "text": True,
     }
+
+    lower_priority = _resolve_lower_priority()
+
     if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+        if lower_priority:
+            creationflags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS  # type: ignore[attr-defined]
+        popen_kwargs["creationflags"] = creationflags
+    elif lower_priority:
+        nice_path = shutil.which("nice")
+        if nice_path is not None:
+            prefix = [nice_path, "-n", "10"]
+            ionice_path = shutil.which("ionice")
+            if ionice_path is not None:
+                prefix = [ionice_path, "-c", "3", *prefix]
+            cmd = [*prefix, *cmd]
+
     return subprocess.Popen(cmd, **popen_kwargs)
 
 
@@ -434,6 +498,7 @@ __all__ = (
     "SetupStep",
     "SetupStepResult",
     "_PlainStep",
+    "_resolve_lower_priority",
     "_resolve_setup_timeout",
     "log_dir_for",
 )
