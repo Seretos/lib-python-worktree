@@ -85,17 +85,27 @@ class SetupFailedError(RuntimeError):
         step_name: str,
         log_path: Path,
         returncode: int,
+        timeout: Optional[float] = None,
     ) -> None:
-        super().__init__(
-            f"setup step {step_index} ({step_name!r}) for worktree "
-            f"{worktree_id!r} failed with exit code {returncode}. "
-            f"See log: {log_path}"
-        )
+        if timeout is not None:
+            message = (
+                f"setup step {step_index} ({step_name!r}) for worktree "
+                f"{worktree_id!r} timed out after {timeout}s. "
+                f"See log: {log_path}"
+            )
+        else:
+            message = (
+                f"setup step {step_index} ({step_name!r}) for worktree "
+                f"{worktree_id!r} failed with exit code {returncode}. "
+                f"See log: {log_path}"
+            )
+        super().__init__(message)
         self.worktree_id = worktree_id
         self.step_index = step_index
         self.step_name = step_name
         self.log_path = log_path
         self.returncode = returncode
+        self.timeout = timeout
 
 
 # ---- path + shell helpers ----------------------------------------------------
@@ -104,6 +114,32 @@ class SetupFailedError(RuntimeError):
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 LOG_ROOT_ENV = "WORKTREE_LOG_ROOT"
 DEFAULT_LOG_ROOT = Path("~/.agent-worktree/logs").expanduser()
+
+_SETUP_TIMEOUT_ENV = "WORKTREE_SETUP_TIMEOUT_SEC"
+_SETUP_TIMEOUT_DEFAULT = 300.0
+
+
+def _resolve_setup_timeout(explicit: Optional[float]) -> Optional[float]:
+    """Resolve the timeout for a single setup/teardown step invocation.
+
+    Precedence: explicit kwarg > ``WORKTREE_SETUP_TIMEOUT_SEC`` env > built-in
+    default of 300.0 s.  ``None`` (either as kwarg or env value ``""``)
+    disables the timeout entirely.  Env is read on every call so test
+    fixtures can change it without re-importing the module.
+    """
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(_SETUP_TIMEOUT_ENV)
+    if raw is None:
+        return _SETUP_TIMEOUT_DEFAULT
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SETUP_TIMEOUT_DEFAULT
+    return value if value > 0 else None
 
 
 def _slug(value: str, max_len: int = 40) -> str:
@@ -157,6 +193,29 @@ def _resolve_shell(step_shell: Optional[str]) -> List[str]:
 # ---- runner ------------------------------------------------------------------
 
 
+def _default_popen(cmd: List[str], *, cwd: str, env: Dict[str, str]) -> subprocess.Popen:
+    """Default ``self._runner`` implementation: a hardened ``subprocess.Popen``.
+
+    Mirrors ``core/_git_utils._run_git``'s hardening: ``stdin=DEVNULL`` so the
+    child can never inherit our stdin and wedge waiting on input, explicit
+    ``stdout=PIPE``/``stderr=PIPE`` (rather than ``capture_output``) because
+    ``_invoke`` drives ``communicate()``/kill itself, and
+    ``creationflags=CREATE_NO_WINDOW`` on Windows to avoid a console flash.
+    """
+
+    popen_kwargs: dict = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    return subprocess.Popen(cmd, **popen_kwargs)
+
+
 class SetupRunner:
     """Executes a contract's ``setup`` steps in a worktree."""
 
@@ -166,13 +225,26 @@ class SetupRunner:
         log_root: Optional[Path] = None,
         env: Optional[Dict[str, str]] = None,
         runner: Optional[Any] = None,
+        timeout: Optional[float] = None,
     ) -> None:
-        """``runner`` is an injection seam used by tests (defaults to
-        ``subprocess.run``)."""
+        """``runner`` is an injection seam used by tests.
+
+        Defaults to a ``subprocess.Popen``-backed implementation
+        (:func:`_default_popen`). It must be a callable shaped
+        ``(cmd, *, cwd, env) -> Popen-like object`` -- an object exposing
+        ``.communicate(timeout=...)`` and ``.kill()`` -- so ``_invoke`` can
+        drive the timeout/kill sequence itself.
+
+        ``timeout`` is the instance-level default step timeout (seconds);
+        ``None`` means "fall through to ``WORKTREE_SETUP_TIMEOUT_SEC`` / the
+        built-in default" (resolved per-call by ``_resolve_setup_timeout``).
+        It can be overridden per call via ``run(timeout=...)``.
+        """
 
         self._log_root = log_root
         self._env = env if env is not None else os.environ
-        self._runner = runner or subprocess.run
+        self._runner = runner or _default_popen
+        self.timeout = timeout
 
     def run(
         self,
@@ -183,6 +255,7 @@ class SetupRunner:
         branch: str,
         port_mapping: Optional[Dict[str, int]] = None,
         isolation: str = "full",
+        timeout: Optional[float] = None,
     ) -> SetupResult:
         """Run all ``setup`` steps in order. Returns a structured result.
 
@@ -190,6 +263,16 @@ class SetupRunner:
         attaches the partial run via ``error.<...>``. The caller (W2's
         ``worktree_create``) is responsible for setting state to
         ``setup_failed`` and leaving the worktree intact for user inspection.
+
+        A step that overruns its timeout also raises ``SetupFailedError``
+        (with ``.timeout`` set) after killing the wedged process -- see
+        ``_invoke``.
+
+        ``timeout``, when not ``None``, overrides ``self.timeout`` for this
+        call. Either way the value is resolved through
+        ``_resolve_setup_timeout`` at the point of use, so the
+        ``WORKTREE_SETUP_TIMEOUT_SEC`` env default applies automatically even
+        when nobody opts in explicitly.
         """
 
         result = SetupResult(worktree_id=worktree_id)
@@ -210,6 +293,8 @@ class SetupRunner:
             port_mapping=port_mapping or {},
         )
 
+        requested_timeout = timeout if timeout is not None else self.timeout
+
         for index, step in enumerate(setup):
             step_name = step.name or f"step-{index}"
             log_path = log_dir / f"setup-{index:02d}-{_slug(step_name)}.log"
@@ -223,6 +308,8 @@ class SetupRunner:
                 log_path=log_path,
                 step_index=index,
                 step_name=step_name,
+                worktree_id=worktree_id,
+                timeout=requested_timeout,
             )
             step_result = SetupStepResult(
                 index=index, name=step_name, returncode=rc, log_path=log_path
@@ -274,15 +361,56 @@ class SetupRunner:
         log_path: Path,
         step_index: int,
         step_name: str,
+        worktree_id: str,
+        timeout: Optional[float] = None,
     ) -> int:
-        proc = self._runner(
-            [*shell_cmd, run_line],
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        """Run one step's process and drive its timeout/kill sequence.
+
+        Mirrors ``core/_git_utils._run_git``'s hardened pattern: the
+        ``self._runner`` seam returns a Popen-like object and this method
+        drives ``communicate(timeout=...)`` itself. On overrun: kill the
+        process, attempt a bounded (5s) post-kill drain (swallowing a second
+        ``TimeoutExpired`` from that drain so it can never itself hang), write
+        a synthetic ``returncode=-1`` log entry noting the timeout, then raise
+        ``SetupFailedError`` (with ``.timeout`` set) -- no new exception type.
+
+        An effective timeout of ``None`` disables the timeout entirely
+        (block-forever opt-out), matching how the git/plugin-install timeout
+        subsystems behave when disabled via empty-string env.
+        """
+        cmd = [*shell_cmd, run_line]
+        proc = self._runner(cmd, cwd=str(cwd), env=env)
+        effective_timeout = _resolve_setup_timeout(timeout)
+
+        try:
+            stdout, stderr = proc.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            # Drain the pipes after kill so the child fully reaps; bound this
+            # too so a stuck drain can never itself hang the runner.
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            header = (
+                f"# setup step {step_index} ({step_name})\n"
+                f"# cmd: {shell_cmd[0]} ... -c {run_line!r}\n"
+                f"# returncode: -1 (timed out after {effective_timeout}s)\n"
+                f"# ---- stdout ----\n"
+            )
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(header)
+                fh.write("\n# ---- stderr ----\n")
+                fh.write("setup step timed out and was killed\n")
+            raise SetupFailedError(
+                worktree_id=worktree_id,
+                step_index=step_index,
+                step_name=step_name,
+                log_path=log_path,
+                returncode=-1,
+                timeout=effective_timeout,
+            ) from None
+
         header = (
             f"# setup step {step_index} ({step_name})\n"
             f"# cmd: {shell_cmd[0]} ... -c {run_line!r}\n"
@@ -291,9 +419,9 @@ class SetupRunner:
         )
         with log_path.open("w", encoding="utf-8") as fh:
             fh.write(header)
-            fh.write(proc.stdout or "")
+            fh.write(stdout or "")
             fh.write("\n# ---- stderr ----\n")
-            fh.write(proc.stderr or "")
+            fh.write(stderr or "")
         return int(proc.returncode)
 
 
@@ -306,5 +434,6 @@ __all__ = (
     "SetupStep",
     "SetupStepResult",
     "_PlainStep",
+    "_resolve_setup_timeout",
     "log_dir_for",
 )

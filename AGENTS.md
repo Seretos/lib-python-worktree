@@ -66,6 +66,7 @@ in `__all__` directly.
 | `WORKTREE_LOG_ROOT` | `~/.agent-worktree/logs` | filesystem path | Root directory for per-step setup/teardown log files. |
 | `WORKTREE_GIT_TIMEOUT_SEC` | `30.0` | float string or `""` | Seconds before a `git` subprocess is killed and `GitTimeoutError` raised. Empty string disables the timeout. |
 | `WORKTREE_PLUGIN_INSTALL_TIMEOUT_SEC` | `60.0` | float string or `""` | Seconds before a `claude plugin install` subprocess is killed. Empty string disables the timeout. |
+| `WORKTREE_SETUP_TIMEOUT_SEC` | `300.0` | float string or `""` | Seconds before a setup/teardown step subprocess is killed and SetupFailedError raised. Empty string disables the timeout. |
 
 ## Release is pipeline-owned
 

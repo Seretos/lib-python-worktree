@@ -274,6 +274,15 @@ Per-step overrides (the `shell:` field):
 before being killed and raising `GitTimeoutError`. Default: `30.0` seconds.
 Set to an empty string to disable the timeout entirely (diagnostic use only).
 
+### Setup timeout
+
+`WORKTREE_SETUP_TIMEOUT_SEC` controls how long each `setup:`/`stop:`/
+`teardown:`/`seed_postprocess:` step's subprocess may run before being killed
+and raising `SetupFailedError`. Default: `300.0` seconds. Set to an empty
+string to disable the timeout entirely (diagnostic use only). Precedence:
+an explicit `timeout=` kwarg passed to `SetupRunner(...)`/`SetupRunner.run(...)`
+wins over this env var, which wins over the built-in default.
+
 ### Process lifecycle
 
 Process detachment on Windows uses `CREATE_NEW_PROCESS_GROUP` so that
