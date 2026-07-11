@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -723,6 +724,18 @@ def test_real_subprocess_has_lowered_priority(tmp_path: Path):
     real-subprocess test in this file. Uses ``psutil`` (an existing project
     dependency, see ``core/process_lifecycle.py``) rather than adding a new
     dev dependency.
+
+    Polls rather than reading niceness exactly once: on POSIX, ``proc.pid``
+    is shared across the whole ``ionice -> nice -> cmd`` exec chain (exec
+    preserves the pid, there is no fork), and ``nice`` only calls
+    ``setpriority()`` partway through that chain. Reading immediately after
+    ``Popen()`` races the child's own startup and can observe the
+    still-inherited (unlowered) niceness even though the mechanism is
+    working correctly -- confirmed nondeterministic in practice (repeated
+    immediate reads on Linux gave e.g. ``0, 10, 0, 0, 0``). Polling for a
+    short window lets the assertion reflect the settled value instead of a
+    startup snapshot, while still failing (via timeout) if the priority is
+    genuinely never lowered.
     """
     import psutil  # noqa: PLC0415
 
@@ -735,14 +748,32 @@ def test_real_subprocess_has_lowered_priority(tmp_path: Path):
     proc = _default_popen(cmd, cwd=str(tmp_path), env=dict(os.environ))
     try:
         ps_proc = psutil.Process(proc.pid)
-        nice_value = ps_proc.nice()
+
         if sys.platform == "win32":
-            assert nice_value == psutil.BELOW_NORMAL_PRIORITY_CLASS
+            # Windows sets the priority class atomically at CreateProcess
+            # time (no exec-chain race), but poll defensively for symmetry
+            # and robustness against CI scheduling jitter.
+            expected = psutil.BELOW_NORMAL_PRIORITY_CLASS
+            is_lowered = lambda value: value == expected  # noqa: E731
         else:
-            # POSIX: `nice -n 10` raises the child's niceness above the
-            # current (test) process's own niceness -- i.e. a lower
-            # scheduling priority.
-            assert nice_value > os.getpriority(os.PRIO_PROCESS, 0)
+            baseline = os.getpriority(os.PRIO_PROCESS, 0)
+            is_lowered = lambda value: value > baseline  # noqa: E731
+
+        deadline = time.monotonic() + 2.0
+        nice_value = ps_proc.nice()
+        while not is_lowered(nice_value) and time.monotonic() < deadline:
+            time.sleep(0.02)
+            try:
+                nice_value = ps_proc.nice()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Transient during the exec-chain transition; keep polling
+                # until the deadline instead of failing the test outright.
+                continue
+
+        assert is_lowered(nice_value), (
+            f"priority was never lowered within the poll window "
+            f"(last observed nice_value={nice_value!r})"
+        )
     finally:
         proc.kill()
         try:
