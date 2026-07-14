@@ -39,6 +39,13 @@ from lib_python_worktree.core.process_lifecycle import (
 from lib_python_worktree.core.manager import WorktreeNotFoundError
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 
+# Generous budget_sec for real (non-mocked) TestWinHandleHoldersReal scans that
+# assert *correctness* rather than deadline bail-out behaviour. The production
+# default (_HANDLE_SCAN_BUDGET_SEC = 15.0s) can expire before the scan reaches
+# the child's PID under high ambient system handle-table load, flaking those
+# tests. This constant is test-only and does not affect production behaviour.
+_REAL_SCAN_TEST_BUDGET_SEC = 120.0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1734,13 +1741,26 @@ class TestWinHandleHoldersReal:
             text=True,
         )
         try:
+            import psutil
+
             ready_line = proc.stdout.readline()
             assert ready_line.strip() == "ready", (
                 f"child process failed to signal readiness: {ready_line!r}"
             )
 
+            # Narrow the scan to just the child pid so that high ambient
+            # system handle-table load elsewhere on the machine can't
+            # starve the scan before it reaches this process, and give it
+            # a generous budget for the same reason (see
+            # _REAL_SCAN_TEST_BUDGET_SEC docstring above).
+            excluded_pids = set(psutil.pids()) - {proc.pid}
+
             # Exact match: querying with the file's own path.
-            found_exact = _win_handle_holders(str(target_file), excluded_pids=set())
+            found_exact = _win_handle_holders(
+                str(target_file),
+                excluded_pids=excluded_pids,
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
             exact_pids = {pid for pid, _ in found_exact}
             assert proc.pid in exact_pids, (
                 f"expected child pid {proc.pid} to be found via exact-path "
@@ -1748,7 +1768,11 @@ class TestWinHandleHoldersReal:
             )
 
             # Subpath match: querying with the file's parent directory.
-            found_subpath = _win_handle_holders(str(target_dir), excluded_pids=set())
+            found_subpath = _win_handle_holders(
+                str(target_dir),
+                excluded_pids=excluded_pids,
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
             subpath_pids = {pid for pid, _ in found_subpath}
             assert proc.pid in subpath_pids, (
                 f"expected child pid {proc.pid} to be found via subpath "
@@ -1758,7 +1782,11 @@ class TestWinHandleHoldersReal:
             # Sibling non-match: a directory that shares a name prefix with
             # the parent but is not an ancestor of the held-open file must
             # not report the child pid.
-            found_sibling = _win_handle_holders(str(sibling_dir), excluded_pids=set())
+            found_sibling = _win_handle_holders(
+                str(sibling_dir),
+                excluded_pids=excluded_pids,
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
             sibling_pids = {pid for pid, _ in found_sibling}
             assert proc.pid not in sibling_pids, (
                 f"sibling directory {sibling_dir} must not false-match the "
@@ -1799,3 +1827,80 @@ class TestWinHandleHoldersReal:
             "it to bail out of the per-handle loop almost immediately instead of "
             "spending time comparable to the full _HANDLE_SCAN_BUDGET_SEC ceiling"
         )
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_real_scan_is_bounded_to_target_pid_regardless_of_load(self, tmp_path):
+        """Regression for #73: pins the API contract of a PID-scoped call --
+        when ``excluded_pids`` is set to every pid except the child's, the
+        scan must report *only* the child's pid (never an extra one) while
+        still finding it. This exercises the same internal ``excluded_pids``
+        filter (see ``_win_handle_holders``'s ``by_pid`` construction) that
+        this module's flaky-test fix now relies on to narrow the per-PID scan
+        loop to a single entry regardless of ambient system handle-table
+        load.
+
+        Note: on a clean test machine, no other real process happens to hold
+        a handle inside the fresh per-test ``tmp_path``, so the "no extra
+        pids" half of this assertion holds true even without the
+        ``excluded_pids`` scoping applied (verified manually while
+        investigating a review comment on this change) -- it does not by
+        itself prove resilience to ambient contention. That resilience is
+        instead demonstrated by budget-starvation timing behaviour (see the
+        module-level ``_REAL_SCAN_TEST_BUDGET_SEC`` comment and the sibling
+        test above): an unscoped call needs a multi-second budget to reach
+        the target pid past hundreds of other live pids, while a PID-scoped
+        call reliably finds it in well under a second because ``by_pid`` has
+        only one entry to iterate."""
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+
+        target_file = target_dir / "held.txt"
+        target_file.write_text("hold me open")
+
+        code = (
+            "import sys, time\n"
+            f"f = open({str(target_file)!r}, 'r')\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(10)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            import psutil
+
+            ready_line = proc.stdout.readline()
+            assert ready_line.strip() == "ready", (
+                f"child process failed to signal readiness: {ready_line!r}"
+            )
+
+            excluded_pids = set(psutil.pids()) - {proc.pid}
+
+            result = _win_handle_holders(
+                str(target_dir),
+                excluded_pids=excluded_pids,
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+            result_pids = {pid for pid, _ in result}
+
+            assert proc.pid in result_pids, (
+                f"expected child pid {proc.pid} to be found in {target_dir}; "
+                f"got {result}"
+            )
+            assert result_pids <= {proc.pid}, (
+                "scan must be bounded to the target pid regardless of "
+                f"ambient system load; got extra pids {result_pids - {proc.pid}}"
+            )
+        finally:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
