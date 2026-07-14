@@ -51,6 +51,29 @@ def _make_record(wt_id: str = "wt-td", **kwargs) -> WorktreeRecord:
     return WorktreeRecord(**defaults)
 
 
+@pytest.fixture(autouse=True)
+def _no_blocking_processes_by_default():
+    """Default-patch ``_find_blocking_processes`` to return ``[]`` for every
+    test in this module (ticket #76).
+
+    ``_teardown``'s Windows-only pre-flight check (Step 2b) calls
+    ``_find_blocking_processes(record.path, os.getpid())`` before running
+    ``git worktree remove``. These tests run on a real Windows dev machine,
+    so ``sys.platform`` is genuinely ``"win32"`` even in tests that never
+    patch ``manager.sys`` -- leaving this unpatched would exercise the real
+    (slow, psutil-based) scan against fake paths in almost every test in
+    this module. Tests that specifically exercise the new pre-flight
+    behaviour override this via their own nested ``patch(...)`` for the
+    duration of their ``with`` block (an inner ``patch`` on the same target
+    always wins for its scope and unwinds back to this outer patch on exit).
+    """
+    with patch(
+        "lib_python_worktree.core.manager._find_blocking_processes",
+        return_value=[],
+    ):
+        yield
+
+
 def _run_teardown_with_mocked_git(
     manager: WorktreeManager,
     record: WorktreeRecord,
@@ -1958,3 +1981,306 @@ class TestLongPathFallbackLockedGuard:
         assert err.worktree_id == "wt-still-locked", (
             f"WorktreeDirLockedError must carry the worktree id, got {err.worktree_id!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestWindowsPreflightBlockingCheck -- ticket #76
+# ---------------------------------------------------------------------------
+
+class TestWindowsPreflightBlockingCheck:
+    """Ticket #76: on Windows, `git worktree remove --force` can return exit
+    0 while still leaving a content-less locked directory behind (an open
+    file handle blocks only the final directory removal, not the individual
+    file unlinks). That used to fall past the lock-detection branch (which
+    only triggers on `returncode != 0`) into the Final guard, which raised
+    WorktreeDirLockedError without ever having attempted a kill -- and by
+    then the destructive removal had already run, so no later retry (even
+    with kill_blocking_processes=True) could ever recover.
+
+    _teardown now runs a Windows-only pre-flight blocking-process check
+    BEFORE the destructive `git worktree remove` call so an errored removal
+    has no destructive side effect, and threads a real `kill_attempted` flag
+    into the Final guard so its message correctly distinguishes "kill
+    attempted, 0 found" from "kill not attempted"."""
+
+    def test_preflight_flag_off_raises_before_git_remove(self, tmp_path):
+        """Windows, kill_blocking_processes=False, pre-flight detects a
+        blocker: _teardown must raise WorktreeDirLockedError with
+        kill_attempted=False and killed=[] WITHOUT ever invoking `git
+        worktree remove` or _kill_blocking_processes -- the destructive git
+        call must never run on this attempt."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-flagoff", path="/fake/store/wt-preflight-flagoff"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=4444, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes"
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_git.assert_not_called()
+        mock_kill.assert_not_called()
+        err = excinfo.value
+        assert err.kill_attempted is False
+        assert err.killed == []
+
+    def test_preflight_no_blockers_falls_through_to_normal_removal(self, tmp_path):
+        """Windows, pre-flight finds nothing: the normal git-remove path runs
+        unchanged -- exit 0, no raise (retrospective coverage: this is the
+        pre-existing happy path, unaffected by the new pre-flight check)."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-clean", path="/fake/store/wt-preflight-clean"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_find.assert_called_once_with(record.path, os.getpid())
+        mock_git.assert_called_once()
+
+    def test_preflight_flag_on_kills_before_git_remove_and_succeeds(self, tmp_path):
+        """Windows, kill_blocking_processes=True, pre-flight detects a
+        blocker: _kill_blocking_processes must be called BEFORE `git
+        worktree remove` runs, and removal then proceeds normally (no
+        raise), with record.killed_pids populated from the pre-flight
+        kill."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-flagon", path="/fake/store/wt-preflight-flagon"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=5555, name="node.exe", cmdline=["node"])]
+
+        call_order: List[str] = []
+
+        def _mock_kill(path):
+            call_order.append("kill")
+            return fake_blockers
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_order.append("git_remove")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                side_effect=_mock_kill,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert call_order == ["kill", "git_remove"], (
+            f"expected pre-flight kill before git remove, got {call_order}"
+        )
+        assert record.killed_pids == fake_blockers
+
+    def test_final_guard_kill_attempted_false_when_no_kill_ever_ran(self, tmp_path):
+        """Ticket #76 root cause: git exits 0 (no lock signal, so the
+        post-removal kill/retry branch never runs) but the directory still
+        persists after all deletion attempts (long-path fallback also
+        fails), and no kill was ever attempted (pre-flight found nothing,
+        flag off). The Final guard must raise WorktreeDirLockedError with
+        kill_attempted=False so the message correctly says "not attempted"
+        instead of the pre-fix bug's false "after killing 0 blocking
+        process(es)"."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-finalguard-nokill", path="/fake/store/wt-finalguard-nokill"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.manager.os.path.exists",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.manager.shutil.rmtree",
+                side_effect=OSError("still locked"),
+            ),
+            patch(
+                "lib_python_worktree.core.manager.subprocess.run",
+                return_value=MagicMock(returncode=1),
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert err.kill_attempted is False, (
+            "no kill was ever attempted (pre-flight clean, no post-removal "
+            "lock signal) -- kill_attempted must be False, not the buggy "
+            "default True"
+        )
+        msg = str(err)
+        assert "kill_blocking_processes=True" in msg
+        assert "after killing 0" not in msg
+
+    def test_post_removal_kill_attempted_true_message_unchanged(self, tmp_path):
+        """Regression: when a kill *is* actually attempted via the existing
+        post-removal lock-retry branch (git returncode != 0 with a lock
+        signal), the exhausted-retry message must still say "after killing
+        N blocking process(es)" -- threading kill_attempted through the
+        Final guard must not regress this pre-existing, correct phrasing
+        for the case where a kill really was attempted."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-postkill-msg", path="/fake/store/wt-postkill-msg"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=6666, name="node.exe", cmdline=["node"])]
+
+        def _git_always_fail(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_git_always_fail,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.time"),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert err.kill_attempted is True
+        assert "after killing 1 blocking process(es)" in str(err)
+
+    def test_preflight_skipped_entirely_on_posix(self, tmp_path):
+        """POSIX: even if _find_blocking_processes were to report a blocker,
+        the Windows-only pre-flight must never run on non-Windows platforms
+        -- _find_blocking_processes must not be called at all, and `git
+        worktree remove` must proceed as the sole removal mechanism (POSIX
+        unlinks files even under an open handle, so a naive pre-flight there
+        would incorrectly block/kill on a merely-cwd'd process)."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-posix", path="/fake/store/wt-preflight-posix"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=7777, name="python", cmdline=["python"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ) as mock_find,
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes"
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "linux"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_find.assert_not_called()
+        mock_kill.assert_not_called()
+        mock_git.assert_called_once()
