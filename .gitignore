@@ -38,3 +38,4 @@ htmlcov/
 .idea/
 *.swp
 .process-ticket-result.json
+.claude-session/
