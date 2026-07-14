@@ -32,6 +32,7 @@ from .process_lifecycle import (
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    _find_blocking_processes,
     _kill_blocking_processes,
     start as _lifecycle_start,
     stop as _lifecycle_stop,
@@ -833,6 +834,48 @@ class WorktreeManager:
             # create().
             pass
 
+        # Step 2b (Windows only, ticket #76): pre-flight blocking-process check
+        # BEFORE the destructive `git worktree remove` call below.
+        #
+        # Root cause this guards against: on Windows, `git worktree remove
+        # --force` can return exit 0 while still leaving a content-less
+        # locked directory behind — an open file handle from a blocking
+        # process blocks only the *final* directory removal, not the
+        # individual file unlinks. That falls past the lock-detection branch
+        # below (which only triggers on `returncode != 0`) into the Final
+        # guard, which used to raise WorktreeDirLockedError with no way to
+        # know a kill was never attempted — and by then the destructive
+        # partial removal has already happened, so no later retry (even with
+        # kill_blocking_processes=True) can ever recover: the files are gone
+        # but the directory is still locked.
+        #
+        # Running this check first means an errored removal has no
+        # destructive side effect, and a later kill_blocking_processes=True
+        # retry can still find and kill the still-alive blocker.
+        #
+        # Placed after the contract stop:/teardown: steps (so daemons that
+        # release handles during those steps are not falsely flagged) but
+        # before the git call. POSIX is intentionally excluded: POSIX unlinks
+        # files even under an open handle, so `git worktree remove` succeeds
+        # there — a naive pre-flight applied to POSIX would incorrectly
+        # block/kill on a merely-cwd'd process rather than a genuine locker.
+        kill_attempted = False
+        if sys.platform == "win32":
+            _preflight_blockers = _find_blocking_processes(record.path, os.getpid())
+            if _preflight_blockers:
+                if kill_blocking_processes:
+                    killed = _kill_blocking_processes(record.path)
+                    record.killed_pids = killed
+                    kill_attempted = True
+                    # Fall through to the (now-safe) git remove call below.
+                else:
+                    # Caller did not opt into the kill-and-retry remedy: raise
+                    # immediately, before the destructive git call runs, so
+                    # no partial removal can occur on this attempt.
+                    raise WorktreeDirLockedError(
+                        record.id, killed=[], kill_attempted=False
+                    )
+
         # Step 3: remove the git worktree checkout directory.
         args = ["worktree", "remove"]
         if force:
@@ -910,6 +953,7 @@ class WorktreeManager:
                     if kill_blocking_processes:
                         killed = _kill_blocking_processes(record.path)
                         record.killed_pids = killed
+                        kill_attempted = True
                         retry_result = None
                         _phantom_on_retry = False
                         for _attempt in range(_POST_KILL_RETRIES):
@@ -987,7 +1031,9 @@ class WorktreeManager:
         # attempts, the worktree is locked by an external process.  Raise
         # rather than returning a false status: "removed".
         if os.path.exists(record.path):
-            raise WorktreeDirLockedError(record.id, killed=record.killed_pids)
+            raise WorktreeDirLockedError(
+                record.id, killed=record.killed_pids, kill_attempted=kill_attempted
+            )
 
         # Step 4: release allocated ports only after the git worktree remove
         # has succeeded.  Freeing ports before the remove would allow a
