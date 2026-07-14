@@ -96,10 +96,34 @@ class WorktreeDirLockedError(WorktreeError):
         self.killed = killed
 
 
+class UnknownVariantError(WorktreeError, ValueError):
+    """Raised when ``WorktreeManager.start()`` is given a ``variant`` that
+    does not match any ``start:`` step name in the contract.
+
+    Ticket #70: the original code raised a plain ``WorktreeError``
+    (``RuntimeError``-based) here even though ``start()``'s docstring
+    documents a ``ValueError`` contract for unknown variants. This class is
+    both, so callers catching either base keep working.
+
+    Both ``variant`` (the requested, unmatched name) and ``available`` (the
+    list of step names that *do* exist) are stored as attributes so callers
+    can react programmatically without parsing the message text.
+    """
+
+    def __init__(self, variant: str, available: "List[str]") -> None:
+        super().__init__(
+            f"no start: step named '{variant}' found in contract "
+            f"(available: {available})"
+        )
+        self.variant = variant
+        self.available = available
+
+
 __all__ = [
     "DirtyWorktreeError",
     "GitTimeoutError",
     "InvalidRepoError",
+    "UnknownVariantError",
     "WorktreeDirLockedError",
     "WorktreeError",
 ]

@@ -37,3 +37,5 @@ htmlcov/
 .vscode/
 .idea/
 *.swp
+.process-ticket-result.json
+.claude-session/

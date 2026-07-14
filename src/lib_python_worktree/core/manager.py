@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
 from ._env_utils import _get_user_profile_env
-from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, UnknownVariantError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
@@ -562,8 +562,10 @@ class WorktreeManager:
         - If *variant* is ``"default"`` and exactly one step has no ``name``
           set, that step is used (backward-compatibility path).
         - Otherwise the step whose ``name`` equals *variant* is used.
-        - If no matching step is found, ``WorktreeError`` is raised listing
-          the available named steps.
+        - If no matching step is found, ``UnknownVariantError`` is raised
+          listing the available named steps. ``UnknownVariantError`` is both
+          a ``WorktreeError`` and a ``ValueError``, so callers may catch
+          either base.
 
         When no ``start:`` step is configured at all (missing
         ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
@@ -609,10 +611,7 @@ class WorktreeManager:
 
         if step is None:
             available = [s.name for s in contract.start if s.name]
-            raise WorktreeError(
-                f"no start: step named '{variant}' found in contract "
-                f"(available: {available})"
-            )
+            raise UnknownVariantError(variant, available)
 
         from ..setup.runner import _resolve_shell
         cmd = [*_resolve_shell(step.shell), step.run]
@@ -1018,6 +1017,7 @@ __all__ = (
     "InvalidBranchError",
     "InvalidRepoError",
     "ManagerConfig",
+    "UnknownVariantError",
     "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeManager",
