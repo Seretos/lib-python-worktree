@@ -547,10 +547,13 @@ class TestKillBlockingProcessesWindows:
         assert record.killed_pids == fake_killed
         assert call_count["n"] == 2
 
-    def test_kill_and_retry_flag_off_raises_git_error(self, tmp_path):
-        """With kill_blocking_processes=False (default), rc=255/'Permission denied'
-        must raise GitCommandError and the kill helper must never be called."""
-        from lib_python_worktree.core.manager import GitCommandError
+    def test_flag_off_lock_signal_raises_dir_locked_with_remedy(self, tmp_path):
+        """Ticket #72 (Befund 2): with kill_blocking_processes=False (default),
+        rc=255/'Permission denied' (a lock signal) must raise
+        WorktreeDirLockedError naming the kill_blocking_processes=True remedy
+        — not a raw GitCommandError — and the kill helper must never be
+        called (no kill is attempted when the flag is off)."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
 
         manager = _make_manager(tmp_path)
         record = _make_record("wt-win-flagoff")
@@ -569,7 +572,7 @@ class TestKillBlockingProcessesWindows:
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
-            with pytest.raises(GitCommandError):
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
                 manager._teardown(
                     record,
                     force=False,
@@ -578,6 +581,15 @@ class TestKillBlockingProcessesWindows:
                 )
 
         mock_kill.assert_not_called()
+        err = excinfo.value
+        assert err.kill_attempted is False
+        assert err.killed == []
+        msg = str(err)
+        assert "kill_blocking_processes=True" in msg
+        # No raw git stderr/path/exit-code leakage in the remedy message.
+        assert "Permission denied" not in msg
+        assert record.path not in msg
+        assert "255" not in msg
 
     def test_still_locked_after_retry_raises_dir_locked_error(self, tmp_path):
         """Both git calls fail; WorktreeDirLockedError raised with killed list."""
@@ -769,6 +781,263 @@ class TestKillBlockingProcessesPosix:
         mock_kill.assert_not_called()
 
 
+class TestTicket72LockVsDirtyClassification:
+    """Regression tests for ticket #72: lock-signal detection must run BEFORE
+    the dirty-tree check (Befund 1), and a genuine lock signal must raise a
+    clean WorktreeDirLockedError instead of leaking GitCommandError when
+    kill_blocking_processes=False, for BOTH force=True and force=False
+    (Befund 2)."""
+
+    def test_befund1_lock_and_dirty_stderr_raises_dir_locked_not_dirty(self, tmp_path):
+        """Windows, force=False, stderr containing BOTH a Win32 lock indicator
+        ('Permission denied') AND the dirty-tree phrase ('contains modified or
+        untracked files'), kill_blocking_processes=False.
+
+        Pre-fix: the dirty-tree substring check ran before any lock check, so
+        this stderr was misclassified as DirtyWorktreeError.
+        Post-fix: the lock-signal check runs first, so this must raise
+        WorktreeDirLockedError (kill_attempted=False), not DirtyWorktreeError.
+        """
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-befund1")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_lock_and_dirty(args, cwd=None, **kwargs):
+            return MagicMock(
+                returncode=128,
+                stderr=(
+                    "fatal: 'some/path' contains modified or untracked files,"
+                    " use --force to delete it (Permission denied)"
+                ),
+            )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_lock_and_dirty),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+        assert excinfo.value.kill_attempted is False
+        assert excinfo.value.killed == []
+
+    def test_befund2_force_true_flag_off_lock_signal_raises_dir_locked(self, tmp_path):
+        """Windows, force=True, rc=255 'Permission denied', kill_blocking_processes=False.
+
+        Pre-fix: this genuine lock signal fell through to the else branch's
+        GitCommandError, leaking git's raw stderr.
+        Post-fix: must raise WorktreeDirLockedError (kill_attempted=False);
+        _kill_blocking_processes must never be called; no GitCommandError.
+        """
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-befund2")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_perm_denied(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_perm_denied),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+        assert excinfo.value.kill_attempted is False
+        assert excinfo.value.killed == []
+
+    def test_befund2_force_true_flag_off_invalid_argument_raises_dir_locked(self, tmp_path):
+        """Same as above but with 'Invalid argument' instead of 'Permission
+        denied' — both Win32 lock strings must be covered."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-befund2-invarg")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_invalid_arg(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Invalid argument")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_invalid_arg),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+        assert excinfo.value.kill_attempted is False
+
+    @pytest.mark.parametrize("force_flag", [True, False])
+    def test_posix_flag_off_lock_stderr_raises_dir_locked_with_remedy(
+        self, tmp_path, force_flag
+    ):
+        """POSIX variant of the remedy branch: 'lock' in stderr (case
+        insensitive), kill_blocking_processes=False, either force value ->
+        WorktreeDirLockedError(kill_attempted=False)."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(f"wt-posix-remedy-{force_flag}")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _git_locked(args, cwd=None, **kwargs):
+            return MagicMock(returncode=1, stderr="fatal: worktree is Locked")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_locked),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=force_flag,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+        assert excinfo.value.kill_attempted is False
+        assert excinfo.value.killed == []
+
+    def test_force_true_kill_true_still_locked_after_retry_raises_dir_locked(
+        self, tmp_path
+    ):
+        """Negative control: force=True + kill_blocking_processes=True, both
+        git calls fail with a lock signal -> WorktreeDirLockedError with
+        kill_attempted defaulting True and a non-empty killed list (the
+        unified lock branch applies for force=True exactly as it does for
+        force=False)."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-force-kill-locked", path="/fake/store/wt-force-kill-locked")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=4242, name="node.exe", cmdline=["node"])]
+
+        def _git_always_fail(args, cwd=None, **kwargs):
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_always_fail),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.time"),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_called_once_with(record.path)
+        err = excinfo.value
+        assert err.kill_attempted is True
+        assert err.killed == fake_killed
+        assert err.killed != []
+
+
+class TestWorktreeDirLockedErrorMessages:
+    """Direct unit tests for WorktreeDirLockedError's two message phrasings
+    (ticket #72)."""
+
+    def test_kill_attempted_true_message_mentions_killed_count(self):
+        from lib_python_worktree.core._exceptions import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        killed = [
+            KilledProcessInfo(pid=1, name="a.exe", cmdline=["a"]),
+            KilledProcessInfo(pid=2, name="b.exe", cmdline=["b"]),
+        ]
+        err = WorktreeDirLockedError("wt-1", killed=killed, kill_attempted=True)
+
+        assert err.kill_attempted is True
+        assert err.killed == killed
+        msg = str(err)
+        assert "after killing 2" in msg
+        assert "wt-1" in msg
+
+    def test_kill_attempted_false_message_mentions_remedy_no_raw_details(self):
+        from lib_python_worktree.core._exceptions import WorktreeDirLockedError
+
+        err = WorktreeDirLockedError("wt-2", killed=[], kill_attempted=False)
+
+        assert err.kill_attempted is False
+        assert err.killed == []
+        msg = str(err)
+        assert "kill_blocking_processes=True" in msg
+        assert "wt-2" in msg
+        # No raw stderr, path, or exit-code leakage in the remedy message.
+        assert "Permission denied" not in msg
+        assert "Invalid argument" not in msg
+        assert "255" not in msg
+        assert "128" not in msg
+
+    def test_kill_attempted_defaults_to_true(self):
+        """Default kill_attempted=True preserves the pre-#72 message wording
+        for any existing call site that doesn't pass the new kwarg."""
+        from lib_python_worktree.core._exceptions import WorktreeDirLockedError
+
+        err = WorktreeDirLockedError("wt-3", killed=[])
+
+        assert err.kill_attempted is True
+        assert "after killing 0" in str(err)
+
+
 class TestKillBlockingFlagOff:
     """When kill_blocking_processes=False (the default), behaviour is unchanged."""
 
@@ -802,9 +1071,12 @@ class TestKillBlockingFlagOff:
         mock_kill.assert_not_called()
 
     def test_remove_default_flag_off(self, tmp_path):
-        """remove() default call (no kill_blocking_processes) raises GitCommandError
-        on exit 255/'Permission denied', confirming the default is unchanged."""
-        from lib_python_worktree.core.manager import GitCommandError
+        """remove() default call (no kill_blocking_processes) on exit
+        255/'Permission denied' — a lock signal — raises WorktreeDirLockedError
+        with the kill_blocking_processes=True remedy (ticket #72, Befund 2),
+        not a raw GitCommandError, confirming remove()'s default plumbing
+        reaches the same classification as _teardown() directly."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
 
         manager = _make_manager(tmp_path)
         record = _make_record("wt-remove-default", branch_created_by_us=False)
@@ -818,8 +1090,10 @@ class TestKillBlockingFlagOff:
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
-            with pytest.raises(GitCommandError):
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
                 manager.remove(record.id)
+
+        assert excinfo.value.kill_attempted is False
 
 
 class TestKillBlockingRecordKilledPids:

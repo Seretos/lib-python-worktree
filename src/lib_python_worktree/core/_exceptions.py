@@ -78,22 +78,51 @@ class InvalidRepoError(WorktreeError):
 
 
 class WorktreeDirLockedError(WorktreeError):
-    """Raised when ``git worktree remove`` still fails after killing blocking
-    processes.
+    """Raised when the worktree checkout directory is held by an OS-level
+    lock (e.g. a Windows process still has a handle open on a file inside
+    it), which ``git worktree remove`` reports distinctly from a dirty
+    working tree.
 
-    The message names only the worktree id and how many processes were killed —
-    no raw paths, exit codes, or git command text are surfaced so that callers
-    can react programmatically without parsing implementation details.
+    Two phrasings, selected by ``kill_attempted``:
+
+    - ``kill_attempted=True`` (default): a kill-and-retry cycle was
+      attempted (``kill_blocking_processes=True`` was passed) and the
+      directory is *still* locked after killing the blocking processes.
+      The message names how many processes were killed (``len(killed)``).
+    - ``kill_attempted=False``: a lock was detected but the caller did not
+      opt into the kill-and-retry remedy (``kill_blocking_processes=False``,
+      ticket #72). The message points at ``kill_blocking_processes=True`` as
+      the way to retry, without attempting a kill itself.
+
+    In both cases the message names only the worktree id and (when
+    applicable) how many processes were killed — no raw paths, exit codes,
+    or git command text are surfaced so that callers can react
+    programmatically without parsing implementation details.
     """
 
-    def __init__(self, worktree_id: str, killed: "List[KilledProcessInfo]") -> None:
-        n = len(killed)
-        super().__init__(
-            f"worktree '{worktree_id}' directory is still locked after killing"
-            f" {n} blocking process(es)."
-        )
+    def __init__(
+        self,
+        worktree_id: str,
+        killed: "List[KilledProcessInfo]",
+        *,
+        kill_attempted: bool = True,
+    ) -> None:
+        if kill_attempted:
+            n = len(killed)
+            message = (
+                f"worktree '{worktree_id}' directory is still locked after killing"
+                f" {n} blocking process(es)."
+            )
+        else:
+            message = (
+                f"worktree '{worktree_id}' directory is locked by another process. "
+                f"Pass kill_blocking_processes=True to kill the blocking process(es) "
+                f"and retry."
+            )
+        super().__init__(message)
         self.worktree_id = worktree_id
         self.killed = killed
+        self.kill_attempted = kill_attempted
 
 
 class UnknownVariantError(WorktreeError, ValueError):
