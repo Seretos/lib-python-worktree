@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lib-python-worktree"
-version = "0.1.0"
+version = "0.2.1"
 description = "Git-worktree lifecycle + contract engine (create/list/remove, YAML setup contract, port allocation, setup-script runner, state persistence) for the Seretos agent-plugin ecosystem"
 requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
