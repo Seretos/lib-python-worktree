@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
 from ._env_utils import _get_user_profile_env
-from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, UnknownVariantError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
@@ -562,8 +562,10 @@ class WorktreeManager:
         - If *variant* is ``"default"`` and exactly one step has no ``name``
           set, that step is used (backward-compatibility path).
         - Otherwise the step whose ``name`` equals *variant* is used.
-        - If no matching step is found, ``WorktreeError`` is raised listing
-          the available named steps.
+        - If no matching step is found, ``UnknownVariantError`` is raised
+          listing the available named steps. ``UnknownVariantError`` is both
+          a ``WorktreeError`` and a ``ValueError``, so callers may catch
+          either base.
 
         When no ``start:`` step is configured at all (missing
         ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
@@ -609,10 +611,7 @@ class WorktreeManager:
 
         if step is None:
             available = [s.name for s in contract.start if s.name]
-            raise WorktreeError(
-                f"no start: step named '{variant}' found in contract "
-                f"(available: {available})"
-            )
+            raise UnknownVariantError(variant, available)
 
         from ..setup.runner import _resolve_shell
         cmd = [*_resolve_shell(step.shell), step.run]
@@ -649,6 +648,17 @@ class WorktreeManager:
         no-op: contract ``stop:`` steps are still run best-effort, but no
         signal is sent and ``ProcessNotRunningError`` is *not* raised.  The
         worktree is marked ``"stopped"`` when no other roles remain.
+
+        This is the engine's documented and intentional behavior (ticket
+        #41) and this method's return type is fixed: it always returns a
+        ``WorktreeRecord`` (or raises ``WorktreeNotFoundError`` for an
+        unknown *worktree_id*), never a dict-shaped "soft error" result.
+        Any dict-shaped soft-error contract for a never-started role (e.g.
+        ``{"error": ..., "code": ...}``) is owned by the MCP wrapper layer in
+        the separate ``agent-worktree`` plugin repo, which translates this
+        engine's return values/exceptions into whatever shape its tool
+        surface promises callers — it is not this engine's concern and is
+        not implemented here (see ``AGENTS.md``'s "Layering" section).
 
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         """
@@ -861,29 +871,30 @@ class WorktreeManager:
                     cwd=Path(record.repo_root),
                 )
                 # Fall through to step 4.
-            elif (
-                proc.returncode == 128
-                and not force
-                and "contains modified or untracked files" in proc.stderr
-            ):
-                # git refused because the worktree has uncommitted changes.
-                # Surface a structured error naming only the engine parameter
-                # (force=True), not the raw git command, path, or exit code.
-                raise DirtyWorktreeError(record.id)
             else:
                 # Determine whether this exit qualifies as a directory-lock
-                # signal that the kill_blocking_processes path should handle.
-                # Windows: exit 255 + "Permission denied" or "Invalid argument"
-                #   in stderr (both are NTFS/Win32 delete-failure strings).
+                # signal (an OS-level lock held by another process on the
+                # worktree directory). This is checked BEFORE the dirty-tree
+                # check (ticket #72, Befund 1): a lock-induced failure must
+                # never be misread as a dirty working tree just because
+                # git's dirty-tree phrase happens to also be present in
+                # stderr (e.g. a stale git error string bundled alongside
+                # a Win32 delete-failure string).
+                # Windows: "Permission denied" or "Invalid argument" in
+                #   stderr (both are NTFS/Win32 delete-failure strings).
+                #   No exit-code requirement — real-world Win32 lock
+                #   failures have been observed on exit codes other than
+                #   255, so the strict `returncode == 255` check has been
+                #   dropped (ticket #72, Befund 2).
                 # POSIX: "lock" in stderr (case-insensitive) — git worktree
                 #   reports a held directory as "locked" / "unable to lock" /
                 #   "cannot lock" / "worktree is locked".  All variants contain
                 #   the substring "lock".  Unrelated git failures (broken
                 #   metadata, network FS errors, "not a git repository", etc.)
-                #   do not, so they fall through to GitCommandError unchanged.
+                #   match neither arm, so they fall through past the
+                #   dirty-tree check to GitCommandError unchanged.
                 _is_lock_signal = (
                     sys.platform == "win32"
-                    and proc.returncode == 255
                     and (
                         "Permission denied" in proc.stderr
                         or "Invalid argument" in proc.stderr
@@ -892,33 +903,56 @@ class WorktreeManager:
                     sys.platform != "win32"
                     and "lock" in proc.stderr.lower()
                 )
-                if kill_blocking_processes and _is_lock_signal:
-                    killed = _kill_blocking_processes(record.path)
-                    record.killed_pids = killed
-                    retry_result = None
-                    _phantom_on_retry = False
-                    for _attempt in range(_POST_KILL_RETRIES):
-                        retry_result = _run_git(args, cwd=Path(record.repo_root))
-                        if retry_result.returncode == 0:
-                            break
-                        if (
-                            retry_result.returncode == 128
-                            and "is not a working tree" in retry_result.stderr
+                if _is_lock_signal:
+                    # A lock's remedy (kill_blocking_processes=True) is
+                    # independent of --force, so this branch applies for
+                    # BOTH force=True and force=False (ticket #72, Befund 2).
+                    if kill_blocking_processes:
+                        killed = _kill_blocking_processes(record.path)
+                        record.killed_pids = killed
+                        retry_result = None
+                        _phantom_on_retry = False
+                        for _attempt in range(_POST_KILL_RETRIES):
+                            retry_result = _run_git(args, cwd=Path(record.repo_root))
+                            if retry_result.returncode == 0:
+                                break
+                            if (
+                                retry_result.returncode == 128
+                                and "is not a working tree" in retry_result.stderr
+                            ):
+                                # git deregistered the worktree between the kill
+                                # and this retry (phantom-state mid-loop).  Treat
+                                # as already-gone and fall through to port release.
+                                _phantom_state_cleanup()
+                                _phantom_on_retry = True
+                                break
+                            if _attempt < _POST_KILL_RETRIES - 1:
+                                time.sleep(_POST_KILL_SLEEP)
+                        if not _phantom_on_retry and (
+                            retry_result is None or retry_result.returncode != 0
                         ):
-                            # git deregistered the worktree between the kill
-                            # and this retry (phantom-state mid-loop).  Treat
-                            # as already-gone and fall through to port release.
-                            _phantom_state_cleanup()
-                            _phantom_on_retry = True
-                            break
-                        if _attempt < _POST_KILL_RETRIES - 1:
-                            time.sleep(_POST_KILL_SLEEP)
-                    if not _phantom_on_retry and (
-                        retry_result is None or retry_result.returncode != 0
-                    ):
-                        raise WorktreeDirLockedError(record.id, killed=killed)
-                    # Retry succeeded (or phantom-state cleanup ran) —
-                    # fall through to long-path check then step 4.
+                            raise WorktreeDirLockedError(record.id, killed=killed)
+                        # Retry succeeded (or phantom-state cleanup ran) —
+                        # fall through to long-path check then step 4.
+                    else:
+                        # Lock detected but the caller did not opt into the
+                        # kill-and-retry remedy: raise a clean domain error
+                        # naming the remedy (kill_blocking_processes=True)
+                        # rather than leaking git's raw stderr via a bare
+                        # GitCommandError (ticket #72, Befund 2). No kill is
+                        # attempted and no retry is performed.
+                        raise WorktreeDirLockedError(
+                            record.id, killed=[], kill_attempted=False
+                        )
+                elif (
+                    proc.returncode == 128
+                    and not force
+                    and "contains modified or untracked files" in proc.stderr
+                ):
+                    # git refused because the worktree has uncommitted changes.
+                    # Surface a structured error naming only the engine parameter
+                    # (force=True), not the raw git command, path, or exit code.
+                    raise DirtyWorktreeError(record.id)
                 else:
                     raise GitCommandError(
                         ["git", *args], proc.returncode, proc.stderr
@@ -1018,6 +1052,7 @@ __all__ = (
     "InvalidBranchError",
     "InvalidRepoError",
     "ManagerConfig",
+    "UnknownVariantError",
     "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeManager",

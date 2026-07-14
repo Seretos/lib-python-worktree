@@ -25,6 +25,7 @@ from lib_python_worktree.core.manager import (
     DuplicateWorktreeError,
     GitTimeoutError,
     ManagerConfig,
+    UnknownVariantError,
     WorktreeError,
     WorktreeManager,
     GitCommandError,
@@ -859,6 +860,7 @@ def test_find_by_branch_matches_after_create_forward_slash_input(
 from unittest.mock import MagicMock, call, patch  # noqa: E402 – after sys-level imports
 
 from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: E402
+from lib_python_worktree.contract.loader import ContractError, ContractValidationError  # noqa: E402
 from lib_python_worktree.setup.runner import _resolve_shell  # noqa: E402
 
 
@@ -1098,6 +1100,98 @@ def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
     assert result.pids == {}
 
 
+# ---------------------------------------------------------------------------
+# Ticket #70 (Befund 1b/1c): malformed/invalid contracts must raise loudly
+# through the FULL start() call path, not be swallowed into a silent "ready".
+#
+# These deliberately duplicate a little of test_contract.py's loader-level
+# coverage but assert at the manager.start() boundary, proving the error
+# propagates unguarded all the way out of the public API — not just out of
+# the loader function in isolation.
+# ---------------------------------------------------------------------------
+
+
+def _write_contract(repo_root: Path, text: str) -> None:
+    p = repo_root / ".seretos" / "worktree-setup.yml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+
+
+def test_manager_start_contract_start_as_string_list_raises_validation_error(
+    tmp_path: Path,
+):
+    """start: as a plain list of strings (not step mappings) raises
+    ContractValidationError through start(), not a silent no-op ready."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: full\nstart:\n  - npm run start\n  - npm run build\n",
+    )
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root))
+    mgr.state.add(record)
+
+    with pytest.raises(ContractValidationError):
+        mgr.start(record.id)
+
+
+def test_manager_start_contract_start_as_name_keyed_dict_raises_validation_error(
+    tmp_path: Path,
+):
+    """start: as a name-keyed/role-nested mapping (instead of a list) raises
+    ContractValidationError through start()."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: full\nstart:\n  default:\n    run: npm run start\n",
+    )
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root))
+    mgr.state.add(record)
+
+    with pytest.raises(ContractValidationError):
+        mgr.start(record.id)
+
+
+def test_manager_start_contract_step_with_command_field_raises_validation_error(
+    tmp_path: Path,
+):
+    """A start: step shaped {name, command} (wrong field name, missing
+    required run:) raises ContractValidationError through start()."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: full\nstart:\n  - name: default\n    command: npm run start\n",
+    )
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root))
+    mgr.state.add(record)
+
+    with pytest.raises(ContractValidationError):
+        mgr.start(record.id)
+
+
+def test_manager_start_contract_invalid_yaml_raises_contract_error(tmp_path: Path):
+    """Syntactically unparseable YAML in worktree-setup.yml raises
+    ContractError through start() (not ContractValidationError — parse
+    failure, not schema failure)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_contract(repo_root, "version: 1\n  bad: indent: here\n")
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root))
+    mgr.state.add(record)
+
+    with pytest.raises(ContractError) as exc_info:
+        mgr.start(record.id)
+
+    # Must be ContractError but NOT the validation subclass.
+    assert not isinstance(exc_info.value, ContractValidationError)
+
+
 def test_manager_start_named_variant_selected(tmp_path: Path):
     """start(variant="headless") picks the step with name="headless" from a multi-step contract."""
     mgr = _make_mgr_in_memory(tmp_path)
@@ -1234,6 +1328,42 @@ def test_manager_start_unknown_variant_raises_worktree_error(tmp_path: Path):
     assert "nonexistent" in error_msg
     assert "headless" in error_msg
     assert "gui" in error_msg
+
+
+def test_manager_start_unknown_variant_is_valueerror(tmp_path: Path):
+    """Ticket #70: start(variant="nonexistent") must ALSO be catchable as a
+    plain ValueError, matching the start() docstring's documented contract.
+
+    Before the fix, the unknown-variant branch raised a bare WorktreeError
+    (RuntimeError-based), silently breaking any caller that followed the
+    docstring and wrapped the call in `except ValueError`.
+    """
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(ValueError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nonexistent")
+
+    error_msg = str(exc_info.value)
+    assert "nonexistent" in error_msg
+    assert "headless" in error_msg
+    assert "gui" in error_msg
+
+    # And it must still be a WorktreeError subclass (so existing callers
+    # catching WorktreeError keep working unchanged).
+    assert issubclass(UnknownVariantError, WorktreeError)
+    assert issubclass(UnknownVariantError, ValueError)
+    assert isinstance(exc_info.value, UnknownVariantError)
 
 
 def test_manager_start_multi_unnamed_steps_unknown_default_raises(tmp_path: Path):
