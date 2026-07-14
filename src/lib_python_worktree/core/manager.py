@@ -649,6 +649,17 @@ class WorktreeManager:
         signal is sent and ``ProcessNotRunningError`` is *not* raised.  The
         worktree is marked ``"stopped"`` when no other roles remain.
 
+        This is the engine's documented and intentional behavior (ticket
+        #41) and this method's return type is fixed: it always returns a
+        ``WorktreeRecord`` (or raises ``WorktreeNotFoundError`` for an
+        unknown *worktree_id*), never a dict-shaped "soft error" result.
+        Any dict-shaped soft-error contract for a never-started role (e.g.
+        ``{"error": ..., "code": ...}``) is owned by the MCP wrapper layer in
+        the separate ``agent-worktree`` plugin repo, which translates this
+        engine's return values/exceptions into whatever shape its tool
+        surface promises callers — it is not this engine's concern and is
+        not implemented here (see ``AGENTS.md``'s "Layering" section).
+
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         """
         record = self.state.get(worktree_id)

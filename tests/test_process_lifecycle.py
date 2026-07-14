@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import time
 from typing import List
@@ -31,6 +32,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _send_graceful_signal,
     _spawn_detached,
     _wait_or_kill,
+    _win_handle_holders,
     start,
     stop,
 )
@@ -1345,3 +1347,455 @@ class TestFindBlockingProcessesWindows:
             f"Process must appear exactly once, got {len(result)} entries"
         )
         assert result[0].pid == 8805
+
+
+# ---------------------------------------------------------------------------
+# TestWinHandleHoldersIntegration -- ticket #71 (Pass 1c wiring)
+# ---------------------------------------------------------------------------
+
+class TestWinHandleHoldersIntegration:
+    """Wiring tests for Pass 1c (``_win_handle_holders``) inside
+    ``_find_blocking_processes``. ``_win_handle_holders`` itself is mocked
+    here -- its real ctypes/NT internals are exercised separately by
+    ``TestWinHandleHoldersReal`` (Windows-only, real subprocess + real
+    handles).
+    """
+
+    def test_foreign_process_invisible_to_other_passes_is_found_via_handle_scan(self):
+        """Regression for ticket #71: a process whose cwd() and
+        open_files() both raise AccessDenied, and whose cmdline contains no
+        path token under the worktree (so it is invisible to Pass 1, 1b,
+        and 2), is still reported once the OS-level handle scan (Pass 1c)
+        reports it holding a handle inside the worktree."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_foreign = MagicMock()
+        proc_foreign.info = {"pid": 9101, "name": "", "cmdline": ["some.exe", "--flag"]}
+        proc_foreign.cwd.side_effect = psutil.AccessDenied(9101)
+        proc_foreign.open_files.side_effect = psutil.AccessDenied(9101)
+
+        def _process_side_effect(pid):
+            m = MagicMock()
+            if pid == host_pid:
+                m.parents.return_value = []
+            else:
+                m.cmdline.return_value = ["some.exe", "--flag"]
+                m.name.return_value = "some.exe"
+            return m
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_foreign]),
+            patch.object(psutil, "Process", side_effect=_process_side_effect),
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                return_value=[(9101, "some.exe")],
+            ) as mock_handle_scan,
+        ):
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        mock_handle_scan.assert_called_once()
+        assert len(result) == 1, f"expected the foreign PID to be reported, got {result}"
+        assert result[0].pid == 9101
+        assert result[0].name == "some.exe"
+
+    def test_pid_already_found_by_earlier_pass_not_duplicated(self):
+        """A PID already matched by Pass 1 (cwd) must not be duplicated
+        when Pass 1c's handle scan also reports it."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_cwd_match = _make_fake_proc(9102, "node", ["node"], target)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_cwd_match]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                return_value=[(9102, "node")],
+            ) as mock_handle_scan,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        mock_handle_scan.assert_called_once()
+        assert len(result) == 1, (
+            f"PID found by both Pass 1 and Pass 1c must appear exactly once, got {result}"
+        )
+        assert result[0].pid == 9102
+
+    def test_handle_scan_excluded_pid_is_dropped(self):
+        """A PID reported by _win_handle_holders that is in excluded_pids
+        (the host process or one of its ancestors) must not appear in the
+        final result."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+        ancestor_pid = 4242
+
+        ancestor_mock = MagicMock()
+        ancestor_mock.pid = ancestor_pid
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                return_value=[(host_pid, "host"), (ancestor_pid, "ancestor")],
+            ),
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = [ancestor_mock]
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result == [], (
+            f"excluded PIDs (host + ancestors) reported by the handle scan "
+            f"must be dropped, got {result}"
+        )
+
+    def test_handle_scan_failure_degrades_gracefully(self):
+        """If _win_handle_holders raises (ctypes/OS failure), the function
+        must not raise and must still return whatever Pass 1/1b/2 already
+        found."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_cwd_match = _make_fake_proc(9103, "bash", ["bash"], target)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_cwd_match]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                side_effect=OSError("simulated ctypes failure"),
+            ),
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)  # must not raise
+
+        assert len(result) == 1
+        assert result[0].pid == 9103
+
+    def test_handle_scan_skipped_on_non_windows(self):
+        """Pass 1c must not run -- and _win_handle_holders must never be
+        called -- on non-Windows platforms."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders"
+            ) as mock_handle_scan,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        mock_handle_scan.assert_not_called()
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# TestHandleScanDeadlineThreading -- ticket #71 follow-up (reviewer finding):
+# Pass 1c's Windows handle-table scan must respect the caller's overall
+# timeout instead of always independently consuming up to its own fixed
+# _HANDLE_SCAN_BUDGET_SEC (15.0s) ceiling on top of it -- e.g.
+# stop(timeout=10.0, kill_orphans=True) must not silently take ~25s.
+# ---------------------------------------------------------------------------
+
+class TestHandleScanDeadlineThreading:
+    """Regression tests: the deadline is computed once in
+    _kill_blocking_processes *before* discovery starts, threaded into
+    _find_blocking_processes as `deadline`, and from there into
+    _win_handle_holders as a capped `budget_sec` -- rather than
+    _win_handle_holders always using its own fixed 15s ceiling regardless of
+    how much time the caller actually has left.
+    """
+
+    def test_kill_blocking_processes_threads_deadline_into_find_blocking_processes(self):
+        """_kill_blocking_processes must pass a `deadline` kwarg to
+        _find_blocking_processes, computed from `timeout` BEFORE discovery
+        starts (so discovery time counts against the same overall budget as
+        the subsequent kill/wait step, instead of being extra time on top)."""
+        target = "/fake/worktree"
+        captured: dict = {}
+        t0 = time.monotonic()
+
+        def _fake_find(path, host_pid, **kwargs):
+            captured["deadline"] = kwargs.get("deadline")
+            return []
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+            side_effect=_fake_find,
+        ):
+            _kill_blocking_processes(target, timeout=3.0)
+
+        assert "deadline" in captured, (
+            "deadline kwarg was not passed to _find_blocking_processes at all"
+        )
+        assert captured["deadline"] is not None, (
+            "deadline must not be None when a finite timeout is given"
+        )
+        # The deadline must be ~t0 + 3.0 (computed before discovery), not
+        # computed afterward -- assert it lands close to the expected value.
+        assert abs(captured["deadline"] - (t0 + 3.0)) < 0.5, (
+            f"deadline {captured['deadline']} should be ~{t0 + 3.0} (t0 + timeout)"
+        )
+
+    def test_find_blocking_processes_caps_handle_scan_budget_to_remaining_deadline(self):
+        """On win32, _win_handle_holders must be called with a `budget_sec`
+        bounded by the time remaining until *deadline*, not the full 15s
+        _HANDLE_SCAN_BUDGET_SEC ceiling, when the caller's deadline leaves
+        less time than that ceiling."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+        captured_budget: List[float] = []
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                side_effect=lambda path, excluded, **kw: (
+                    captured_budget.append(kw.get("budget_sec")) or []
+                ),
+            ),
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            deadline = time.monotonic() + 0.2  # far less than the 15.0s ceiling
+            _find_blocking_processes(target, host_pid, deadline=deadline)
+
+        assert len(captured_budget) == 1, "expected exactly one _win_handle_holders call"
+        budget = captured_budget[0]
+        assert budget is not None, (
+            "_win_handle_holders must be called with an explicit budget_sec"
+        )
+        assert budget <= 0.2 + 0.05, (
+            f"handle scan budget {budget} must be bounded by the caller's remaining "
+            f"deadline (~0.2s), not the full _HANDLE_SCAN_BUDGET_SEC ceiling (15.0s)"
+        )
+
+    def test_find_blocking_processes_skips_handle_scan_when_deadline_already_passed(self):
+        """When *deadline* has already elapsed by the time Pass 1c would
+        run, it must be skipped entirely -- _win_handle_holders must not be
+        called at all, rather than being called with a near-zero budget."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders"
+            ) as mock_handle_scan,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            past_deadline = time.monotonic() - 1.0
+            result = _find_blocking_processes(target, host_pid, deadline=past_deadline)
+
+        mock_handle_scan.assert_not_called()
+        assert result == []
+
+    def test_no_deadline_uses_full_ceiling_backward_compatible(self):
+        """Direct/legacy callers that omit `deadline` entirely (e.g. calling
+        _find_blocking_processes without it, as pre-existing tests and code
+        do) must still get the full _HANDLE_SCAN_BUDGET_SEC ceiling passed
+        to _win_handle_holders -- this keeps the new parameter opt-in and
+        backward compatible."""
+        import psutil
+        from lib_python_worktree.core.process_lifecycle import _HANDLE_SCAN_BUDGET_SEC
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+        captured_budget: List[float] = []
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                side_effect=lambda path, excluded, **kw: (
+                    captured_budget.append(kw.get("budget_sec")) or []
+                ),
+            ),
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            _find_blocking_processes(target, host_pid)  # no deadline kwarg
+
+        assert captured_budget == [_HANDLE_SCAN_BUDGET_SEC]
+
+
+# ---------------------------------------------------------------------------
+# TestWinHandleHoldersReal -- ticket #71 (real subprocess + real OS handles)
+# ---------------------------------------------------------------------------
+
+class TestWinHandleHoldersReal:
+    """Windows-only real-subprocess test for ``_win_handle_holders``.
+
+    Unlike ``TestWinHandleHoldersIntegration`` (which mocks
+    ``_win_handle_holders`` entirely), this exercises the actual
+    ``ctypes``/``ntdll`` internals -- ``NtQuerySystemInformation``,
+    ``DuplicateHandle``, and ``NtQueryObject`` -- against a real child
+    process holding a real open file handle. Skipped outside win32 since
+    the implementation is ctypes/ntdll-only and has no meaning elsewhere.
+
+    Also covers the required path-boundary correctness case: exact match,
+    true subpath match, and the sibling-directory negative case, all
+    against one real held-open file handle.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_real_subprocess_holding_open_file_is_detected_with_path_boundaries(
+        self, tmp_path
+    ):
+        """A real child process holding a real open file handle under a
+        temp directory is detected by _win_handle_holders, with correct
+        path-boundary semantics:
+
+        - exact match: querying with the file's own path finds it.
+        - subpath match: querying with the file's parent directory finds it.
+        - sibling non-match: a directory sharing a name prefix with the
+          parent (but not an ancestor of the file) does NOT find it.
+        """
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        sibling_dir = tmp_path / "target-sibling"
+        sibling_dir.mkdir()
+
+        target_file = target_dir / "held.txt"
+        target_file.write_text("hold me open")
+
+        code = (
+            "import sys, time\n"
+            f"f = open({str(target_file)!r}, 'r')\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(10)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            ready_line = proc.stdout.readline()
+            assert ready_line.strip() == "ready", (
+                f"child process failed to signal readiness: {ready_line!r}"
+            )
+
+            # Exact match: querying with the file's own path.
+            found_exact = _win_handle_holders(str(target_file), excluded_pids=set())
+            exact_pids = {pid for pid, _ in found_exact}
+            assert proc.pid in exact_pids, (
+                f"expected child pid {proc.pid} to be found via exact-path "
+                f"match against {target_file}; got {found_exact}"
+            )
+
+            # Subpath match: querying with the file's parent directory.
+            found_subpath = _win_handle_holders(str(target_dir), excluded_pids=set())
+            subpath_pids = {pid for pid, _ in found_subpath}
+            assert proc.pid in subpath_pids, (
+                f"expected child pid {proc.pid} to be found via subpath "
+                f"match against {target_dir}; got {found_subpath}"
+            )
+
+            # Sibling non-match: a directory that shares a name prefix with
+            # the parent but is not an ancestor of the held-open file must
+            # not report the child pid.
+            found_sibling = _win_handle_holders(str(sibling_dir), excluded_pids=set())
+            sibling_pids = {pid for pid, _ in found_sibling}
+            assert proc.pid not in sibling_pids, (
+                f"sibling directory {sibling_dir} must not false-match the "
+                f"child pid holding a handle only under {target_dir}; "
+                f"got {found_sibling}"
+            )
+        finally:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_budget_sec_bounds_real_scan_wall_clock(self, tmp_path):
+        """Regression for the deadline-threading fix: passing a near-zero
+        ``budget_sec`` must make the per-handle resolution loop bail out
+        almost immediately against the real, full system handle table,
+        rather than spending up to the full 15s _HANDLE_SCAN_BUDGET_SEC
+        ceiling. This is the real (non-mocked) mechanism that
+        _find_blocking_processes relies on to keep Pass 1c bounded by
+        whatever remains of a caller's overall timeout."""
+        target = str(tmp_path / "definitely-not-a-real-worktree")
+
+        t0 = time.monotonic()
+        result = _win_handle_holders(target, excluded_pids=set(), budget_sec=0.0)
+        elapsed = time.monotonic() - t0
+
+        assert result == []
+        # Well under the 15s ceiling -- the handle-table dump itself is
+        # unavoidable, but the per-handle resolution loop must not run once
+        # the (already-expired) budget is exhausted.
+        assert elapsed < 8.0, (
+            f"_win_handle_holders(budget_sec=0.0) took {elapsed:.2f}s -- expected "
+            "it to bail out of the per-handle loop almost immediately instead of "
+            "spending time comparable to the full _HANDLE_SCAN_BUDGET_SEC ceiling"
+        )
