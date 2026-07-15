@@ -50,6 +50,41 @@ _PORT_RANGE_DEFAULT = (30000, 40000)
 _POST_KILL_RETRIES: int = 5      # attempts after kill before giving up
 _POST_KILL_SLEEP: float = 0.5    # seconds to wait between retries
 
+# Timeout for the Windows long-path robocopy empty-mirror fallback in
+# _teardown (ticket #78). Without a bound, robocopy's own defaults
+# (/R:1000000 /W:30) retry a locked directory for ~347 days, wedging the
+# single synchronous MCP request thread and hanging the whole server.
+# Mirrors the WORKTREE_GIT_TIMEOUT_SEC convention in _git_utils.py: an
+# explicit float string overrides the default, an empty string disables the
+# timeout entirely (diagnostic use only).
+_ROBOCOPY_TIMEOUT_ENV = "WORKTREE_ROBOCOPY_TIMEOUT_SEC"
+_ROBOCOPY_TIMEOUT_DEFAULT = 30.0
+
+
+def _resolve_robocopy_timeout() -> Optional[float]:
+    """Resolve the timeout for the robocopy long-path fallback.
+
+    Precedence: ``WORKTREE_ROBOCOPY_TIMEOUT_SEC`` env > built-in default of
+    30.0s. ``None`` (env value ``""``) disables the timeout entirely; that
+    path exists for diagnostics, not normal use.
+
+    Env is read on every call so that test fixtures and operators can change
+    the value without re-importing the module.
+    """
+    raw = os.environ.get(_ROBOCOPY_TIMEOUT_ENV)
+    if raw is None:
+        return _ROBOCOPY_TIMEOUT_DEFAULT
+    raw = raw.strip()
+    if not raw:
+        # Empty string is "no timeout", matching _resolve_git_timeout's
+        # explicit-None semantics.
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return _ROBOCOPY_TIMEOUT_DEFAULT
+    return value if value > 0 else None
+
 # Stable since git 2.5 (builtin/worktree.c). Captures branch + path from
 # the two variants git emits when refusing `worktree add` on a conflict:
 #   fatal: 'feature/x' is already checked out at '/path/to/wt'
@@ -1017,9 +1052,21 @@ class WorktreeManager:
                     import tempfile
                     try:
                         with tempfile.TemporaryDirectory() as empty_tmp:
+                            # Ticket #78: bound this call two independent ways
+                            # so a locked directory can never wedge the
+                            # single synchronous MCP request thread. /R:1
+                            # /W:1 override robocopy's own default of a
+                            # million retries at 30s apart; the explicit
+                            # timeout= is a second, independent backstop.
+                            # subprocess.TimeoutExpired is caught by the
+                            # broad except below, so the Final guard's
+                            # WorktreeDirLockedError still fires correctly
+                            # when this call times out.
                             subprocess.run(
-                                ["robocopy", empty_tmp, record.path, "/MIR"],
+                                ["robocopy", empty_tmp, record.path, "/MIR", "/R:1", "/W:1"],
                                 capture_output=True,
+                                timeout=_resolve_robocopy_timeout(),
+                                creationflags=subprocess.CREATE_NO_WINDOW,
                             )
                             shutil.rmtree(record.path, ignore_errors=True)
                     except Exception:  # noqa: BLE001
