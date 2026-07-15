@@ -2284,3 +2284,247 @@ class TestWindowsPreflightBlockingCheck:
         mock_find.assert_not_called()
         mock_kill.assert_not_called()
         mock_git.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestRobocopyTimeoutBounding -- ticket #78
+# ---------------------------------------------------------------------------
+
+class TestRobocopyTimeoutBounding:
+    """Ticket #78: the Windows long-path robocopy empty-mirror fallback in
+    _teardown used to call `subprocess.run(["robocopy", ...])` with no
+    timeout at all. Robocopy's own defaults (/R:1000000 /W:30) retry a
+    locked directory for ~347 days, wedging the single synchronous MCP
+    request thread and hanging the whole server -- while the destructive
+    git worktree remove had *already* completed. This class verifies the
+    fix bounds that call two independent ways (explicit timeout= kwarg,
+    plus robocopy's own /R:1 /W:1 fast-fail flags), that a timeout still
+    surfaces the existing clean WorktreeDirLockedError contract rather than
+    leaking subprocess.TimeoutExpired, that the timeout is env-configurable,
+    and that the Step 2b preflight boundary from ticket #76/#77 is
+    unaffected by this change."""
+
+    def test_robocopy_fallback_is_time_bounded(self, tmp_path):
+        """Driving test: the subprocess.run call for robocopy must carry a
+        finite numeric timeout= kwarg and robocopy's own fast-fail retry
+        flags (/R:1 /W:1) -- so a locked directory can never wedge the
+        request thread for robocopy's default ~347-day retry window."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-robocopy-bounded", path="C:\\fake\\store\\wt-robocopy-bounded"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        robocopy_calls: list = []
+        robocopy_kwargs: list = []
+
+        def _mock_rmtree(path, **kwargs):
+            if path.startswith("\\\\?\\"):
+                raise OSError("path too long")
+            # Second call (after robocopy) succeeds silently.
+
+        def _mock_subprocess_run(cmd, **kwargs):
+            robocopy_calls.append(cmd)
+            robocopy_kwargs.append(kwargs)
+            return MagicMock(returncode=1)  # robocopy exits 1 on success-with-copies
+
+        # See explanation in
+        # test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
+        _path_calls = {"n": 0}
+
+        def _mock_exists(path):
+            if str(path) == record.path:
+                _path_calls["n"] += 1
+                return _path_calls["n"] == 1
+            return False
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert robocopy_calls, "robocopy must be called when extended-path rmtree fails"
+        kwargs = robocopy_kwargs[0]
+        assert "timeout" in kwargs, (
+            f"robocopy subprocess.run must pass an explicit timeout kwarg, got kwargs={kwargs}"
+        )
+        assert isinstance(kwargs["timeout"], (int, float)) and kwargs["timeout"] > 0, (
+            f"robocopy timeout must be a finite positive number, got {kwargs['timeout']!r}"
+        )
+        args = robocopy_calls[0]
+        assert "/R:1" in args, f"robocopy args must include fast-fail /R:1, got {args}"
+        assert "/W:1" in args, f"robocopy args must include fast-fail /W:1, got {args}"
+
+    def test_robocopy_timeout_raises_dir_locked(self, tmp_path):
+        """When robocopy itself times out (subprocess.TimeoutExpired), with
+        the leftover directory still present, _teardown must not leak the
+        raw TimeoutExpired -- the existing Final guard must still raise
+        WorktreeDirLockedError, carrying the record's id."""
+        import subprocess as subprocess_module
+
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-robocopy-timeout", path="C:\\fake\\store\\wt-robocopy-timeout"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _mock_rmtree(path, **kwargs):
+            if path.startswith("\\\\?\\"):
+                raise OSError("path too long")
+
+        def _mock_subprocess_run(cmd, **kwargs):
+            raise subprocess_module.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            # Leftover dir stays present throughout (robocopy never got the
+            # chance to mirror it empty), so both the long-path guard and
+            # the Final guard see it as still there. Contract-file loads
+            # are wrapped in broad try/except in _teardown so a "True" for
+            # those paths too is harmless (matches the existing
+            # test_directory_still_exists_after_fallback_raises pattern).
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as exc_info:
+                manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert exc_info.value.worktree_id == "wt-robocopy-timeout"
+
+    def test_robocopy_timeout_env_override(self, tmp_path, monkeypatch):
+        """WORKTREE_ROBOCOPY_TIMEOUT_SEC overrides the built-in 30s default
+        when set to a float string; an empty string disables the timeout
+        entirely (resolves to timeout=None), mirroring WORKTREE_GIT_TIMEOUT_SEC."""
+        manager = _make_manager(tmp_path)
+
+        mock_lifecycle = MagicMock()
+        captured = {"timeout": "unset"}
+
+        def _mock_rmtree(path, **kwargs):
+            if path.startswith("\\\\?\\"):
+                raise OSError("path too long")
+
+        def _mock_subprocess_run(cmd, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return MagicMock(returncode=1)
+
+        def _make_exists_for(target_path):
+            calls = {"n": 0}
+
+            def _mock_exists(path):
+                if str(path) == target_path:
+                    calls["n"] += 1
+                    return calls["n"] == 1
+                return False
+
+            return _mock_exists
+
+        # --- Override to a specific value ---
+        record_override = _make_record(
+            "wt-robocopy-env-override", path="C:\\fake\\store\\wt-robocopy-env-override"
+        )
+        manager.state.add(record_override)
+        monkeypatch.setenv("WORKTREE_ROBOCOPY_TIMEOUT_SEC", "12.5")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager.os.path.exists",
+                side_effect=_make_exists_for(record_override.path),
+            ),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(record_override, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert captured["timeout"] == 12.5
+
+        # --- Empty string disables the timeout entirely ---
+        record_disabled = _make_record(
+            "wt-robocopy-env-disabled", path="C:\\fake\\store\\wt-robocopy-env-disabled"
+        )
+        manager.state.add(record_disabled)
+        monkeypatch.setenv("WORKTREE_ROBOCOPY_TIMEOUT_SEC", "")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager.os.path.exists",
+                side_effect=_make_exists_for(record_disabled.path),
+            ),
+            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(record_disabled, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert captured["timeout"] is None
+
+    def test_no_regression_preflight_nokill_raises_before_git(self, tmp_path):
+        """Regression guard (pins PR #77's Step 2b preflight boundary): with
+        kill_blocking_processes=False and a detected blocker, _teardown must
+        still raise WorktreeDirLockedError at the preflight, BEFORE either
+        `git worktree remove` or the robocopy fallback ever runs. This fix
+        must not shift that boundary. Expected to already pass unmodified --
+        it is a regression guard, not new behavior."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-nokill-regression",
+            path="/fake/store/wt-preflight-nokill-regression",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=9999, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes"
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.subprocess.run") as mock_robocopy,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_git.assert_not_called()
+        mock_kill.assert_not_called()
+        mock_robocopy.assert_not_called()
+        err = excinfo.value
+        assert err.kill_attempted is False
+        assert err.killed == []
+        assert err.worktree_id == "wt-preflight-nokill-regression"

@@ -283,6 +283,17 @@ string to disable the timeout entirely (diagnostic use only). Precedence:
 an explicit `timeout=` kwarg passed to `SetupRunner(...)`/`SetupRunner.run(...)`
 wins over this env var, which wins over the built-in default.
 
+### Robocopy timeout
+
+`WORKTREE_ROBOCOPY_TIMEOUT_SEC` controls how long the Windows long-path
+`robocopy` fallback in `_teardown` may run (used when the extended-path
+`shutil.rmtree` fails to remove a worktree checkout). Default: `30.0`
+seconds; the call also passes `/R:1 /W:1` so robocopy itself fails fast
+instead of retrying a locked directory for its default of ~347 days. On
+timeout, teardown falls through to the existing `WorktreeDirLockedError`
+contract rather than hanging. Set to an empty string to disable the timeout
+entirely (diagnostic use only).
+
 ### Process lifecycle
 
 Process detachment on Windows uses `CREATE_NEW_PROCESS_GROUP` so that
