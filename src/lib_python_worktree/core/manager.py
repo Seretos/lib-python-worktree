@@ -1066,7 +1066,20 @@ class WorktreeManager:
                                 ["robocopy", empty_tmp, record.path, "/MIR", "/R:1", "/W:1"],
                                 capture_output=True,
                                 timeout=_resolve_robocopy_timeout(),
-                                creationflags=subprocess.CREATE_NO_WINDOW,
+                                # getattr(..., 0), not subprocess.CREATE_NO_WINDOW
+                                # directly: this branch is guarded by
+                                # `sys.platform == "win32"` above, but tests
+                                # (and the real world, under a mocked
+                                # sys.platform) can reach this line while the
+                                # *real* subprocess module has no such
+                                # attribute (e.g. running on Linux CI with
+                                # sys.platform patched to "win32" to exercise
+                                # this code path). A direct attribute access
+                                # would raise AttributeError there, which the
+                                # broad `except Exception` below silently
+                                # swallows -- skipping the robocopy call
+                                # entirely without any indication why.
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                             )
                             shutil.rmtree(record.path, ignore_errors=True)
                     except Exception:  # noqa: BLE001
