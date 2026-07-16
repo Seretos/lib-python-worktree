@@ -55,6 +55,11 @@ jobs:
             4. Commit and open a PR.
           WORKTREE_TICKET_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
           WORKBOARD_TICKET_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
+          # Separate token: the two tokens above only need Issues:write on
+          # their consumer repo, but adding an item to a user-owned Projects
+          # v2 board needs account-level project scope — kept as its own
+          # secret so the narrower per-consumer tokens don't need broadening.
+          PROJECT_BOARD_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
         run: |
           # Validate version is semver without a leading 'v'.
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
@@ -75,31 +80,36 @@ jobs:
             esac
             export GH_TOKEN="$TOKEN"
 
-            # Idempotency: skip if an open issue with this exact title already exists.
+            # Idempotency: skip if an open issue with this exact title already
+            # exists — reuse its URL instead of creating a duplicate.
             # --paginate follows all pages; jq filter excludes pull requests.
-            EXISTING=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
-              --jq 'map(select(.pull_request|not)) | .[].title' 2>/dev/null || true)
-            if echo "$EXISTING" | grep -qxF "$TITLE"; then
-              echo "Issue already exists in ${CONSUMER}, skipping."
-              continue
+            ISSUE_URL=$(gh api --paginate "repos/${CONSUMER}/issues?state=open&per_page=100" \
+              --jq --arg t "$TITLE" 'map(select((.pull_request|not) and (.title==$t))) | .[0].html_url // empty' 2>/dev/null || true)
+            if [ -n "$ISSUE_URL" ]; then
+              echo "Issue already exists in ${CONSUMER}, skipping creation."
+            else
+              # Attempt creation with the 'dependencies' label; fall back
+              # without it if the label does not exist in the consumer repo.
+              ISSUE_URL=$(gh issue create \
+                --repo "$CONSUMER" \
+                --title "$TITLE" \
+                --body "$BODY" \
+                --label dependencies \
+              || gh issue create \
+                --repo "$CONSUMER" \
+                --title "$TITLE" \
+                --body "$BODY")
+              if [ -n "$ISSUE_URL" ]; then
+                echo "Ticket opened in ${CONSUMER}: ${ISSUE_URL}"
+              else
+                echo "::error::Failed to open ticket in ${CONSUMER}."
+                FAILED_LIST="$FAILED_LIST $CONSUMER"
+                continue
+              fi
             fi
 
-            # Attempt creation with the 'dependencies' label; fall back
-            # without it if the label does not exist in the consumer repo.
-            if gh issue create \
-              --repo "$CONSUMER" \
-              --title "$TITLE" \
-              --body "$BODY" \
-              --label dependencies \
-            || gh issue create \
-              --repo "$CONSUMER" \
-              --title "$TITLE" \
-              --body "$BODY"; then
-              echo "Ticket opened in ${CONSUMER}."
-            else
-              echo "::error::Failed to open ticket in ${CONSUMER}."
-              FAILED_LIST="$FAILED_LIST $CONSUMER"
-            fi
+            GH_TOKEN="$PROJECT_BOARD_TOKEN" gh project item-add 2 --owner Seretos --url "$ISSUE_URL" \
+              || echo "::warning::Could not add $ISSUE_URL to project board 2 (check PROJECT_BOARD_TOKEN)."
           done
 
           echo "failed_consumers=${FAILED_LIST}" >> "$GITHUB_OUTPUT"

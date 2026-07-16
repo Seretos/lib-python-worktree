@@ -89,6 +89,14 @@ release itself.
 
 `GITHUB_TOKEN` cannot open cross-repo issues, so both PATs are required.
 
+Right after filing (or finding) each ticket, a follow-up step adds it to the
+`users/Seretos/projects/2` board via `gh project item-add`, using a separate
+`PROJECT_BOARD_TOKEN` secret (a classic PAT with the `project` scope, or a
+fine-grained PAT with account-level Projects: write — not repo-scoped, so the
+same token value is reused across every repo in the ecosystem that has this
+step). Missing/invalid token → the board-add is skipped or logged as a
+`::warning::`, never fails the run — the ticket itself still opens normally.
+
 **If the automatic step was skipped or failed**, re-file manually by running
 the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via "Run
 workflow" in GitHub Actions. Supply:
