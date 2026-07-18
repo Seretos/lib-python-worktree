@@ -53,13 +53,12 @@ jobs:
             2. Run `pwsh scripts/test.ps1` to verify the test suite passes.
             3. Run `pwsh scripts/build.ps1` to confirm the build succeeds.
             4. Commit and open a PR.
+          # Each per-consumer token below must also carry account-level
+          # "Projects: write" alongside its repo-scoped Issues: write, so the
+          # board-add call further down authenticates with the same token —
+          # no separate board secret is needed.
           WORKTREE_TICKET_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
           WORKBOARD_TICKET_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
-          # Separate token: the two tokens above only need Issues:write on
-          # their consumer repo, but adding an item to a user-owned Projects
-          # v2 board needs account-level project scope — kept as its own
-          # secret so the narrower per-consumer tokens don't need broadening.
-          PROJECT_BOARD_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
         run: |
           # Validate version is semver without a leading 'v'.
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
@@ -74,8 +73,8 @@ jobs:
 
             # Select the correct token per consumer.
             case "$CONSUMER" in
-              Seretos/agent-worktree) TOKEN="$WORKTREE_TICKET_TOKEN" ;;
-              Seretos/workboard)      TOKEN="$WORKBOARD_TICKET_TOKEN" ;;
+              Seretos/agent-worktree) TOKEN="$WORKTREE_TICKET_TOKEN"; TOKEN_NAME="WORKTREE_TICKET_TOKEN" ;;
+              Seretos/workboard)      TOKEN="$WORKBOARD_TICKET_TOKEN"; TOKEN_NAME="WORKBOARD_TICKET_TOKEN" ;;
               *) echo "::error::No token configured for consumer ${CONSUMER}"; FAILED_LIST="$FAILED_LIST $CONSUMER"; continue ;;
             esac
             export GH_TOKEN="$TOKEN"
@@ -108,8 +107,10 @@ jobs:
               fi
             fi
 
-            GH_TOKEN="$PROJECT_BOARD_TOKEN" gh project item-add 2 --owner Seretos --url "$ISSUE_URL" \
-              || echo "::warning::Could not add $ISSUE_URL to project board 2 (check PROJECT_BOARD_TOKEN)."
+            # Reuses the per-consumer GH_TOKEN exported above, which must
+            # also carry account-level "Projects: write".
+            gh project item-add 2 --owner Seretos --url "$ISSUE_URL" \
+              || echo "::warning::Could not add $ISSUE_URL to project board 2 (check that ${TOKEN_NAME} has account-level Projects: write)."
           done
 
           echo "failed_consumers=${FAILED_LIST}" >> "$GITHUB_OUTPUT"

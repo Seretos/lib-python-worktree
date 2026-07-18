@@ -182,15 +182,16 @@ jobs:
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Add agent-worktree ticket to project board
-        # Separate token: WORKTREE_TICKET_TOKEN only needs Issues:write on
-        # the consumer repo, but adding an item to a user-owned Projects v2
-        # board needs account-level project scope — kept as its own secret
-        # so the narrower per-consumer token doesn't need broadening.
+        # Reuses WORKTREE_TICKET_TOKEN: adding an item to a user-owned
+        # Projects v2 board needs account-level "Projects: write", which a
+        # fine-grained PAT can carry alongside its repo-scoped Issues: write —
+        # so this consumer's own ticket token is used, no separate board
+        # secret required.
         if: steps.file_worktree.outputs.issue_url != ''
         continue-on-error: true
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
+          GH_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
         run: |
           gh project item-add 2 --owner Seretos --url "${{ steps.file_worktree.outputs.issue_url }}"
 
@@ -248,10 +249,12 @@ jobs:
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Add workboard ticket to project board
+        # Reuses WORKBOARD_TICKET_TOKEN, which must also carry account-level
+        # "Projects: write" alongside its repo-scoped Issues: write.
         if: steps.file_workboard.outputs.issue_url != ''
         continue-on-error: true
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
+          GH_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
         run: |
           gh project item-add 2 --owner Seretos --url "${{ steps.file_workboard.outputs.issue_url }}"
