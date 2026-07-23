@@ -246,6 +246,29 @@ def test_worktree_record_with_pids_roundtrip(yaml_store: YamlStateStore):
     assert retrieved.pids == {"server": 1234, "worker": 5678}
 
 
+def test_worktree_record_with_returncode_and_start_log_path_roundtrip(
+    yaml_store: YamlStateStore, tmp_path: Path
+):
+    """Ticket #81 (reviewer finding): a real YamlStateStore add/get cycle must
+    round-trip non-default ``returncode``/``start_log_path`` values.
+
+    Unlike ``InMemoryStateStore`` (whose ``.update()``/``.add()`` just
+    re-store the same object reference and therefore give zero protection
+    against a serialization bug), this goes through the real
+    ``_record_to_dict``/``_record_from_dict`` YAML (de)serialization path.
+    """
+    log_path = str(tmp_path / "start-main.log")
+    rec = _make_record(id="rec-returncode")
+    rec.returncode = 3
+    rec.start_log_path = log_path
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-returncode")
+    assert retrieved is not None
+    assert retrieved.returncode == 3
+    assert retrieved.start_log_path == log_path
+
+
 # ---------------------------------------------------------------------------
 # reconcile(): orphaned path
 # ---------------------------------------------------------------------------
