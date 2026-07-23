@@ -83,11 +83,21 @@ so a broken or missing token for one consumer never blocks the other or the
 release itself.
 
 - **`WORKTREE_TICKET_TOKEN`** — fine-grained PAT with **Issues: write** on
-  `Seretos/agent-worktree`. Used for the agent-worktree ticket step.
+  `Seretos/agent-worktree` **and** account-level **Projects: write**. Used for
+  the agent-worktree ticket step and its board-add follow-up.
 - **`WORKBOARD_TICKET_TOKEN`** — fine-grained PAT with **Issues: write** on
-  `Seretos/workboard`. Used for the workboard ticket step.
+  `Seretos/workboard` **and** account-level **Projects: write**. Used for the
+  workboard ticket step and its board-add follow-up.
 
 `GITHUB_TOKEN` cannot open cross-repo issues, so both PATs are required.
+
+Right after filing (or finding) each ticket, a follow-up step adds it to the
+`users/Seretos/projects/2` board via `gh project item-add`, reusing that
+consumer's own ticket token — no separate board secret. A fine-grained PAT can
+carry account-level **Projects: write** alongside its repo-scoped
+**Issues: write**, so each per-consumer token above covers both its ticket step
+and its board-add. Missing permission → the board-add is skipped or logged as a
+`::warning::`, never fails the run — the ticket itself still opens normally.
 
 **If the automatic step was skipped or failed**, re-file manually by running
 the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via "Run
@@ -103,8 +113,13 @@ token per consumer automatically and marks the run red if any consumer fails,
 naming the offending consumer in the error output.
 
 **Human prerequisite -- `WORKTREE_TICKET_TOKEN`:** create this repository secret
-(Settings -> Secrets -> Actions) once before the first release.
+(Settings -> Secrets -> Actions) once before the first release. Generate a
+fine-grained PAT scoped to `Seretos/agent-worktree` with **Issues: write**
+permission, and add account-level **Projects: write** so the same token can add
+the ticket to project board 2.
 
 **Human prerequisite -- `WORKBOARD_TICKET_TOKEN`:** create this repository secret
 (Settings -> Secrets -> Actions) once before the first release. Generate a
-fine-grained PAT scoped to `Seretos/workboard` with **Issues: write** permission.
+fine-grained PAT scoped to `Seretos/workboard` with **Issues: write**
+permission, and add account-level **Projects: write** so the same token can add
+the ticket to project board 2.
