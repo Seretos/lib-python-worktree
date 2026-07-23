@@ -33,6 +33,8 @@ class WorktreeRecord:
     pids: Dict[str, int] = field(default_factory=dict)
     branch_created_by_us: bool = False
     killed_pids: List["KilledProcessInfo"] = field(default_factory=list)
+    returncode: Optional[int] = None
+    start_log_path: Optional[str] = None
 
 
 class StateStore(Protocol):

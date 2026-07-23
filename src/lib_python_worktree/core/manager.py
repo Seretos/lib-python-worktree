@@ -613,7 +613,9 @@ class WorktreeManager:
         ticket #41.
 
         Delegates to ``process_lifecycle.start`` with ``store=self.state``
-        only when a concrete ``start:`` step is selected.
+        only when a concrete ``start:`` step is selected. ``cwd=None``
+        (the default) defaults to ``record.path`` (ticket #81), not the
+        caller's own working directory.
         """
         record = self.state.get(worktree_id)
         if record is None:
@@ -658,7 +660,7 @@ class WorktreeManager:
             store=self.state,
             role=role,
             env=_build_worktree_env(record, env),
-            cwd=cwd,
+            cwd=cwd if cwd is not None else record.path,
         )
 
     def stop(

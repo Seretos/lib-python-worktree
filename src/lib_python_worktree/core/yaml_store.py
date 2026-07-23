@@ -123,6 +123,8 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "ports": dict(rec.ports),
         "pids": dict(rec.pids),
         "branch_created_by_us": rec.branch_created_by_us,
+        "returncode": rec.returncode,
+        "start_log_path": rec.start_log_path,
     }
 
 
@@ -144,6 +146,8 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         ports=dict(d.get("ports") or {}),
         pids=dict(d.get("pids") or {}),
         branch_created_by_us=bool(d.get("branch_created_by_us", False)),
+        returncode=d.get("returncode"),
+        start_log_path=d.get("start_log_path"),
     )
 
 
