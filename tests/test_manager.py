@@ -909,13 +909,59 @@ def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
     assert call_kwargs.args[1] == expected_cmd
     assert call_kwargs.kwargs["store"] is mgr.state
     assert call_kwargs.kwargs["role"] == "main"
-    assert call_kwargs.kwargs["cwd"] is None
+    assert call_kwargs.kwargs["cwd"] == record.path
     # env must be a dict (built by _build_worktree_env, not None)
     built_env = call_kwargs.kwargs["env"]
     assert isinstance(built_env, dict)
     assert built_env["WORKTREE_ID"] == record.id
     assert built_env["WORKTREE_PATH"] == record.path
     assert built_env["WORKTREE_BRANCH"] == record.branch
+
+
+def test_manager_start_defaults_cwd_to_worktree_path(tmp_path: Path):
+    """Ticket #81: a cwd=None start defaults to record.path, not the caller's cwd."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, cwd=None)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["cwd"] == record.path
+
+
+def test_manager_start_explicit_cwd_passed_through(tmp_path: Path):
+    """An explicit cwd reaches _lifecycle_start unchanged, not overridden by record.path."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, cwd="/some/dir")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["cwd"] == "/some/dir"
 
 
 def test_manager_start_injects_worktree_env_vars(tmp_path: Path):

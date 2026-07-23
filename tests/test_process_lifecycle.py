@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock, call, patch
 
@@ -47,6 +48,20 @@ from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 _REAL_SCAN_TEST_BUDGET_SEC = 120.0
 
 
+@pytest.fixture(autouse=True)
+def _redirect_start_log_root(tmp_path, monkeypatch):
+    """Redirect WORKTREE_LOG_ROOT to a tmp dir for every test in this module.
+
+    ``start()`` now unconditionally writes a captured-output log file under
+    the resolved log root (ticket #81). Without this, any test in this file
+    that calls ``start()`` without an explicit ``env=`` would fall back to
+    the real ``os.environ`` and write log files under the ambient
+    ``WORKTREE_LOG_ROOT``/``~/.agent-worktree/logs`` on the machine running
+    the suite.
+    """
+    monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -75,8 +90,8 @@ def _make_record(wt_id: str = "wt-abc", **kwargs) -> WorktreeRecord:
 
 class TestSpawnDetached:
     def test_returns_positive_pid(self):
-        """_spawn_detached returns a valid PID for a short-lived process."""
-        pid = _spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"])
+        """_spawn_detached returns a Popen whose .pid is a valid PID."""
+        pid = _spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"]).pid
         assert pid > 0
         # Cleanup
         try:
@@ -99,7 +114,7 @@ class TestSpawnDetached:
 
     def test_pid_is_alive_after_spawn(self):
         """Regression #8: spawned process is alive immediately after start."""
-        pid = _spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"])
+        pid = _spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"]).pid
         assert _pid_alive(pid), "spawned process must be alive"
         # Cleanup
         try:
@@ -229,6 +244,113 @@ class TestStart:
             _force_kill(pid)
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------------------
+# start(): output capture + early-exit detection (ticket #81)
+# ---------------------------------------------------------------------------
+
+class TestStartOutputCaptureAndEarlyExit:
+    def test_start_detects_immediate_exit(self, tmp_path):
+        """Ticket #81: an immediately-exiting command is surfaced as
+        status='exited' with its returncode, and its output is captured to
+        the start log file rather than being lost to DEVNULL."""
+        record = _make_record("wt-exit")
+        store = _make_store(record)
+
+        result = start(
+            "wt-exit",
+            [sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"],
+            store=store,
+        )
+
+        assert result.status == "exited"
+        assert result.returncode == 3
+        assert result.start_log_path is not None
+        log_path = Path(result.start_log_path)
+        assert log_path.exists()
+        assert "boom" in log_path.read_text(encoding="utf-8", errors="replace")
+
+    def test_start_long_lived_reports_running(self):
+        """A process still alive after the early-exit poll reports status='running'
+        and returncode=None."""
+        record = _make_record("wt-long")
+        store = _make_store(record)
+
+        result = start(
+            "wt-long",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+        )
+
+        assert result.status == "running"
+        assert result.returncode is None
+
+        # Cleanup
+        pid = result.pids.get(DEFAULT_ROLE, 0)
+        try:
+            _force_kill(pid)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def test_start_log_file_created_and_written(self):
+        """A chatty short-lived command yields a non-empty start_log_path file."""
+        record = _make_record("wt-chatty")
+        store = _make_store(record)
+
+        result = start(
+            "wt-chatty",
+            [sys.executable, "-c", "print('hello from child')"],
+            store=store,
+        )
+
+        log_path = Path(result.start_log_path)
+        assert log_path.exists()
+        assert log_path.stat().st_size > 0
+        assert "hello from child" in log_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+
+    def test_start_missing_log_root_falls_back_to_default(self, monkeypatch, tmp_path):
+        """With WORKTREE_LOG_ROOT unset, start_log_path resolves under
+        DEFAULT_LOG_ROOT."""
+        monkeypatch.delenv("WORKTREE_LOG_ROOT", raising=False)
+        import lib_python_worktree.setup.runner as _runner_module
+        fake_default = tmp_path / "default-logs"
+        monkeypatch.setattr(_runner_module, "DEFAULT_LOG_ROOT", fake_default)
+
+        record = _make_record("wt-default-log")
+        store = _make_store(record)
+
+        result = start(
+            "wt-default-log",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+        )
+
+        log_path = Path(result.start_log_path)
+        assert log_path.exists()
+        assert str(fake_default) in str(log_path)
+
+    def test_start_exited_status_persisted(self):
+        """After an immediate-exit start, store.get(id) round-trips status,
+        returncode, and start_log_path -- proving these survive
+        store.update()/serialization (see YamlStateStore round-trip test for
+        the on-disk serialization path)."""
+        record = _make_record("wt-exit-persist")
+        store = _make_store(record)
+
+        start(
+            "wt-exit-persist",
+            [sys.executable, "-c", "import sys; sys.exit(7)"],
+            store=store,
+        )
+
+        stored = store.get("wt-exit-persist")
+        assert stored is not None
+        assert stored.status == "exited"
+        assert stored.returncode == 7
+        assert stored.start_log_path is not None
 
 
 # ---------------------------------------------------------------------------

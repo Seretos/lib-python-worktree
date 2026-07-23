@@ -43,6 +43,12 @@ from .yaml_store import _pid_alive
 # The role key used when the caller does not supply an explicit role.
 DEFAULT_ROLE = "main"
 
+# Bounded wait, right after spawning, for the child to prove it has already
+# exited (ticket #81). Keeps start() from blocking meaningfully while still
+# catching a process that dies on launch, so that outcome is surfaced as
+# status="exited" (with a returncode) instead of a false "running".
+_EARLY_EXIT_WAIT_SEC = 0.25
+
 # Per-query timeout for the NtQueryObject watchdog inside _win_handle_holders
 # (ticket #71). Measured empirically against a real, ordinary Windows dev
 # machine: a non-trivial fraction (measured up to ~270, out of ~6.5k queries
@@ -127,19 +133,22 @@ def _spawn_detached(
     *,
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[str] = None,
-) -> int:
-    """Spawn *cmd* as a fully detached process and return its PID.
+    log_path: Optional[Path] = None,
+) -> subprocess.Popen:
+    """Spawn *cmd* as a fully detached process and return its ``Popen`` object.
 
-    The child process does not inherit standard streams and is detached from
-    the caller's process group so it survives if the MCP host exits.
+    The child process is detached from the caller's process group so it
+    survives if the MCP host exits.  ``stdin`` is always ``subprocess.DEVNULL``
+    — a detached child must never inherit the caller's stdin.  When
+    *log_path* is given, ``stdout``/``stderr`` are redirected to that file
+    (opened append-binary) so a spawned process's output and early-exit
+    reason are recoverable; otherwise they are also ``subprocess.DEVNULL``.
     """
     if not cmd:
         raise ValueError("cmd must be a non-empty list")
 
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
         "close_fds": True,
     }
     if env is not None:
@@ -161,8 +170,22 @@ def _spawn_detached(
     else:
         kwargs["start_new_session"] = True
 
-    proc = subprocess.Popen(cmd, **kwargs)
-    return proc.pid
+    if log_path is not None:
+        log_file = open(log_path, "ab")
+        try:
+            kwargs["stdout"] = log_file
+            kwargs["stderr"] = log_file
+            proc = subprocess.Popen(cmd, **kwargs)
+        finally:
+            # The child inherits its own duplicate of the handle; the parent
+            # closes its copy immediately after Popen returns.
+            log_file.close()
+    else:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+        proc = subprocess.Popen(cmd, **kwargs)
+
+    return proc
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +991,11 @@ def start(
     # Import here to avoid a circular-import at module level (manager imports
     # us and manager defines WorktreeNotFoundError).
     from .manager import WorktreeNotFoundError
+    # Lazy import mirrors the existing _resolve_shell lazy import in
+    # manager.start, avoiding a circular import (setup.runner does not import
+    # process_lifecycle, but importing at module level here would still tie
+    # this module's import order to setup.runner's).
+    from ..setup.runner import _slug, log_dir_for
 
     if not cmd:
         raise ValueError("cmd must be a non-empty list")
@@ -982,10 +1010,25 @@ def start(
     if existing_pid and _pid_alive(existing_pid):
         raise ProcessAlreadyRunningError(worktree_id, role, existing_pid)
 
-    pid = _spawn_detached(cmd, env=env, cwd=cwd)
+    log_dir = log_dir_for(worktree_id, env=env)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"start-{_slug(role)}.log"
 
-    record.pids[role] = pid
-    record.status = "running"
+    proc = _spawn_detached(cmd, env=env, cwd=cwd, log_path=log_path)
+
+    try:
+        proc.wait(timeout=_EARLY_EXIT_WAIT_SEC)
+    except subprocess.TimeoutExpired:
+        status = "running"
+        returncode = None
+    else:
+        status = "exited"
+        returncode = proc.returncode
+
+    record.pids[role] = proc.pid
+    record.status = status
+    record.returncode = returncode
+    record.start_log_path = str(log_path)
     store.update(record)
 
     return record
