@@ -82,22 +82,25 @@ Each consumer has its own dedicated ticket step with `continue-on-error: true`,
 so a broken or missing token for one consumer never blocks the other or the
 release itself.
 
-- **`WORKTREE_TICKET_TOKEN`** — fine-grained PAT with **Issues: write** on
-  `Seretos/agent-worktree` **and** account-level **Projects: write**. Used for
-  the agent-worktree ticket step and its board-add follow-up.
-- **`WORKBOARD_TICKET_TOKEN`** — fine-grained PAT with **Issues: write** on
-  `Seretos/workboard` **and** account-level **Projects: write**. Used for the
-  workboard ticket step and its board-add follow-up.
+- **`WORKTREE_TICKET_TOKEN`** — classic PAT with the **`repo`** scope
+  (Issues: write on `Seretos/agent-worktree`) **and** the **`project`**
+  scope. Used for the agent-worktree ticket step and its board-add follow-up.
+- **`WORKBOARD_TICKET_TOKEN`** — classic PAT with the **`repo`** scope
+  (Issues: write on `Seretos/workboard`) **and** the **`project`** scope.
+  Used for the workboard ticket step and its board-add follow-up.
 
 `GITHUB_TOKEN` cannot open cross-repo issues, so both PATs are required.
+Fine-grained PATs cannot be used here — they have no "Projects" permission
+at all, a hard GitHub platform limitation, not a setting to look for harder
+in the UI; only classic PATs (Tokens (classic)) expose the `project` scope.
 
 Right after filing (or finding) each ticket, a follow-up step adds it to the
 `users/Seretos/projects/2` board via `gh project item-add`, reusing that
-consumer's own ticket token — no separate board secret. A fine-grained PAT can
-carry account-level **Projects: write** alongside its repo-scoped
-**Issues: write**, so each per-consumer token above covers both its ticket step
-and its board-add. Missing permission → the board-add is skipped or logged as a
-`::warning::`, never fails the run — the ticket itself still opens normally.
+consumer's own ticket token — no separate board secret. Each per-consumer
+classic PAT above carries both `repo` and `project` scopes, so it covers both
+its ticket step and its board-add. Missing `project` scope → the board-add is
+skipped or logged as a `::warning::`, never fails the run — the ticket itself
+still opens normally.
 
 **If the automatic step was skipped or failed**, re-file manually by running
 the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via "Run
@@ -114,12 +117,13 @@ naming the offending consumer in the error output.
 
 **Human prerequisite -- `WORKTREE_TICKET_TOKEN`:** create this repository secret
 (Settings -> Secrets -> Actions) once before the first release. Generate a
-fine-grained PAT scoped to `Seretos/agent-worktree` with **Issues: write**
-permission, and add account-level **Projects: write** so the same token can add
+**classic PAT** (Settings -> Developer settings -> Personal access tokens ->
+**Tokens (classic)**) with the `repo` scope (Issues: write on
+`Seretos/agent-worktree`) and the `project` scope so the same token can add
 the ticket to project board 2.
 
 **Human prerequisite -- `WORKBOARD_TICKET_TOKEN`:** create this repository secret
 (Settings -> Secrets -> Actions) once before the first release. Generate a
-fine-grained PAT scoped to `Seretos/workboard` with **Issues: write**
-permission, and add account-level **Projects: write** so the same token can add
-the ticket to project board 2.
+**classic PAT** with the `repo` scope (Issues: write on `Seretos/workboard`)
+and the `project` scope so the same token can add the ticket to project
+board 2.
