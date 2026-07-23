@@ -183,10 +183,10 @@ jobs:
 
       - name: Add agent-worktree ticket to project board
         # Reuses WORKTREE_TICKET_TOKEN: adding an item to a user-owned
-        # Projects v2 board needs account-level "Projects: write", which a
-        # fine-grained PAT can carry alongside its repo-scoped Issues: write —
-        # so this consumer's own ticket token is used, no separate board
-        # secret required.
+        # Projects v2 board needs the `project` scope, which only a classic
+        # PAT can carry alongside its `repo` scope (fine-grained PATs have no
+        # Projects permission at all) — so this consumer's own ticket token
+        # is used, no separate board secret required.
         if: steps.file_worktree.outputs.issue_url != ''
         continue-on-error: true
         shell: bash
@@ -249,8 +249,8 @@ jobs:
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Add workboard ticket to project board
-        # Reuses WORKBOARD_TICKET_TOKEN, which must also carry account-level
-        # "Projects: write" alongside its repo-scoped Issues: write.
+        # Reuses WORKBOARD_TICKET_TOKEN, which must be a classic PAT carrying
+        # both `repo` and `project` scopes.
         if: steps.file_workboard.outputs.issue_url != ''
         continue-on-error: true
         shell: bash
