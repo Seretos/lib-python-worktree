@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -232,6 +232,23 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
     with ``classify_checkout()``'s and ``_validate_repo()``'s handling of a
     failing ``_run_git`` call; a git failure is a real error, not "zero
     environments".
+
+    **Branch-freshness contract, per entry kind (ticket #85):**
+
+    - **Primary:** ``record.branch`` is always ``None`` (#84) and must be
+      resolved live via ``WorktreeManager._effective_branch(record)``.
+    - **Tracked linked worktree:** ``record.branch`` is refreshed *in memory*
+      from git's live ``worktree list --porcelain`` view on every call --
+      the stored value goes stale the moment someone runs a manual
+      ``git checkout`` inside the worktree. This is a read view only:
+      nothing is written back to the state store, so ``record.branch`` here
+      may legitimately differ from what is persisted to ``state.yaml``, and
+      callers must not treat it as evidence of a store update.
+    - **Detached tracked linked worktree:** porcelain emits no ``branch``
+      line for a detached HEAD, so the entry keeps its stored / last-known
+      branch instead of being refreshed to ``None``.
+    - **Untracked linked worktree:** ``record.branch`` comes from porcelain
+      by construction, same as always (unchanged by this ticket).
     """
     info = classify_checkout(path)
     repo_root_str = info.repo_root.as_posix()
@@ -265,6 +282,16 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
         is_primary_block = wt_path == primary_path
         record = records_by_path.get(wt_path)
         tracked = record is not None
+
+        if record is not None and not is_primary_block:
+            # Refresh a tracked linked worktree's branch from git's live view: the
+            # stored value goes stale after a manual `git checkout` inside the
+            # worktree. dataclasses.replace() (never in-place mutation) because
+            # InMemoryStateStore.list() hands out its live record objects -- this
+            # function is read-only and must never write back to the store.
+            live_branch = block.get("branch")
+            if live_branch and live_branch != record.branch:
+                record = replace(record, branch=live_branch)
 
         if record is None:
             if is_primary_block:
