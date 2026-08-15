@@ -168,3 +168,33 @@ def test_update_missing_raises_key_error():
     rec = _make_record(id="ghost")
     with pytest.raises(KeyError):
         store.update(rec)
+
+
+# ---------------------------------------------------------------------------
+# backing field (ticket #84)
+# ---------------------------------------------------------------------------
+
+def test_worktree_record_default_backing_is_worktree():
+    rec = _make_record()
+    assert rec.backing == "worktree"
+
+
+def test_find_by_branch_skips_primary_records():
+    """A primary record must never shadow a create() duplicate-branch check
+    via find_by_branch() (ticket #84, R4 edge case).
+
+    Deliberately gives the primary record a matching ``branch="main"`` (even
+    though a real primary always stores ``branch=None``) so the assertion
+    proves the explicit ``backing == "primary"`` skip is doing the work --
+    not merely that the branch values happen not to match.
+    """
+    store = InMemoryStateStore()
+    primary_rec = WorktreeRecord(
+        id="primary-shadow",
+        repo_root="/repos/myrepo",
+        branch="main",
+        path="/repos/myrepo",
+        backing="primary",
+    )
+    store.add(primary_rec)
+    assert store.find_by_branch("/repos/myrepo", "main") is None

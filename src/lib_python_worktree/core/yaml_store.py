@@ -46,6 +46,10 @@ _PORTS_FILE = "ports.yaml"
 _STATE_SCHEMA_VERSION = 1
 _PORTS_SCHEMA_VERSION = 1
 _LOCK_TIMEOUT = 10.0  # seconds
+# Canonical separator between a ports.yaml key's owner id and its slot name
+# (e.g. "wt-a:web"). Owned by this module; port_allocator.py aliases it as
+# _KEY_SEP so the import direction (port_allocator -> yaml_store) stays intact.
+_PORT_KEY_SEP = ":"
 # EXCLUSIVE|NON_BLOCKING lets portalocker poll with its own retry loop and
 # honour the timeout argument.  Pure LOCK_EX (blocking) makes the OS block
 # indefinitely and portalocker cannot interrupt it for the timeout.
@@ -125,6 +129,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "branch_created_by_us": rec.branch_created_by_us,
         "returncode": rec.returncode,
         "start_log_path": rec.start_log_path,
+        "backing": rec.backing,
     }
 
 
@@ -140,7 +145,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
     return WorktreeRecord(
         id=d["id"],
         repo_root=d["repo_root"].replace("\\", "/"),
-        branch=d["branch"],
+        branch=d.get("branch"),
         path=d["path"].replace("\\", "/"),
         status=d.get("status", "created"),
         ports=dict(d.get("ports") or {}),
@@ -148,6 +153,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         branch_created_by_us=bool(d.get("branch_created_by_us", False)),
         returncode=d.get("returncode"),
         start_log_path=d.get("start_log_path"),
+        backing=d.get("backing", "worktree"),
     )
 
 
@@ -382,6 +388,11 @@ class YamlStateStore:
         with self._with_state_lock():
             records = self._load_state()
         for rec in records.values():
+            if rec.backing == "primary":
+                # A primary record's branch is never stored (read live via
+                # _effective_branch) and must never shadow a create()
+                # duplicate-branch check.
+                continue
             if rec.repo_root == repo_root and rec.branch == branch:
                 return rec
         return None
@@ -460,10 +471,16 @@ def reconcile(
             store._save_state(records)
 
     # --- Phase 2: ports.yaml ---
-    # Build the set of all surviving PIDs (from the freshly-reconciled records)
-    surviving_pids: set[int] = set()
-    for rec in records.values():
-        surviving_pids.update(rec.pids.values())
+    # Free a port allocation only when its *owning record* no longer exists in
+    # state.yaml — not based on whether the port is currently listening or
+    # whether any PID happens to still be alive somewhere. Each ports.yaml key
+    # is `<owner_id><_PORT_KEY_SEP><slot>`; a legacy/hand-written key with no
+    # separator is treated as its own owner id (unprefixed keys have no
+    # matching record and are therefore always freed). This fixes a bug where
+    # a stopped-but-still-tracked environment (no live PIDs) would have its
+    # port reservation wiped by reconcile() even though the record — and
+    # therefore the reservation's rightful owner — still exists.
+    surviving_ids: set[str] = set(records.keys())
 
     ports_lock = portalocker.Lock(
         str(store._ports_path) + ".lock",
@@ -473,14 +490,9 @@ def reconcile(
     with ports_lock:
         allocated = store._ports._load()
         to_free: List[str] = []
-        for name, port in list(allocated.items()):
-            in_use = _port_in_use(port)
-            if not in_use and not surviving_pids:
-                # Port not listening and no surviving PIDs remain in any
-                # worktree record — safe to release.  When a live process
-                # is still tracked (surviving_pids is non-empty) we keep
-                # the allocation because the process may not have bound
-                # yet (race between startup and reconcile).
+        for name, _port in list(allocated.items()):
+            owner_id = name.split(_PORT_KEY_SEP, 1)[0]
+            if owner_id not in surviving_ids:
                 to_free.append(name)
         for name in to_free:
             port = allocated.pop(name)

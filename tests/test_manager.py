@@ -2246,3 +2246,86 @@ def test_create_fetch_true_branches_from_origin_not_stale_local(
     assert wt_head != local_head_before, (
         "New worktree must NOT start from the stale local main"
     )
+
+
+# ---------------------------------------------------------------------------
+# R2 (ticket #84, B2) -- _validate_repo() resolves the main clone from
+# anywhere inside the repo, including from within a linked worktree.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_create_from_linked_worktree_path_targets_main_clone(
+    manager: WorktreeManager, git_repo: Path, linked_worktree: Path
+):
+    """R2 driving test: create() called with repo_root pointing INSIDE a
+    linked worktree must target the main clone, not that linked worktree."""
+    # fetch=False: the git_repo fixture has no `origin` remote configured
+    # (same reason every other base= test in this file passes fetch=False).
+    record = manager.create(str(linked_worktree), "feature/beta", base="main", fetch=False)
+
+    assert record.repo_root == git_repo.resolve().as_posix()
+
+    # The new worktree must appear in `git worktree list --porcelain` when
+    # run from the main clone (proving it was actually created off the main
+    # clone's registry, not the linked worktree's).
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert record.path in listing.replace("\\", "/") or Path(record.path).name in listing
+
+
+@pytest.mark.requires_git
+def test_validate_repo_from_main_clone_subdir_targets_main_clone(
+    manager: WorktreeManager, git_repo: Path
+):
+    subdir = git_repo / "sub"
+    subdir.mkdir()
+    resolved = manager._validate_repo(str(subdir))
+    assert resolved == git_repo.resolve()
+
+
+@pytest.mark.requires_git
+def test_adopt_from_linked_worktree_path_targets_main_clone(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """adopt() called with a linked-worktree path still adopts against the
+    main clone (extends the existing adopt() coverage above)."""
+    state_dir = tmp_path / "state-r2-adopt"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store-r2-adopt"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    oot_path = tmp_path / "oot-wt-r2"
+    subprocess.run(
+        ["git", "worktree", "add", str(oot_path), "-b", "feature/r2-oot", "main"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    try:
+        report = mgr.adopt(str(linked_worktree))
+        # linked_worktree (feature/alpha) itself is also untracked in this
+        # fresh store, so BOTH it and oot_path (feature/r2-oot) get adopted.
+        # The point under test is repo_root resolution, not adoption count.
+        assert len(report.adopted) == 2
+        for rec in mgr.list():
+            assert rec.repo_root == git_repo.resolve().as_posix()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(oot_path)],
+            cwd=git_repo, capture_output=True,
+        )
+
+
+def test_validate_repo_non_repo_path_still_raises_invalid_repo_error(tmp_path: Path):
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+    plain_dir = tmp_path / "not-a-repo"
+    plain_dir.mkdir()
+    with pytest.raises(InvalidRepoError):
+        mgr._validate_repo(str(plain_dir))

@@ -65,6 +65,7 @@ m.prune("/path/to/repo")
 │    └─ yaml_store.py  — YamlStateStore, reconcile, adopt  │
 │    └─ port_allocator.py — PortAllocator                  │
 │    └─ process_lifecycle.py — start / stop                │
+│    └─ checkout.py    — classify_checkout, list_repo      │
 │    └─ _git_utils.py  — _run_git (timeout-hardened)       │
 │    └─ _exceptions.py — WorktreeError hierarchy           │
 └──────────────┬──────────────────────────────────────────┘
@@ -80,12 +81,23 @@ m.prune("/path/to/repo")
 ```
 
 `manager.py` imports from `state.py`, `yaml_store.py`, `port_allocator.py`,
-`process_lifecycle.py`, `_git_utils.py`, and `contract/loader.py`.
+`process_lifecycle.py`, `checkout.py`, `_git_utils.py`, and `contract/loader.py`.
 `yaml_store.py` imports from `_git_utils.py`; `port_allocator.py` imports from
-`yaml_store.py` (sharing `_LOCK_FLAGS`, `_LOCK_TIMEOUT`, `_PortsFile`, and
-`_port_in_use`).
+`yaml_store.py` (sharing `_LOCK_FLAGS`, `_LOCK_TIMEOUT`, `_PortsFile`,
+`_PORT_KEY_SEP`, and `_port_in_use`). `checkout.py` imports only
+`_exceptions.py`, `_git_utils.py`, and `state.py` -- never `manager.py` -- so
+`manager.py` can depend on it without a cycle.
 `setup/runner.py` is independent of `core/`; `manager.py` imports it lazily
 inside `_teardown` to avoid a circular import.
+
+`reconcile()`'s port-freeing rule (ticket #84): a `ports.yaml` entry is freed
+only when its *owning record* (parsed from the `<owner_id>:<slot>` key,
+matching `port_allocator`'s `_PORT_KEY_SEP`) no longer exists in
+`state.yaml` -- not based on whether the port is currently listening
+(`_port_in_use`, still used by `PortAllocator.allocate()`'s own
+collision-avoidance check) or whether any PID happens to be alive. A
+stopped-but-still-tracked environment's reservation is therefore never
+wiped, and it survives to its next `start()`.
 
 ## On-disk layout
 

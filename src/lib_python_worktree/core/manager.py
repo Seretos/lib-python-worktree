@@ -25,8 +25,17 @@ from typing import Dict, List, Optional
 
 from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
 from ._env_utils import _get_user_profile_env
-from ._exceptions import DirtyWorktreeError, GitTimeoutError, InvalidRepoError, UnknownVariantError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
+from .checkout import (
+    CheckoutInfo,
+    EnvironmentEntry,
+    RepoListing,
+    _path_contains,
+    classify_checkout,
+    list_repo as _list_repo,
+    primary_id_for,
+)
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
     ProcessAlreadyRunningError,
@@ -263,6 +272,42 @@ def _is_path_prunable(repo_path: Path, target_path: str) -> Optional[bool]:
     return found
 
 
+def _effective_branch(record: "WorktreeRecord") -> str:
+    """Return *record*'s effective branch name, read live for a primary.
+
+    A primary ``WorktreeRecord`` never stores its branch (see the ``backing``
+    docstring on ``WorktreeRecord``) precisely so it can never go stale
+    across a ``git checkout``/branch switch done directly in the main clone
+    -- it is read fresh, on every call, via ``git rev-parse --abbrev-ref
+    HEAD`` in ``record.path``. A linked worktree's ``record.branch`` is
+    always set at creation time and is returned as-is with **no** git call
+    at all (a worktree's branch cannot change out from under it the same
+    way).
+
+    Detached HEAD reads back as ``"HEAD"`` from ``--abbrev-ref``; that case
+    falls back to the short commit sha via ``git rev-parse --short HEAD`` so
+    callers still get a meaningful, non-generic value. Any git failure
+    (unreadable repo, etc.) returns ``""`` rather than raising -- this value
+    only feeds environment variables / contract-step context, never a
+    correctness gate.
+    """
+    if record.branch:
+        return record.branch
+
+    proc = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=Path(record.path))
+    if proc.returncode != 0:
+        return ""
+    ref = proc.stdout.strip()
+    if ref and ref != "HEAD":
+        return ref
+
+    # Detached HEAD (or unexpectedly empty output): fall back to short sha.
+    short_proc = _run_git(["rev-parse", "--short", "HEAD"], cwd=Path(record.path))
+    if short_proc.returncode != 0:
+        return ""
+    return short_proc.stdout.strip()
+
+
 def _build_worktree_env(
     record: "WorktreeRecord",
     caller_env: "Optional[Dict[str, str]]",
@@ -286,7 +331,7 @@ def _build_worktree_env(
     env: Dict[str, str] = _get_user_profile_env()
     env["WORKTREE_ID"] = record.id
     env["WORKTREE_PATH"] = record.path
-    env["WORKTREE_BRANCH"] = record.branch
+    env["WORKTREE_BRANCH"] = _effective_branch(record)
     for slot, port in record.ports.items():
         env[f"WORKTREE_PORT_{slot.upper()}"] = str(port)
     if caller_env is not None:
@@ -480,7 +525,7 @@ class WorktreeManager:
                     setup=_setup_contract.setup,
                     worktree_id=record.id,
                     worktree_path=Path(record.path),
-                    branch=record.branch,
+                    branch=_effective_branch(record),
                     port_mapping=record.ports,
                 )
             except Exception:  # noqa: BLE001
@@ -525,6 +570,17 @@ class WorktreeManager:
             raise WorktreeNotFoundError(
                 f"No worktree tracked with id '{worktree_id}'"
             )
+        # Guard 1 (ticket #84): refuse a primary checkout before any
+        # teardown/FS work runs -- never honours force=True. A primary
+        # checkout IS the repo; deleting it would be catastrophic and
+        # structurally different from removing a disposable linked worktree.
+        # _teardown() carries the same guard (guard 2) for callers that reach
+        # it directly, so this refusal holds even if a mislabelled record
+        # (backing="worktree" but path == repo_root) slips through here.
+        if record.backing == "primary" or Path(record.path).resolve() == Path(
+            record.repo_root
+        ).resolve():
+            raise PrimaryCheckoutError(worktree_id)
         # Phase 1: remove the git worktree checkout.  If this raises the
         # directory still exists, so we keep the state record and propagate.
         self._teardown(record, force=force, kill_blocking_processes=kill_blocking_processes)
@@ -580,15 +636,32 @@ class WorktreeManager:
 
     def start(
         self,
-        worktree_id: str,
+        worktree_id: Optional[str] = None,
         *,
+        checkout_path: Optional[str] = None,
         role: str = "main",
         env: Optional[dict] = None,
         cwd: Optional[str] = None,
         variant: str = "default",
     ) -> WorktreeRecord:
-        """Spawn a detached process for *worktree_id* using the contract's
-        ``start:`` step, and record its PID.
+        """Spawn a detached process for the target environment, using the
+        contract's ``start:`` step, and record its PID.
+
+        The target is resolved by ``_resolve_target()`` from *worktree_id*
+        and/or *checkout_path* (ticket #84):
+
+        - *worktree_id* alone: today's exact-path lookup, unchanged.
+        - *checkout_path* alone: classified via ``classify_checkout()``. A
+          primary checkout resolves to its deterministic id
+          (``primary_id_for()``) and is **materialised** here (this is the
+          only place a primary ``WorktreeRecord`` is ever written) if it has
+          never been started before. A linked worktree resolves to whichever
+          tracked record's path matches exactly; an untracked one raises
+          ``WorktreeNotFoundError`` naming ``adopt()``.
+        - Both given: resolved via *checkout_path* as above, then the
+          resolved id must equal *worktree_id* or ``CheckoutTargetError`` is
+          raised.
+        - Neither given: ``CheckoutTargetError``.
 
         The command is read from the ``start:`` field of the worktree contract
         at ``<repo_root>/.seretos/worktree-setup.yml``.
@@ -612,18 +685,29 @@ class WorktreeManager:
         of the box for simple repos (e.g. dependency-bump chores).  See
         ticket #41.
 
+        Before either the no-op or a real spawn, any contract ``ports:``
+        slot the resolved record does not have yet is allocated (ticket #84,
+        R9): incremental, so a contract gaining a new slot picks it up on
+        the next ``start()`` without disturbing existing slots, and a
+        stopped environment's already-allocated ports survive to the next
+        start (``stop()``/``_teardown()`` never release them for a still-
+        tracked record — see ``reconcile()``'s per-owner rule).
+
         Delegates to ``process_lifecycle.start`` with ``store=self.state``
         only when a concrete ``start:`` step is selected. ``cwd=None``
         (the default) defaults to ``record.path`` (ticket #81), not the
         caller's own working directory.
         """
-        record = self.state.get(worktree_id)
-        if record is None:
-            raise WorktreeNotFoundError(
-                f"No worktree tracked with id '{worktree_id}'"
-            )
+        record = self._resolve_target(worktree_id, checkout_path, materialise=True)
 
         contract = _load_contract(Path(record.repo_root) / CONTRACT_FILENAME)
+
+        if contract.ports:
+            missing = [s.name for s in contract.ports if s.name not in record.ports]
+            if missing:
+                allocated = self._allocator.allocate(missing, record.id)
+                record.ports.update(allocated)
+                self.state.update(record)
 
         if not contract.start:
             # No start: step configured — nothing to run.  Treat as a no-op
@@ -655,7 +739,7 @@ class WorktreeManager:
         cmd = [*_resolve_shell(step.shell), step.run]
 
         return _lifecycle_start(
-            worktree_id,
+            record.id,
             cmd,
             store=self.state,
             role=role,
@@ -665,13 +749,21 @@ class WorktreeManager:
 
     def stop(
         self,
-        worktree_id: str,
+        worktree_id: Optional[str] = None,
         *,
+        checkout_path: Optional[str] = None,
         role: str = "main",
         timeout: float = 10.0,
         kill_orphans: bool = False,
     ) -> WorktreeRecord:
-        """Stop the process recorded under *role* for *worktree_id*.
+        """Stop the process recorded under *role* for the target environment.
+
+        The target is resolved by ``_resolve_target()`` exactly as in
+        ``start()`` (ticket #84), with ``materialise=False``: stopping an
+        environment that was never started has no record to operate on and
+        raises ``WorktreeNotFoundError`` — consistent with today's
+        unknown-id contract, and it keeps "a primary record is written only
+        by the first ``start()``" literally true.
 
         If the contract defines ``stop:`` steps, they are run (best-effort,
         errors are swallowed) before sending the stop signal.
@@ -690,7 +782,7 @@ class WorktreeManager:
         This is the engine's documented and intentional behavior (ticket
         #41) and this method's return type is fixed: it always returns a
         ``WorktreeRecord`` (or raises ``WorktreeNotFoundError`` for an
-        unknown *worktree_id*), never a dict-shaped "soft error" result.
+        unknown target), never a dict-shaped "soft error" result.
         Any dict-shaped soft-error contract for a never-started role (e.g.
         ``{"error": ..., "code": ...}``) is owned by the MCP wrapper layer in
         the separate ``agent-worktree`` plugin repo, which translates this
@@ -699,12 +791,10 @@ class WorktreeManager:
         not implemented here (see ``AGENTS.md``'s "Layering" section).
 
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
+        Ports are deliberately **not** released here — see ``start()``'s
+        docstring and ``reconcile()``'s per-owner rule (ticket #84, R9).
         """
-        record = self.state.get(worktree_id)
-        if record is None:
-            raise WorktreeNotFoundError(
-                f"No worktree tracked with id '{worktree_id}'"
-            )
+        record = self._resolve_target(worktree_id, checkout_path, materialise=False)
 
         # Run contract stop: steps (best-effort — a failure must not prevent
         # the SIGTERM from being sent).
@@ -719,7 +809,7 @@ class WorktreeManager:
                         setup=contract.stop,
                         worktree_id=record.id,
                         worktree_path=Path(record.path),
-                        branch=record.branch,
+                        branch=_effective_branch(record),
                         port_mapping=record.ports,
                     )
                 except Exception:  # noqa: BLE001
@@ -737,7 +827,7 @@ class WorktreeManager:
             return record
 
         return _lifecycle_stop(
-            worktree_id,
+            record.id,
             store=self.state,
             role=role,
             timeout=timeout,
@@ -776,8 +866,125 @@ class WorktreeManager:
             setup=contract.seed_postprocess,
             worktree_id=record.id,
             worktree_path=Path(record.path),
-            branch=record.branch,
+            branch=_effective_branch(record),
             port_mapping=record.ports,
+        )
+
+    def list_repo(self, path: str) -> "RepoListing":
+        """Return the repo-scoped listing (primary + linked worktrees) for
+        any *path* inside a repo (ticket #84, §8).
+
+        Thin wrapper around the pure ``checkout.list_repo()`` function, fed
+        with the current store's records — the actual join/synthesis logic
+        lives there (store-free, independently unit-testable) so this method
+        stays a two-line, read-only pass-through.
+        """
+        return _list_repo(path, self.state.list())
+
+    def _resolve_target(
+        self,
+        worktree_id: Optional[str],
+        checkout_path: Optional[str],
+        *,
+        materialise: bool,
+    ) -> WorktreeRecord:
+        """Resolve a ``start()``/``stop()`` target from *worktree_id* and/or
+        *checkout_path* (ticket #84). See the resolution table in the
+        ticket's plan; behaviour is exhaustively covered by the
+        ``test_target_resolution_*`` tests in
+        ``tests/test_primary_environment.py``.
+
+        *materialise*: when ``True`` (only ``start()`` passes this), an
+        unresolved primary checkout is created and persisted here — the
+        **only** place a primary ``WorktreeRecord`` is ever written.
+        ``False`` (``stop()``) never writes a record; an unresolved primary
+        raises ``WorktreeNotFoundError`` instead.
+        """
+        if checkout_path is None:
+            if worktree_id is None:
+                raise CheckoutTargetError(
+                    worktree_id=None, checkout_path=None, reason="missing"
+                )
+            record = self.state.get(worktree_id)
+            if record is None:
+                raise WorktreeNotFoundError(
+                    f"No worktree tracked with id '{worktree_id}'. "
+                    f"Pass checkout_path=... to start the primary checkout."
+                )
+            return record
+
+        # checkout_path given (worktree_id may or may not also be given).
+        # classify_checkout() runs before any state access, per the
+        # resolution table's "checkout_path at a non-repo dir" row.
+        info = classify_checkout(checkout_path)
+
+        existing_record: Optional[WorktreeRecord] = None
+        resolved_id: Optional[str] = None
+        if info.backing == "primary":
+            resolved_id = primary_id_for(info.repo_root)
+            existing_record = self.state.get(resolved_id)
+        else:
+            # Match on containment (path == rec.path, or path is a
+            # subdirectory of rec.path), not exact equality -- mirrors how
+            # the primary branch above resolves subdirectories via
+            # primary_id_for()/repo_root. Scoped to this repo's records
+            # (rec.repo_root == info.repo_root) so a same-prefix path under
+            # a different repo's worktree can never match. When several
+            # tracked worktrees could contain the path (nested worktrees),
+            # prefer the most specific (longest/deepest) match so a nested
+            # worktree isn't shadowed by an ancestor.
+            target_path = info.checkout_path
+            repo_root_str = info.repo_root.as_posix()
+            best_rec: Optional[WorktreeRecord] = None
+            best_depth = -1
+            for rec in self.state.list():
+                if rec.backing != "worktree" or rec.repo_root != repo_root_str:
+                    continue
+                rec_path = Path(rec.path).resolve()
+                if rec_path != target_path and not _path_contains(rec_path, target_path):
+                    continue
+                depth = len(rec_path.parts)
+                if depth > best_depth:
+                    best_depth = depth
+                    best_rec = rec
+            if best_rec is not None:
+                existing_record = best_rec
+                resolved_id = best_rec.id
+
+        if (
+            worktree_id is not None
+            and resolved_id is not None
+            and resolved_id != worktree_id
+        ):
+            raise CheckoutTargetError(
+                worktree_id=worktree_id,
+                checkout_path=str(checkout_path),
+                resolved_id=resolved_id,
+                reason="id_mismatch",
+            )
+
+        if existing_record is not None:
+            return existing_record
+
+        if info.backing == "primary":
+            if not materialise:
+                raise WorktreeNotFoundError(
+                    f"No primary checkout environment started yet for "
+                    f"'{info.repo_root}'. Call start(checkout_path=...) first."
+                )
+            record = WorktreeRecord(
+                id=resolved_id,
+                repo_root=info.repo_root.as_posix(),
+                branch=None,
+                path=info.repo_root.as_posix(),
+                backing="primary",
+            )
+            self.state.add(record)
+            return record
+
+        raise WorktreeNotFoundError(
+            f"No tracked worktree at '{checkout_path}'. "
+            f"Use adopt() to import it first."
         )
 
     # ---- seams for later phases ----
@@ -808,6 +1015,16 @@ class WorktreeManager:
         ``_lifecycle_module`` is an injection seam for tests; callers should
         leave it as ``None`` (the real ``process_lifecycle`` module is used).
         """
+        # Guard 2 (ticket #84): the same primary-checkout refusal as
+        # remove(), repeated here so that any caller reaching _teardown()
+        # directly (or a mislabelled record whose backing says "worktree"
+        # but whose path IS the repo root) can never trigger the destructive
+        # FS work below. Checked before any lifecycle/FS side effect.
+        if record.backing == "primary" or Path(record.path).resolve() == Path(
+            record.repo_root
+        ).resolve():
+            raise PrimaryCheckoutError(record.id)
+
         lifecycle = _lifecycle_module
         if lifecycle is None:
             from . import process_lifecycle as lifecycle  # type: ignore[assignment]
@@ -1115,6 +1332,13 @@ class WorktreeManager:
         Skips silently if the branch is already gone (idempotent).
         """
 
+        if record.backing == "primary" or not record.branch:
+            # Defense-in-depth (ticket #84): remove()/_teardown() already
+            # refuse a primary record before this could ever be reached, and
+            # a primary's branch_created_by_us is never True in practice --
+            # this guard exists so _delete_owned_branch() is safe even if
+            # called directly (e.g. from a test) against a primary record.
+            return
         if not record.branch_created_by_us:
             return
         repo_path = Path(record.repo_root)
@@ -1137,10 +1361,14 @@ class WorktreeManager:
         path = Path(repo_root).expanduser().resolve()
         if not path.exists():
             raise InvalidRepoError(repo_root, f"repo_root does not exist: {path}")
-        proc = _run_git(["rev-parse", "--show-toplevel"], cwd=path)
-        if proc.returncode != 0:
-            raise InvalidRepoError(repo_root, f"not a git repository: {path}")
-        return Path(proc.stdout.strip()).resolve()
+        # Ticket #84 (B2): classify_checkout() resolves the MAIN clone's root
+        # from any path inside the repo -- including a linked worktree. The
+        # previous `git rev-parse --show-toplevel` call resolved *whichever*
+        # checkout `path` happened to be inside, so calling create()/adopt()/
+        # prune() from within a linked worktree silently targeted that
+        # worktree instead of the main clone.
+        info = classify_checkout(path)
+        return info.repo_root
 
     def _branch_exists(self, repo_path: Path, branch: str) -> bool:
         proc = _run_git(
@@ -1153,13 +1381,18 @@ class WorktreeManager:
 __all__ = (
     "BranchAlreadyCheckedOutError",
     "BranchNotFoundError",
+    "CheckoutInfo",
+    "CheckoutTargetError",
     "DirtyWorktreeError",
     "DuplicateWorktreeError",
+    "EnvironmentEntry",
     "GitCommandError",
     "GitTimeoutError",
     "InvalidBranchError",
     "InvalidRepoError",
     "ManagerConfig",
+    "PrimaryCheckoutError",
+    "RepoListing",
     "UnknownVariantError",
     "WorktreeDirLockedError",
     "WorktreeError",
@@ -1169,4 +1402,6 @@ __all__ = (
     "ProcessAlreadyRunningError",
     "ProcessLifecycleError",
     "ProcessNotRunningError",
+    "classify_checkout",
+    "primary_id_for",
 )

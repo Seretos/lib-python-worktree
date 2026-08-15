@@ -17,16 +17,25 @@ if TYPE_CHECKING:
 
 @dataclass
 class WorktreeRecord:
-    """A single tracked worktree.
+    """A single tracked worktree (or, since ticket #84, a primary checkout).
 
     Fields ``ports``, ``pids``, and ``status`` exist for forward compatibility
     with W4/W5/W6 and are populated by later phases. W2 leaves them at their
     defaults.
+
+    ``backing`` (ticket #84) is the checkout *substrate* -- ``"worktree"``
+    (default, a linked ``git worktree`` checkout) or ``"primary"`` (the
+    repo's main clone, addressed via ``checkout_path`` rather than created by
+    ``create()``). It is explicitly orthogonal to ``branch_created_by_us``:
+    the latter tracks whether *this manager* created the branch, the former
+    tracks what kind of checkout the record describes. ``branch`` is
+    ``Optional`` because a primary record's branch is never stored -- it is
+    read live via ``_effective_branch`` so it can never go stale.
     """
 
     id: str
     repo_root: str
-    branch: str
+    branch: Optional[str]
     path: str
     status: str = "created"
     ports: Dict[str, int] = field(default_factory=dict)
@@ -35,6 +44,7 @@ class WorktreeRecord:
     killed_pids: List["KilledProcessInfo"] = field(default_factory=list)
     returncode: Optional[int] = None
     start_log_path: Optional[str] = None
+    backing: str = "worktree"
 
 
 class StateStore(Protocol):
@@ -79,6 +89,11 @@ class InMemoryStateStore:
         self, repo_root: str, branch: str
     ) -> Optional[WorktreeRecord]:
         for rec in self._records.values():
+            if rec.backing == "primary":
+                # A primary record's branch is never stored (read live via
+                # _effective_branch) and must never shadow a create()
+                # duplicate-branch check.
+                continue
             if rec.repo_root == repo_root and rec.branch == branch:
                 return rec
         return None
