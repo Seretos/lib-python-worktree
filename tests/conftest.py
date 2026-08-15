@@ -6,6 +6,9 @@ Provides:
 - manager_factory: factory returning WorktreeManager instances with automatic
                    teardown of any worktrees created during the test.
 - manager:         convenience wrapper around manager_factory for single-manager tests.
+- linked_worktree: a real `git worktree add`-ed checkout off git_repo.
+- yaml_manager:    factory building a WorktreeManager on a real YamlStateStore
+                   (so the real PortAllocator is exercised, not _NoOpPortAllocator).
 """
 
 from __future__ import annotations
@@ -145,3 +148,81 @@ def manager_factory(
 def manager(manager_factory: Callable[..., WorktreeManager]) -> WorktreeManager:
     """A single ``WorktreeManager`` backed by the shared manager_factory."""
     return manager_factory()
+
+
+# ---------------------------------------------------------------------------
+# linked_worktree: a real `git worktree add`-ed checkout off git_repo
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def linked_worktree(git_repo: Path, tmp_path: Path) -> Iterator[Path]:
+    """Yield a Path to a real linked worktree checked out from ``git_repo``.
+
+    Checked out on ``feature/alpha`` (already branched off ``main`` by the
+    ``git_repo`` fixture), so this can stand in wherever a test needs "some
+    other, already-existing checkout of the same repo" without going through
+    ``WorktreeManager.create()``.
+    """
+    wt_path = tmp_path / "linked-wt"
+    _run_git("worktree", "add", str(wt_path), "feature/alpha", cwd=git_repo)
+    yield wt_path
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        cwd=git_repo,
+        capture_output=True,
+    )
+    shutil.rmtree(wt_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# yaml_manager: WorktreeManager on a real YamlStateStore (real PortAllocator)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def yaml_manager(
+    tmp_path: Path, skip_if_no_git  # noqa: ARG001
+) -> Iterator[Callable[..., WorktreeManager]]:
+    """Yield a factory building a ``WorktreeManager`` on a real
+    ``YamlStateStore``, so ``self._allocator`` is the real ``PortAllocator``
+    (not ``_NoOpPortAllocator``, which the plain ``manager``/``manager_factory``
+    fixtures get via ``InMemoryStateStore``).  Needed to exercise real port
+    allocation/reservation behaviour (ticket #84, R9) and primary-checkout
+    persistence (R7) end-to-end.
+    """
+    from lib_python_worktree.core.yaml_store import YamlStateStore
+
+    managers: List[WorktreeManager] = []
+    store_counter = [0]
+
+    def _make(store_root: Path | None = None) -> WorktreeManager:
+        store_counter[0] += 1
+        root = store_root or (tmp_path / f"store-{store_counter[0]}")
+        state_dir = tmp_path / f"state-{store_counter[0]}"
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=root),
+            state=YamlStateStore(state_dir=state_dir),
+            reconcile_on_init=False,
+        )
+        managers.append(mgr)
+        return mgr
+
+    yield _make
+
+    for mgr in managers:
+        for record in mgr.state.list():
+            wt_path = Path(record.path)
+            repo_root = Path(record.repo_root)
+            if wt_path.resolve() == repo_root.resolve():
+                # Never rmtree a primary checkout's directory during test
+                # cleanup -- it IS the repo (often the shared git_repo
+                # fixture's own tmp_path directory).
+                continue
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(wt_path)],
+                    cwd=repo_root,
+                    capture_output=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            shutil.rmtree(wt_path, ignore_errors=True)

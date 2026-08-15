@@ -12,7 +12,7 @@ Import hierarchy:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
     from .process_lifecycle import KilledProcessInfo
@@ -148,10 +148,76 @@ class UnknownVariantError(WorktreeError, ValueError):
         self.available = available
 
 
+class PrimaryCheckoutError(WorktreeError):
+    """Raised when an operation that would delete a checkout is attempted
+    against a primary (main-clone) record.
+
+    Ticket #84: unlike a linked worktree, a primary checkout IS the repo --
+    ``remove()`` must refuse it structurally, and this refusal must never be
+    bypassable via ``force=True`` (the parameter that overrides every other
+    removal safeguard). The message names only the worktree id, not the raw
+    path, so callers can react programmatically without parsing implementation
+    details.
+    """
+
+    def __init__(self, worktree_id: str) -> None:
+        super().__init__(
+            f"worktree '{worktree_id}' is a primary checkout and cannot be "
+            f"removed. Primary checkouts are never deleted, even with "
+            f"force=True."
+        )
+        self.worktree_id = worktree_id
+
+
+class CheckoutTargetError(WorktreeError, ValueError):
+    """Raised by ``start()``/``stop()`` when the ``(worktree_id,
+    checkout_path)`` pair does not resolve to a single, unambiguous target.
+
+    Modelled on ``UnknownVariantError``'s dual base (``WorktreeError`` and
+    ``ValueError``) so callers catching either base keep working.
+
+    ``reason`` is one of:
+    - ``"missing"``: neither ``worktree_id`` nor ``checkout_path`` was given.
+    - ``"id_mismatch"``: both were given, but the id resolved from
+      ``checkout_path`` (``resolved_id``) does not equal ``worktree_id``.
+
+    Both ``worktree_id``/``checkout_path`` (the raw values passed by the
+    caller) and ``resolved_id`` (populated only for ``"id_mismatch"``) are
+    stored as attributes so callers can react programmatically without
+    parsing the message text.
+    """
+
+    def __init__(
+        self,
+        *,
+        worktree_id: "Optional[str]",
+        checkout_path: "Optional[str]",
+        resolved_id: "Optional[str]" = None,
+        reason: str,
+    ) -> None:
+        if reason == "missing":
+            message = (
+                "start()/stop() require either worktree_id or checkout_path "
+                "to address a target; neither was given."
+            )
+        else:
+            message = (
+                f"checkout_path resolved to id '{resolved_id}' which does "
+                f"not match the given worktree_id '{worktree_id}'."
+            )
+        super().__init__(message)
+        self.worktree_id = worktree_id
+        self.checkout_path = checkout_path
+        self.resolved_id = resolved_id
+        self.reason = reason
+
+
 __all__ = [
+    "CheckoutTargetError",
     "DirtyWorktreeError",
     "GitTimeoutError",
     "InvalidRepoError",
+    "PrimaryCheckoutError",
     "UnknownVariantError",
     "WorktreeDirLockedError",
     "WorktreeError",

@@ -372,19 +372,21 @@ def test_reconcile_freed_port(state_dir: Path, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# reconcile(): port retained when a surviving PID exists
+# reconcile(): port retained when its owner record still exists
 # ---------------------------------------------------------------------------
 
-def test_reconcile_port_retained_when_surviving_pid(state_dir: Path, tmp_path: Path):
-    """A non-listening port must NOT be freed when a live PID is still tracked.
+def test_reconcile_port_retained_when_owner_record_exists(state_dir: Path, tmp_path: Path):
+    """A non-listening port must NOT be freed when its owning record still
+    exists in state.yaml -- regardless of whether any PID is alive.
 
-    The worktree process may not have bound the port yet (race between startup
-    and reconcile). As long as its PID is alive, the allocation is kept.
+    The worktree process may not have bound the port yet (race between
+    startup and reconcile), or the environment may simply be stopped. As long
+    as the owning record is still tracked, the allocation is kept.
     """
     store = YamlStateStore(state_dir=state_dir)
     # Use a high port number extremely unlikely to be in use.
     unused_port = 19998
-    store._ports._save({"myservice": unused_port})
+    store._ports._save({"wt-live-port:myservice": unused_port})
 
     # Add a worktree with an existing path and a live PID (this process).
     wt_path = tmp_path / "wt-live-port"
@@ -402,11 +404,45 @@ def test_reconcile_port_retained_when_surviving_pid(state_dir: Path, tmp_path: P
 
     report = reconcile(store)
 
-    # Port must NOT have been freed because a live PID is still tracked.
-    assert "myservice" not in report.freed_ports
+    # Port must NOT have been freed because its owning record still exists.
+    assert "wt-live-port:myservice" not in report.freed_ports
     remaining = store._ports.get_all()
-    assert "myservice" in remaining
-    assert remaining["myservice"] == unused_port
+    assert "wt-live-port:myservice" in remaining
+    assert remaining["wt-live-port:myservice"] == unused_port
+
+
+def test_reconcile_keeps_port_of_surviving_record_with_no_pids(state_dir: Path, tmp_path: Path):
+    """R1 driving test: a stopped-but-tracked record's port must survive
+    reconcile() even when it has no PIDs at all (not just a dead one).
+
+    Under the old global-``surviving_pids`` heuristic this port was wiped
+    because *no* record anywhere had a live PID -- even though the owning
+    record ``wt-a`` was still perfectly tracked in state.yaml.
+    """
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-a"
+    wt_path.mkdir()
+    store.add(_make_record(id="wt-a", path=str(wt_path), ports={"web": 19997}))
+    store._ports._save({"wt-a:web": 19997})
+
+    report = reconcile(store)
+
+    assert "wt-a:web" not in report.freed_ports
+    remaining = store._ports.get_all()
+    assert remaining.get("wt-a:web") == 19997
+
+
+def test_reconcile_frees_port_of_vanished_record(state_dir: Path, tmp_path: Path):
+    """A port whose owner record no longer exists in state.yaml is freed."""
+    store = YamlStateStore(state_dir=state_dir)
+    # No record for "wt-gone" is ever added to the store.
+    store._ports._save({"wt-gone:web": 19996})
+
+    report = reconcile(store)
+
+    assert "wt-gone:web" in report.freed_ports
+    remaining = store._ports.get_all()
+    assert "wt-gone:web" not in remaining
 
 
 # ---------------------------------------------------------------------------
@@ -997,3 +1033,68 @@ def test_adopt_record_paths_use_forward_slashes(
     assert "\\" not in rec.path, (
         f"path must use forward slashes, got: {rec.path!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# R4 (ticket #84) -- `backing` round-trips and legacy state.yaml still
+# deserialises
+# ---------------------------------------------------------------------------
+
+def test_backing_round_trips_and_defaults_for_legacy_entries(state_dir: Path):
+    """R4 driving test: a legacy state.yaml entry with no `backing` key (and
+    `branch: null`) still deserialises, defaulting backing to "worktree";
+    an explicit primary entry round-trips backing="primary"."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    raw = {
+        "version": 1,
+        "worktrees": {
+            "legacy-wt": {
+                "id": "legacy-wt",
+                "repo_root": "/repos/myrepo",
+                "branch": None,
+                "path": "/store/myrepo/legacy-wt",
+                "status": "created",
+                "ports": {},
+                "pids": {},
+                "branch_created_by_us": False,
+                # no "backing" key at all -- simulates a pre-#84 state.yaml.
+            },
+        },
+    }
+    (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    store = YamlStateStore(state_dir=state_dir)
+    legacy = store.get("legacy-wt")
+    assert legacy is not None
+    assert legacy.backing == "worktree"
+    assert legacy.branch is None
+
+    primary_rec = _make_record(id="primary-1", branch=None, path="/repos/myrepo")
+    primary_rec.backing = "primary"
+    store.add(primary_rec)
+
+    reloaded_store = YamlStateStore(state_dir=state_dir)
+    reloaded = reloaded_store.get("primary-1")
+    assert reloaded is not None
+    assert reloaded.backing == "primary"
+    assert reloaded.branch is None
+
+
+def test_find_by_branch_skips_primary_records_yaml(state_dir: Path):
+    """A primary record must never shadow a create() duplicate-branch check
+    via find_by_branch() (ticket #84, R4 edge case).
+
+    Deliberately gives the primary record a matching ``branch="main"`` (even
+    though a real primary always stores ``branch=None``) so the assertion
+    proves the explicit ``backing == "primary"`` skip is doing the work --
+    not merely that the branch values happen not to match.
+    """
+    store = YamlStateStore(state_dir=state_dir)
+    primary_rec = _make_record(
+        id="primary-shadow", repo_root="/repos/myrepo", branch="main",
+        path="/repos/myrepo",
+    )
+    primary_rec.backing = "primary"
+    store.add(primary_rec)
+
+    assert store.find_by_branch("/repos/myrepo", "main") is None
