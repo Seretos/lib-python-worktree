@@ -462,7 +462,14 @@ def reconcile(
                     wt_id, pid, role,
                 )
                 changed = True
-                if rec.status not in ("orphaned",):
+                # Ticket #87 follow-up (finding B2): "stop_incomplete" is a
+                # sticky, deliberately-honest status set by process_lifecycle
+                # .stop() when it could not confirm everything it tried to
+                # kill actually died. A dead role discovered here later must
+                # not silently overwrite that guarantee back to "stopped" --
+                # only "orphaned" (path gone) is allowed to already outrank
+                # the default "stopped" outcome of this branch.
+                if rec.status not in ("orphaned", "stop_incomplete"):
                     rec.status = "stopped"
                 if wt_id not in report.stopped:
                     report.stopped.append(wt_id)
