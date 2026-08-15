@@ -75,6 +75,73 @@ def _step_yaml(run_line: str, *, name: "str | None" = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _wait_for_file_content(
+    path: Path,
+    expected: str,
+    *,
+    record: "WorktreeRecord | None" = None,
+    timeout: float = 30.0,
+    interval: float = 0.2,
+) -> None:
+    """Poll *path* until its stripped text content equals *expected*.
+
+    Used to observe the side effect of a *detached* ``start:`` step (ticket
+    #84's live-branch-export tests): ``mgr.start()`` returns as soon as the
+    child process is spawned, well before a cold-started Python interpreter
+    on a loaded CI runner has necessarily gotten around to writing its
+    output file. A fixed short poll budget flakes under exactly that kind of
+    scheduling pressure (GH Actions run 31888867221, windows-latest only --
+    5s budget, 508 other tests green, identical commit passed on
+    pull_request-event the same day), so this uses a much longer budget
+    (30s) suited to a cold Windows CI runner while still failing fast on a
+    genuine defect via a short poll interval.
+
+    On timeout this raises a clear ``AssertionError`` naming what was
+    expected vs. what is actually on disk (or that the file never appeared)
+    instead of letting a bare ``read_text()`` raise ``FileNotFoundError`` --
+    that bare exception is uninformative about *why* the step never wrote
+    the file. When *record* is given and carries a ``start_log_path``, the
+    step's own log is read and appended to the failure message, since that
+    log is what would actually explain a genuine (non-timing) failure.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    last_seen: "str | None" = None
+    while True:
+        if path.exists():
+            last_seen = path.read_text(encoding="utf-8").strip()
+            if last_seen == expected:
+                return
+        if _time.monotonic() >= deadline:
+            break
+        _time.sleep(interval)
+
+    if not path.exists():
+        detail = f"file {path} was never created"
+    else:
+        detail = f"file {path} contained {last_seen!r}"
+
+    log_excerpt = ""
+    log_path = getattr(record, "start_log_path", None) if record is not None else None
+    if log_path:
+        log_file = Path(log_path)
+        if log_file.exists():
+            log_excerpt = (
+                f"\n--- start step log ({log_path}) ---\n"
+                + log_file.read_text(encoding="utf-8", errors="replace")
+            )
+        else:
+            log_excerpt = f"\n--- start step log ({log_path}) does not exist ---"
+    elif record is not None:
+        log_excerpt = "\n--- record has no start_log_path ---"
+
+    raise AssertionError(
+        f"timed out after {timeout}s waiting for {path} to contain "
+        f"{expected!r}; {detail}{log_excerpt}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # R6 -- remove()/_teardown() refuse a primary record, even with force=True
 # ---------------------------------------------------------------------------
@@ -462,13 +529,11 @@ def test_primary_start_exports_live_branch(yaml_manager, git_repo: Path):
 
     record = mgr.start(checkout_path=str(git_repo))
     assert record.branch is None
-    # Give the quick write-and-exit step a moment to land.
-    import time as _time
-    for _ in range(50):
-        if out_file.exists() and out_file.read_text(encoding="utf-8").strip():
-            break
-        _time.sleep(0.1)
-    assert out_file.read_text(encoding="utf-8").strip() == "main"
+    # Wait for the detached write-and-exit step to land its output. Uses a
+    # generous, CI-suited budget (see _wait_for_file_content) rather than
+    # asserting on the file directly, since a bare read_text() on a not-yet
+    # -written file raises an uninformative FileNotFoundError.
+    _wait_for_file_content(out_file, "main", record=record)
 
     mgr.stop(checkout_path=str(git_repo))
 
@@ -477,11 +542,7 @@ def test_primary_start_exports_live_branch(yaml_manager, git_repo: Path):
 
     record2 = mgr.start(checkout_path=str(git_repo))
     assert record2.branch is None
-    for _ in range(50):
-        if out_file.exists() and out_file.read_text(encoding="utf-8").strip() == "feature/alpha":
-            break
-        _time.sleep(0.1)
-    assert out_file.read_text(encoding="utf-8").strip() == "feature/alpha"
+    _wait_for_file_content(out_file, "feature/alpha", record=record2)
 
     try:
         mgr.stop(checkout_path=str(git_repo))
