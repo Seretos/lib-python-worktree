@@ -32,9 +32,18 @@ from .contract import (
     load,
     load_text,
 )
+from .core.checkout import (
+    CheckoutInfo,
+    EnvironmentEntry,
+    RepoListing,
+    classify_checkout,
+    list_repo,
+    primary_id_for,
+)
 from .core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
+    CheckoutTargetError,
     DirtyWorktreeError,
     DuplicateWorktreeError,
     GitCommandError,
@@ -43,6 +52,7 @@ from .core.manager import (
     InvalidRepoError,
     ManagerConfig,
     PortAllocationError,
+    PrimaryCheckoutError,
     UnknownVariantError,
     WorktreeDirLockedError,
     WorktreeError,
@@ -86,6 +96,15 @@ __all__ = [
     "GitTimeoutError",
     "UnknownVariantError",
     "WorktreeDirLockedError",
+    # checkout classification (ticket #84)
+    "CheckoutInfo",
+    "CheckoutTargetError",
+    "EnvironmentEntry",
+    "PrimaryCheckoutError",
+    "RepoListing",
+    "classify_checkout",
+    "list_repo",
+    "primary_id_for",
     # process lifecycle
     "KilledProcessInfo",
     "ProcessLifecycleError",

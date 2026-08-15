@@ -25,9 +25,11 @@ from typing import Dict, List, Optional
 
 import portalocker
 
-from .yaml_store import _LOCK_FLAGS, _LOCK_TIMEOUT, _PortsFile, _port_in_use
+from .yaml_store import _LOCK_FLAGS, _LOCK_TIMEOUT, _PORT_KEY_SEP, _PortsFile, _port_in_use
 
-_KEY_SEP = ":"
+# Alias of yaml_store._PORT_KEY_SEP -- yaml_store owns the canonical
+# separator; this module only imports from yaml_store, never the reverse.
+_KEY_SEP = _PORT_KEY_SEP
 
 
 class PortAllocationError(RuntimeError):

@@ -16,8 +16,9 @@ Concretely: any *"where is X defined / what does the code support / which Y exis
 
 The engine is fully implemented under `src/lib_python_worktree/`. Key modules:
 
-- `core/manager.py` — `WorktreeManager` (public facade: create / list / remove / adopt / prune / start / stop)
-- `core/state.py` — `StateStore` protocol + `WorktreeRecord` dataclass
+- `core/manager.py` — `WorktreeManager` (public facade: create / list / list_repo / remove / adopt / prune / start / stop)
+- `core/checkout.py` — `classify_checkout`, `CheckoutInfo`, `primary_id_for` (primary-vs-linked-worktree classification, ticket #84); `EnvironmentEntry`, `RepoListing`, `list_repo` (repo-scoped listing)
+- `core/state.py` — `StateStore` protocol + `WorktreeRecord` dataclass (`backing: "worktree" | "primary"`, ticket #84)
 - `core/yaml_store.py` — `YamlStateStore` (file-backed store), `reconcile`, `adopt`, `ReconcileReport`, `AdoptReport`
 - `core/port_allocator.py` — `PortAllocator` (locked, atomic read-modify-write against `ports.yaml`)
 - `core/process_lifecycle.py` — `start` / `stop` (detached process management, cross-platform)
