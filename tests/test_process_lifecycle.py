@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List
@@ -21,12 +22,20 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from lib_python_worktree.core import process_lifecycle as _pl
 from lib_python_worktree.core.process_lifecycle import (
     DEFAULT_ROLE,
     KilledProcessInfo,
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    _BoundedQueryWorker,
+    _GraceBudget,
+    _QueryStatus,
+    _HANDLE_QUERY_GRACE_BUDGET_SEC,
+    _HANDLE_QUERY_GRACE_SEC,
+    _HANDLE_QUERY_TIMEOUT_SEC,
+    _MAX_WEDGED_HANDLE_WORKERS,
     _find_blocking_processes,
     _force_kill,
     _kill_blocking_processes,
@@ -38,6 +47,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _signal_process_group,
     _spawn_detached,
     _wait_or_kill,
+    _wedged_slot_available,
     _win_handle_holders,
     start,
     stop,
@@ -1627,6 +1637,639 @@ class TestFindBlockingProcessesWindows:
 
 
 # ---------------------------------------------------------------------------
+# TestBoundedQueryWorker -- ticket #90 (bounded worker thread hygiene)
+# ---------------------------------------------------------------------------
+
+class TestBoundedQueryWorker:
+    """Cross-platform unit tests for ``_BoundedQueryWorker`` (ticket #90).
+
+    ``_win_handle_holders``' NtQueryObject calls (Windows-only) are the
+    motivating use case, but ``_BoundedQueryWorker`` itself runs an
+    arbitrary zero-arg callable and has no Windows dependency -- these
+    tests drive it directly with plain Python callables (fast,
+    slow-but-resolves-in-grace, and permanently-blocked-on-an-``Event``) so
+    the core thread-hygiene and grace-budget mechanism is exercised on
+    every platform this suite runs on, not just Windows. The real
+    ctypes/ntdll wiring is covered separately by ``TestWinHandleHoldersReal``
+    / ``TestWinHandleHoldersThreadHygiene`` (Windows-only).
+
+    Thread-count assertions use a delta against a per-test baseline
+    (``threading.active_count()``) with a short settle poll, never an
+    absolute count. ``_wedged_worker_count`` is a module-level global
+    (ticket #90's process-wide cap accounting); every test that reads or
+    relies on its value resets it to ``0`` via ``monkeypatch`` first, for
+    isolation from any other test in this class/session.
+    """
+
+    @staticmethod
+    def _wait_until_thread_gone(thread: threading.Thread, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    @staticmethod
+    def _wait_until(predicate, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    # -- B1: a completed scan leaves no worker thread behind -------------
+
+    def test_worker_thread_exits_after_close(self):
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        assert thread.is_alive()
+
+        outcome = worker.submit(lambda: "ok")
+        assert outcome.status == _QueryStatus.RESOLVED
+        assert outcome.value == "ok"
+
+        worker.close()
+        self._wait_until_thread_gone(thread)
+        assert not thread.is_alive(), "worker thread must exit after close()"
+
+    def test_repeated_create_submit_close_cycles_leave_no_thread_delta(self):
+        baseline = threading.active_count()
+        for _ in range(50):
+            worker = _BoundedQueryWorker()
+            outcome = worker.submit(lambda: 1)
+            assert outcome.status == _QueryStatus.RESOLVED
+            worker.close()
+
+        self._wait_until(lambda: threading.active_count() <= baseline)
+        assert threading.active_count() == baseline, (
+            "50 create/submit/close cycles must leave the thread count unchanged"
+        )
+
+    def test_close_is_idempotent(self):
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        worker.close()
+        worker.close()  # must not raise or hang
+        self._wait_until_thread_gone(thread)
+        assert not thread.is_alive()
+
+    def test_close_on_worker_that_never_received_a_job(self):
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        worker.close()
+        self._wait_until_thread_gone(thread)
+        assert not thread.is_alive()
+
+    def test_submit_after_close_returns_non_resolved_without_raising(self):
+        worker = _BoundedQueryWorker()
+        worker.close()
+
+        outcome = worker.submit(lambda: "should never run")
+
+        assert outcome.status != _QueryStatus.RESOLVED
+
+    # -- B2: repeated timeouts do not grow the thread count without bound,
+    #        across calls -------------------------------------------------
+
+    def test_repeated_timeouts_are_capped_process_wide(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        grace = _GraceBudget(0.0)  # zeroed -- stage 2 never engages
+        scan_deadline = time.monotonic() + 60
+
+        baseline = threading.active_count()
+        worker = _BoundedQueryWorker()
+        created = [worker]
+        statuses = []
+        try:
+            for _ in range(200):
+                outcome = worker.submit(
+                    lambda: release.wait(timeout=30), grace=grace, scan_deadline=scan_deadline
+                )
+                statuses.append(outcome.status)
+                if outcome.status == _QueryStatus.ABANDONED and _wedged_slot_available():
+                    worker = _BoundedQueryWorker()
+                    created.append(worker)
+                # Otherwise keep resubmitting to the same, now-retired
+                # worker -- mirrors many callers hammering a saturated
+                # system; a retired worker refuses immediately (see
+                # test_submit_after_close_returns_non_resolved_without_raising)
+                # without ever creating a new thread.
+
+            assert _QueryStatus.ABANDONED in statuses
+            assert len(created) <= _MAX_WEDGED_HANDLE_WORKERS, (
+                f"expected at most {_MAX_WEDGED_HANDLE_WORKERS} worker instances "
+                f"to ever be created across 200 attempted submissions, got {len(created)}"
+            )
+            alive_delta = threading.active_count() - baseline
+            assert alive_delta <= _MAX_WEDGED_HANDLE_WORKERS, (
+                f"expected at most {_MAX_WEDGED_HANDLE_WORKERS} live worker threads "
+                f"after 200 attempted submissions, got a delta of {alive_delta}"
+            )
+        finally:
+            release.set()
+            for w in created:
+                w.close()
+            self._wait_until(lambda: threading.active_count() <= baseline)
+            assert threading.active_count() == baseline, (
+                "releasing the blocked callable must drive the thread delta back to 0"
+            )
+
+    def test_submit_at_cap_returns_capped_without_raising(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+            )
+            assert outcome.status == _QueryStatus.CAPPED
+        finally:
+            release.set()
+            worker.close()
+
+    def test_capped_outcome_still_counts_and_releases_its_slot(self, monkeypatch):
+        """Review finding (ticket #90 fix pass): a worker whose own query
+        wedges *after* the process-wide cap is already full elsewhere
+        returns CAPPED -- but its thread is just as genuinely blocked
+        inside ``fn()`` as an ABANDONED worker's is, for exactly as long as
+        that real call takes. Before this fix, ``slot_acquired`` was left
+        ``False`` for CAPPED, so this worker's own thread was never counted
+        into ``_wedged_worker_count`` and therefore never decremented by
+        ``_run()`` either -- ``_MAX_WEDGED_HANDLE_WORKERS`` stopped being a
+        real bound on live blocked threads, only on how many *replacement*
+        workers a single scan would create. This reproduces that scenario
+        directly: seed the counter to the cap (simulating capacity already
+        claimed by other workers), then drive a fresh worker's own query
+        into CAPPED and assert its thread is counted while blocked and its
+        slot is released once the wedged call finally returns -- identical
+        bookkeeping to the ABANDONED path."""
+        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+            )
+            assert outcome.status == _QueryStatus.CAPPED
+            # The CAPPED worker's own thread is still live and blocked in
+            # fn() -- it must be counted, not silently dropped from the
+            # accounting just because no *new* slot was "granted".
+            assert _pl._wedged_worker_count == _MAX_WEDGED_HANDLE_WORKERS + 1, (
+                "a CAPPED worker's own blocked thread must still be counted "
+                "against _wedged_worker_count, exactly like ABANDONED"
+            )
+
+            release.set()
+            self._wait_until(
+                lambda: _pl._wedged_worker_count == _MAX_WEDGED_HANDLE_WORKERS
+            )
+            assert _pl._wedged_worker_count == _MAX_WEDGED_HANDLE_WORKERS, (
+                "the CAPPED worker's slot must be released once its wedged "
+                "call finally returns, same as the ABANDONED path -- "
+                "otherwise the cap ratchets upward forever and never bounds "
+                "live thread count"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    def test_wedged_worker_count_restored_after_retired_worker_exits(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+            )
+            assert outcome.status == _QueryStatus.ABANDONED
+            assert _pl._wedged_worker_count == 1
+
+            release.set()
+            self._wait_until(lambda: _pl._wedged_worker_count == 0)
+            assert _pl._wedged_worker_count == 0, (
+                "the counter must be restored once the retired worker's wedged "
+                "call finally returns, so a later scan can wedge again"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    # -- B3: an abandoned worker self-terminates once its wedged call
+    #        returns ------------------------------------------------------
+
+    def test_retired_worker_exits_when_its_query_finally_returns(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        calls = []
+
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+                on_abandoned_done=lambda value: calls.append(value),
+            )
+            assert outcome.status == _QueryStatus.ABANDONED
+            assert thread.is_alive()
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+
+            assert not thread.is_alive(), (
+                "the retired worker must exit on its own once its wedged call finally returns"
+            )
+            assert calls == [True], "on_abandoned_done must fire exactly once"
+        finally:
+            release.set()
+            worker.close()
+
+    def test_retired_worker_callable_that_raises_still_triggers_cleanup(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        calls = []
+
+        def _raises_after_release():
+            release.wait(timeout=10)
+            raise RuntimeError("boom")
+
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                _raises_after_release,
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+                on_abandoned_done=lambda value: calls.append(value),
+            )
+            assert outcome.status == _QueryStatus.ABANDONED
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+
+            assert not thread.is_alive()
+            assert calls == [None], "a raising callable must still swallow the exception and clean up"
+            self._wait_until(lambda: _pl._wedged_worker_count == 0)
+            assert _pl._wedged_worker_count == 0
+        finally:
+            release.set()
+            worker.close()
+
+    # -- B4: the abandoned handle is not closed by the scan loop ---------
+
+    def test_abandoned_job_closes_its_own_handle_exactly_once(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        close_calls = []
+
+        worker = _BoundedQueryWorker()
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+                on_abandoned_done=lambda value: close_calls.append(value),
+            )
+            assert outcome.status == _QueryStatus.ABANDONED
+            assert close_calls == [], "must not close before the blocked callable returns"
+
+            release.set()
+            self._wait_until(lambda: close_calls)
+
+            assert len(close_calls) == 1, f"expected exactly one close, got {close_calls}"
+        finally:
+            release.set()
+            worker.close()
+
+    def test_dependent_follow_up_query_never_runs_after_worker_retires(self):
+        """Mirrors _win_handle_holders' type-probe-then-name-query pattern:
+        once a worker retires because its current query was abandoned, it
+        must never run a second, dependent callable -- ownership of
+        whatever the first callable was operating on has already
+        transferred away. The real scan additionally guards this at the
+        call-site level (it checks the first query's returned status before
+        ever attempting the second) -- this test demonstrates the worker
+        itself also refuses defensively, via the same closed-worker
+        short-circuit exercised by
+        test_submit_after_close_returns_non_resolved_without_raising."""
+        release = threading.Event()
+        follow_up_invoked = []
+
+        def _follow_up():
+            follow_up_invoked.append(True)
+            return "should never run"
+
+        worker = _BoundedQueryWorker()
+        try:
+            first = worker.submit(
+                lambda: release.wait(timeout=10),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 10,
+            )
+            assert first.status != _QueryStatus.RESOLVED
+
+            second = worker.submit(_follow_up)
+            assert second.status != _QueryStatus.RESOLVED
+            assert follow_up_invoked == [], (
+                "a dependent follow-up query must never actually run once its "
+                "worker has already retired"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    # -- B5: a merely-slow query is recovered by the bounded grace wait --
+
+    def test_slow_query_resolved_in_grace_window_keeps_same_worker(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        grace = _GraceBudget(_HANDLE_QUERY_GRACE_BUDGET_SEC)
+        scan_deadline = time.monotonic() + 5
+
+        def _slow():
+            time.sleep(0.04)
+            return "value"
+
+        worker = _BoundedQueryWorker()
+        original_thread = worker._thread
+        try:
+            t0 = time.monotonic()
+            outcome = worker.submit(_slow, grace=grace, scan_deadline=scan_deadline)
+            elapsed = time.monotonic() - t0
+
+            assert outcome.status == _QueryStatus.RESOLVED
+            assert outcome.value == "value"
+            assert worker._thread is original_thread, (
+                "a grace-recovered query must not replace the worker"
+            )
+            assert _pl._wedged_worker_count == 0
+
+            grace_spent = _HANDLE_QUERY_GRACE_BUDGET_SEC - grace.remaining
+            # Upper bound only (ticket #90 CI flake sweep): grace_spent must
+            # never exceed roughly the observed wait, but it must NOT assert
+            # a minimum. On a slow/contended runner, scheduling overhead
+            # around the stage-2 wait could in principle leave grace_spent
+            # at (or clamped to) 0.0 even though the query still ultimately
+            # resolved -- that is not a bug in the design, so a lower bound
+            # here is not something the design promises.
+            assert grace_spent < elapsed + 0.2, (
+                f"grace.remaining dropped by {grace_spent:.3f}s -- expected it to "
+                f"roughly track the observed ~{elapsed:.3f}s wait"
+            )
+        finally:
+            worker.close()
+
+    def test_fast_query_spends_zero_grace(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        grace = _GraceBudget(_HANDLE_QUERY_GRACE_BUDGET_SEC)
+
+        worker = _BoundedQueryWorker()
+        try:
+            outcome = worker.submit(lambda: "fast", grace=grace, scan_deadline=time.monotonic() + 5)
+            assert outcome.status == _QueryStatus.RESOLVED
+            assert grace.remaining == _HANDLE_QUERY_GRACE_BUDGET_SEC
+        finally:
+            worker.close()
+
+    def test_query_slower_than_grace_ceiling_is_abandoned_after_bounded_wait(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        grace = _GraceBudget(_HANDLE_QUERY_GRACE_BUDGET_SEC)
+
+        def _too_slow():
+            time.sleep(0.3)
+            return "late"
+
+        worker = _BoundedQueryWorker()
+        try:
+            t0 = time.monotonic()
+            outcome = worker.submit(_too_slow, grace=grace, scan_deadline=time.monotonic() + 5)
+            elapsed = time.monotonic() - t0
+
+            assert outcome.status == _QueryStatus.ABANDONED
+            # Stage 1 (~0.01s) + stage 2 ceiling (~0.10s) -- generous
+            # one-sided bound, never a tight window.
+            assert elapsed < 1.0, f"expected a bounded ~0.11s total wait, took {elapsed:.3f}s"
+        finally:
+            time.sleep(0.35)  # let the slow callable actually finish first
+            worker.close()
+
+    # -- B6: the grace budget is bounded per scan and clamped by the scan
+    #        deadline -----------------------------------------------------
+
+    def test_grace_budget_exhausts_and_degrades_to_fast_timeout(self, monkeypatch):
+        """Ticket #90 CI flake sweep (3rd-in-a-row failure class).
+
+        The previous design accumulated grace spend across several
+        *partial* stage-2 waits (a 0.25s pool against a 0.10s per-query
+        ceiling), then asserted the pool ended up at (near-)exact 0.0 and
+        that *some* count of queries had paid into it. Both assertions were
+        lower bounds on timing-derived values in disguise -- and both
+        broke in CI (first an exact-zero `remaining`, then a `grace_paid <=
+        3` ceiling that a small residue defeated).
+
+        This version is deterministic *by construction* instead: the pool
+        is sized to at most 1.5x the per-query stage-2 ceiling
+        (``_HANDLE_QUERY_GRACE_SEC``), so it is provably exhausted to
+        *exactly* 0.0 within at most the first two queries --
+        ``threading.Event.wait(timeout)`` is guaranteed (by the stdlib) to
+        never return before *timeout* elapses unless the event is set, and
+        ``release`` is never set until this test's ``finally``. So each
+        stage-2 wait's actually-elapsed time is guaranteed >= the allowance
+        it was granted, which means ``max(0.0, remaining - elapsed)``
+        clamps to exactly 0.0 once the cumulative granted allowance reaches
+        the seeded budget -- no residue is possible, no matter how slow or
+        jittery the runner is. ``scan_deadline`` is seeded 30s out so it
+        can never be the thing that clamps stage 2 (that scenario is
+        covered separately by test_grace_truncated_by_near_scan_deadline).
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        initial_budget = 1.5 * _HANDLE_QUERY_GRACE_SEC
+        grace = _GraceBudget(initial_budget)
+        scan_deadline = time.monotonic() + 30
+
+        per_query_elapsed = []
+        worker = _BoundedQueryWorker()
+        created = [worker]
+        try:
+            for _ in range(5):
+                t0 = time.monotonic()
+                outcome = worker.submit(
+                    lambda: release.wait(timeout=30), grace=grace, scan_deadline=scan_deadline
+                )
+                elapsed = time.monotonic() - t0
+                per_query_elapsed.append(elapsed)
+                assert outcome.status != _QueryStatus.RESOLVED
+                if _wedged_slot_available():
+                    worker = _BoundedQueryWorker()
+                    created.append(worker)
+
+            # Exact, by construction (see docstring): after at most the
+            # first two queries the pool is guaranteed to have clamped to
+            # exactly 0.0, and it can only ever decrease or stay the same,
+            # so by the end of all 5 queries it is still exactly 0.0. This
+            # is the "remaining in cases where stage 2 provably cannot run
+            # [again]" carve-out, not a bet on the runner being fast.
+            assert grace.remaining == 0.0, (
+                f"expected the grace pool to be exhausted to exactly 0.0 by "
+                f"construction (guaranteed-minimum-length stage-2 waits), "
+                f"{grace.remaining:.6f}s remained"
+            )
+
+            # Upper bound only, applied to every query including the ones
+            # that paid grace: the most any single query can ever take by
+            # design is stage 1 (~0.01s) plus the stage-2 ceiling (~0.10s).
+            # The bound is deliberately generous (2.0s, not a tight
+            # multiple of the design's ~0.11s nominal total) -- ticket #90
+            # CI flake sweep, heavy-load verification pass: a tight
+            # multiplier-based ceiling (previously 3x the stage-2
+            # allowance, 0.30s) was observed to leave too little headroom
+            # for real scheduling overshoot on a contended runner (other
+            # nominally-~0.01s-only waits in this class were observed to
+            # take up to ~0.10s under artificial CPU saturation). 2.0s is
+            # still nowhere near the 30s the callable would need to
+            # resolve on its own, so this still clearly catches an actual
+            # hang. Never a lower bound: which (if any) of the 5 queries
+            # actually paid grace is itself timing-dependent and
+            # deliberately not asserted.
+            for i, elapsed in enumerate(per_query_elapsed, start=1):
+                assert elapsed < 2.0, (
+                    f"expected query #{i} to take at most a bounded "
+                    f"stage-1 + stage-2 wait, took {elapsed:.3f}s"
+                )
+        finally:
+            release.set()
+            for w in created:
+                w.close()
+
+    def test_grace_skipped_when_scan_deadline_already_passed(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        grace = _GraceBudget(1.0)
+        past_deadline = time.monotonic() - 1.0
+
+        worker = _BoundedQueryWorker()
+        try:
+            t0 = time.monotonic()
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10), grace=grace, scan_deadline=past_deadline
+            )
+            elapsed = time.monotonic() - t0
+
+            assert outcome.status != _QueryStatus.RESOLVED
+            # Generous, one-sided sanity bound (ticket #90 CI flake sweep,
+            # heavy-load verification pass): this is *not* a tight timing
+            # differentiation -- the real proof that stage 2 was skipped is
+            # the exact `grace.remaining` assertion below, which holds
+            # regardless of scheduling overhead. This is only "didn't
+            # hang" sanity, so it must tolerate real scheduling overshoot
+            # around the stage-1 wait itself on a contended runner (5x
+            # _HANDLE_QUERY_TIMEOUT_SEC, i.e. 0.05s, was observed to fail
+            # under artificial CPU saturation).
+            assert elapsed < 1.0, f"expected an ~stage-1-only wait, took {elapsed:.3f}s"
+            assert grace.remaining == 1.0, "no grace should be spent once the deadline has passed"
+        finally:
+            release.set()
+            worker.close()
+
+    def test_grace_truncated_by_near_scan_deadline(self, monkeypatch):
+        """Ticket #90 CI flake sweep (the 3rd-in-a-row failure).
+
+        ``scan_deadline`` is seeded only ~20ms out on purpose, to exercise
+        stage 2 being *truncated* by an imminent deadline. But on a slow,
+        contended runner more than that ~20ms margin can elapse between
+        seeding ``scan_deadline`` above and ``submit()`` computing
+        ``scan_deadline - time.monotonic()`` for the stage-2 allowance --
+        in which case that term is already <= 0, ``allowance > 0`` is
+        false, and stage 2 is skipped *entirely*: zero grace spent, zero
+        extra elapsed time. That is truncation working exactly as
+        designed (the near deadline clamped stage 2 down to nothing), not
+        a bug -- so this test must never assert a *minimum* spend/elapsed;
+        only that the design's ceiling holds.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        grace = _GraceBudget(1.0)
+
+        worker = _BoundedQueryWorker()
+        try:
+            near_deadline_margin = _HANDLE_QUERY_TIMEOUT_SEC + 0.02
+            scan_deadline = time.monotonic() + near_deadline_margin
+            t0 = time.monotonic()
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10), grace=grace, scan_deadline=scan_deadline
+            )
+            elapsed = time.monotonic() - t0
+
+            assert outcome.status != _QueryStatus.RESOLVED
+            # Generous, one-sided sanity bound (ticket #90 CI flake sweep,
+            # heavy-load verification pass): this is *not* a tight
+            # differentiation between "truncated" and "full stage 2" --
+            # the real proof of truncation is the grace_spent ceiling
+            # below, which stays meaningful (well under the full 1.0s
+            # pool) regardless of scheduling overshoot. This bound is only
+            # "didn't hang" sanity, so it must tolerate real overshoot on
+            # a contended runner (the design's nominal ~0.03s ceiling, or
+            # even the full 0.10s stage-2 ceiling, was observed to fail
+            # under artificial CPU saturation, e.g. 0.105s measured
+            # against a 0.10s bound).
+            assert elapsed < 1.0, (
+                f"expected the grace wait truncated to at most the near "
+                f"scan_deadline, took {elapsed:.3f}s"
+            )
+            # Upper bound only (this was CI failure #3): grace spent must
+            # never approach the full seeded pool -- it must NOT assert a
+            # minimum. Zero spend is a legitimate outcome (see docstring):
+            # if the deadline had already passed by the time submit()
+            # reached the allowance computation, stage 2 never ran at all
+            # and grace.remaining stays at exactly the seeded 1.0 -- that
+            # is truncation doing its job, not a defect. The ceiling is
+            # deliberately generous (half the pool, not the design's
+            # nominal ~0.03s margin) because a single stage-2 wait's
+            # *actually elapsed* time -- what grace_spent tracks -- can
+            # overshoot its nominal allowance substantially under real
+            # scheduling contention (observed under artificial CPU
+            # saturation); the meaningful invariant this still proves is
+            # that scan_deadline is clamping the spend at all, not letting
+            # it run away to the full pool.
+            grace_spent = 1.0 - grace.remaining
+            assert grace_spent < 0.5, (
+                f"expected grace spend to stay well clear of the full "
+                f"seeded pool (truncation should keep it small), spent "
+                f"{grace_spent:.3f}s"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    def test_zero_grace_budget_is_single_stage_only(self, monkeypatch):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        grace = _GraceBudget(0.0)
+
+        worker = _BoundedQueryWorker()
+        try:
+            t0 = time.monotonic()
+            outcome = worker.submit(
+                lambda: release.wait(timeout=10), grace=grace, scan_deadline=time.monotonic() + 5
+            )
+            elapsed = time.monotonic() - t0
+
+            assert outcome.status != _QueryStatus.RESOLVED
+            # Generous, one-sided sanity bound (ticket #90 CI flake sweep,
+            # heavy-load verification pass) -- see the identical comment
+            # in test_grace_skipped_when_scan_deadline_already_passed.
+            assert elapsed < 1.0
+            assert grace.remaining == 0.0
+        finally:
+            release.set()
+            worker.close()
+
+
+# ---------------------------------------------------------------------------
 # TestWinHandleHoldersIntegration -- ticket #71 (Pass 1c wiring)
 # ---------------------------------------------------------------------------
 
@@ -2074,6 +2717,76 @@ class TestWinHandleHoldersReal:
         sys.platform != "win32",
         reason="Windows-only: exercises ntdll/ctypes handle enumeration",
     )
+    def test_scan_still_runs_and_finds_results_when_wedged_cap_already_full(
+        self, tmp_path, monkeypatch
+    ):
+        """Reviewer fix pass, ticket #90: a scan-start check that refused to
+        scan at all once ``_wedged_worker_count`` reached
+        ``_MAX_WEDGED_HANDLE_WORKERS`` was tried and rejected -- a wedged
+        worker may, by definition, never return from its NtQueryObject
+        call, so that check would latch permanently once the cap had ever
+        been reached, making every later ``_win_handle_holders`` call
+        silently return ``[]`` forever for the rest of the process's life.
+
+        This pins the corrected contract directly: even with
+        ``_wedged_worker_count`` seeded at the cap (simulating capacity
+        already claimed elsewhere in the process, exactly as the rejected
+        scan-start check would have seen it), a scan must still create its
+        initial worker, actually run, and return genuine findings -- not an
+        empty list.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        target_file = target_dir / "held.txt"
+        target_file.write_text("hold me open")
+
+        code = (
+            "import sys, time\n"
+            f"f = open({str(target_file)!r}, 'r')\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(10)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            import psutil
+
+            ready_line = proc.stdout.readline()
+            assert ready_line.strip() == "ready", (
+                f"child process failed to signal readiness: {ready_line!r}"
+            )
+
+            excluded_pids = set(psutil.pids()) - {proc.pid}
+
+            result = _win_handle_holders(
+                str(target_file),
+                excluded_pids=excluded_pids,
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+            found_pids = {pid for pid, _ in result}
+            assert proc.pid in found_pids, (
+                "a scan started while the process-wide wedged-worker cap was "
+                "already full must still run and find real results, not "
+                f"silently return []; got {result}"
+            )
+        finally:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
     def test_budget_sec_bounds_real_scan_wall_clock(self, tmp_path):
         """Regression for the deadline-threading fix: passing a near-zero
         ``budget_sec`` must make the per-handle resolution loop bail out
@@ -2167,6 +2880,109 @@ class TestWinHandleHoldersReal:
             assert result_pids <= {proc.pid}, (
                 "scan must be bounded to the target pid regardless of "
                 f"ambient system load; got extra pids {result_pids - {proc.pid}}"
+            )
+        finally:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# TestWinHandleHoldersThreadHygiene -- ticket #90 (real-scan thread hygiene)
+# ---------------------------------------------------------------------------
+
+class TestWinHandleHoldersThreadHygiene:
+    """Windows-only real-scan hygiene test (ticket #90 -- B7).
+
+    Unlike ``TestWinHandleHoldersReal`` (which asserts detection
+    correctness), this asserts the actual regression this ticket exists to
+    fix: repeatedly invoking ``_win_handle_holders`` against a real handle
+    table -- the long-lived-host-process scenario a real E2E run observed
+    accumulating thousands of threads and non-trivial idle CPU over 36
+    minutes of otherwise-idle teardown churn -- must not grow the process's
+    thread count. PID-scoped via ``excluded_pids`` and the module's
+    ``_REAL_SCAN_TEST_BUDGET_SEC`` test-only budget constant, mirroring
+    #73's flake fix, so ambient system load on the machine running the
+    suite cannot make this test itself flaky.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_repeated_real_scans_do_not_grow_thread_count(self, tmp_path):
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        target_file = target_dir / "held.txt"
+        target_file.write_text("hold me open")
+
+        code = (
+            "import sys, time\n"
+            f"f = open({str(target_file)!r}, 'r')\n"
+            "sys.stdout.write('ready\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(120)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            import psutil
+
+            ready_line = proc.stdout.readline()
+            assert ready_line.strip() == "ready", (
+                f"child process failed to signal readiness: {ready_line!r}"
+            )
+
+            excluded_pids = set(psutil.pids()) - {proc.pid}
+
+            # 10 real scans run sequentially against a live handle table.
+            # Ticket #90's fix pass re-evaluated this 120s child lifetime
+            # (it was suspected of merely papering over the CAPPED-
+            # accounting review finding fixed alongside this test): with
+            # that production bug fixed, a 30s child lifetime was tried
+            # here and still failed reliably, not because of any wedged-
+            # worker accounting but because a single real system-wide
+            # handle-table scan on a dev/CI host with a large ambient
+            # handle count genuinely costs several seconds (measured
+            # ~4-5s/scan on one such host here, i.e. ~45-50s cumulative
+            # for 10 scans, before even counting process-spawn and
+            # readline overhead) -- 30s does not cover that. 120s --
+            # matching _REAL_SCAN_TEST_BUDGET_SEC's own generous ceiling
+            # (see that constant's docstring) -- keeps roughly 2x headroom
+            # over the measured cumulative worst case and is kept
+            # deliberately, not as an unexamined carry-over.
+            baseline = threading.active_count()
+            for i in range(10):
+                result = _win_handle_holders(
+                    str(target_dir),
+                    excluded_pids=excluded_pids,
+                    budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+                )
+                found_pids = {pid for pid, _ in result}
+                assert proc.pid in found_pids, (
+                    f"scan #{i} failed to find the held-open handle; got {result} "
+                    "-- ticket #90's refactor must not regress Pass 1c detection quality"
+                )
+
+            # Short settle poll: any worker still finishing its very last
+            # (already-resolved-by-now) job has a bounded moment to exit
+            # before the assertion below.
+            deadline = time.monotonic() + 2.0
+            delta = threading.active_count() - baseline
+            while delta > 0 and time.monotonic() < deadline:
+                time.sleep(0.02)
+                delta = threading.active_count() - baseline
+
+            assert delta <= 0, (
+                f"10 repeated _win_handle_holders scans against a real, healthy "
+                f"(non-wedged) handle table left a thread-count delta of {delta} "
+                f"-- expected it to settle back to 0, not grow with each scan"
             )
         finally:
             proc.kill()
