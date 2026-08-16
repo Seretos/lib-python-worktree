@@ -79,7 +79,7 @@ from .setup import (
     log_dir_for,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.3.2"
 
 __all__ = [
     # core / manager
