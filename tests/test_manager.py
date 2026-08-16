@@ -1798,6 +1798,104 @@ def test_manager_stop_without_pid_is_noop(tmp_path: Path):
     assert mgr.state.get(record.id).status == "stopped"
 
 
+class TestManagerStopStickyStatus:
+    """R6 (ticket #95): the no-pid-for-role no-op path in ``WorktreeManager.stop``
+    must not clobber a sticky honest status.
+
+    Root cause (finding 6): ``manager.py``'s no-op branch set
+    ``record.status = "stopped"`` unconditionally whenever ``record.pids`` was
+    empty, unlike ``process_lifecycle.stop()``'s own guard (which excludes
+    ``"stop_incomplete"``/``"orphaned"``). A worktree already marked
+    ``"stop_incomplete"`` by an earlier ``stop()`` call for a different role
+    (or ``"orphaned"`` by ``reconcile()``) could have that honest status
+    silently overwritten back to ``"stopped"`` just by calling ``stop()``
+    again on a role with no recorded PID.
+    """
+
+    def test_no_pid_for_role_does_not_clobber_stop_incomplete(self, tmp_path: Path):
+        """Driving test: a record already marked "stop_incomplete" with no
+        recorded pids must keep that status through a no-op stop() call."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(status="stop_incomplete")  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)  # must not raise
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stop_incomplete"
+        assert mgr.state.get(record.id).status == "stop_incomplete"
+
+    def test_no_pid_for_role_does_not_clobber_orphaned(self, tmp_path: Path):
+        """Same guard for the "orphaned" status set by reconcile()."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(status="orphaned")  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "orphaned"
+        assert mgr.state.get(record.id).status == "orphaned"
+
+    def test_no_pid_for_role_running_still_becomes_stopped(self, tmp_path: Path):
+        """Non-sticky statuses (e.g. "running") are still normalized to
+        "stopped" by the no-op path -- the guard only protects the sticky
+        statuses, it must not turn the no-op branch into a total no-op."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(status="running")  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stopped"
+        assert mgr.state.get(record.id).status == "stopped"
+
+    def test_no_pid_for_role_still_runs_contract_stop_steps(self, tmp_path: Path):
+        """The sticky-status guard must not skip running contract stop: steps
+        -- only the status assignment changes."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(status="stop_incomplete")  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="echo done")],
+        )
+        mock_runner_instance = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_runner_instance.run.assert_called_once()
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stop_incomplete"
+
+
 # ---------------------------------------------------------------------------
 # Ticket #27: Consistent error contract — InvalidRepoError / InvalidBranchError
 # ---------------------------------------------------------------------------
