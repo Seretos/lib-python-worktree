@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Iterator
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -32,6 +33,7 @@ from lib_python_worktree.core.yaml_store import (
     ReconcileReport,
     YamlStateStore,
     _pid_alive,
+    _pid_alive_windows,
     adopt,
     reconcile,
 )
@@ -1141,3 +1143,188 @@ def test_find_by_branch_skips_primary_records_yaml(state_dir: Path):
     store.add(primary_rec)
 
     assert store.find_by_branch("/repos/myrepo", "main") is None
+
+
+# ---------------------------------------------------------------------------
+# TestPidAliveWindowsAccessDenied -- ticket #95, R4
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="_pid_alive_windows exercises win32-only ctypes APIs "
+    "(ctypes.get_last_error/set_last_error, kernel32 bindings)",
+)
+class TestPidAliveWindowsAccessDenied:
+    """R4 (ticket #95): ``_pid_alive_windows`` must not read ACCESS_DENIED as
+    dead.
+
+    Root cause (finding 4): the original implementation opened with only
+    ``PROCESS_QUERY_INFORMATION`` and returned ``False`` on *any*
+    ``OpenProcess`` failure -- including ``ERROR_ACCESS_DENIED``, which
+    actually proves the PID still exists (the OS returns
+    ``ERROR_INVALID_PARAMETER`` for a PID that is genuinely gone). A live
+    survivor process that ``stop()`` cannot open (e.g. spawned by another
+    user/elevated context) therefore silently read as already dead, masking
+    a real leaked process from the survivor re-probe.
+    """
+
+    @staticmethod
+    def _get_exit_code_side_effect(value: int):
+        def _side_effect(handle, ref):
+            ref._obj.value = value
+            return 1
+
+        return _side_effect
+
+    def test_access_denied_reads_as_alive(self):
+        """Driving test: both OpenProcess attempts fail and GetLastError()
+        reports ERROR_ACCESS_DENIED (5) -- the PID must read as alive, not
+        dead."""
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        with (
+            patch(
+                "lib_python_worktree.core.yaml_store._kernel32_lasterror",
+                return_value=kernel32,
+            ),
+            patch("ctypes.get_last_error", return_value=5),
+            patch("ctypes.set_last_error"),
+        ):
+            assert _pid_alive_windows(1234) is True
+
+    def test_invalid_parameter_reads_as_dead(self):
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        with (
+            patch(
+                "lib_python_worktree.core.yaml_store._kernel32_lasterror",
+                return_value=kernel32,
+            ),
+            patch("ctypes.get_last_error", return_value=87),
+            patch("ctypes.set_last_error"),
+        ):
+            assert _pid_alive_windows(999999) is False
+
+    def test_unknown_error_code_reads_as_dead(self):
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        with (
+            patch(
+                "lib_python_worktree.core.yaml_store._kernel32_lasterror",
+                return_value=kernel32,
+            ),
+            patch("ctypes.get_last_error", return_value=1234),
+            patch("ctypes.set_last_error"),
+        ):
+            assert _pid_alive_windows(555) is False
+
+    def test_limited_info_tried_before_falling_back(self):
+        """PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is tried first; only
+        falls back to the classic PROCESS_QUERY_INFORMATION (0x0400) if that
+        fails."""
+        kernel32 = MagicMock()
+        calls = []
+
+        def _open_process(desired_access, inherit, pid):
+            calls.append(desired_access)
+            return 0
+
+        kernel32.OpenProcess.side_effect = _open_process
+        with (
+            patch(
+                "lib_python_worktree.core.yaml_store._kernel32_lasterror",
+                return_value=kernel32,
+            ),
+            patch("ctypes.get_last_error", return_value=87),
+            patch("ctypes.set_last_error"),
+        ):
+            _pid_alive_windows(111)
+        assert calls == [0x1000, 0x0400]
+
+    def test_still_active_unchanged(self):
+        """Happy path unchanged by the hardening: a successfully opened
+        handle with a STILL_ACTIVE exit code reports alive."""
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 42
+        kernel32.GetExitCodeProcess.side_effect = self._get_exit_code_side_effect(259)
+        with patch(
+            "lib_python_worktree.core.yaml_store._kernel32_lasterror",
+            return_value=kernel32,
+        ):
+            assert _pid_alive_windows(42) is True
+
+    def test_exited_process_reads_as_dead(self):
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 42
+        kernel32.GetExitCodeProcess.side_effect = self._get_exit_code_side_effect(0)
+        with patch(
+            "lib_python_worktree.core.yaml_store._kernel32_lasterror",
+            return_value=kernel32,
+        ):
+            assert _pid_alive_windows(42) is False
+
+    def test_real_own_pid_is_alive(self):
+        """End-to-end sanity check against a real Windows process: our own
+        PID must read as alive."""
+        assert _pid_alive_windows(os.getpid()) is True
+
+
+# ---------------------------------------------------------------------------
+# TestJobNameRoundTrip -- ticket #95, R5
+# ---------------------------------------------------------------------------
+
+class TestJobNameRoundTrip:
+    """R5 (ticket #95): ``WorktreeRecord.job_names`` (per-role mapping,
+    reviewer fix cycle -- was originally a single record-wide scalar
+    ``job_name``) persists through ``state.yaml``, and a pre-fix record with
+    no ``job_names``/``job_name`` key at all still deserialises (defaulting
+    to ``{}``)."""
+
+    def test_job_name_round_trips(self, state_dir: Path):
+        """Driving test: a record with real per-role job names round-trips
+        through a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-job-name")
+        record.job_names = {
+            "main": "Local\\worktree-deadbeefcafebabe",
+            "worker": "Local\\worktree-feedfacecafebeef",
+        }
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-job-name")
+        assert reloaded is not None
+        assert reloaded.job_names == {
+            "main": "Local\\worktree-deadbeefcafebabe",
+            "worker": "Local\\worktree-feedfacecafebeef",
+        }
+
+    def test_legacy_record_without_job_name_key_defaults_to_none(self, state_dir: Path):
+        """A pre-fix state.yaml entry with no `job_names` (nor the older
+        scalar `job_name`) key at all must still deserialise, defaulting
+        job_names to an empty dict."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-job": {
+                    "id": "legacy-wt-job",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-job",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    # no "job_names" (nor "job_name") key at all -- simulates
+                    # a pre-fix state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-job")
+        assert legacy is not None
+        assert legacy.job_names == {}

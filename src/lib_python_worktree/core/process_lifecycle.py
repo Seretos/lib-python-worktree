@@ -23,7 +23,15 @@ Platform differences
 --------------------
 - Windows: ``CREATE_NEW_PROCESS_GROUP`` to detach from the MCP host's
   process group while still allowing ``CTRL_BREAK_EVENT`` delivery;
-  ``TerminateProcess`` (via ctypes) for force-kill.
+  ``TerminateProcess`` (via ctypes) for force-kill. ``start()`` also creates
+  a Windows Job Object (ticket #95) and assigns the spawned process to it --
+  a ppid-INDEPENDENT containment mechanism that ``stop()`` enumerates and
+  terminates as a unit, closing the gap the ppid-derived process-tree walk
+  cannot: a ``ShellExecuteEx``-delegated launch (what ``Start-Process`` uses
+  without stream redirection) lands outside our ppid lineage entirely, no
+  matter how deep the tree walk recurses. See ``_create_job_object``'s
+  docstring for why no limit flags (in particular, never
+  ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``) are ever set on it.
 - POSIX:   ``start_new_session=True``; ``SIGTERM`` for graceful stop;
   ``SIGKILL`` for force-kill.
 
@@ -43,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -185,6 +194,62 @@ _DISCOVERY_MAX_SEC = 20.0
 # deadline.
 _DISCOVERY_RESERVE_SEC = 1.0
 
+# Ticket #95, finding 2 (budget starvation): stop() used to hand the primary
+# _wait_or_kill call the ENTIRE remaining timeout budget. On Windows, a
+# CTRL_BREAK_EVENT to a CREATE_NEW_PROCESS_GROUP child sharing no console
+# frequently does nothing, so _wait_or_kill polls the full timeout before
+# force-killing -- leaving 0.0s for the subsequent tree kill and orphan scan,
+# whose own deadline-driven guards then all fail immediately (Pass 1c, the
+# Windows handle-table scan, never executes). _compute_stop_budget below caps
+# the primary wait's share and reserves floors for the other two steps so
+# neither can ever be starved down to zero by an adversarial primary step.
+#
+# The shares are chosen so _PRIMARY_WAIT_SHARE == 1 - (_TREE_KILL_FLOOR_SHARE
+# + _ORPHAN_SCAN_FLOOR_SHARE): the share-based and absolute-second caps
+# coincide exactly for kill_orphans=True at any timeout <= 10s; the absolute
+# floors only bind (clamp below the share) once timeout > 10s.
+_PRIMARY_WAIT_SHARE = 0.6
+_TREE_KILL_FLOOR_SEC = 1.0
+_TREE_KILL_FLOOR_SHARE = 0.10
+_ORPHAN_SCAN_FLOOR_SEC = 3.0
+_ORPHAN_SCAN_FLOOR_SHARE = 0.30
+
+
+def _compute_stop_budget(timeout: float, kill_orphans: bool) -> Tuple[float, float, float]:
+    """Split *timeout* across stop()'s primary wait, tree kill, and orphan
+    scan steps (ticket #95, finding 2).
+
+    Returns ``(primary_cap, tree_floor, orphan_floor)``:
+
+    - ``primary_cap`` -- the maximum seconds the primary ``_wait_or_kill``
+      call may be granted, regardless of how much of *timeout* remains at
+      that point.
+    - ``tree_floor`` -- seconds of *timeout* reserved so the tree-kill step
+      (``_kill_process_tree``) is never handed a budget below this, even if
+      the primary wait consumed its entire cap.
+    - ``orphan_floor`` -- seconds of *timeout* reserved for the orphan scan
+      (``_kill_blocking_processes``) in the same way. Always ``0.0`` when
+      *kill_orphans* is ``False`` -- there is no point reserving room for a
+      scan that will not run, and the tree kill should get the full
+      remainder instead.
+
+    ``timeout <= 0`` collapses every value to ``0.0``, preserving today's
+    immediate-force-kill behaviour for ``stop(timeout=0)``.
+    """
+    if timeout <= 0:
+        return 0.0, 0.0, 0.0
+
+    tree_floor = min(_TREE_KILL_FLOOR_SEC, _TREE_KILL_FLOOR_SHARE * timeout)
+    orphan_floor = (
+        min(_ORPHAN_SCAN_FLOOR_SEC, _ORPHAN_SCAN_FLOOR_SHARE * timeout)
+        if kill_orphans
+        else 0.0
+    )
+    primary_cap = max(
+        0.0, min(timeout * _PRIMARY_WAIT_SHARE, timeout - (tree_floor + orphan_floor))
+    )
+    return primary_cap, tree_floor, orphan_floor
+
 
 # ---------------------------------------------------------------------------
 # Error hierarchy
@@ -282,7 +347,321 @@ def _spawn_detached(
         kwargs["stderr"] = subprocess.DEVNULL
         proc = subprocess.Popen(cmd, **kwargs)
 
+    # Ticket #95, R5: Windows Job Object containment -- a ppid-independent
+    # mechanism that closes the gap _process_tree's ppid-walk cannot: a
+    # ShellExecuteEx-delegated launch (what `Start-Process` uses without
+    # stream redirection) lands OUTSIDE our ppid lineage entirely, so no
+    # amount of recursion depth in _process_tree can ever find it. Every
+    # process this job contains -- however it was spawned, however deeply
+    # nested, regardless of ppid -- is enumerable and terminable as a unit
+    # by stop() (see _job_object_member_pids / _terminate_job_object).
+    #
+    # job_name is stashed as an attribute on the returned Popen rather than
+    # changing this function's return type, to keep every existing caller
+    # (including tests that do `_spawn_detached(...).pid`) working
+    # unchanged. `None` means "no containment available" -- POSIX, or any
+    # Windows failure -- callers must always treat it as optional.
+    job_name: Optional[str] = None
+    if sys.platform == "win32":
+        candidate_job_name = f"Local\\worktree-{uuid.uuid4().hex}"
+        job_handle = _create_job_object(candidate_job_name)
+        if job_handle is not None:
+            if _assign_process_to_job(job_handle, proc.pid):
+                job_name = candidate_job_name
+            else:
+                # Assignment failed (e.g. lost the sub-millisecond race
+                # against the child already exiting) -- leave job_name None
+                # so nothing persists a job with no member in it. Ticket #95
+                # fix cycle (blocking finding, round 4): job_name staying
+                # None means record.job_names[role] is never populated for
+                # this attempt, so stop()'s job-handle-close logic (which
+                # only runs when record.job_names.get(role) is truthy) can
+                # never discover this handle -- it and its _JOB_HANDLES
+                # entry would otherwise leak indefinitely on a long-lived
+                # host. Close and evict it here instead, on this
+                # assignment-failure path specifically, since this is the
+                # only place that will ever know about it.
+                _close_job_object_handle(job_handle)
+                _JOB_HANDLES.pop(candidate_job_name, None)
+    proc._worktree_job_name = job_name  # type: ignore[attr-defined]
+
     return proc
+
+
+# ---------------------------------------------------------------------------
+# Windows Job Object containment -- ticket #95, R5
+# ---------------------------------------------------------------------------
+
+# A named Job Object dies the moment its LAST HANDLE closes -- there is no
+# per-process "owner" tie-in the way there is for e.g. a child process. The
+# spawning host process must therefore keep at least one handle open for as
+# long as containment should hold; this module-level dict is that keeper,
+# indexed by job_name.
+#
+# Consequence, documented rather than worked around: containment holds only
+# for the lifetime of the HOST process that spawned it. A stop() call issued
+# by a RESTARTED host degrades gracefully to the ppid/process-group path --
+# the job object itself is already gone by the time a new host process
+# starts (its last handle, held by the now-dead old host, already closed) --
+# this is rule N7, not a stop_incomplete-triggering condition.
+_JOB_HANDLES: Dict[str, int] = {}
+
+# QueryInformationJobObject(JobObjectBasicProcessIdList) buffer sizing
+# (ticket #95): start generous enough to avoid a second round-trip in the
+# common case, grow to the OS-reported exact size on ERROR_MORE_DATA, but
+# never past this cap -- mirrors _process_tree's _MAX_TREE_NODES treatment:
+# hitting it is never silently trusted as "that's everyone" (see stop()'s
+# job-member-list truncation handling, the same class as
+# tree_possibly_truncated).
+_JOB_MEMBER_LIST_INITIAL_SLOTS = 64
+_JOB_MEMBER_LIST_MAX_SLOTS = 4096
+
+
+def _create_job_object(job_name: str) -> Optional[int]:
+    """Windows-only: create a new Job Object named *job_name* with NO limit
+    flags set, and register its handle in :data:`_JOB_HANDLES`.
+
+    Deliberately sets no limits -- in particular, this NEVER calls
+    ``SetInformationJobObject`` to set ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``.
+    That flag would terminate every process still assigned to the job the
+    moment ITS OWN handle closes (e.g. when this host process exits) --
+    which would directly contradict this module's core detachment
+    invariant: a process spawned via :func:`_spawn_detached` must survive
+    the host process exiting. This job object exists purely as a
+    containment/enumeration mechanism for :func:`stop`, never as an
+    auto-kill-on-host-exit mechanism.
+
+    Returns the handle (``int``) on success, ``None`` on any failure --
+    best-effort; POSIX never calls this, and a Windows failure here simply
+    means the caller falls back to the ppid-tree-only containment path
+    (rule N7).
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        handle = kernel32.CreateJobObjectW(None, job_name)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        return None
+    if not handle:
+        return None
+    _JOB_HANDLES[job_name] = handle
+    return handle
+
+
+def _assign_process_to_job(job_handle: int, pid: int) -> bool:
+    """Windows-only: ``AssignProcessToJobObject(job_handle, pid)``.
+
+    Opens *pid* with ``PROCESS_SET_QUOTA | PROCESS_TERMINATE`` -- the
+    minimal access ``AssignProcessToJobObject`` needs.
+
+    A sub-millisecond race is accepted and documented rather than worked
+    around: ``subprocess.Popen`` closes the child's thread handle once it
+    returns, so ``CREATE_SUSPENDED``/``PROC_THREAD_ATTRIBUTE_JOB_LIST`` are
+    not reachable through it -- the child could in principle spawn its own
+    descendants in the brief window before this assignment lands. Those very
+    early descendants would not be job members, but they remain covered by
+    the existing ppid-tree path (:func:`_process_tree`) regardless -- this
+    job-object mechanism is additive containment, not a replacement for it.
+
+    Returns ``True`` on success. Best-effort; never raises.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_SET_QUOTA = 0x0100
+    PROCESS_TERMINATE = 0x0001
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        proc_handle = kernel32.OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid
+        )
+        if not proc_handle:
+            return False
+        try:
+            return bool(kernel32.AssignProcessToJobObject(job_handle, proc_handle))
+        finally:
+            kernel32.CloseHandle(proc_handle)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        return False
+
+
+def _open_job_object(job_name: str) -> Optional[int]:
+    """Windows-only: return a handle usable for
+    ``QueryInformationJobObject``/``TerminateJobObject`` on *job_name*.
+
+    Prefers the :data:`_JOB_HANDLES` registry's own handle -- the common
+    case, when this is the same host process that created the job (and
+    therefore the only process guaranteed to still have it alive at all;
+    see that dict's docstring). Falls back to a fresh ``OpenJobObjectW``
+    attempt otherwise, which is a harmless no-op failure in the
+    restarted-host case (the object's last handle -- held by the now-dead
+    old host -- has already closed by then).
+
+    Returns ``None`` on any failure. Best-effort; never raises.
+    """
+    if sys.platform != "win32":
+        return None
+    if job_name in _JOB_HANDLES:
+        return _JOB_HANDLES[job_name]
+
+    import ctypes
+    from ctypes import wintypes
+
+    JOB_OBJECT_QUERY = 0x0004
+    JOB_OBJECT_TERMINATE = 0x0001
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+        kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        handle = kernel32.OpenJobObjectW(
+            JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, False, job_name
+        )
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        return None
+    return handle or None
+
+
+def _job_object_member_pids(job_handle: int) -> "_PartialList":
+    """Windows-only: return every PID currently assigned to *job_handle* via
+    ``QueryInformationJobObject(JobObjectBasicProcessIdList)``.
+
+    Buffer sizing starts at :data:`_JOB_MEMBER_LIST_INITIAL_SLOTS`, retried
+    at the OS-reported ``NumberOfAssignedProcesses`` on ``ERROR_MORE_DATA``,
+    capped at :data:`_JOB_MEMBER_LIST_MAX_SLOTS`. Reaching the cap without
+    room for every assigned process is reported the same way
+    :func:`_process_tree` reports hitting ``_MAX_TREE_NODES`` -- a
+    :class:`_PartialList` with ``complete=False`` -- so ``stop()`` can treat
+    it the same, conservative way (never silently trusted as "that's
+    everyone").
+
+    Never raises: any ctypes/structure failure degrades to
+    ``_PartialList([], complete=False)`` -- "never looked", not "found
+    nothing".
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+    ERROR_MORE_DATA = 234
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+
+        header_size = ctypes.sizeof(ctypes.c_ulong) * 2
+        slot_size = ctypes.sizeof(ctypes.c_size_t)
+        slots = _JOB_MEMBER_LIST_INITIAL_SLOTS
+
+        for _attempt in range(6):
+            buf_size = header_size + slots * slot_size
+            buf = ctypes.create_string_buffer(buf_size)
+            return_length = wintypes.DWORD(0)
+            ctypes.set_last_error(0)
+            ok = kernel32.QueryInformationJobObject(
+                job_handle,
+                JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+                buf,
+                buf_size,
+                ctypes.byref(return_length),
+            )
+            if ok:
+                number_in_list = ctypes.c_ulong.from_buffer_copy(buf, 4).value
+                pids = [
+                    ctypes.c_size_t.from_buffer_copy(
+                        buf, header_size + i * slot_size
+                    ).value
+                    for i in range(number_in_list)
+                ]
+                return _PartialList(pids, complete=True)
+
+            err = ctypes.get_last_error()
+            if err != ERROR_MORE_DATA:
+                return _PartialList([], complete=False)
+
+            number_assigned = ctypes.c_ulong.from_buffer_copy(buf, 0).value
+            if slots >= _JOB_MEMBER_LIST_MAX_SLOTS:
+                # Already at the cap and still not enough room -- give up
+                # rather than looping forever; report as incomplete.
+                return _PartialList([], complete=False)
+            slots = min(_JOB_MEMBER_LIST_MAX_SLOTS, max(slots * 2, number_assigned))
+
+        return _PartialList([], complete=False)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        return _PartialList([], complete=False)
+
+
+def _terminate_job_object(job_handle: int) -> None:
+    """Windows-only: ``TerminateJobObject(job_handle, 1)``.
+
+    The ppid-independent force step -- terminates every process still
+    assigned to the job in one call, regardless of how deeply nested or how
+    it was spawned. Best-effort; never raises.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject(job_handle, 1)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        pass
+
+
+def _close_job_object_handle(job_handle: int) -> None:
+    """Windows-only: ``CloseHandle(job_handle)`` for a Job Object handle
+    (ticket #95 fix cycle -- blocking finding: Job Object handles leak in
+    the common path).
+
+    Every job handle :func:`stop` obtains via :func:`_open_job_object` --
+    whether served from the :data:`_JOB_HANDLES` keeper registry (the
+    common path) or opened fresh via the ``OpenJobObjectW`` fallback (the
+    narrower restarted-host path round 1 nit-picked) -- must be closed once
+    :func:`_terminate_job_object` has run against it. Before this fix,
+    nothing anywhere called ``CloseHandle`` on a job handle: on a
+    long-lived host process (e.g. an MCP server that never restarts), every
+    ``start()``/``stop()`` cycle for a Windows worktree leaked one kernel
+    HANDLE indefinitely. Mirrors the explicit ``argtypes`` pattern used for
+    other HANDLE-typed bindings in this module (e.g.
+    :func:`_assign_process_to_job`'s own ``CloseHandle`` usage) rather than
+    relying on ctypes' default int guessing, which silently truncates 64-bit
+    HANDLE values on x64. Best-effort; never raises.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle(job_handle)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +791,50 @@ class KilledProcessInfo:
     pid: int
     name: str
     cmdline: List[str] = field(default_factory=list)
+
+
+class _PartialList(list):
+    """A ``list`` subclass that also tracks discovery *coverage* (ticket #95,
+    finding 3).
+
+    ``_find_blocking_processes``, ``_kill_blocking_processes``, and
+    ``_win_handle_holders`` used to return a plain ``[]`` in both the
+    "genuinely found nothing" case and the "discovery was starved by the
+    deadline (or a worker-cap/exception) before it could look" case --
+    callers (``stop()``) could not tell them apart, so a starved scan
+    silently read as a clean, confirmed-empty result.
+
+    ``complete`` tracks discovery COVERAGE only -- never kill efficacy
+    (whether a killed process is actually dead is the survivor re-probe's
+    job, not this flag's) and never platform applicability (a pass simply
+    not running on this OS, e.g. Pass 1b/1c on POSIX, is not incompleteness
+    -- see the D1-D8 / N1-N8 rules documented on ``_find_blocking_processes``
+    and ``_kill_blocking_processes``).
+
+    ``skipped_passes`` names which pass(es) contributed to ``complete=False``,
+    using short tags (e.g. ``"cwd:truncated"``, ``"handle_scan:skipped"``) so
+    a caller's warning log can point an operator at the specific pass that
+    degraded, not just "something, somewhere, might be incomplete".
+
+    This deliberately keeps every existing call site working unchanged: a
+    plain ``[]`` returned by an old test mock, or received by
+    ``manager._teardown``'s positional ``_kill_blocking_processes(record.path)``
+    call, has no ``.complete``/``.skipped_passes`` attributes at all --
+    every reader in this module uses ``getattr(result, "complete", True)``
+    (default: trust it, exactly what a bare list has always implicitly
+    meant) rather than requiring this subclass.
+    """
+
+    def __init__(
+        self,
+        iterable=(),
+        *,
+        complete: bool = True,
+        skipped_passes: Tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(iterable)
+        self.complete = complete
+        self.skipped_passes = tuple(skipped_passes)
 
 
 def _process_tree(pid: int) -> List[KilledProcessInfo]:
@@ -1033,7 +1456,7 @@ def _win_handle_holders(
     excluded_pids: "set[int]",
     *,
     budget_sec: float = _HANDLE_SCAN_BUDGET_SEC,
-) -> List[Tuple[int, str]]:
+) -> "_PartialList":
     """Windows-only: system-wide OS handle-table scan (ticket #71 — Pass 1c).
 
     Returns ``(pid, name)`` pairs for processes holding an *open OS handle*
@@ -1237,10 +1660,12 @@ def _win_handle_holders(
             buf_size = max(buf_size * 2, return_length.value + (1 << 16))
             continue
         if status != STATUS_SUCCESS:
-            return []
+            # The one-shot dump itself failed -- this scan never looked at
+            # any handle at all, not merely "found nothing".
+            return _PartialList([], complete=False)
         break
     else:
-        return []
+        return _PartialList([], complete=False)
 
     size_t_size = ctypes.sizeof(ctypes.c_size_t)
     entry_size = ctypes.sizeof(_SystemHandleTableEntryInfoEx)
@@ -1461,9 +1886,25 @@ def _win_handle_holders(
             return _MATCHED
         return _CONTINUE
 
+    # Ticket #95, finding 3 (D5 vs N2): distinguish this scan's OWN
+    # budget_sec expiring mid-enumeration (deadline_truncated -- genuine
+    # incompleteness, "ran out of time before it could look") from the
+    # process-wide wedged-worker cap being hit (stop_scan via a CAPPED
+    # verdict -- an internal degradation the design explicitly does NOT
+    # treat as incompleteness, since the handle table up to that point WAS
+    # actually enumerated; see _bounded_query's CAPPED branch). Both cause
+    # the same early `break`, but only the deadline case sets
+    # deadline_truncated -- checked as a distinct condition, and only when
+    # stop_scan is not ALSO already true (i.e. the deadline is the actual
+    # reason this iteration stopped, not a cap hit on a prior handle that
+    # would have broken the loop already).
+    deadline_truncated = False
     try:
         for pid, handle_entries in by_pid.items():
-            if time.monotonic() > scan_deadline or stop_scan:
+            if stop_scan:
+                break
+            if time.monotonic() > scan_deadline:
+                deadline_truncated = True
                 break
             proc_handle = kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, pid)
             if not proc_handle:
@@ -1472,7 +1913,10 @@ def _win_handle_holders(
                 continue
             try:
                 for handle_value, type_index in handle_entries:
-                    if time.monotonic() > scan_deadline or stop_scan:
+                    if stop_scan:
+                        break
+                    if time.monotonic() > scan_deadline:
+                        deadline_truncated = True
                         break
                     verdict = _process_handle(proc_handle, pid, handle_value, type_index)
                     if verdict == _STOP:
@@ -1485,7 +1929,7 @@ def _win_handle_holders(
     finally:
         worker.close()
 
-    return found
+    return _PartialList(found, complete=not deadline_truncated)
 
 
 def _find_blocking_processes(
@@ -1493,7 +1937,7 @@ def _find_blocking_processes(
     host_pid: int,
     *,
     deadline: Optional[float] = None,
-) -> List[KilledProcessInfo]:
+) -> "_PartialList":
     """Return processes whose cwd or open file handles are under *path*.
 
     Detection passes:
@@ -1543,6 +1987,21 @@ def _find_blocking_processes(
         large/slow ambient process list that measured ~75s of CPU for a
         single call that found nothing. See ``_DISCOVERY_MAX_SEC`` /
         ``_DISCOVERY_RESERVE_SEC`` below.
+
+    Returns
+    -------
+    A :class:`_PartialList` (ticket #95, finding 3). ``.complete`` is
+    ``False`` when any pass's entry guard was false (never ran at all -- e.g.
+    ``"cwd:skipped"``) or its inner per-process loop broke on ``scan_stop``
+    (ran, but did not finish -- e.g. ``"cwd:truncated"``), and likewise for
+    Pass 1b (``"cmdline:..."``), Pass 1c (``"handle_scan:..."``, including
+    ``"handle_scan:failed"`` when :func:`_win_handle_holders` raised and was
+    swallowed -- zero coverage from that pass, not a mere degradation), and
+    Pass 2 (``"open_files:..."``). A pass simply not applicable on this OS
+    (Pass 1b/1c off Windows) never contributes a tag. An individual PID
+    raising ``AccessDenied``/``NoSuchProcess`` within a pass is caught and
+    skipped (``continue``) without affecting that pass's completeness -- only
+    a whole pass being skipped/truncated/failed does.
     """
     import psutil
 
@@ -1587,11 +2046,18 @@ def _find_blocking_processes(
 
     seen_pids: set[int] = set()
     result: List[KilledProcessInfo] = []
+    # Ticket #95, finding 3: names of passes that were skipped entirely
+    # (entry guard false) or truncated (inner loop broke on scan_stop),
+    # failed (raised and was swallowed), in the order encountered. See the
+    # D1-D8 / N1-N8 rules documented above.
+    skipped_passes: List[str] = []
 
     # Pass 1: CWD match.
     if time.monotonic() <= scan_stop:
+        pass_truncated = False
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             if time.monotonic() > scan_stop:
+                pass_truncated = True
                 break
             try:
                 pid = proc.info["pid"]
@@ -1614,35 +2080,46 @@ def _find_blocking_processes(
                     )
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 continue
+        if pass_truncated:  # D2
+            skipped_passes.append("cwd:truncated")
+    else:
+        skipped_passes.append("cwd:skipped")  # D1
 
     # Pass 1b (Windows only): cmdline token scan.
     # proc.cwd() raises AccessDenied for almost all foreign processes on Windows.
     # Scan cmdline tokens as a fallback: if any token resolves to a path under
     # the worktree directory, treat the process as blocking.
-    if sys.platform == "win32" and time.monotonic() <= scan_stop:
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-            if time.monotonic() > scan_stop:
-                break
-            try:
-                pid = proc.info["pid"]
-                if pid in excluded_pids or pid in seen_pids:
-                    continue
-                cmdline = proc.info["cmdline"] or []
-                for token in cmdline:
-                    try:
-                        norm_token = os.path.normcase(os.path.normpath(token))
-                    except (ValueError, TypeError):
+    if sys.platform == "win32":
+        if time.monotonic() <= scan_stop:
+            pass_truncated = False
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                if time.monotonic() > scan_stop:
+                    pass_truncated = True
+                    break
+                try:
+                    pid = proc.info["pid"]
+                    if pid in excluded_pids or pid in seen_pids:
                         continue
-                    if norm_token == normalized or norm_token.startswith(normalized + os.sep):
-                        seen_pids.add(pid)
-                        result.append(KilledProcessInfo(
-                            pid=pid,
-                            name=proc.info["name"] or "",
-                            cmdline=cmdline,
-                        ))
-                        break
-            except (psutil.AccessDenied, psutil.NoSuchProcess):
-                continue
+                    cmdline = proc.info["cmdline"] or []
+                    for token in cmdline:
+                        try:
+                            norm_token = os.path.normcase(os.path.normpath(token))
+                        except (ValueError, TypeError):
+                            continue
+                        if norm_token == normalized or norm_token.startswith(normalized + os.sep):
+                            seen_pids.add(pid)
+                            result.append(KilledProcessInfo(
+                                pid=pid,
+                                name=proc.info["name"] or "",
+                                cmdline=cmdline,
+                            ))
+                            break
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    continue
+            if pass_truncated:  # D3
+                skipped_passes.append("cmdline:truncated")
+        else:
+            skipped_passes.append("cmdline:skipped")  # D3
 
     # Pass 1c (Windows only): OS-level handle-table scan (ticket #71). See
     # _win_handle_holders' docstring for the full rationale/mechanism. This
@@ -1657,46 +2134,56 @@ def _find_blocking_processes(
     # time remains at all, the scan is skipped outright rather than spending
     # any of the remaining time on a scan that has no chance to report back
     # before the deadline is needed elsewhere (Pass 2 / the kill/wait step).
-    if sys.platform == "win32" and time.monotonic() <= scan_stop:
-        if deadline is None:
-            handle_scan_budget = _HANDLE_SCAN_BUDGET_SEC
-        else:
-            handle_scan_budget = min(
-                _HANDLE_SCAN_BUDGET_SEC, max(0.0, deadline - time.monotonic())
-            )
-        if handle_scan_budget <= 0:
-            handle_holders: List[Tuple[int, str]] = []
-        else:
-            try:
-                handle_holders = _win_handle_holders(
-                    path, excluded_pids, budget_sec=handle_scan_budget
+    if sys.platform == "win32":
+        if time.monotonic() <= scan_stop:
+            if deadline is None:
+                handle_scan_budget = _HANDLE_SCAN_BUDGET_SEC
+            else:
+                handle_scan_budget = min(
+                    _HANDLE_SCAN_BUDGET_SEC, max(0.0, deadline - time.monotonic())
                 )
-            except Exception:  # noqa: BLE001 -- best-effort, never propagate
-                handle_holders = []
-        for pid, name in handle_holders:
-            if pid in excluded_pids or pid in seen_pids:
-                continue
-            cmdline: List[str] = []
-            proc_name = name
-            try:
-                p = psutil.Process(pid)
-                cmdline = p.cmdline()
-                if not proc_name:
-                    proc_name = p.name()
-            except Exception:  # noqa: BLE001
-                # Best-effort info gathering only -- a psutil failure here
-                # must not prevent the PID from being reported as a blocker.
-                pass
-            seen_pids.add(pid)
-            result.append(
-                KilledProcessInfo(pid=pid, name=proc_name or "", cmdline=cmdline)
-            )
+            if handle_scan_budget <= 0:
+                handle_holders: "_PartialList" = _PartialList([], complete=True)
+                skipped_passes.append("handle_scan:skipped")  # D4
+            else:
+                try:
+                    handle_holders = _win_handle_holders(
+                        path, excluded_pids, budget_sec=handle_scan_budget
+                    )
+                except Exception:  # noqa: BLE001 -- best-effort, never propagate
+                    handle_holders = _PartialList([], complete=True)
+                    skipped_passes.append("handle_scan:failed")  # D6
+                else:
+                    if not getattr(handle_holders, "complete", True):
+                        skipped_passes.append("handle_scan:truncated")  # D5
+            for pid, name in handle_holders:
+                if pid in excluded_pids or pid in seen_pids:
+                    continue
+                cmdline: List[str] = []
+                proc_name = name
+                try:
+                    p = psutil.Process(pid)
+                    cmdline = p.cmdline()
+                    if not proc_name:
+                        proc_name = p.name()
+                except Exception:  # noqa: BLE001
+                    # Best-effort info gathering only -- a psutil failure here
+                    # must not prevent the PID from being reported as a blocker.
+                    pass
+                seen_pids.add(pid)
+                result.append(
+                    KilledProcessInfo(pid=pid, name=proc_name or "", cmdline=cmdline)
+                )
+        else:
+            skipped_passes.append("handle_scan:skipped")  # D4
 
     # Pass 2: open file handles — catches daemons that have changed their cwd
     # away from the worktree but still hold file locks inside it.
     if time.monotonic() <= scan_stop:
+        pass_truncated = False
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             if time.monotonic() > scan_stop:
+                pass_truncated = True
                 break
             try:
                 pid = proc.info["pid"]
@@ -1720,15 +2207,21 @@ def _find_blocking_processes(
                         break
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 continue
+        if pass_truncated:  # D7
+            skipped_passes.append("open_files:truncated")
+    else:
+        skipped_passes.append("open_files:skipped")  # D7
 
-    return result
+    return _PartialList(
+        result, complete=not skipped_passes, skipped_passes=tuple(skipped_passes)
+    )
 
 
 def _kill_blocking_processes(
     path: str,
     *,
     timeout: float = 5.0,
-) -> List[KilledProcessInfo]:
+) -> "_PartialList":
     """Kill all processes whose cwd is under *path* and return their info.
 
     Sends the graceful signal first, waits, then force-kills any survivors.
@@ -1777,29 +2270,38 @@ def _kill_blocking_processes(
     stops issuing further :func:`_process_tree` calls and degrades
     gracefully to whatever lineage was already expanded so far -- the same
     pattern :func:`_find_blocking_processes` already uses for its own Pass
-    1/1b/1c/2 discovery loops.
+    1/1b/1c/2 discovery loops. Ticket #95, finding 3 (D8): when this happens
+    it is folded into the returned :class:`_PartialList` as
+    ``"lineage:truncated"`` and ``complete=False`` -- carrying forward
+    whatever incompleteness :func:`_find_blocking_processes` itself already
+    reported, if any.
     """
     deadline = time.monotonic() + timeout
     found = _find_blocking_processes(path, os.getpid(), deadline=deadline)
     if not found:
         return found
 
+    discovery_complete = getattr(found, "complete", True)
+    discovery_skipped_passes = tuple(getattr(found, "skipped_passes", ()))
+
     seen_pids = {info.pid for info in found}
     expanded: List[KilledProcessInfo] = list(found)
+    lineage_truncated = False
     for info in found:
         if time.monotonic() >= deadline:
             # Budget exhausted -- stop issuing further _process_tree() calls;
             # whatever lineage was expanded so far is kept, not discarded.
+            lineage_truncated = True
             break
         for descendant in _process_tree(info.pid):
             if descendant.pid in seen_pids:
                 continue
             seen_pids.add(descendant.pid)
             expanded.append(descendant)
-    found = expanded
+    found_list = expanded
 
-    n = len(found)
-    for info in found:
+    n = len(found_list)
+    for info in found_list:
         # Always send the graceful signal, even if the budget is exhausted.
         # This ensures every orphan is notified regardless of how much time
         # is left.  Only the _wait_or_kill call is gated on remaining budget.
@@ -1811,7 +2313,15 @@ def _kill_blocking_processes(
             continue
         per_pid_budget = min(remaining, timeout / n)
         _wait_or_kill(info.pid, timeout=per_pid_budget)
-    return found
+
+    skipped_passes = discovery_skipped_passes
+    if lineage_truncated:  # D8
+        skipped_passes = skipped_passes + ("lineage:truncated",)
+    return _PartialList(
+        found_list,
+        complete=discovery_complete and not lineage_truncated,
+        skipped_passes=skipped_passes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1896,6 +2406,20 @@ def start(
     record.status = status
     record.returncode = returncode
     record.start_log_path = str(log_path)
+    # Ticket #95, R5 (fix cycle: per-role, not a record-wide scalar --
+    # mirrors how `pids` is keyed by role): persist the Job Object name (if
+    # one was successfully created and the child assigned to it) under this
+    # specific role's key, so stop() can later enumerate/terminate its
+    # members without disturbing any OTHER role's job. On POSIX, or on any
+    # Windows failure, no Job Object exists for this role -- pop any stale
+    # entry left over from a previous start() of this same role rather than
+    # storing a None (job_names values are always real job names, never
+    # None -- absence of the key IS "no containment available").
+    spawned_job_name = getattr(proc, "_worktree_job_name", None)
+    if spawned_job_name is not None:
+        record.job_names[role] = spawned_job_name
+    else:
+        record.job_names.pop(role, None)
     store.update(record)
 
     return record
@@ -1950,7 +2474,34 @@ def stop(
     The *timeout* budget is shared across the primary signal/wait step, the
     tree kill, and the optional orphan scan: each later step receives only
     the time that remains after the previous one completes, so the total
-    operation is always bounded by *timeout* seconds.
+    operation is always bounded by *timeout* seconds. Ticket #95, finding 2:
+    the primary step is additionally capped by :func:`_compute_stop_budget`
+    so it can never consume the *entire* budget and starve the tree kill /
+    orphan scan down to a 0.0s slice -- see that function's docstring for
+    the exact split. ``_wait_or_kill`` polls on a 0.1s tick, so the primary
+    step can overshoot its own cap by up to one tick plus the force-kill
+    cost. Since ticket #95's round-3 starvation fix, the tree-kill step's
+    budget is ``max(tree_floor, deadline - time.monotonic() - orphan_floor)``
+    rather than a plain ``max(0.0, ...)`` clamp, so in the pathological case
+    where the primary wait already overran into or past the deadline, the
+    tree kill still gets its full ``tree_floor`` seconds rather than a
+    near-zero slice. That means the "total bounded by *timeout*" guarantee
+    above holds only to within one poll tick plus force-kill cost in the
+    common case, but can stretch up to ``tree_floor`` seconds (up to 1.0s by
+    default) past *timeout* in that pathological overrun case -- an
+    intentional trade-off protecting the tree kill from starvation, not a
+    regression. With ``kill_orphans=True``
+    on a tight *timeout*, the orphan scan's Windows handle-table pass (Pass
+    1c) may only get a truncated slice of its own budget -- pass a larger
+    *timeout* (e.g. 20.0) for a caller that needs a guaranteed-complete
+    Windows orphan scan.
+
+    ``record.killed_pids`` (ticket #95, finding 1) is set to every PID this
+    call actually attempted to terminate -- the tree kill, the tracked PID
+    itself (only when it was alive at entry), and the orphan scan (when
+    ``kill_orphans=True``) -- de-duplicated, deepest-first. This is a
+    transient, in-memory-only field: it is never persisted to ``state.yaml``
+    (see ``WorktreeRecord.killed_pids``'s own docstring).
 
     Status honesty (ticket #87)
     -----------------------------
@@ -2027,6 +2578,17 @@ def stop(
     # timeout.
     deadline = time.monotonic() + timeout
 
+    # Ticket #95, finding 2: pre-split the budget so the primary wait can
+    # never starve the tree kill / orphan scan down to zero. See
+    # _compute_stop_budget's docstring for the full rationale. tree_floor is
+    # actually enforced at the _kill_process_tree call site below (ticket
+    # #95 fix cycle, blocking finding) -- it used to be unpacked into a
+    # throwaway variable and discarded, so an overrun of the primary wait
+    # past its own primary_cap (acknowledged as possible -- _wait_or_kill
+    # polls on a 0.1s tick) could still starve the tree kill down to 0.0s,
+    # reintroducing a narrower version of this ticket's own original bug.
+    primary_cap, tree_floor, orphan_floor = _compute_stop_budget(timeout, kill_orphans)
+
     # Snapshot the descendant tree BEFORE any signal is sent (ticket #87):
     # once the root dies, a reparented grandchild becomes invisible to
     # anything that only looks at the tracked PID.
@@ -2045,6 +2607,35 @@ def stop(
     # conservative, cheap trade-off documented on _process_tree.
     tree_possibly_truncated = len(tree) >= _MAX_TREE_NODES
 
+    # Ticket #95, R5: Windows Job Object containment -- a ppid-independent
+    # mechanism that closes the gap _process_tree's ppid-walk cannot by
+    # construction: a ShellExecuteEx-delegated launch (what `Start-Process`
+    # uses without stream redirection) lands OUTSIDE our ppid lineage
+    # entirely, so no amount of recursion depth in _process_tree can ever
+    # find it. Enumerated BEFORE any signal is sent -- same rationale as the
+    # tree/group-member snapshots below: once a member dies, the job's own
+    # membership list shrinks, so this must be captured first.
+    # Ticket #95 fix cycle: look up THIS role's job name from the per-role
+    # mapping, not a record-wide scalar -- a record-wide field would have
+    # stop(role="main") open/terminate whichever role's job happened to be
+    # written there last (e.g. role "worker"'s job, if "worker" was started
+    # after "main"), corrupting an unrelated role's containment.
+    job_name = record.job_names.get(role)
+    job_handle: Optional[int] = None
+    job_member_pids: List[int] = []
+    job_list_truncated = False
+    if job_name:
+        job_handle = _open_job_object(job_name)
+        if job_handle is not None:
+            job_members = _job_object_member_pids(job_handle)
+            job_list_truncated = not getattr(job_members, "complete", True)
+            job_member_pids = list(job_members)
+        # else: no live handle available (POSIX, or OpenJobObjectW failed --
+        # e.g. a restarted host whose predecessor's keeper handle already
+        # closed the object). This is rule N7 -- a fallback degrading to the
+        # ppid-tree/process-group path, never itself a stop_incomplete
+        # trigger.
+
     # POSIX only, also snapshotted BEFORE any signal (ticket #87 follow-up,
     # finding B3): the PIDs of any OTHER process sharing *pid*'s process
     # group. _signal_process_group below fires a single SIGTERM at the whole
@@ -2061,9 +2652,10 @@ def stop(
     # group leader, or when doing so would signal our own group.
     _signal_process_group(pid, force=False)
 
-    if _pid_alive(pid):
+    pid_was_alive = _pid_alive(pid)
+    if pid_was_alive:
         _send_graceful_signal(pid)
-        _wait_or_kill(pid, max(0.0, deadline - time.monotonic()))
+        _wait_or_kill(pid, max(0.0, min(deadline - time.monotonic(), primary_cap)))
 
     # Kill the snapshotted descendant tree, plus any process-group members
     # not already covered by it (finding B3) -- both get the identical
@@ -2077,8 +2669,53 @@ def stop(
         for gpid in group_member_pids
         if gpid not in tree_pids and gpid != pid
     ]
-    killed_tree = tree + group_only_infos
-    _kill_process_tree(killed_tree, timeout=max(0.0, deadline - time.monotonic()))
+    # Ticket #95, R5: fold in any Job Object member not already covered by
+    # the ppid tree or the process-group snapshot -- this is precisely the
+    # ShellExecuteEx-delegated-grandchild case the job object exists to
+    # catch. Host process and the tracked pid itself are always excluded
+    # (both already handled elsewhere).
+    already_covered = tree_pids | {info.pid for info in group_only_infos}
+    job_only_infos = [
+        KilledProcessInfo(pid=jpid, name="", cmdline=[])
+        for jpid in job_member_pids
+        if jpid not in already_covered and jpid != pid and jpid != os.getpid()
+    ]
+    killed_tree = tree + group_only_infos + job_only_infos
+    # Ticket #95 fix cycle (blocking finding): enforce tree_floor here, not
+    # just reserve orphan_floor -- the pre-fix `max(0.0, ...)` clamp let an
+    # overrun of the primary wait (past its own primary_cap; _wait_or_kill
+    # only polls on a 0.1s tick, so this is acknowledged as possible) push
+    # `deadline - time.monotonic()` to zero or negative, silently starving
+    # the tree kill down to 0.0s despite _compute_stop_budget's tree_floor
+    # promising it would never happen. max(tree_floor, ...) guarantees this
+    # step always gets at least tree_floor seconds, exactly as documented.
+    _kill_process_tree(
+        killed_tree,
+        timeout=max(tree_floor, deadline - time.monotonic() - orphan_floor),
+    )
+
+    # Ticket #95, R5: the ppid-independent force step -- terminates every
+    # process still assigned to the job in one call, catching anything that
+    # ignored the graceful signal above (or was never reachable by it at
+    # all, e.g. it holds no console to deliver CTRL_BREAK_EVENT to). Run
+    # AFTER the tree kill (which already gave everything a graceful chance)
+    # and BEFORE the orphan scan.
+    if job_handle is not None:
+        _terminate_job_object(job_handle)
+        # Ticket #95 fix cycle (blocking finding): release the handle this
+        # call opened/queried, and evict it from the _JOB_HANDLES keeper
+        # registry when it was that registry's own handle -- otherwise this
+        # leaks one kernel HANDLE (and, in the registry case, one
+        # _JOB_HANDLES entry) per stop() call, indefinitely, on a
+        # long-lived host process. Covers both paths _open_job_object can
+        # serve a handle from: the common keeper-registry case (this host
+        # created the job at start() time) and the OpenJobObjectW fallback
+        # (a restarted host querying afresh) -- only the former also needs
+        # a registry eviction, since the fallback handle was never in
+        # _JOB_HANDLES to begin with.
+        _close_job_object_handle(job_handle)
+        if _JOB_HANDLES.get(job_name) == job_handle:
+            _JOB_HANDLES.pop(job_name, None)
 
     # Orphan scan: kill processes that survived because they detached far
     # enough (e.g. into their own session/process group) to evade both the
@@ -2087,7 +2724,17 @@ def stop(
     # orphans. Pass remaining budget so the scan is also bounded.
     orphan_found: List[KilledProcessInfo] = []
     if kill_orphans:
-        orphan_budget = max(0.0, deadline - time.monotonic())
+        # Ticket #95 fix cycle, R5 (blocking finding): enforce orphan_floor
+        # here, mirroring the tree_floor enforcement above -- the pre-fix
+        # `max(0.0, ...)` clamp let an overrun of the primary wait (plus the
+        # tree-kill step legitimately consuming up to tree_floor extra
+        # seconds past the deadline to satisfy ITS OWN floor) push
+        # `deadline - time.monotonic()` to zero or negative, silently
+        # starving the orphan scan down to 0.0s despite
+        # _compute_stop_budget's docstring promising it would never happen.
+        # max(orphan_floor, ...) guarantees this step always gets at least
+        # orphan_floor seconds, exactly as documented.
+        orphan_budget = max(orphan_floor, deadline - time.monotonic())
         orphan_found = _kill_blocking_processes(record.path, timeout=orphan_budget)
 
     # Never report a false "stopped" (ticket #87): re-probe liveness of
@@ -2097,9 +2744,47 @@ def stop(
     candidate_pids = [pid] + [info.pid for info in killed_tree] + [info.pid for info in orphan_found]
     survivor_pids = [p for p in candidate_pids if _pid_alive(p)]
 
+    # Ticket #95, finding 1: killed_pids was never populated by stop() --
+    # only ever written by manager.py's separate _kill_blocking_processes
+    # call sites (the _teardown kill-and-retry paths). Populate it here too
+    # so a caller inspecting the returned record can see exactly what this
+    # call attempted to terminate. Deepest-first: the tree (already
+    # deepest-first from _process_tree) comes first, then the tracked pid
+    # itself (the root -- only when something was actually attempted
+    # against it, i.e. it was alive at entry), then the orphan scan's
+    # results. De-duplicated by pid. Deliberately transient -- see
+    # WorktreeRecord.killed_pids' docstring; _record_to_dict never persists
+    # it, so this never round-trips through state.yaml.
+    _attempted_infos = list(killed_tree)
+    if pid_was_alive:
+        _attempted_infos.append(KilledProcessInfo(pid=pid, name="", cmdline=[]))
+    _attempted_infos.extend(orphan_found)
+    _seen_killed_pids: "set[int]" = set()
+    killed_pids: List[KilledProcessInfo] = []
+    for info in _attempted_infos:
+        if info.pid in _seen_killed_pids:
+            continue
+        _seen_killed_pids.add(info.pid)
+        killed_pids.append(info)
+    record.killed_pids = killed_pids
+
     # Clear the role regardless of whether the process was alive — the
     # important postcondition is that the record no longer references it.
     del record.pids[role]
+    # Ticket #95 fix cycle: mirror the pids[role] clear above for this
+    # role's job_names entry -- once stop() has attempted to open/enumerate/
+    # terminate this role's job, the record must no longer name it, exactly
+    # as pids[role] is unconditionally cleared regardless of survivor
+    # status. Uses .pop(role, None) rather than `del` since job_name may be
+    # absent entirely (no Job Object existed for this role -- POSIX, or
+    # Windows Job Object creation failed at start() time).
+    # Safe to do unconditionally even on a stop_incomplete outcome below:
+    # `del record.pids[role]` above already unconditionally removed this
+    # role, so no later stop(role=...) call can ever reach this record state
+    # for that role again, and no reconcile/adopt pathway reads job_names
+    # outside of stop() itself -- there is nothing left that depends on this
+    # entry surviving a stop.
+    record.job_names.pop(role, None)
 
     if survivor_pids:
         _logger.warning(
@@ -2119,6 +2804,34 @@ def stop(
             "descendant was found and killed, reporting stop_incomplete "
             "instead of stopped",
             worktree_id, role, pid, _MAX_TREE_NODES,
+        )
+        record.status = "stop_incomplete"
+    elif job_list_truncated:
+        # Ticket #95, R5: same class as tree_possibly_truncated above --
+        # every candidate we DID collect came back dead, but the Job
+        # Object's member list hit the _JOB_MEMBER_LIST_MAX_SLOTS cap, so an
+        # unknown number of members beyond it were never even examined.
+        _logger.warning(
+            "stop(worktree_id=%s, role=%s): Job Object '%s' member list was "
+            "truncated at the %s-slot cap -- cannot guarantee every job "
+            "member was found and killed, reporting stop_incomplete instead "
+            "of stopped",
+            worktree_id, role, job_name, _JOB_MEMBER_LIST_MAX_SLOTS,
+        )
+        record.status = "stop_incomplete"
+    elif kill_orphans and not getattr(orphan_found, "complete", True):
+        # Ticket #95, finding 3: every candidate we DID collect came back
+        # dead, but the orphan scan itself did not have full discovery
+        # coverage (a pass was skipped/truncated/failed against the
+        # deadline -- see _PartialList/_find_blocking_processes' D1-D8
+        # rules). "Found nothing" and "never looked" used to be
+        # indistinguishable ([] either way); reporting "stopped" here would
+        # reintroduce exactly that silent false positive.
+        _logger.warning(
+            "stop(worktree_id=%s, role=%s): orphan scan discovery was "
+            "incomplete (skipped_passes=%s) -- cannot guarantee no orphans "
+            "were missed, reporting stop_incomplete instead of stopped",
+            worktree_id, role, getattr(orphan_found, "skipped_passes", ()),
         )
         record.status = "stop_incomplete"
     elif not record.pids and record.status not in ("stop_incomplete", "orphaned"):

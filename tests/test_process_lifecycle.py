@@ -1450,6 +1450,498 @@ class TestStopTimeoutBudget:
 
 
 # ---------------------------------------------------------------------------
+# TestStopBudgetReallocation -- ticket #95, R1
+# ---------------------------------------------------------------------------
+
+class TestStopBudgetReallocation:
+    """R1 (ticket #95): the primary signal/wait step must never be able to
+    starve the tree-kill and orphan-scan steps of their whole budget.
+
+    Root cause (finding 2): ``stop()`` used to hand the *entire* remaining
+    timeout to the primary ``_wait_or_kill`` call. On Windows, a
+    ``CTRL_BREAK_EVENT`` to a ``CREATE_NEW_PROCESS_GROUP`` child sharing no
+    console frequently does nothing, so ``_wait_or_kill`` polls the full
+    budget before force-killing -- leaving 0.0s for the orphan scan
+    (``_kill_blocking_processes(..., timeout=0.0)``), whose deadline-driven
+    guards (Pass 1/1b/1c/2) then all fail immediately. The fix reserves a
+    floor for the tree kill and orphan scan up front, computed by
+    ``_compute_stop_budget``, and caps the primary wait at
+    ``primary_cap`` so it can never eat into those floors.
+    """
+
+    def test_primary_wait_cannot_starve_orphan_scan(self):
+        """Driving test: even when the primary wait consumes its entire
+        granted timeout, the orphan scan still receives a real, non-trivial
+        budget -- not the 0.0s the pre-fix code handed it."""
+        fake_pid = 55555
+        record = _make_record("wt-no-starve", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_primary_timeout: List[float] = []
+        captured_orphan_timeout: List[float] = []
+
+        def fake_wait_or_kill(pid, timeout):
+            captured_primary_timeout.append(timeout)
+            # Simulate the pathological case: _wait_or_kill burns its whole
+            # granted budget (e.g. CTRL_BREAK_EVENT was a no-op).
+            time.sleep(timeout)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=fake_wait_or_kill,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                side_effect=lambda path, **kw: captured_orphan_timeout.append(
+                    kw.get("timeout", -1)
+                ) or [],
+            ),
+        ):
+            stop("wt-no-starve", store=store, kill_orphans=True, timeout=1.0)
+
+        assert len(captured_primary_timeout) == 1
+        assert captured_primary_timeout[0] <= 0.6 + 0.05, (
+            f"primary wait received {captured_primary_timeout[0]:.3f}s -- "
+            "must be capped at primary_cap (~0.6s of a 1.0s budget)"
+        )
+        assert len(captured_orphan_timeout) == 1
+        assert captured_orphan_timeout[0] >= 0.25, (
+            f"orphan scan received only {captured_orphan_timeout[0]:.3f}s -- "
+            "the primary wait starved it almost entirely"
+        )
+
+    def test_budget_split_arithmetic_at_default_timeout(self):
+        """_compute_stop_budget's formula matches the pinned design at the
+        documented default timeout (10.0s), for both kill_orphans values."""
+        primary_cap, tree_floor, orphan_floor = _pl._compute_stop_budget(10.0, True)
+        assert tree_floor == pytest.approx(1.0)
+        assert orphan_floor == pytest.approx(3.0)
+        assert primary_cap == pytest.approx(6.0)
+
+        primary_cap2, tree_floor2, orphan_floor2 = _pl._compute_stop_budget(10.0, False)
+        assert tree_floor2 == pytest.approx(1.0)
+        assert orphan_floor2 == 0.0
+        assert primary_cap2 == pytest.approx(6.0)
+
+    def test_tree_kill_receives_nonzero_budget_when_primary_exhausts(self):
+        """When the primary wait consumes its entire cap, _kill_process_tree
+        must still be handed a strictly positive timeout (never the 0.0s the
+        pre-fix code could produce)."""
+        fake_pid = 55556
+        tree = [KilledProcessInfo(pid=90001, name="child", cmdline=["child"])]
+        record = _make_record("wt-tree-budget", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_tree_timeout: List[float] = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=lambda pid, timeout: time.sleep(timeout),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=lambda killed_tree, **kw: captured_tree_timeout.append(
+                    kw.get("timeout", -1)
+                ) or killed_tree,
+            ),
+        ):
+            stop("wt-tree-budget", store=store, kill_orphans=False, timeout=1.0)
+
+        assert len(captured_tree_timeout) == 1
+        assert captured_tree_timeout[0] > 0.0, (
+            "tree kill must receive a strictly positive budget even when the "
+            "primary wait exhausted its own cap"
+        )
+
+    def test_kill_orphans_false_reserves_no_orphan_floor(self):
+        """orphan_floor is 0.0 when kill_orphans=False -- the tree kill gets
+        the entire remainder instead of ceding a floor to a scan that will
+        never run."""
+        _primary_cap, _tree_floor, orphan_floor = _pl._compute_stop_budget(5.0, False)
+        assert orphan_floor == 0.0
+
+    def test_timeout_zero_still_bounded(self):
+        """timeout=0.0 must still compute a sane, all-zero split -- today's
+        immediate-force-kill behaviour is preserved."""
+        primary_cap, tree_floor, orphan_floor = _pl._compute_stop_budget(0.0, True)
+        assert primary_cap == 0.0
+        assert tree_floor == 0.0
+        assert orphan_floor == 0.0
+
+    def test_total_elapsed_never_exceeds_timeout(self):
+        """Wall-clock smoke test: stop() with an immortal fake pid and a
+        pathological _wait_or_kill that always burns its full grant must
+        still return within the caller's overall timeout (plus a small
+        scheduling tolerance)."""
+        fake_pid = 55557
+        record = _make_record("wt-total-bound", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=lambda pid, timeout: time.sleep(timeout),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=[],
+            ),
+        ):
+            t0 = time.monotonic()
+            stop("wt-total-bound", store=store, kill_orphans=True, timeout=1.0)
+            elapsed = time.monotonic() - t0
+
+        assert elapsed <= 1.0 + 0.2, (
+            f"stop() took {elapsed:.2f}s -- total must stay bounded by timeout"
+        )
+
+    def test_tree_kill_receives_at_least_tree_floor_when_primary_overruns(self):
+        """Driving test (ticket #95 fix cycle, blocking finding): tree_floor
+        must actually be ENFORCED, not merely computed and discarded.
+
+        Root cause: the call site unpacked ``_compute_stop_budget``'s
+        ``tree_floor`` into a throwaway ``_tree_floor`` and never used it --
+        the tree-kill call only ever reserved ``orphan_floor``:
+        ``timeout=max(0.0, deadline - time.monotonic() - orphan_floor)``.
+        ``_wait_or_kill`` polls on a 0.1s tick and can therefore overrun its
+        granted ``primary_cap`` (acknowledged in stop()'s own docstring) --
+        when it does, ``deadline - time.monotonic()`` can be zero or even
+        negative, which the pre-fix ``max(0.0, ...)`` clamp would silently
+        round to ``0.0``, starving the tree-kill step exactly like this
+        ticket's original bug (just one step later in the pipeline).
+
+        Simulates that overrun directly: _wait_or_kill sleeps well past its
+        granted primary_cap, pushing time.monotonic() past stop()'s own
+        deadline before the tree-kill budget is computed. The tree kill must
+        still receive at least tree_floor seconds, never 0.0.
+        """
+        fake_pid = 55558
+        tree = [KilledProcessInfo(pid=90002, name="child", cmdline=["child"])]
+        record = _make_record("wt-tree-floor-overrun", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_tree_timeout: List[float] = []
+        timeout = 1.0
+        _primary_cap, tree_floor, _orphan_floor = _pl._compute_stop_budget(
+            timeout, False
+        )
+
+        def fake_wait_or_kill(pid, timeout_arg):
+            # Simulate _wait_or_kill overrunning its granted primary_cap --
+            # e.g. a polling tick landing just past the deadline -- so that
+            # by the time the tree-kill budget is computed, the shared
+            # deadline has already passed.
+            time.sleep(timeout_arg + 0.3)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=fake_wait_or_kill,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=lambda killed_tree, **kw: captured_tree_timeout.append(
+                    kw.get("timeout", -1)
+                ) or killed_tree,
+            ),
+        ):
+            stop("wt-tree-floor-overrun", store=store, kill_orphans=False, timeout=timeout)
+
+        assert len(captured_tree_timeout) == 1
+        assert captured_tree_timeout[0] >= tree_floor, (
+            f"tree kill received only {captured_tree_timeout[0]:.3f}s after the "
+            f"primary wait overran its budget -- must be >= tree_floor "
+            f"({tree_floor:.3f}s), the guarantee _compute_stop_budget's "
+            "docstring documents but the call site was not enforcing"
+        )
+
+    def test_orphan_scan_receives_at_least_orphan_floor_when_primary_overruns(self):
+        """Driving test (ticket #95 fix cycle, R5 review): orphan_floor must
+        actually be ENFORCED for the orphan scan, not merely computed and
+        discarded -- the identical starvation bug already fixed for the
+        tree-kill step (see the sibling test above) but left unfixed one
+        step further down the pipeline.
+
+        Root cause: the orphan-scan call site computed its budget as
+        ``orphan_budget = max(0.0, deadline - time.monotonic())`` -- no
+        floor enforcement. Simulates the pathological overrun chain: the
+        primary wait overruns its granted ``primary_cap`` (acknowledged
+        possible -- ``_wait_or_kill`` polls on a 0.1s tick), and the
+        tree-kill step then legitimately consumes up to its own
+        ``tree_floor`` seconds past the deadline to satisfy the guarantee
+        fixed earlier in this cycle. By the time the orphan budget is
+        computed, ``time.monotonic()`` is already well past ``deadline``,
+        so the pre-fix ``max(0.0, ...)`` clamp collapses it to exactly
+        ``0.0`` -- silently skipping the orphan scan (Pass 1c, the whole
+        reason this ticket exists) in exactly the scenario this ticket is
+        about.
+        """
+        fake_pid = 55559
+        record = _make_record("wt-orphan-floor-overrun", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_orphan_timeout: List[float] = []
+        timeout = 1.0
+        _primary_cap, tree_floor, orphan_floor = _pl._compute_stop_budget(
+            timeout, True
+        )
+
+        def fake_wait_or_kill(pid, timeout_arg):
+            # Simulate _wait_or_kill overrunning its granted primary_cap --
+            # e.g. a polling tick landing just past the deadline.
+            time.sleep(timeout_arg + 0.3)
+
+        def fake_kill_process_tree(killed_tree, **kw):
+            # Simulate the tree-kill step legitimately consuming up to its
+            # own tree_floor seconds past the (already-overrun) deadline --
+            # exactly what the earlier fix in this cycle now guarantees it
+            # may do.
+            time.sleep(tree_floor)
+            return killed_tree
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=fake_wait_or_kill,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=fake_kill_process_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                side_effect=lambda path, **kw: captured_orphan_timeout.append(
+                    kw.get("timeout", -1)
+                ) or [],
+            ),
+        ):
+            stop(
+                "wt-orphan-floor-overrun",
+                store=store,
+                kill_orphans=True,
+                timeout=timeout,
+            )
+
+        assert len(captured_orphan_timeout) == 1
+        assert captured_orphan_timeout[0] >= orphan_floor, (
+            f"orphan scan received only {captured_orphan_timeout[0]:.3f}s after "
+            f"the primary wait and tree-kill step overran the deadline -- must "
+            f"be >= orphan_floor ({orphan_floor:.3f}s), the guarantee "
+            "_compute_stop_budget's docstring documents but the call site was "
+            "not enforcing"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestStopReportsKilledPids -- ticket #95, R3
+# ---------------------------------------------------------------------------
+
+class TestStopReportsKilledPids:
+    """R3 (ticket #95): stop() must populate ``record.killed_pids``.
+
+    Root cause (finding 1): ``WorktreeRecord.killed_pids`` is only ever
+    written at two call sites in ``manager.py`` (the ``_teardown`` kill-and-
+    retry paths) -- ``process_lifecycle.stop()`` never touches it, so its
+    ``killed_pids: []`` in any report built from a ``stop()`` result is
+    structurally guaranteed, regardless of what was actually killed.
+    """
+
+    def test_stop_populates_killed_pids_with_tree_and_orphans(self):
+        """Driving test: a 2-node descendant tree plus 1 orphan must all
+        appear in ``result.killed_pids``, deepest-first (tree, then the
+        tracked pid, then orphans), deduplicated, and NOT persisted to the
+        YAML-shaped dict ``_record_to_dict`` would produce."""
+        fake_pid = 71000
+        record = _make_record("wt-killed-pids", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        child = KilledProcessInfo(pid=71001, name="child", cmdline=["child"])
+        grandchild = KilledProcessInfo(pid=71002, name="grandchild", cmdline=["gc"])
+        orphan = KilledProcessInfo(pid=71003, name="orphan", cmdline=["orphan"])
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[grandchild, child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([orphan]),
+            ),
+        ):
+            result = stop(
+                "wt-killed-pids", store=store, kill_orphans=True, timeout=5.0,
+            )
+
+        killed_pids_by_pid = {info.pid: info for info in result.killed_pids}
+        assert set(killed_pids_by_pid) == {71001, 71002, 71003}, (
+            f"expected tree + orphan pids, got {set(killed_pids_by_pid)}"
+        )
+        # Deepest-first: the tree's own order (grandchild, child) must be
+        # preserved ahead of the orphan.
+        pids_in_order = [info.pid for info in result.killed_pids]
+        assert pids_in_order.index(71002) < pids_in_order.index(71001), (
+            "grandchild must be listed before its parent (deepest-first)"
+        )
+        assert pids_in_order.index(71001) < pids_in_order.index(71003), (
+            "tree entries must precede orphan entries"
+        )
+
+        # Never persisted -- killed_pids is transient (state.py docstring).
+        from lib_python_worktree.core.yaml_store import _record_to_dict
+        assert "killed_pids" not in _record_to_dict(result)
+
+    def test_stop_killed_pids_includes_tracked_pid_when_alive(self):
+        """The tracked PID itself is included in killed_pids when it was
+        alive and something was actually attempted against it."""
+        fake_pid = 71100
+        record = _make_record("wt-killed-pids-tracked", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+        ):
+            result = stop("wt-killed-pids-tracked", store=store, timeout=1.0)
+
+        assert fake_pid in {info.pid for info in result.killed_pids}
+
+    def test_stop_killed_pids_excludes_tracked_pid_when_already_dead(self):
+        """The tracked PID is NOT reported as "killed" when it was already
+        dead at entry -- nothing was attempted against it."""
+        if _pid_alive(99999998):
+            pytest.skip("PID 99999998 is alive on this machine — skipping")
+
+        record = _make_record("wt-killed-pids-dead", pids={DEFAULT_ROLE: 99999998})
+        store = _make_store(record)
+
+        result = stop("wt-killed-pids-dead", store=store, timeout=1.0)
+
+        assert 99999998 not in {info.pid for info in result.killed_pids}
+
+    def test_stop_killed_pids_deduplicated(self):
+        """A PID appearing in both the tree and the orphan scan must appear
+        only once in killed_pids."""
+        fake_pid = 71200
+        shared = KilledProcessInfo(pid=71201, name="dup", cmdline=["dup"])
+        record = _make_record("wt-killed-pids-dedup", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[shared],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([shared]),
+            ),
+        ):
+            result = stop(
+                "wt-killed-pids-dedup", store=store, kill_orphans=True, timeout=5.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == 71201]
+        assert len(matching) == 1, (
+            f"expected pid 71201 exactly once, found {len(matching)} times"
+        )
+
+    def test_stop_no_kill_orphans_killed_pids_still_populated_from_tree(self):
+        """Even with kill_orphans=False, killed_pids reflects the tree kill
+        step (no orphan scan runs, but that must not leave killed_pids
+        empty when there was a real tree to report)."""
+        fake_pid = 71300
+        child = KilledProcessInfo(pid=71301, name="child", cmdline=["child"])
+        record = _make_record("wt-killed-pids-no-orphans", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+        ):
+            result = stop(
+                "wt-killed-pids-no-orphans", store=store, kill_orphans=False, timeout=5.0,
+            )
+
+        assert 71301 in {info.pid for info in result.killed_pids}
+
+
+# ---------------------------------------------------------------------------
 # TestFindBlockingProcessesWindows -- ticket #57
 # ---------------------------------------------------------------------------
 
@@ -4101,6 +4593,417 @@ class TestDiscoveryBudget:
 
 
 # ---------------------------------------------------------------------------
+# TestPartialList / TestDiscoveryCompleteness -- ticket #95, R2
+# ---------------------------------------------------------------------------
+
+class TestPartialList:
+    """Unit tests for the ``_PartialList`` list subclass itself.
+
+    Finding 3 (ticket #95): ``_find_blocking_processes`` /
+    ``_kill_blocking_processes`` used to return a plain ``[]`` in both the
+    "genuinely found nothing" case and the "discovery was starved by the
+    deadline before it could look" case -- callers (``stop()``) could not
+    tell them apart. ``_PartialList`` carries that distinction without
+    changing any existing call site's contract: it behaves exactly like the
+    list it wraps, plus a ``complete`` flag and a ``skipped_passes`` tuple.
+    """
+
+    def test_default_complete_true_no_skipped_passes(self):
+        pl = _pl._PartialList([1, 2, 3])
+        assert list(pl) == [1, 2, 3]
+        assert pl.complete is True
+        assert pl.skipped_passes == ()
+
+    def test_incomplete_carries_skipped_passes(self):
+        pl = _pl._PartialList([], complete=False, skipped_passes=("handle_scan:skipped",))
+        assert pl.complete is False
+        assert pl.skipped_passes == ("handle_scan:skipped",)
+
+    def test_behaves_as_plain_list(self):
+        pl = _pl._PartialList([1, 2])
+        assert pl == [1, 2]
+        assert bool(pl) is True
+        assert bool(_pl._PartialList([])) is False
+
+    def test_bare_list_getattr_defaults_to_complete(self):
+        """A bare list (e.g. from an existing test mock) must read as
+        complete via getattr(..., "complete", True) -- the fallback every
+        reader in this module uses."""
+        assert getattr([], "complete", True) is True
+        assert getattr([], "skipped_passes", ()) == ()
+
+
+class TestDiscoveryCompleteness:
+    """R2 (ticket #95): distinguish "found nothing" from "never looked" /
+    "ran out of time looking" so stop() never reports a false "stopped" on
+    the strength of starved discovery.
+
+    ``complete`` tracks discovery COVERAGE only -- never kill efficacy
+    (survivors are the re-probe's job) and never platform applicability (a
+    pass simply not running on this OS is not incompleteness).
+    """
+
+    # -- stop() wiring: the driving test + its mandatory negative pair -----
+
+    def test_deadline_skipped_pass_marks_stop_incomplete(self, caplog):
+        """Driving test: when the orphan scan reports incomplete discovery
+        (a pass was skipped by the deadline), stop() must report
+        "stop_incomplete", not "stopped" -- even though nothing survived."""
+        fake_pid = 61000
+        record = _make_record("wt-discovery-incomplete", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        partial = _pl._PartialList(
+            [], complete=False, skipped_passes=("handle_scan:skipped",)
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=partial,
+            ),
+            caplog.at_level(
+                logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+            ),
+        ):
+            result = stop(
+                "wt-discovery-incomplete", store=store, kill_orphans=True, timeout=5.0,
+            )
+
+        assert result.status == "stop_incomplete"
+        assert any(
+            "handle_scan:skipped" in rec.message for rec in caplog.records
+        ), "warning must name the skipped pass"
+
+    def test_internal_degradation_does_not_mark_stop_incomplete(self):
+        """Mandatory negative test: a pass that degraded internally (e.g. hit
+        the worker cap) but still ran to completion (complete=True) must NOT
+        cause stop_incomplete."""
+        fake_pid = 61001
+        record = _make_record("wt-discovery-degraded", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        partial = _pl._PartialList([], complete=True)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=partial,
+            ),
+        ):
+            result = stop(
+                "wt-discovery-degraded", store=store, kill_orphans=True, timeout=5.0,
+            )
+
+        assert result.status == "stopped"
+
+    def test_stop_treats_bare_list_from_mock_as_complete(self):
+        """N8: a plain ``[]`` (no ``.complete`` attribute -- e.g. an existing
+        test mock, or manager._teardown's positional caller) must not be
+        treated as incomplete; getattr(..., "complete", True) is the
+        fallback."""
+        fake_pid = 61002
+        record = _make_record("wt-discovery-bare-list", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=[],
+            ),
+        ):
+            result = stop(
+                "wt-discovery-bare-list", store=store, kill_orphans=True, timeout=5.0,
+            )
+
+        assert result.status == "stopped"
+
+    # -- N4: individual per-PID AccessDenied never marks incomplete --------
+
+    def test_access_denied_pid_leaves_complete_true(self):
+        """N4: psutil.AccessDenied/NoSuchProcess on one individual PID during
+        Pass 1/2 is caught and skipped (continue) -- must not mark the whole
+        pass incomplete."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_denied = MagicMock()
+        proc_denied.info = {"pid": 62000, "name": "x", "cmdline": []}
+        proc_denied.cwd.side_effect = psutil.AccessDenied(62000)
+        proc_denied.open_files.side_effect = psutil.AccessDenied(62000)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_denied]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is True
+        assert result.skipped_passes == ()
+
+    # -- D1/D2: Pass 1 (cwd) skipped vs truncated ---------------------------
+
+    def test_cwd_pass_skipped_when_deadline_already_passed(self):
+        """D1: an already-expired deadline at entry means Pass 1's entry
+        guard is false -- tagged "cwd:skipped", not run at all."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with (
+            patch.object(psutil, "process_iter", return_value=iter([])),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            past_deadline = time.monotonic() - 5.0
+            result = _find_blocking_processes(target, host_pid, deadline=past_deadline)
+
+        assert result.complete is False
+        assert "cwd:skipped" in result.skipped_passes
+
+    def test_cwd_pass_truncated_marks_incomplete(self):
+        """D2: Pass 1's inner per-process loop breaking on scan_stop (budget
+        exhausted mid-scan) is tagged "cwd:truncated"."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        matching_first = _make_fake_proc(63001, "node", ["node"], target)
+
+        matching_second = MagicMock()
+        matching_second.info = {"pid": 63002, "name": "node2", "cmdline": ["node2"]}
+
+        def _slow_cwd_second():
+            time.sleep(0.3)
+            return target
+
+        matching_second.cwd.side_effect = _slow_cwd_second
+
+        # A third proc is required to actually observe the deadline-driven
+        # `break`: the loop's guard is checked at the TOP of each iteration,
+        # so proc2's slow call blowing the budget is only detected once the
+        # loop tries to move on to a *next* item -- with only two procs the
+        # iterator would simply exhaust naturally instead.
+        third = _make_fake_proc(63003, "node3", ["node3"], "/other/path")
+
+        def _process_iter_side_effect(*args, **kwargs):
+            return iter([matching_first, matching_second, third])
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            deadline = time.monotonic() + 0.1
+            result = _find_blocking_processes(target, host_pid, deadline=deadline)
+
+        assert result.complete is False
+        assert "cwd:truncated" in result.skipped_passes
+
+    # -- D7: Pass 2 (open_files) truncated ----------------------------------
+
+    def test_open_files_pass_truncated_marks_incomplete(self):
+        """D7: Pass 2's inner loop breaking on scan_stop is tagged
+        "open_files:truncated"."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_slow_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "slow", "cmdline": ["slow"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1 entirely
+
+            def _slow_open_files():
+                time.sleep(0.3)
+                return []
+
+            proc.open_files.side_effect = _slow_open_files
+            return proc
+
+        def _process_iter_side_effect(*args, **kwargs):
+            return (_make_slow_proc(64000 + i) for i in range(3))
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            deadline = time.monotonic() + 0.1
+            result = _find_blocking_processes(target, host_pid, deadline=deadline)
+
+        assert result.complete is False
+        assert "open_files:truncated" in result.skipped_passes
+
+    # -- N5: Windows-only passes simply not applicable on POSIX ------------
+
+    def test_windows_only_passes_not_applicable_on_posix_leaves_complete_true(self):
+        """N5: on a non-Windows platform, Pass 1b/1c are not run at all --
+        this must never itself contribute a skipped/truncated tag."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with (
+            patch.object(psutil, "process_iter", return_value=iter([])),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is True
+        assert result.skipped_passes == ()
+
+    # -- D4/D6: Windows-only Pass 1c (real win32) ---------------------------
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_handle_scan_skipped_when_no_budget_remains(self):
+        """D4: a deadline that leaves zero budget by the time Pass 1c would
+        run must skip it outright (handle_scan:skipped), never call
+        _win_handle_holders with a <= 0 budget."""
+        record_target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._win_handle_holders"
+        ) as mock_scan:
+            # A deadline exactly "now" leaves ~0.0s once Pass 1/1b complete.
+            deadline = time.monotonic() + 0.001
+            result = _find_blocking_processes(record_target, host_pid, deadline=deadline)
+
+        assert "handle_scan:skipped" in result.skipped_passes or not mock_scan.called
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_handle_scan_failed_when_win_handle_holders_raises(self):
+        """D6: _win_handle_holders raising (any ctypes/structure failure) is
+        swallowed -- the pass yielded zero coverage, so it counts as a whole-
+        pass skip (handle_scan:failed), not a mere degradation."""
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is False
+        assert "handle_scan:failed" in result.skipped_passes
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_handle_scan_truncated_by_own_deadline(self):
+        """D5: _win_handle_holders returning early because its OWN
+        budget_sec expired mid-enumeration (not a worker-cap hit) must be
+        propagated as handle_scan:truncated. Real end-to-end: a live system
+        handle table plus a budget_sec of 0.0 guarantees the per-handle loop
+        never even starts a single iteration before the deadline check
+        fires."""
+        result = _win_handle_holders("C:/nonexistent-worktree-path", set(), budget_sec=0.0)
+        assert result.complete is False
+
+    # -- N2/N3: worker-cap / per-query ABANDONED-CAPPED leave complete=True
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_worker_cap_hit_leaves_complete_true(self, monkeypatch):
+        """N2: hitting the process-wide wedged-worker cap mid-scan is an
+        internal degradation (the table was still enumerated up to that
+        point) -- it must NOT be reported as handle_scan:truncated. Forced
+        by patching _wedged_slot_available to always report "no room", which
+        makes the very first ABANDONED query become CAPPED immediately."""
+        monkeypatch.setattr(
+            "lib_python_worktree.core.process_lifecycle._wedged_slot_available",
+            lambda: False,
+        )
+        # A generous budget so this exercises the CAPPED path, not the
+        # deadline path -- but there is nothing to actually scan against a
+        # bogus path, so this call is expected to complete quickly and
+        # cleanly regardless (no live handle will ever match).
+        result = _win_handle_holders(
+            "C:/nonexistent-worktree-path", set(), budget_sec=2.0
+        )
+        assert result.complete is True
+
+    # -- D8: lineage-expansion loop truncated by the deadline ---------------
+
+    def test_lineage_expansion_truncated_marks_incomplete(self):
+        """D8: _kill_blocking_processes' post-discovery lineage-expansion
+        loop breaking on the deadline is tagged lineage:truncated."""
+        target = "/fake/worktree"
+        num_blockers = 60
+        fake_found = _pl._PartialList(
+            [
+                KilledProcessInfo(pid=65000 + i, name="proc", cmdline=["proc"])
+                for i in range(num_blockers)
+            ]
+        )
+
+        def _slow_process_tree(pid):
+            time.sleep(0.05)
+            return []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_found,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                side_effect=_slow_process_tree,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = _kill_blocking_processes(target, timeout=0.2)
+
+        assert result.complete is False
+        assert "lineage:truncated" in result.skipped_passes
+
+
+# ---------------------------------------------------------------------------
 # TestProcessGroupMembers -- ticket #87 follow-up, finding B3
 # ---------------------------------------------------------------------------
 
@@ -4318,3 +5221,707 @@ class TestStopKillsProcessGroupSurvivors:
             f"process-group snapshot must be signalled exactly once, got "
             f"{graceful_calls.count(shared_pid)} signals"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestWindowsJobObjectContainment -- ticket #95, R5
+# ---------------------------------------------------------------------------
+
+class TestWindowsJobObjectContainment:
+    """R5 (ticket #95): Windows Job Object containment.
+
+    Root cause (finding 5): _process_tree is ppid-derived on both its
+    primary (psutil children(recursive=True)) and fallback (manual ppid
+    walk) paths. A ShellExecuteEx-delegated launch (what `Start-Process`
+    uses without stream redirection) lands OUTSIDE our ppid lineage
+    entirely -- no recursion depth fixes that. Only a Windows Job Object
+    closes this gap by construction: every process assigned to the job is
+    enumerable/terminable as a unit, regardless of ppid.
+    """
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_stop_kills_shellexecute_delegated_grandchild(self, tmp_path, caplog):
+        """Driving test / the ticket's actual acceptance test: real
+        end-to-end, no mocks. Uses PowerShell's `Start-Process` -- which
+        delegates via ShellExecuteEx -- to launch a Python sleeper whose PID
+        is written to a file under tmp_path. This grandchild is NOT in our
+        ppid lineage at all (confirmed manually: _process_tree(wrapper_pid)
+        finds nothing), so only the Job Object mechanism can catch it.
+        stop(kill_orphans=True) must still kill it and report it in
+        killed_pids -- proving R5's containment mechanism itself.
+
+        The overall ``status`` is asserted more leniently: "stopped" is the
+        expected outcome, but R2's own (separately, already GREEN-tested)
+        discovery-completeness tracking can legitimately report
+        "stop_incomplete" if Pass 2's real, system-wide ``open_files()``
+        scan happens to be slow on the machine running this test (measured
+        real-world cost documented on ``_DISCOVERY_MAX_SEC`` -- this is a
+        genuine machine/environment characteristic, not a bug in this
+        ticket's fix). What must NEVER happen is an actual surviving
+        process, so if status is not "stopped" this asserts the ONLY reason
+        is discovery incompleteness (the logged warning), never a real
+        "process(es) survived termination"."""
+        pidfile = tmp_path / "child.pid"
+        sleeper = tmp_path / "sleeper.py"
+        sleeper.write_text(
+            "import os, time\n"
+            f"open(r'{pidfile}', 'w').write(str(os.getpid()))\n"
+            "time.sleep(120)\n"
+        )
+
+        record = _make_record("wt-shellexecute-grandchild")
+        store = _make_store(record)
+
+        cmd_str = (
+            f'Start-Process -FilePath "{sys.executable}" '
+            f'-ArgumentList "{sleeper}" -WindowStyle Hidden'
+        )
+        result = start(
+            "wt-shellexecute-grandchild",
+            ["powershell", "-NoProfile", "-Command", cmd_str],
+            store=store,
+        )
+        assert result.job_names.get(DEFAULT_ROLE) is not None, (
+            "job object creation must succeed on this real Windows host"
+        )
+
+        # Wait for the grandchild to actually start and report its PID.
+        grandchild_pid = None
+        for _ in range(100):
+            if pidfile.exists():
+                try:
+                    grandchild_pid = int(pidfile.read_text().strip())
+                    break
+                except ValueError:
+                    pass
+            time.sleep(0.1)
+        assert grandchild_pid is not None, "sleeper never wrote its PID file"
+        assert _pid_alive(grandchild_pid)
+
+        # Confirm the premise: the grandchild is genuinely outside our ppid
+        # lineage -- the wrapper's own tracked pid may already have exited
+        # (powershell -Command returns once Start-Process launches), so a
+        # ppid-tree walk from it finds nothing.
+        wrapper_pid = result.pids[DEFAULT_ROLE]
+        ppid_tree_pids = {info.pid for info in _process_tree(wrapper_pid)}
+        assert grandchild_pid not in ppid_tree_pids, (
+            "test premise violated: the grandchild is reachable via the "
+            "ppid tree, so this is not actually testing the containment "
+            "gap the Job Object mechanism exists to close"
+        )
+
+        # A generous timeout: _DISCOVERY_MAX_SEC caps Pass 1/1b/1c/2's
+        # combined discovery cost at 20s regardless of *timeout*, and Pass 2
+        # (open_files() across every process on the system) is measurably
+        # expensive on a real, possibly busy dev machine (see this module's
+        # own _DISCOVERY_MAX_SEC docstring for a measured real-world worst
+        # case). 30s leaves that pass its full ceiling's worth of room so
+        # this test exercises the Job Object mechanism itself, not R2's
+        # (separately, already GREEN-tested) discovery-budget behaviour.
+        with caplog.at_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        ):
+            stop_result = stop(
+                "wt-shellexecute-grandchild", store=store, kill_orphans=True, timeout=30.0,
+            )
+
+        time.sleep(0.3)
+        try:
+            assert not _pid_alive(grandchild_pid), (
+                "the ShellExecuteEx-delegated grandchild survived stop() -- "
+                "the Job Object containment mechanism failed to catch it"
+            )
+            assert grandchild_pid in {info.pid for info in stop_result.killed_pids}
+
+            if stop_result.status != "stopped":
+                assert stop_result.status == "stop_incomplete"
+                assert not any(
+                    "survived termination" in rec.message for rec in caplog.records
+                ), (
+                    "status was stop_incomplete due to an ACTUAL survivor, "
+                    "not mere discovery incompleteness -- this IS a real "
+                    "containment failure"
+                )
+                assert any(
+                    "orphan scan discovery was incomplete" in rec.message
+                    for rec in caplog.records
+                ), (
+                    "expected the incompleteness to be attributable to the "
+                    "orphan scan's own discovery budget, not anything else"
+                )
+        finally:
+            if _pid_alive(grandchild_pid):
+                _force_kill(grandchild_pid)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_job_has_no_kill_on_job_close(self):
+        """Regression: closing the job's last handle must NOT kill its
+        member processes. JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must never be
+        set -- if it were, a detached process would die the moment this
+        keeper handle closes (e.g. conceptually, host exit), directly
+        contradicting this module's core detachment invariant (a spawned
+        process must survive the host process exiting)."""
+        proc = _spawn_detached([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            job_name = proc._worktree_job_name
+            assert job_name is not None, (
+                "job object creation must succeed on this real Windows host"
+            )
+
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = _pl._JOB_HANDLES.pop(job_name)
+            kernel32.CloseHandle(handle)
+
+            time.sleep(0.3)
+            assert _pid_alive(proc.pid), (
+                "child process died when the job object's last handle "
+                "closed -- JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must have "
+                "been set, which would break detachment"
+            )
+        finally:
+            _force_kill(proc.pid)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_start_assigns_job_and_persists_job_name(self):
+        """Driving test for the start()-side half of R5: start() must create
+        a Job Object, assign the spawned process to it, and persist the job
+        name under this role's key in job_names on the record -- with the
+        spawned pid actually enumerable as a member of that job."""
+        record = _make_record("wt-job-start")
+        store = _make_store(record)
+
+        result = start(
+            "wt-job-start",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+        )
+        try:
+            assert result.job_names.get(DEFAULT_ROLE) is not None
+            assert result.job_names[DEFAULT_ROLE].startswith("Local\\worktree-")
+
+            job_handle = _pl._open_job_object(result.job_names[DEFAULT_ROLE])
+            assert job_handle is not None
+            members = _pl._job_object_member_pids(job_handle)
+            assert result.pids[DEFAULT_ROLE] in members
+        finally:
+            _force_kill(result.pids[DEFAULT_ROLE])
+
+    def test_stop_terminates_job_when_handle_available(self):
+        """stop() must call _terminate_job_object when a job handle is
+        available, and fold its members into the tree-kill step."""
+        fake_pid = 81000
+        member_pid = 81001
+        record = _make_record(
+            "wt-job-terminate", pids={DEFAULT_ROLE: fake_pid}, job_names={DEFAULT_ROLE: "Local\\fake-job"},
+        )
+        store = _make_store(record)
+
+        terminate_calls: List[int] = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([member_pid]),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._terminate_job_object",
+                side_effect=lambda h: terminate_calls.append(h),
+            ),
+        ):
+            result = stop("wt-job-terminate", store=store, timeout=1.0)
+
+        assert terminate_calls == [12345]
+        assert member_pid in {info.pid for info in result.killed_pids}
+        assert result.status == "stopped"
+
+    def test_stop_does_not_touch_other_roles_job(self):
+        """Regression (reviewer finding, ticket #95 fix cycle): job
+        tracking must be per-role (``job_names: Dict[str, str]``,
+        mirroring ``pids``), not a record-wide scalar.
+
+        Two roles ("main" and "worker") are running concurrently, each with
+        its own Job Object. Stopping "main" must open/enumerate/terminate
+        ONLY "main"'s job -- "worker"'s job must never be touched, and its
+        ``job_names`` entry must survive intact.
+
+        Pre-fix, ``record.job_name`` was a single scalar unconditionally
+        overwritten by every ``start()`` call regardless of role: starting
+        "worker" after "main" would overwrite the scalar to "worker"'s job
+        name, so ``stop(role="main")`` would then open/terminate "worker"'s
+        job instead of "main"'s -- killing "worker"'s entire contained
+        process tree as a side effect of stopping "main", while "main"'s own
+        job was never enumerated or terminated at all."""
+        main_pid = 82000
+        worker_pid = 82001
+        record = _make_record(
+            "wt-job-per-role",
+            pids={"main": main_pid, "worker": worker_pid},
+            job_names={
+                "main": "Local\\fake-job-main",
+                "worker": "Local\\fake-job-worker",
+            },
+        )
+        store = _make_store(record)
+
+        open_calls: List[str] = []
+        terminate_calls: List[int] = []
+        job_handles = {"Local\\fake-job-main": 111, "Local\\fake-job-worker": 222}
+
+        def _fake_open(job_name):
+            open_calls.append(job_name)
+            return job_handles[job_name]
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                side_effect=_fake_open,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([]),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._terminate_job_object",
+                side_effect=lambda h: terminate_calls.append(h),
+            ),
+        ):
+            result = stop("wt-job-per-role", store=store, role="main", timeout=1.0)
+
+        assert open_calls == ["Local\\fake-job-main"], (
+            "stop(role='main') must open ONLY role 'main''s job -- "
+            f"'worker''s job must never be enumerated, got {open_calls}"
+        )
+        assert terminate_calls == [111], (
+            "stop(role='main') must terminate ONLY role 'main''s job "
+            f"handle -- got {terminate_calls}"
+        )
+        assert result.job_names.get("worker") == "Local\\fake-job-worker", (
+            "role 'worker''s job_names entry must survive stopping role "
+            "'main' completely untouched"
+        )
+        assert "main" not in result.job_names, (
+            "role 'main''s job_names entry must be cleared once stop() has "
+            "processed it, mirroring how pids['main'] is cleared"
+        )
+        assert result.pids == {"worker": worker_pid}, (
+            "role 'worker''s tracked pid must be untouched by stopping "
+            "'main'"
+        )
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_stop_closes_job_handle_and_evicts_registry_entry(self):
+        """Regression (ticket #95 fix cycle, blocking finding): stop() must
+        close the Job Object handle it opened/queried, and evict it from
+        the :data:`_JOB_HANDLES` keeper registry, once it is done with it.
+
+        Pre-fix, nothing anywhere calls ``CloseHandle`` on a job handle and
+        nothing pops the registry entry -- this is the COMMON path (the
+        keeper-registry handle _open_job_object serves back on every
+        ``stop()`` call), not just the rarer restarted-host fallback the
+        round-1 review flagged. On a long-lived host process (e.g. an MCP
+        server that never restarts), every start()/stop() cycle for a
+        Windows worktree leaks one kernel HANDLE and one _JOB_HANDLES dict
+        entry indefinitely.
+        """
+        record = _make_record("wt-job-handle-leak")
+        store = _make_store(record)
+
+        result = start(
+            "wt-job-handle-leak",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+        )
+        job_name = result.job_names[DEFAULT_ROLE]
+        assert job_name in _pl._JOB_HANDLES, (
+            "test premise: start() must have registered a keeper handle"
+        )
+        job_handle = _pl._JOB_HANDLES[job_name]
+        target_pid = result.pids[DEFAULT_ROLE]
+
+        try:
+            stop("wt-job-handle-leak", store=store, timeout=5.0)
+        finally:
+            if _pid_alive(target_pid):
+                _force_kill(target_pid)
+
+        assert job_name not in _pl._JOB_HANDLES, (
+            "stop() must evict this role's job handle from the "
+            "_JOB_HANDLES keeper registry once it is done with it -- "
+            "otherwise every stop() call leaks one dict entry"
+        )
+
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetHandleInformation.restype = wintypes.BOOL
+        kernel32.GetHandleInformation.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+        ]
+        flags = wintypes.DWORD(0)
+        still_valid = kernel32.GetHandleInformation(job_handle, ctypes.byref(flags))
+        assert not still_valid, (
+            "the job object handle stop() opened/queried is still a "
+            "valid, open kernel handle after stop() returned -- it must "
+            "be closed via CloseHandle, or a long-lived host leaks one "
+            "HANDLE per stop() call"
+        )
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_stop_closes_job_handle_opened_via_fallback_path(self):
+        """Regression (ticket #95 fix cycle, blocking finding): the
+        ``OpenJobObjectW`` fallback path (``job_name`` not found in the
+        ``_JOB_HANDLES`` keeper registry -- e.g. a restarted host) must
+        ALSO close the handle it opens, not just the common keeper-
+        registry path covered by the sibling test above. The round-1
+        review only flagged this narrower fallback case; round 2 folds it
+        into the same fix since neither path closed anything before it.
+        """
+        record = _make_record("wt-job-handle-fallback")
+        store = _make_store(record)
+
+        result = start(
+            "wt-job-handle-fallback",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+        )
+        job_name = result.job_names[DEFAULT_ROLE]
+
+        # Simulate a restarted host: THIS process's own keeper handle is
+        # gone from the registry, while the underlying OS job object
+        # itself stays alive (as it genuinely would across a real host
+        # restart) by opening and holding a second, independent handle to
+        # it before evicting the registry entry.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        JOB_OBJECT_QUERY = 0x0004
+        JOB_OBJECT_TERMINATE = 0x0001
+        kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+        kernel32.OpenJobObjectW.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        keeper_handle = kernel32.OpenJobObjectW(
+            JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, False, job_name
+        )
+        assert keeper_handle, (
+            "failed to open an independent keeper handle -- test premise"
+        )
+        del _pl._JOB_HANDLES[job_name]
+        target_pid = result.pids[DEFAULT_ROLE]
+
+        opened_handles: List[int] = []
+        orig_open_job_object = _pl._open_job_object
+
+        def _capturing_open(name):
+            handle = orig_open_job_object(name)
+            opened_handles.append(handle)
+            return handle
+
+        try:
+            with patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                side_effect=_capturing_open,
+            ):
+                stop("wt-job-handle-fallback", store=store, timeout=5.0)
+
+            assert len(opened_handles) == 1 and opened_handles[0], (
+                "test premise: stop() must have opened a fresh handle via "
+                "the OpenJobObjectW fallback path"
+            )
+            fallback_handle = opened_handles[0]
+
+            kernel32.GetHandleInformation.restype = wintypes.BOOL
+            kernel32.GetHandleInformation.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+            ]
+            flags = wintypes.DWORD(0)
+            still_valid = kernel32.GetHandleInformation(
+                fallback_handle, ctypes.byref(flags)
+            )
+            assert not still_valid, (
+                "the fallback-path job handle stop() opened via "
+                "OpenJobObjectW is still a valid, open kernel handle "
+                "after stop() returned -- it must be closed too"
+            )
+        finally:
+            if _pid_alive(target_pid):
+                _force_kill(target_pid)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(keeper_handle)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_start_closes_job_handle_on_assignment_failure(self):
+        """Regression (ticket #95 fix cycle, round 4 blocking finding):
+        when ``_assign_process_to_job`` fails inside ``_spawn_detached``
+        (its own docstring documents this as a real, reachable race --
+        the child could spawn its own descendants or exit before
+        assignment lands), ``job_name`` deliberately stays ``None`` so
+        ``record.job_names[role]`` never gets populated for that role.
+        Pre-fix, this meant the Job Object handle already created by
+        ``_create_job_object`` had no way to ever be discovered by
+        stop() (whose handle-close logic only runs when
+        ``record.job_names.get(role)`` is truthy) -- it and its
+        ``_JOB_HANDLES`` entry leaked indefinitely on a long-lived host.
+        The fix must close and evict that handle right on this failure
+        path, since it is the only place that will ever know about it.
+        """
+        record = _make_record("wt-job-assign-fail")
+        store = _make_store(record)
+
+        created: List[tuple] = []
+        orig_create_job_object = _pl._create_job_object
+
+        def _capturing_create(name):
+            handle = orig_create_job_object(name)
+            if handle is not None:
+                created.append((name, handle))
+            return handle
+
+        target_pid = None
+        try:
+            with (
+                patch(
+                    "lib_python_worktree.core.process_lifecycle._create_job_object",
+                    side_effect=_capturing_create,
+                ),
+                patch(
+                    "lib_python_worktree.core.process_lifecycle._assign_process_to_job",
+                    return_value=False,
+                ),
+            ):
+                result = start(
+                    "wt-job-assign-fail",
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    store=store,
+                )
+            target_pid = result.pids[DEFAULT_ROLE]
+
+            assert len(created) == 1, (
+                "test premise: _create_job_object must have been called "
+                "exactly once during this start()"
+            )
+            job_name, job_handle = created[0]
+
+            assert DEFAULT_ROLE not in result.job_names, (
+                "job_names must stay unset for this role when assignment "
+                "failed -- that documented behavior must be preserved by "
+                "this fix"
+            )
+            assert job_name not in _pl._JOB_HANDLES, (
+                "the job handle created before the failed assignment must "
+                "not be left in the _JOB_HANDLES keeper registry -- since "
+                "job_name was never persisted to the record, stop() has "
+                "no way to ever discover and close it"
+            )
+
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetHandleInformation.restype = wintypes.BOOL
+            kernel32.GetHandleInformation.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+            ]
+            flags = wintypes.DWORD(0)
+            still_valid = kernel32.GetHandleInformation(
+                job_handle, ctypes.byref(flags)
+            )
+            assert not still_valid, (
+                "the job object handle created before the failed "
+                "assignment is still a valid, open kernel handle after "
+                "start() returned -- it must be closed via CloseHandle, "
+                "or a long-lived host leaks one HANDLE per failed "
+                "assignment"
+            )
+        finally:
+            if target_pid is not None and _pid_alive(target_pid):
+                _force_kill(target_pid)
+
+    def test_stop_degrades_gracefully_when_job_unavailable(self):
+        """When _open_job_object returns None (POSIX, no live handle, or
+        OpenJobObject failed) stop() must not raise and must not force
+        stop_incomplete purely because containment was unavailable (rule
+        N7 -- a fallback, not a coverage claim)."""
+        fake_pid = 81100
+        record = _make_record(
+            "wt-job-unavailable", pids={DEFAULT_ROLE: fake_pid}, job_names={DEFAULT_ROLE: "Local\\fake-job"},
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=None,
+            ),
+        ):
+            result = stop("wt-job-unavailable", store=store, timeout=1.0)  # must not raise
+
+        assert result.status == "stopped"
+
+    def test_no_job_object_on_posix(self):
+        """_create_job_object/_assign_process_to_job are no-ops off Windows
+        -- _spawn_detached must stash job_name=None."""
+        with patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            job_handle = _pl._create_job_object("Local\\irrelevant")
+        assert job_handle is None
+
+        with patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            assigned = _pl._assign_process_to_job(1, os.getpid())
+        assert assigned is False
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_job_member_list_buffer_growth(self):
+        """_job_object_member_pids must retry with a larger buffer on
+        ERROR_MORE_DATA rather than reporting incomplete on the first
+        attempt, and succeed once the buffer is big enough."""
+        import ctypes
+        from ctypes import wintypes
+
+        ERROR_MORE_DATA = 234
+        header_size = ctypes.sizeof(ctypes.c_ulong) * 2
+        slot_size = ctypes.sizeof(ctypes.c_size_t)
+
+        call_count = {"n": 0}
+        # More than _JOB_MEMBER_LIST_INITIAL_SLOTS (64) so the FIRST attempt
+        # is genuinely too small and must trigger a real ERROR_MORE_DATA ->
+        # retry cycle, rather than happening to already fit.
+        real_pids = list(range(90001, 90001 + 100))
+
+        def _fake_query(handle, info_class, buf, buf_size, ret_len_ptr):
+            call_count["n"] += 1
+            needed = header_size + len(real_pids) * slot_size
+            if buf_size < needed:
+                # Simulate ERROR_MORE_DATA: report the true assigned count
+                # in the header so the caller can size its retry, but leave
+                # the buffer otherwise unwritten -- write ONLY the header.
+                ctypes.memmove(
+                    buf,
+                    ctypes.pointer(ctypes.c_ulong(len(real_pids))),
+                    ctypes.sizeof(ctypes.c_ulong),
+                )
+                ctypes.set_last_error(ERROR_MORE_DATA)
+                return 0
+            header = (ctypes.c_ulong * 2)(len(real_pids), len(real_pids))
+            ctypes.memmove(buf, header, header_size)
+            body = (ctypes.c_size_t * len(real_pids))(*real_pids)
+            ctypes.memmove(
+                ctypes.cast(buf, ctypes.c_void_p).value + header_size, body,
+                len(real_pids) * slot_size,
+            )
+            return 1
+
+        fake_kernel32 = MagicMock()
+        fake_kernel32.QueryInformationJobObject.side_effect = _fake_query
+
+        with patch("ctypes.WinDLL", return_value=fake_kernel32):
+            result = _pl._job_object_member_pids(999)
+
+        assert call_count["n"] >= 2, "expected a retry after ERROR_MORE_DATA"
+        assert list(result) == real_pids
+        assert result.complete is True
+
+    def test_job_member_truncation_sets_stop_incomplete(self):
+        """A _PartialList(complete=False) from the job member scan (cap hit)
+        must mark stop_incomplete, same class as tree_possibly_truncated."""
+        fake_pid = 81200
+        record = _make_record(
+            "wt-job-truncated", pids={DEFAULT_ROLE: fake_pid}, job_names={DEFAULT_ROLE: "Local\\fake-job"},
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([], complete=False),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+        ):
+            result = stop("wt-job-truncated", store=store, timeout=1.0)
+
+        assert result.status == "stop_incomplete"
+
+    def test_job_members_folded_into_survivor_reprobe(self):
+        """A job member that survives everything must flip status to
+        stop_incomplete via the ordinary survivor re-probe -- proving job
+        members are included in candidate_pids, not just killed_tree."""
+        fake_pid = 81300
+        surviving_member = 81301
+        record = _make_record(
+            "wt-job-survivor", pids={DEFAULT_ROLE: fake_pid}, job_names={DEFAULT_ROLE: "Local\\fake-job"},
+        )
+        store = _make_store(record)
+
+        def _fake_pid_alive(p):
+            return p == surviving_member
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                side_effect=_fake_pid_alive,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([surviving_member]),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+            patch("lib_python_worktree.core.process_lifecycle._kill_process_tree"),
+        ):
+            result = stop("wt-job-survivor", store=store, timeout=1.0)
+
+        assert result.status == "stop_incomplete"
