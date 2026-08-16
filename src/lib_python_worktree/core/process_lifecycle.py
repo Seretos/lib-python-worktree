@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,7 +78,67 @@ _EARLY_EXIT_WAIT_SEC = 0.25
 # per-hang cost low while still reliably resolving legitimate (fast)
 # handles, confirmed by a real end-to-end test against a live held-open
 # file that consistently completes in single-digit seconds at this value.
+#
+# Ticket #90: this is now stage 1 of a two-stage wait (see
+# _HANDLE_QUERY_GRACE_SEC / _HANDLE_QUERY_GRACE_BUDGET_SEC below). #71's
+# finding above still stands and is NOT contradicted by adding stage 2: a
+# *flat* larger per-query timeout is still not affordable, because its cost
+# multiplies by however many slow handles the table holds (the exact
+# behaviour #71 measured as impractically slow). Stage 2 sidesteps that by
+# drawing from a small, fixed *per-scan* pool instead of inflating every
+# query's own timeout -- the total extra wall clock a single scan can ever
+# spend in stage 2 is capped by _HANDLE_QUERY_GRACE_BUDGET_SEC regardless of
+# how many handles are slow, which is precisely what a flat per-query
+# timeout cannot bound.
 _HANDLE_QUERY_TIMEOUT_SEC = 0.01
+
+# Ticket #90 -- stage 2 of the bounded NtQueryObject wait. When a query
+# does not resolve within _HANDLE_QUERY_TIMEOUT_SEC (stage 1), it is given
+# one more bounded chance to resolve -- up to this many additional seconds
+# -- before being treated as wedged. This recovers merely-slow handles
+# (e.g. under transient contention) that stage 1 alone would misclassify as
+# hung, without paying the unbounded-multiplication cost #71 found with a
+# flat larger stage-1 timeout, because the *total* stage-2 time a scan may
+# spend is capped separately (see _HANDLE_QUERY_GRACE_BUDGET_SEC).
+_HANDLE_QUERY_GRACE_SEC = 0.10
+
+# Ticket #90 -- total stage-2 grace a single _win_handle_holders scan may
+# spend across ALL of its queries combined, drawn from a per-scan
+# _GraceBudget seeded to this value. This is what keeps stage 2 affordable
+# where a flat larger per-query timeout was not (#71): the extra wall clock
+# a pathological handle table with many slow handles can add to one scan is
+# capped at this constant regardless of how many such handles exist, rather
+# than scaling with their count.
+_HANDLE_QUERY_GRACE_BUDGET_SEC = 1.0
+
+# Ticket #90 -- process-wide ceiling on how many permanently-wedged
+# NtQueryObject worker threads (see _BoundedQueryWorker) may exist at once,
+# across every _win_handle_holders scan in this process's lifetime. Before
+# this cap existed, a long-lived host process invoking _win_handle_holders
+# many times (many worktree teardowns) could accumulate one abandoned
+# daemon thread per genuine hang encountered, unboundedly, for as long as
+# the process ran -- see the ticket for the observed real-world blowup
+# (thousands of threads after 36 minutes of otherwise-idle teardown churn).
+# Once this many wedged workers are outstanding, a scan degrades gracefully
+# -- stops attempting further queries and returns whatever it already
+# found -- rather than creating yet another worker on top of the pile. This
+# cap gates only *replacement*-worker creation once a scan's own worker
+# wedges (see _win_handle_holders' _bounded_query). It must NEVER be used
+# to refuse to start a scan's initial worker at all: a wedged worker may,
+# by definition, never return from its NtQueryObject call, so a scan-start
+# gate on this cap would eventually latch permanently once
+# _MAX_WEDGED_HANDLE_WORKERS wedged workers had ever accumulated -- every
+# later call to _win_handle_holders would then silently return `[]` forever
+# for the rest of the process's life. That was tried and rejected; do not
+# reintroduce it.
+_MAX_WEDGED_HANDLE_WORKERS = 8
+
+# Ticket #90 -- bounded join _BoundedQueryWorker.close() waits for a
+# healthy (non-wedged) worker's thread to actually exit after being sent
+# the shutdown sentinel. A worker that is not wedged drains its queue and
+# exits almost immediately, so this only needs to be small; it exists so
+# close() itself can never block indefinitely even in an unexpected case.
+_WORKER_CLOSE_JOIN_SEC = 0.05
 
 # Ceiling on the wall-clock budget for _win_handle_holders' system-wide handle
 # scan. Defense in depth on top of the per-query watchdog timeout above:
@@ -687,6 +749,285 @@ def _kill_process_tree(
     return tree
 
 
+# ---------------------------------------------------------------------------
+# Bounded background-query worker -- ticket #90
+#
+# _win_handle_holders' NtQueryObject calls can hang indefinitely (see that
+# function's docstring). _BoundedQueryWorker is the OS-agnostic plumbing
+# that bounds a single such call without ever leaking the thread that ran
+# it, whether the call resolves quickly, resolves late (within a bounded
+# "grace" second chance), or never resolves at all. It is deliberately
+# generic -- it runs an arbitrary zero-arg callable, not anything
+# ctypes/Windows-specific -- so it (and its cross-platform test coverage)
+# has no dependency on running on Windows at all.
+# ---------------------------------------------------------------------------
+
+class _QueryStatus:
+    """Tri-state result of a :meth:`_BoundedQueryWorker.submit` call."""
+
+    RESOLVED = "resolved"
+    ABANDONED = "abandoned"
+    CAPPED = "capped"
+
+
+@dataclass
+class _QueryOutcome:
+    """Result of one :meth:`_BoundedQueryWorker.submit` call.
+
+    ``status`` is one of :class:`_QueryStatus`. ``value`` carries the
+    submitted callable's return value when ``status == RESOLVED``; it is
+    always ``None`` otherwise (a query that was not resolved in time never
+    got its answer *back to the caller* -- see ``on_abandoned_done`` on
+    :meth:`_BoundedQueryWorker.submit` for how a late answer is still
+    delivered, out of band, once it eventually arrives).
+    """
+
+    status: str
+    value: Optional[str] = None
+
+
+@dataclass
+class _GraceBudget:
+    """Mutable per-scan pool of stage-2 grace time (ticket #90).
+
+    A single instance is shared across every :meth:`_BoundedQueryWorker.submit`
+    call made during one scan. Each call that needs stage 2 deducts its
+    *actually elapsed* wait from ``remaining``, so the total extra wall
+    clock a scan can ever spend across all of its slow queries combined is
+    capped at whatever ``remaining`` was seeded to -- this is what makes
+    stage 2 affordable where a flat larger per-query timeout was not (see
+    ``_HANDLE_QUERY_GRACE_BUDGET_SEC``'s docstring): the cost is bounded
+    per scan, not multiplied by the number of slow handles.
+    """
+
+    remaining: float
+
+
+# Process-wide ceiling accounting (ticket #90): how many _BoundedQueryWorker
+# threads, across every concurrent _win_handle_holders scan in this process,
+# are currently permanently blocked inside a wedged callable. Guarded by
+# _wedged_worker_lock; incremented by submit() unconditionally, for every
+# worker it retires -- ABANDONED or CAPPED alike, since both leave a thread
+# genuinely and permanently blocked in fn() for as long as that real call
+# takes (review finding, ticket #90 fix pass: a CAPPED worker's thread is
+# just as live as an ABANDONED one and must be tracked the same way, or
+# _MAX_WEDGED_HANDLE_WORKERS stops bounding the true number of live blocked
+# threads). Decremented by the retired worker's own thread, in a
+# ``finally``, the moment its wedged callable finally returns. The
+# ABANDONED/CAPPED distinction governs only whether a caller may create a
+# *replacement* worker for the scan's next query -- never whether this
+# worker's own thread is counted.
+_wedged_worker_count = 0
+_wedged_worker_lock = threading.Lock()
+
+
+def _wedged_slot_available() -> bool:
+    """``True`` iff another worker may currently be created without the
+    process-wide live-blocked-thread count reaching ``_MAX_WEDGED_HANDLE_WORKERS``
+    (ticket #90).
+
+    A cheap, best-effort peek used by callers (e.g. _win_handle_holders'
+    scan loop, for in-scan *replacement* workers only -- never for a scan's
+    initial worker, which must always be created regardless of this check;
+    see the note on ``_MAX_WEDGED_HANDLE_WORKERS`` above) to avoid spinning
+    up a brand-new worker/thread that would immediately be at risk of
+    pushing the live blocked-thread count over the cap. The authoritative
+    check is still the atomic one inside ``submit()`` itself -- concurrent
+    scans in different threads can race this peek, in which case
+    ``submit()``'s own check is what actually decides ``ABANDONED`` vs
+    ``CAPPED`` for that specific worker.
+    """
+    with _wedged_worker_lock:
+        return _wedged_worker_count < _MAX_WEDGED_HANDLE_WORKERS
+
+
+class _BoundedQueryWorker:
+    """One daemon thread that runs submitted zero-arg callables, bounded.
+
+    Owns exactly one ``queue.Queue`` and one daemon ``threading.Thread``.
+    :meth:`submit` dispatches a callable to that thread and waits for it,
+    first for up to ``_HANDLE_QUERY_TIMEOUT_SEC`` (stage 1), then --  if a
+    *grace* budget was supplied and has room -- for a further bounded
+    "second chance" (stage 2, ``_HANDLE_QUERY_GRACE_SEC`` at most, further
+    clamped by the caller's *scan_deadline* and by however much of *grace*
+    remains). :meth:`close` always shuts the thread down cleanly.
+
+    Every worker, whether it turns out healthy or wedged, is guaranteed to
+    eventually receive its own shutdown sentinel and exit -- a *healthy*
+    worker via :meth:`close` (called by callers, e.g. in a ``finally``, once
+    they are done with it), a worker whose current job goes unresolved past
+    both stages via ``submit`` itself, immediately at the moment it gives
+    up waiting (the job is already the only thing dispatched to that
+    worker's queue at that point, so posting the sentinel right behind it is
+    safe -- once the wedged callable finally returns, the worker's loop
+    drains straight to that sentinel and exits, instead of parking on
+    ``queue.get()`` forever). This is what makes a long-lived caller that
+    creates many of these over its lifetime never accumulate threads
+    without bound (ticket #90).
+    """
+
+    def __init__(self) -> None:
+        self._job_queue: "queue.Queue" = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._job_queue.get()
+            if item is None:
+                return
+            fn, state = item
+            try:
+                value = fn()
+            except Exception:  # noqa: BLE001 -- best-effort, never propagate
+                value = None
+            with state["lock"]:
+                state["value"] = value
+                state["completed"] = True
+                was_abandoned = state["abandoned"]
+                callback = state["on_abandoned_done"] if was_abandoned else None
+                slot_acquired = state["slot_acquired"]
+            state["done"].set()
+            if was_abandoned:
+                if callback is not None:
+                    try:
+                        callback(value)
+                    except Exception:  # noqa: BLE001 -- best-effort cleanup
+                        pass
+                if slot_acquired:
+                    global _wedged_worker_count
+                    with _wedged_worker_lock:
+                        _wedged_worker_count = max(0, _wedged_worker_count - 1)
+
+    def submit(
+        self,
+        fn,
+        *,
+        grace: Optional[_GraceBudget] = None,
+        scan_deadline: Optional[float] = None,
+        on_abandoned_done=None,
+    ) -> _QueryOutcome:
+        """Run *fn* (a zero-arg callable) through this worker, bounded.
+
+        Returns a :class:`_QueryOutcome`:
+
+        - ``RESOLVED`` -- *fn* returned within stage 1 or stage 2; ``value``
+          carries its return value (or ``None`` if it raised).
+        - ``ABANDONED`` -- *fn* did not resolve within either stage. This
+          worker is now retired (see the class docstring) -- callers must
+          not submit to it again. *on_abandoned_done*, if given, is invoked
+          (on the worker's own thread) with *fn*'s eventual return value
+          once it finally returns. This worker's own thread is counted
+          against the process-wide ``_wedged_worker_count`` for as long as
+          it remains blocked in *fn* (decremented by ``_run()`` the moment
+          *fn* finally returns), and the cap had room left *after* counting
+          it in -- so a caller may safely create one more replacement
+          worker for this scan's next query.
+        - ``CAPPED`` -- *fn* did not resolve within either stage, and this
+          worker's own thread -- counted in exactly the same way as the
+          ABANDONED case above, including *on_abandoned_done* still being
+          invoked once *fn* finally returns -- filled the last available
+          process-wide slot (or the cap was already full before it).
+          ``CAPPED`` differs from ``ABANDONED`` *only* in that signal to
+          the caller: do not create a replacement worker for this scan's
+          next query right now. It never means this worker's own thread
+          goes uncounted -- every non-resolved outcome is tracked and
+          released the same way, or ``_MAX_WEDGED_HANDLE_WORKERS`` would
+          not actually bound the number of live blocked threads.
+
+        Calling ``submit`` on an already-closed/retired worker returns
+        ``ABANDONED`` immediately without running *fn* at all, rather than
+        raising.
+        """
+        if self._closed:
+            return _QueryOutcome(_QueryStatus.ABANDONED, None)
+
+        state = {
+            "lock": threading.Lock(),
+            "done": threading.Event(),
+            "value": None,
+            "completed": False,
+            "abandoned": False,
+            "on_abandoned_done": on_abandoned_done,
+            "slot_acquired": False,
+        }
+        self._job_queue.put((fn, state))
+
+        if state["done"].wait(_HANDLE_QUERY_TIMEOUT_SEC):
+            return _QueryOutcome(_QueryStatus.RESOLVED, state["value"])
+
+        # Stage 2: a single bounded "second chance", drawn from the shared
+        # per-scan grace pool and clamped by whatever remains of the
+        # caller's own scan deadline -- neither of which this single query
+        # may exceed.
+        allowance = 0.0
+        if grace is not None:
+            allowance = min(_HANDLE_QUERY_GRACE_SEC, grace.remaining)
+            if scan_deadline is not None:
+                allowance = min(allowance, scan_deadline - time.monotonic())
+            allowance = max(0.0, allowance)
+
+        if allowance > 0:
+            t0 = time.monotonic()
+            got = state["done"].wait(allowance)
+            elapsed = time.monotonic() - t0
+            grace.remaining = max(0.0, grace.remaining - elapsed)
+            if got:
+                return _QueryOutcome(_QueryStatus.RESOLVED, state["value"])
+
+        # Neither stage resolved it -- this worker's thread is now
+        # permanently tied up in *fn*. Decide retirement atomically against
+        # _run() possibly completing the job at this exact moment.
+        global _wedged_worker_count
+        with state["lock"]:
+            if state["completed"]:
+                return _QueryOutcome(_QueryStatus.RESOLVED, state["value"])
+            # Every retiring worker's thread is genuinely, permanently
+            # blocked in *fn* for as long as that real call takes --
+            # regardless of whether the process-wide cap already had room.
+            # It must therefore always be counted in here (and decremented
+            # by _run() once fn() finally returns), or _wedged_worker_count
+            # stops reflecting the true number of live blocked threads and
+            # _MAX_WEDGED_HANDLE_WORKERS stops being a real bound on them
+            # (review finding, ticket #90 fix pass). The cap only ever
+            # governs whether a *replacement* worker may be created for
+            # this scan's next query -- that decision is the CAPPED vs
+            # ABANDONED distinction below, checked *after* this worker's
+            # own slot is already claimed.
+            with _wedged_worker_lock:
+                _wedged_worker_count += 1
+                at_cap = _wedged_worker_count >= _MAX_WEDGED_HANDLE_WORKERS
+            state["abandoned"] = True
+            state["slot_acquired"] = True
+
+        # Retire this worker now: it must never process another job, and
+        # must never park on queue.get() forever once *fn* finally returns.
+        # The queue is otherwise empty at this point -- the only job ever
+        # put on it is the one still running -- so posting the sentinel now
+        # guarantees _run() drains straight to it next.
+        self._closed = True
+        self._job_queue.put(None)
+
+        if at_cap:
+            return _QueryOutcome(_QueryStatus.CAPPED, None)
+        return _QueryOutcome(_QueryStatus.ABANDONED, None)
+
+    def close(self) -> None:
+        """Shut this worker down. Idempotent; never raises.
+
+        A healthy worker (no job in flight, or its most recent job resolved
+        normally) drains to the sentinel and exits almost immediately. A
+        worker already retired by :meth:`submit` has already been sent its
+        own sentinel -- this is then a no-op beyond the bounded join, which
+        only succeeds once the wedged call eventually returns.
+        """
+        if not self._closed:
+            self._closed = True
+            self._job_queue.put(None)
+        self._thread.join(_WORKER_CLOSE_JOIN_SEC)
+
+
 def _win_handle_holders(
     path: str,
     excluded_pids: "set[int]",
@@ -745,18 +1086,44 @@ def _win_handle_holders(
     types (named pipes with no listener, in particular). There is no
     OS-level way to cancel a blocked kernel call, so each query -- both the
     one-per-type-index type probe and the per-handle name resolution -- is
-    dispatched through a single reusable background worker thread guarded
-    by a bounded queue/event timeout, rather than spawning a new OS thread
-    per handle (thread-creation overhead alone made a naive one-thread-per-
+    dispatched through a single reusable :class:`_BoundedQueryWorker`
+    background thread per scan (rather than spawning a new OS thread per
+    handle -- thread-creation overhead alone made a naive one-thread-per-
     handle implementation take upwards of tens of minutes against a normal
-    handle table -- confirmed impractically slow in practice). When a query
-    does not return within the timeout, the worker thread is permanently
-    wedged on it; that single call is abandoned (the thread is a daemon and
-    is simply replaced with a fresh worker for subsequent queries) rather
-    than blocking the rest of the scan. An overall wall-clock budget
-    (``_HANDLE_SCAN_BUDGET_SEC``) additionally bounds the whole function as
-    defense in depth: once exceeded, the scan stops early and returns
-    whatever it has found so far rather than continuing indefinitely.
+    handle table, confirmed impractically slow in practice).
+
+    Each query first gets ``_HANDLE_QUERY_TIMEOUT_SEC`` (stage 1); one that
+    does not resolve in time gets a second, bounded chance
+    (``_HANDLE_QUERY_GRACE_SEC``, stage 2) drawn from a small per-scan grace
+    pool (``_HANDLE_QUERY_GRACE_BUDGET_SEC`` total, clamped by
+    ``scan_deadline``) that recovers merely-slow handles without the
+    unbounded-multiplication cost ticket #71 found with a flat larger
+    per-query timeout -- see the constants' own docstrings. A query that
+    still has not resolved after both stages is treated as wedged: the
+    worker that ran it is retired (ticket #90) rather than abandoned in
+    place -- it is sent its own shutdown sentinel immediately, so it exits
+    on its own the moment the wedged call finally returns instead of
+    parking on ``queue.get()`` forever, and a fresh worker takes over for
+    subsequent queries, up to a process-wide ceiling of
+    ``_MAX_WEDGED_HANDLE_WORKERS`` outstanding retired workers. Once that
+    ceiling is hit, the scan stops issuing further queries and returns
+    whatever it already found, exactly like exhausting ``scan_deadline``.
+    Ownership of the underlying duplicated handle transfers to the retired
+    worker in this case too (via an ``on_abandoned_done`` callback that
+    closes it once the wedged call returns) -- the scan loop itself must
+    never close a handle whose query it gave up waiting on, since Windows
+    can recycle that same handle *value* onto a different, unrelated object
+    in the meantime (a real use-after-close/false-match bug fixed by this
+    same change). Every worker created during a scan -- healthy or retired
+    -- is guaranteed to eventually receive a shutdown sentinel and exit, so
+    a long-lived host process invoking this function many times over its
+    lifetime does not accumulate threads without bound (the operational
+    limitation this module used to accept — see the ticket for the
+    real-world blowup that made it no longer acceptable). An overall
+    wall-clock budget (``_HANDLE_SCAN_BUDGET_SEC``) additionally bounds the
+    whole function as defense in depth: once exceeded, the scan stops early
+    and returns whatever it has found so far rather than continuing
+    indefinitely.
 
     Never raises: any unexpected ctypes/structure failure (missing API,
     unexpected buffer layout, etc.) is expected to be caught by the caller
@@ -780,11 +1147,13 @@ def _win_handle_holders(
         without inspecting any individual handle.
     """
     import ctypes
-    import queue
-    import threading
     from ctypes import wintypes
 
     scan_deadline = time.monotonic() + max(0.0, budget_sec)
+    # Ticket #90: total stage-2 grace this scan may spend, drawn down as
+    # queries need it. Created here (not module scope) so it is scoped to
+    # exactly one scan -- see _HANDLE_QUERY_GRACE_BUDGET_SEC's docstring.
+    grace_budget = _GraceBudget(remaining=_HANDLE_QUERY_GRACE_BUDGET_SEC)
 
     normalized = os.path.normcase(os.path.normpath(path))
 
@@ -944,65 +1313,88 @@ def _win_handle_holders(
             return None
         return None
 
-    # A single reusable background worker thread services bounded queries.
-    # Spawning a fresh OS thread per handle was measured to be prohibitively
-    # slow against a full system handle table (thread-creation overhead
-    # dominates at that volume); reusing one worker via a queue/event makes
-    # the common (fast, non-hanging) case near-zero overhead. If a query
-    # ever wedges the worker (timeout elapses while it's still running), that
-    # worker is abandoned -- it is a daemon thread, so it either eventually
-    # returns and is garbage-collected or blocks forever harmlessly -- and a
-    # fresh worker replaces it for subsequent queries.
-    #
-    # Known operational limitation (accepted, not an oversight): this
-    # replacement has no cross-call cap. A long-lived host process that
-    # invokes _win_handle_holders many times over its lifetime (many
-    # worktree teardowns) can accumulate one permanently-wedged daemon
-    # thread per genuine NtQueryObject hang encountered, for as long as the
-    # host process keeps running -- each abandoned thread is never joined or
-    # cleaned up. In practice this is judged acceptable: each such thread is
-    # small and inert (blocked in a kernel call, never scheduled again,
-    # daemon so it cannot block interpreter shutdown), and genuine hangs are
-    # rare per call (see _HANDLE_QUERY_TIMEOUT_SEC's docstring). A hard cap
-    # / bounded thread pool would add real complexity for a failure mode
-    # that has not been observed to matter in practice; revisit only if a
-    # host process is seen accumulating a large number of these threads
-    # (e.g. very many teardowns against systems with many
-    # persistently-hanging handles, such as many unconnected named pipes).
-    def _make_worker():
-        job_queue: "queue.Queue" = queue.Queue()
+    # Ticket #90: exactly one _BoundedQueryWorker services this whole scan.
+    # A scan always creates and uses its initial worker, even when the
+    # process-wide wedged-worker cap (_MAX_WEDGED_HANDLE_WORKERS) is
+    # already full: refusing to scan at the cap was tried and rejected,
+    # because a wedged worker is -- by definition -- stuck in an
+    # NtQueryObject call that may NEVER return. If a scan-start check
+    # instead skipped scanning once the cap filled, then once
+    # _MAX_WEDGED_HANDLE_WORKERS workers accumulated process-wide,
+    # every later call to this function would return `[]` forever, for
+    # the remaining life of the process -- a silent, permanent, wrong
+    # answer that is worse than the thread leak this ticket set out to
+    # fix. The cap instead gates only *replacement*-worker creation
+    # inside `_bounded_query` below (once this scan's own worker wedges),
+    # never the initial worker. The accepted tradeoff is a small, bounded
+    # overshoot: each concurrently-running scan may hold one worker
+    # beyond the cap, bounded by the (small) number of concurrent scans.
+    # Do not reintroduce a scan-start gate here.
+    # It is always shut down via the try/finally below -- a healthy worker
+    # drains and exits promptly; a worker retired because a query wedged
+    # (see _BoundedQueryWorker.submit) has already been sent its own
+    # shutdown sentinel at retirement time, so close() on it is a fast
+    # no-op and the retired thread still self-terminates on its own once
+    # the wedged call finally returns. Either way this scan leaks no
+    # thread. See _BoundedQueryWorker's docstring for the full mechanism.
+    worker = _BoundedQueryWorker()
+    stop_scan = False
+    cap_already_logged = False
 
-        def _run() -> None:
-            while True:
-                item = job_queue.get()
-                if item is None:
-                    return
-                dup_handle, info_class, outcome, done = item
-                try:
-                    outcome["value"] = _query_object_raw(dup_handle, info_class)
-                except Exception:  # noqa: BLE001 -- best-effort, never propagate
-                    outcome["value"] = None
-                done.set()
+    _RESOLVED, _MATCHED, _CONTINUE, _STOP = (
+        "resolved", "matched", "continue", "stop",
+    )
 
-        worker_thread = threading.Thread(target=_run, daemon=True)
-        worker_thread.start()
-        return job_queue
+    def _make_handle_closer(dup_handle):
+        # Bound to *this* dup_handle via the default-argument trick isn't
+        # needed here since each call site builds a fresh closure per
+        # handle -- captured by simple closure instead.
+        def _closer(_value: Optional[str]) -> None:
+            kernel32.CloseHandle(dup_handle)
+        return _closer
 
-    worker_queue = _make_worker()
+    def _bounded_query(dup_handle, info_class: int):
+        """Run one NtQueryObject call through the per-scan worker.
 
-    def _query_object_bounded(
-        dup_handle, info_class: int, timeout: float = _HANDLE_QUERY_TIMEOUT_SEC
-    ) -> Optional[str]:
-        nonlocal worker_queue
-        outcome: dict = {}
-        done = threading.Event()
-        worker_queue.put((dup_handle, info_class, outcome, done))
-        if done.wait(timeout):
-            return outcome.get("value")
-        # The worker is now permanently wedged inside NtQueryObject for this
-        # handle -- replace it so subsequent queries are not blocked.
-        worker_queue = _make_worker()
-        return None
+        Returns ``(_RESOLVED, value)`` on success, or ``(_STOP, None)``
+        once this scan has no usable worker left (process-wide wedged-
+        worker cap hit, with or without this specific query being the one
+        that hit it) -- callers must stop issuing further queries in that
+        case. A wedged query's handle ownership is transferred to the
+        retired worker via ``on_abandoned_done`` in every non-resolved
+        case; the caller must NOT close *dup_handle* itself when this
+        does not return ``_RESOLVED`` (ticket #90's handle-reuse /
+        false-match fix).
+        """
+        nonlocal worker, cap_already_logged
+        outcome = worker.submit(
+            lambda: _query_object_raw(dup_handle, info_class),
+            grace=grace_budget,
+            scan_deadline=scan_deadline,
+            on_abandoned_done=_make_handle_closer(dup_handle),
+        )
+        if outcome.status == _QueryStatus.RESOLVED:
+            return _RESOLVED, outcome.value
+        if outcome.status == _QueryStatus.ABANDONED and _wedged_slot_available():
+            # This worker is now permanently tied up in the still-running
+            # wedged call (and has already been sent its own shutdown
+            # sentinel by submit()) -- replace it so subsequent queries in
+            # this scan are not blocked.
+            worker = _BoundedQueryWorker()
+            return _CONTINUE, None
+        # Either genuinely CAPPED, or ABANDONED with no capacity left for a
+        # replacement worker -- either way this scan cannot make further
+        # progress on new queries. Log once per scan, at debug, so an
+        # operator can see from the logs alone that a scan degraded early.
+        if not cap_already_logged:
+            _logger.debug(
+                "_win_handle_holders: hit the process-wide wedged NtQueryObject "
+                "worker cap (_MAX_WEDGED_HANDLE_WORKERS=%s, live=%s) -- "
+                "stopping this scan early and returning partial results",
+                _MAX_WEDGED_HANDLE_WORKERS, _wedged_worker_count,
+            )
+            cap_already_logged = True
+        return _STOP, None
 
     found: List[Tuple[int, str]] = []
     current_process = kernel32.GetCurrentProcess()
@@ -1013,55 +1405,85 @@ def _win_handle_holders(
     _UNSET = object()
     type_name_cache: Dict[int, Optional[str]] = {}
 
-    for pid, handle_entries in by_pid.items():
-        if time.monotonic() > scan_deadline:
-            break
-        proc_handle = kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, pid)
-        if not proc_handle:
-            # No PROCESS_DUP_HANDLE access -- elevated/other-user process we
-            # cannot cross without running elevated ourselves.
-            continue
+    def _process_handle(proc_handle, pid: int, handle_value: int, type_index: int) -> str:
+        """Resolve one (handle_value, type_index) for *pid*.
+
+        Returns ``_MATCHED`` (pid appended to *found*), ``_CONTINUE``
+        (nothing to report, keep scanning this pid's other handles), or
+        ``_STOP`` (this scan has no usable worker left -- callers must stop
+        issuing further queries entirely, not just for this pid).
+        """
+        cached_type = type_name_cache.get(type_index, _UNSET)
+        if cached_type is not _UNSET and cached_type != "File":
+            return _CONTINUE  # known non-file type -- skip without duplicating
+
+        dup_handle = wintypes.HANDLE()
+        ok = kernel32.DuplicateHandle(
+            proc_handle,
+            wintypes.HANDLE(handle_value),
+            current_process,
+            ctypes.byref(dup_handle),
+            0,
+            False,
+            DUPLICATE_SAME_ACCESS,
+        )
+        if not ok:
+            return _CONTINUE
+
+        owns_handle = True
+        nt_name: Optional[str] = None
         try:
-            for handle_value, type_index in handle_entries:
-                if time.monotonic() > scan_deadline:
-                    break
+            if cached_type is _UNSET:
+                status, type_name = _bounded_query(dup_handle, OBJECT_TYPE_INFORMATION)
+                if status != _RESOLVED:
+                    owns_handle = False
+                    return _STOP if status == _STOP else _CONTINUE
+                type_name_cache[type_index] = type_name
+                if type_name != "File":
+                    return _CONTINUE
 
-                cached_type = type_name_cache.get(type_index, _UNSET)
-                if cached_type is not _UNSET and cached_type != "File":
-                    continue  # known non-file type -- skip without duplicating
-
-                dup_handle = wintypes.HANDLE()
-                ok = kernel32.DuplicateHandle(
-                    proc_handle,
-                    wintypes.HANDLE(handle_value),
-                    current_process,
-                    ctypes.byref(dup_handle),
-                    0,
-                    False,
-                    DUPLICATE_SAME_ACCESS,
-                )
-                if not ok:
-                    continue
-                try:
-                    if cached_type is _UNSET:
-                        type_name = _query_object_bounded(dup_handle, OBJECT_TYPE_INFORMATION)
-                        type_name_cache[type_index] = type_name
-                        if type_name != "File":
-                            continue
-                    nt_name = _query_object_bounded(dup_handle, OBJECT_NAME_INFORMATION)
-                finally:
-                    kernel32.CloseHandle(dup_handle)
-                if not nt_name:
-                    continue
-                dos_path = _nt_path_to_dos(nt_name)
-                if not dos_path:
-                    continue
-                norm = os.path.normcase(os.path.normpath(dos_path))
-                if norm == normalized or norm.startswith(normalized + os.sep):
-                    found.append((pid, ""))
-                    break  # one matching handle is enough to flag this pid
+            status, nt_name = _bounded_query(dup_handle, OBJECT_NAME_INFORMATION)
+            if status != _RESOLVED:
+                owns_handle = False
+                return _STOP if status == _STOP else _CONTINUE
         finally:
-            kernel32.CloseHandle(proc_handle)
+            if owns_handle:
+                kernel32.CloseHandle(dup_handle)
+
+        if not nt_name:
+            return _CONTINUE
+        dos_path = _nt_path_to_dos(nt_name)
+        if not dos_path:
+            return _CONTINUE
+        norm = os.path.normcase(os.path.normpath(dos_path))
+        if norm == normalized or norm.startswith(normalized + os.sep):
+            found.append((pid, ""))
+            return _MATCHED
+        return _CONTINUE
+
+    try:
+        for pid, handle_entries in by_pid.items():
+            if time.monotonic() > scan_deadline or stop_scan:
+                break
+            proc_handle = kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, pid)
+            if not proc_handle:
+                # No PROCESS_DUP_HANDLE access -- elevated/other-user process
+                # we cannot cross without running elevated ourselves.
+                continue
+            try:
+                for handle_value, type_index in handle_entries:
+                    if time.monotonic() > scan_deadline or stop_scan:
+                        break
+                    verdict = _process_handle(proc_handle, pid, handle_value, type_index)
+                    if verdict == _STOP:
+                        stop_scan = True
+                        break
+                    if verdict == _MATCHED:
+                        break  # one matching handle is enough to flag this pid
+            finally:
+                kernel32.CloseHandle(proc_handle)
+    finally:
+        worker.close()
 
     return found
 
