@@ -2078,7 +2078,17 @@ class TestBoundedQueryWorker:
                     created.append(worker)
 
             assert grace_paid <= 3, f"expected at most 3 queries to pay a grace wait, got {grace_paid}"
-            assert grace.remaining == 0.0
+            # Each stage-2 wait deducts the *actually elapsed* wall-clock
+            # time (clamped at 0.0), so real timing jitter can leave a tiny
+            # positive residue instead of landing on exact 0.0 -- assert
+            # "effectively exhausted" rather than bit-exact zero. The 0.01s
+            # tolerance is one tenth of _HANDLE_QUERY_GRACE_SEC (0.10s), far
+            # too small to fund another grace wait, so this still proves
+            # exhaustion rather than masking a real bug.
+            assert grace.remaining < 0.01, (
+                f"expected the grace budget to be effectively exhausted, "
+                f"{grace.remaining:.6f}s remained"
+            )
         finally:
             release.set()
             for w in created:
