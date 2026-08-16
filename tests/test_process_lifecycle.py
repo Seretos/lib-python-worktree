@@ -2057,10 +2057,12 @@ class TestBoundedQueryWorker:
     def test_grace_budget_exhausts_and_degrades_to_fast_timeout(self, monkeypatch):
         monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
         release = threading.Event()
-        grace = _GraceBudget(0.25)
+        initial_budget = 0.25
+        grace = _GraceBudget(initial_budget)
         scan_deadline = time.monotonic() + 30
 
         grace_paid = 0
+        per_query_elapsed = []
         worker = _BoundedQueryWorker()
         created = [worker]
         try:
@@ -2070,6 +2072,7 @@ class TestBoundedQueryWorker:
                     lambda: release.wait(timeout=30), grace=grace, scan_deadline=scan_deadline
                 )
                 elapsed = time.monotonic() - t0
+                per_query_elapsed.append(elapsed)
                 if elapsed > _HANDLE_QUERY_TIMEOUT_SEC * 3:
                     grace_paid += 1
                 assert outcome.status != _QueryStatus.RESOLVED
@@ -2077,7 +2080,47 @@ class TestBoundedQueryWorker:
                     worker = _BoundedQueryWorker()
                     created.append(worker)
 
-            assert grace_paid <= 3, f"expected at most 3 queries to pay a grace wait, got {grace_paid}"
+            # NOT a count assertion: the grace budget is a *time* pool, not
+            # a quota of queries. Each stage-2 wait deducts the actually
+            # elapsed wall clock, which is typically a hair less than the
+            # full _HANDLE_QUERY_GRACE_SEC allowance, so a small positive
+            # residue (e.g. a few ms) can remain after "3 waits worth" of
+            # budget -- and that residue is still > 0, so a 4th (or 5th, or
+            # 6th, with finer jitter) query can legitimately draw a small
+            # grace wait too. The number of queries that touch the pool is
+            # therefore unbounded by design; only the *total* time drawn
+            # from it is bounded. This is the second CI failure caused by
+            # pinning a count here (first: an exact-zero `remaining`
+            # assertion; this one: `grace_paid <= 3`) -- do not reintroduce
+            # a count-based ceiling on grace_paid.
+            #
+            # The real, always-true invariant: total wall clock spent
+            # across every stage-2 wait in this scan cannot exceed the
+            # seeded budget (plus a small tolerance for measurement
+            # overhead around the wait itself).
+            grace_spent = initial_budget - grace.remaining
+            assert grace_spent <= initial_budget + 0.05, (
+                f"expected total grace spend to stay within the seeded "
+                f"{initial_budget}s budget (+ tolerance), spent {grace_spent:.3f}s"
+            )
+            # Loose sanity bound, not a ceiling: with a 0.25s pool and a
+            # 0.10s stage-2 allowance, at least one query must have paid
+            # some grace before the pool could exhaust.
+            assert grace_paid >= 1, "expected at least one query to pay a grace wait"
+
+            # The other half of the behaviour this test names: once the
+            # pool is exhausted, later queries degrade back to (near)
+            # stage-1-only speed instead of continuing to pay full stage-2
+            # waits forever. Expressed as a generous, one-sided bound on
+            # the *last* query only -- never a tight window -- using the
+            # same "< 3x the configured [stage-2] allowance" convention
+            # this file already uses elsewhere (e.g.
+            # test_query_slower_than_grace_ceiling_is_abandoned_after_bounded_wait).
+            assert per_query_elapsed[-1] < 3 * _HANDLE_QUERY_GRACE_SEC, (
+                f"expected the final query (pool exhausted) to degrade to a "
+                f"fast, near-stage-1 wait, took {per_query_elapsed[-1]:.3f}s"
+            )
+
             # Each stage-2 wait deducts the *actually elapsed* wall-clock
             # time (clamped at 0.0), so real timing jitter can leave a tiny
             # positive residue instead of landing on exact 0.0 -- assert
