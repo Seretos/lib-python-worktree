@@ -170,7 +170,7 @@ class PrimaryCheckoutError(WorktreeError):
 
 
 class CheckoutTargetError(WorktreeError, ValueError):
-    """Raised by ``start()``/``stop()`` when the ``(worktree_id,
+    """Raised by ``start()``/``stop()``/``remove()`` when the ``(worktree_id,
     checkout_path)`` pair does not resolve to a single, unambiguous target.
 
     Modelled on ``UnknownVariantError``'s dual base (``WorktreeError`` and
@@ -197,8 +197,8 @@ class CheckoutTargetError(WorktreeError, ValueError):
     ) -> None:
         if reason == "missing":
             message = (
-                "start()/stop() require either worktree_id or checkout_path "
-                "to address a target; neither was given."
+                "start()/stop()/remove() require either worktree_id or "
+                "checkout_path to address a target; neither was given."
             )
         else:
             message = (

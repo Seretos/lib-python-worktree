@@ -39,6 +39,7 @@ from .core.checkout import (
     classify_checkout,
     list_repo,
     primary_id_for,
+    untracked_id_for,
 )
 from .core.manager import (
     BranchAlreadyCheckedOutError,
@@ -105,6 +106,7 @@ __all__ = [
     "classify_checkout",
     "list_repo",
     "primary_id_for",
+    "untracked_id_for",
     # process lifecycle
     "KilledProcessInfo",
     "ProcessLifecycleError",

@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from lib_python_worktree.core._exceptions import GitTimeoutError, InvalidRepoError
-from lib_python_worktree.core.checkout import classify_checkout, primary_id_for
+from lib_python_worktree.core.checkout import (
+    classify_checkout,
+    primary_id_for,
+    untracked_id_for,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -105,3 +109,49 @@ def test_primary_id_stable_and_location_unique(tmp_path: Path):
 
     import re
     assert re.fullmatch(r"repo-root-[0-9a-f]{8}", id_a1)
+
+
+# ---------------------------------------------------------------------------
+# ticket #88 -- deterministic untracked-linked-worktree id
+# ---------------------------------------------------------------------------
+
+def test_untracked_id_for_stable_and_location_unique(tmp_path: Path):
+    """untracked_id_for() mirrors primary_id_for()'s guarantees (stable,
+    location-unique, non-normalised-path-safe) but for a linked-worktree
+    checkout path rather than a repo root."""
+    parent_a = tmp_path / "a"
+    parent_a.mkdir()
+    wt_a = parent_a / "wt"
+    wt_a.mkdir()
+    parent_b = tmp_path / "b"
+    parent_b.mkdir()
+    wt_b = parent_b / "wt"
+    wt_b.mkdir()
+
+    id_a1 = untracked_id_for(wt_a)
+    id_a2 = untracked_id_for(wt_a)
+    id_b = untracked_id_for(wt_b)
+
+    # Determinism across repeated calls.
+    assert id_a1 == id_a2
+    # Distinctness for two same-named worktree dirs under different parents.
+    assert id_a1 != id_b
+
+    # Stability across a relative / non-normalised spelling of the same path.
+    id_a_relative = untracked_id_for(wt_a / ".." / "wt")
+    assert id_a_relative == id_a1
+
+    # Never empty.
+    assert id_a1
+
+    import re
+    assert re.fullmatch(r"wt-untracked-[0-9a-f]{8}", id_a1)
+
+
+def test_untracked_id_for_never_equals_primary_id_for_same_repo(tmp_path: Path):
+    """The two id families are shaped differently (`-root-` vs
+    `-untracked-`) and must never collide for the same path."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert untracked_id_for(repo) != primary_id_for(repo)

@@ -12,7 +12,7 @@ import pytest
 
 from lib_python_worktree.core._exceptions import InvalidRepoError
 from lib_python_worktree.core.checkout import list_repo as _list_repo
-from lib_python_worktree.core.checkout import primary_id_for
+from lib_python_worktree.core.checkout import primary_id_for, untracked_id_for
 from lib_python_worktree.core.manager import ManagerConfig, WorktreeManager
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 from lib_python_worktree.core.yaml_store import YamlStateStore
@@ -188,9 +188,11 @@ def test_list_repo_untracked_linked_worktree_appears_tracked_false(
     linked_entries = [e for e in listing.entries if e.record.backing == "worktree"]
     assert len(linked_entries) == 1
     assert linked_entries[0].tracked is False
-    # No deterministic id exists for a linked worktree -- pinned contract:
-    # the empty string, never mistaken for a real tracked id.
-    assert linked_entries[0].record.id == ""
+    # Ticket #88: a deterministic, location-hashed id -- not "" -- so the
+    # entry environment_list displays is addressable via
+    # remove(checkout_path=...).
+    assert linked_entries[0].record.id == untracked_id_for(linked_worktree)
+    assert linked_entries[0].record.id
     assert linked_entries[0].record.path == linked_worktree.resolve().as_posix()
     assert linked_entries[0].record.branch == "feature/alpha"
     assert linked_entries[0].record.repo_root == git_repo.resolve().as_posix()
@@ -231,7 +233,7 @@ def test_list_repo_tracked_and_untracked_linked_worktrees_mixed(
 
         untracked_entry = linked_entries[linked_worktree.resolve().as_posix()]
         assert untracked_entry.tracked is False
-        assert untracked_entry.record.id == ""
+        assert untracked_entry.record.id == untracked_id_for(linked_worktree)
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(other_wt)],

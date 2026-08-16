@@ -185,11 +185,38 @@ at construction to clean up stale records.
 |--------|-----------|---------|-------------|
 | `create` | `(repo_root: str, branch: str, base: Optional[str] = None)` | `WorktreeRecord` | Add a git worktree, allocate ports per the contract, and persist state. Pass `base` to create the branch. |
 | `list` | `()` | `List[WorktreeRecord]` | Return all tracked worktree records. |
-| `remove` | `(worktree_id: str, force: bool = False)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. `force=True` removes despite uncommitted changes. |
+| `list_repo` | `(path: str)` | `RepoListing` | Repo-scoped listing (primary + linked worktrees) for any path inside a repo, joining git's live `worktree list --porcelain` view against tracked records. Entries not yet persisted (the primary before its first `start()`, or a linked worktree never `adopt()`-ed) are synthesised with `tracked=False`. |
+| `remove` | `(worktree_id: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False, *, checkout_path: Optional[str] = None)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. Target by `worktree_id` **or** `checkout_path`; a `checkout_path` pointing at an untracked/orphaned linked worktree is removed without needing `adopt()` first (see "Orphan worktree recovery" below). `force=True` removes despite uncommitted changes; never bypasses the primary-checkout refusal. |
 | `adopt` | `(repo_root: str)` | `AdoptReport` | Import untracked on-disk worktrees into the state store. Requires `YamlStateStore`. |
 | `prune` | `(repo_root: str)` | `None` | Run `git worktree prune --expire=now` to clear stale git metadata. |
-| `start` | `(worktree_id: str, cmd: List[str], *, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None)` | `WorktreeRecord` | Spawn a detached process and record its PID. |
-| `stop` | `(worktree_id: str, *, role: str = "main", timeout: float = 10.0)` | `WorktreeRecord` | Gracefully stop the process for `role`; force-kills if it does not exit within `timeout` seconds. |
+| `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID. |
+| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role`; force-kills if it does not exit within `timeout` seconds. |
+
+### Orphan worktree recovery
+
+A linked worktree that was created outside this tool (by hand, or by a
+process that crashed before persisting its record) shows up in
+`list_repo()` — and thus in `environment_list` — as an entry with
+`tracked=False`. Its `record.id` is a deterministic, location-hashed id
+(`untracked_id_for(path)`), but that id is display/correlation only: it is
+**not** a state-store key and cannot be passed as `remove(worktree_id=...)`.
+Recover (or discard) it via `checkout_path` instead:
+
+```python
+listing = manager.list_repo(repo_root)
+orphan = next(e for e in listing.entries if not e.tracked)
+
+# Discard it directly -- no adopt() needed:
+manager.remove(checkout_path=orphan.record.path, force=True)
+
+# ...or import it into the state store first, if you want to keep it:
+manager.adopt(repo_root)
+```
+
+`remove(checkout_path=...)` tears the checkout down without ever writing to
+the state store for an untracked target, and never deletes its branch
+(a synthesised record always has `branch_created_by_us=False`) — even with
+`force=True`.
 
 ### `ManagerConfig`
 
