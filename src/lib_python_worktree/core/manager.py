@@ -962,7 +962,13 @@ class WorktreeManager:
         # the no-op "ready" start).  Avoid delegating to _lifecycle_stop, which
         # would raise ProcessNotRunningError.
         if role not in record.pids:
-            if not record.pids:
+            if not record.pids and record.status not in ("stop_incomplete", "orphaned"):
+                # Ticket #95, finding 6: mirror process_lifecycle.stop()'s own
+                # guard (see its identical exclusion). "stop_incomplete" and
+                # "orphaned" are sticky, deliberately-honest statuses set by
+                # an earlier stop()/reconcile() call -- this no-op branch
+                # clearing the last pid entry for an unrelated role must not
+                # silently overwrite that guarantee back to "stopped".
                 record.status = "stopped"
             self.state.update(record)
             return record

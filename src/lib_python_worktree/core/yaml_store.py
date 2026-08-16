@@ -92,18 +92,85 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _kernel32_lasterror():
+    """Return ``kernel32`` bound with ``use_last_error=True`` (ticket #95).
+
+    ``ctypes.windll.kernel32`` cannot carry ``use_last_error`` -- it is a
+    fixed, process-wide singleton binding. A dedicated ``ctypes.WinDLL(...,
+    use_last_error=True)`` call is needed so ``ctypes.get_last_error()``
+    reliably reflects the outcome of the most recent call made through the
+    handle this function returns. Factored into its own function (rather
+    than inlined) purely to give tests a patch seam that works even when not
+    running on Windows.
+    """
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+
+
 def _pid_alive_windows(pid: int) -> bool:
-    """Windows-specific PID liveness check via ctypes."""
+    """Windows-specific PID liveness check via ctypes (hardened -- ticket #95).
+
+    Tries ``PROCESS_QUERY_LIMITED_INFORMATION`` (0x1000, introduced in
+    Vista -- requires fewer privileges) first, then falls back to the
+    classic ``PROCESS_QUERY_INFORMATION`` (0x0400) if that fails.
+
+    Finding 4 (ticket #95): the previous implementation treated *any*
+    ``OpenProcess`` failure as "dead". But ``OpenProcess`` failing with
+    ``ERROR_ACCESS_DENIED`` actually proves the PID still exists -- the OS
+    returns ``ERROR_INVALID_PARAMETER`` for a PID that is genuinely gone.
+    A live process we cannot open (e.g. spawned by another user or an
+    elevated context) therefore used to read as already dead, silently
+    masking a real survivor from callers such as ``stop()``'s post-kill
+    re-probe. When both ``OpenProcess`` attempts fail, ``GetLastError()`` is
+    now classified:
+
+    - ``ERROR_ACCESS_DENIED`` (5)      -> ``True``  (the PID exists)
+    - ``ERROR_INVALID_PARAMETER`` (87) -> ``False`` (no such process)
+    - anything else                    -> ``False``, logged at debug level
+
+    Note: classifying ACCESS_DENIED as "alive" makes a PID-reuse false
+    positive marginally more likely (an unrelated, inaccessible process
+    happens to reuse the tracked PID number) -- consistent with the
+    PID-reuse limitation already documented as out of scope on ``stop()``.
+    """
     import ctypes
     import ctypes.wintypes
 
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     PROCESS_QUERY_INFORMATION = 0x0400
     STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_PARAMETER = 87
 
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+    kernel32 = _kernel32_lasterror()
+
+    ctypes.set_last_error(0)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
+        first_err = ctypes.get_last_error()
+        if first_err == ERROR_ACCESS_DENIED:
+            # The less-privileged query already proves the PID exists --
+            # PROCESS_QUERY_INFORMATION requires strictly MORE privilege, so
+            # retrying with it can only fail the same way. Short-circuit
+            # rather than making a second, guaranteed-redundant syscall.
+            return True
+        ctypes.set_last_error(0)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+
+    if not handle:
+        err = ctypes.get_last_error()
+        if err == ERROR_ACCESS_DENIED:
+            return True
+        if err == ERROR_INVALID_PARAMETER:
+            return False
+        logger.debug(
+            "_pid_alive_windows(pid=%s): OpenProcess failed with unrecognized "
+            "GetLastError()=%s -- treating as dead",
+            pid, err,
+        )
         return False
+
     try:
         exit_code = ctypes.wintypes.DWORD()
         if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
@@ -130,6 +197,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "returncode": rec.returncode,
         "start_log_path": rec.start_log_path,
         "backing": rec.backing,
+        "job_names": dict(rec.job_names),
     }
 
 
@@ -154,6 +222,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         returncode=d.get("returncode"),
         start_log_path=d.get("start_log_path"),
         backing=d.get("backing", "worktree"),
+        job_names=dict(d.get("job_names") or {}),
     )
 
 

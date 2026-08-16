@@ -21,7 +21,7 @@ The engine is fully implemented under `src/lib_python_worktree/`. Key modules:
 - `core/state.py` — `StateStore` protocol + `WorktreeRecord` dataclass (`backing: "worktree" | "primary"`, ticket #84)
 - `core/yaml_store.py` — `YamlStateStore` (file-backed store), `reconcile`, `adopt`, `ReconcileReport`, `AdoptReport`
 - `core/port_allocator.py` — `PortAllocator` (locked, atomic read-modify-write against `ports.yaml`)
-- `core/process_lifecycle.py` — `start` / `stop` (detached process management, cross-platform)
+- `core/process_lifecycle.py` — `start` / `stop` (detached process management, cross-platform); on Windows, `start()` also assigns the spawned process to a Job Object (ticket #95) that `stop()` enumerates/terminates as a ppid-independent containment mechanism (catches `Start-Process`/ShellExecuteEx-delegated grandchildren the ppid-derived process-tree walk cannot reach)
 - `core/_git_utils.py` — `_run_git` (timeout-hardened git subprocess runner)
 - `core/plugin_install.py` — `install_enabled_plugins` (CLI-driven `enabledPlugins` install; primary mechanism, with `plugin_seed` as fallback)
 - `core/_exceptions.py` — `WorktreeError` base hierarchy (`GitTimeoutError`, `DirtyWorktreeError`, etc.)

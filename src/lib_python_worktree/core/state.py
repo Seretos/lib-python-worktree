@@ -45,6 +45,27 @@ class WorktreeRecord:
     returncode: Optional[int] = None
     start_log_path: Optional[str] = None
     backing: str = "worktree"
+    job_names: Dict[str, str] = field(default_factory=dict)
+    """Windows-only (ticket #95): per-role mapping of ``role`` -> the name of
+    the Job Object ``start()`` created and assigned that role's spawned
+    process to. Mirrors ``pids`` -- one entry per currently-tracked role. A
+    role with no Job Object (POSIX, or Job Object creation failed on
+    Windows) has no key in this dict at all, never a ``None`` value. Used by
+    ``stop()`` as a ppid-independent containment mechanism -- see
+    ``process_lifecycle._create_job_object``'s docstring for the full
+    rationale. Persisted (unlike ``killed_pids``): a record loaded by a
+    *different* host process still names the job so ``stop()`` can attempt
+    ``OpenJobObjectW`` on it, even though that process no longer holds the
+    keeper handle itself (see ``_JOB_HANDLES``'s docstring for what this does
+    and does not guarantee).
+
+    Ticket #95 fix-cycle note: this was originally a single scalar
+    ``job_name: Optional[str]`` field, unconditionally overwritten by every
+    ``start()`` call regardless of role -- in a multi-role worktree, starting
+    a second role silently lost the first role's job name, and ``stop()``
+    for the first role would then open/terminate the *second* role's job
+    instead. Changed to a per-role dict, consistent with ``pids``, to close
+    that cross-role bleed."""
 
 
 class StateStore(Protocol):
