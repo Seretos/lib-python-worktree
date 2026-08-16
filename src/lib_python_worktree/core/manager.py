@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # `subprocess` is kept for CompletedProcess / DEVNULL references inside this
 # module even though _run_git now lives in _git_utils.
@@ -35,6 +35,7 @@ from .checkout import (
     classify_checkout,
     list_repo as _list_repo,
     primary_id_for,
+    untracked_id_for,
 )
 from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
 from .process_lifecycle import (
@@ -50,6 +51,10 @@ from .state import InMemoryStateStore, StateStore, WorktreeRecord
 from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+# Matches the synthesised-id suffix minted by checkout.untracked_id_for()
+# (ticket #88), so remove()'s id-only path can name the right remedy
+# (checkout_path=...) instead of a generic "not found" for this case.
+_UNTRACKED_ID_RE = re.compile(r"-untracked-[0-9a-f]{8}$")
 _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
 _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
@@ -561,15 +566,47 @@ class WorktreeManager:
 
     def remove(
         self,
-        worktree_id: str,
+        worktree_id: Optional[str] = None,
         force: bool = False,
         kill_blocking_processes: bool = False,
+        *,
+        checkout_path: Optional[str] = None,
     ) -> WorktreeRecord:
-        record = self.state.get(worktree_id)
-        if record is None:
-            raise WorktreeNotFoundError(
-                f"No worktree tracked with id '{worktree_id}'"
-            )
+        """Remove a worktree, addressed by *worktree_id* and/or
+        *checkout_path* (ticket #88).
+
+        A *tracked* target (a persisted ``WorktreeRecord`` exists) behaves as
+        before: the git worktree checkout is torn down, the state record is
+        removed, and an owned branch (``branch_created_by_us``) is deleted.
+
+        An *untracked* target -- a linked worktree that is on disk (per
+        ``git worktree list --porcelain``, as ``list_repo()``/
+        ``environment_list`` would report it with ``tracked=False``) but has
+        no persisted record -- is addressable **only** via *checkout_path*:
+        its ``list_repo()``-displayed id (``untracked_id_for(path)``) is not
+        a state-store key and cannot be looked up. For such a target this
+        method synthesises an ephemeral ``WorktreeRecord`` (mirroring
+        ``list_repo()``'s own synthesis, so the id reported back matches the
+        id ``environment_list`` displayed), tears down the checkout, and
+        returns that record with ``status="removed"`` -- **without ever
+        writing to the state store**. Because the synthesised record always
+        has ``branch_created_by_us=False``, an orphan's branch is never
+        deleted, even with ``force=True``.
+
+        A primary checkout is refused on every path (by id, by
+        *checkout_path* on a tracked primary, or by *checkout_path* on a
+        never-started primary) with ``PrimaryCheckoutError`` --
+        ``force=True`` never bypasses this.
+
+        Raises ``CheckoutTargetError`` if neither argument is given
+        (``reason="missing"``), or if both are given and disagree
+        (``reason="id_mismatch"``). Raises ``WorktreeNotFoundError`` if
+        *worktree_id* does not resolve to any tracked record (its message
+        names ``checkout_path=`` as the remedy when the id looks like a
+        synthesised untracked id) or if *checkout_path* does not resolve to
+        any environment at all.
+        """
+        record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
         # teardown/FS work runs -- never honours force=True. A primary
         # checkout IS the repo; deleting it would be catastrophic and
@@ -580,24 +617,32 @@ class WorktreeManager:
         if record.backing == "primary" or Path(record.path).resolve() == Path(
             record.repo_root
         ).resolve():
-            raise PrimaryCheckoutError(worktree_id)
+            raise PrimaryCheckoutError(record.id)
         # Phase 1: remove the git worktree checkout.  If this raises the
         # directory still exists, so we keep the state record and propagate.
         self._teardown(record, force=force, kill_blocking_processes=kill_blocking_processes)
-        # Phase 2: the worktree directory is now gone.  Remove the state record
-        # *before* the branch-delete step so that a branch-delete failure
-        # (e.g. ``git branch -d`` refusing an unmerged branch when force=False)
-        # does not leave a stale orphaned record in the state store.
-        removed = self.state.remove(worktree_id)
-        assert removed is not None  # state.get returned record above
-        removed.status = "removed"
-        # Copy killed_pids from the in-memory record: YamlStateStore.remove()
-        # returns a freshly-deserialized object that never carries killed_pids
-        # (the field is transient and not written to state.yaml), so we must
-        # propagate it explicitly from the object _teardown mutated.
-        removed.killed_pids = record.killed_pids
+        # Phase 2: the worktree directory is now gone.  Remove the state
+        # record *before* the branch-delete step so that a branch-delete
+        # failure (e.g. ``git branch -d`` refusing an unmerged branch when
+        # force=False) does not leave a stale orphaned record in the state
+        # store. An untracked target (ticket #88) never touched the store in
+        # the first place, so there is nothing to remove there.
+        if tracked:
+            removed = self.state.remove(record.id)
+            assert removed is not None  # _resolve_removal_target confirmed it exists
+            removed.status = "removed"
+            # Copy killed_pids from the in-memory record: YamlStateStore.remove()
+            # returns a freshly-deserialized object that never carries killed_pids
+            # (the field is transient and not written to state.yaml), so we must
+            # propagate it explicitly from the object _teardown mutated.
+            removed.killed_pids = record.killed_pids
+        else:
+            removed = record
+            removed.status = "removed"
         # Phase 3: delete the owned branch (if any).  May raise GitCommandError
         # (e.g. unmerged + force=False); the record is already gone from state.
+        # A synthesised (untracked) record always has branch_created_by_us=False,
+        # so an orphan's branch is never deleted here.
         self._delete_owned_branch(record, force=force)
         return removed
 
@@ -986,6 +1031,95 @@ class WorktreeManager:
             f"No tracked worktree at '{checkout_path}'. "
             f"Use adopt() to import it first."
         )
+
+    def _resolve_removal_target(
+        self,
+        worktree_id: Optional[str],
+        checkout_path: Optional[str],
+    ) -> Tuple[WorktreeRecord, bool]:
+        """Resolve a ``remove()`` target from *worktree_id* and/or
+        *checkout_path* (ticket #88).
+
+        Returns ``(record, tracked)``. ``tracked=True`` means *record* came
+        from the state store, so ``remove()`` must delete it there;
+        ``tracked=False`` means *record* was freshly synthesised (never
+        persisted) for an untracked linked worktree discovered via
+        ``list_repo()``, so ``remove()`` must not touch the store at all.
+
+        By id only (``checkout_path is None``): looked up directly via
+        ``self.state.get()``, same as before ticket #88 -- an id can only
+        ever resolve to a *tracked* record. Unlike ``start()``/``stop()``'s
+        ``_resolve_target()``, this method never materialises anything, so
+        it does not need a ``materialise`` flag.
+
+        By *checkout_path* (with or without *worktree_id*): first delegates
+        to the unmodified ``_resolve_target(materialise=False)`` -- so #84's
+        containment/longest-match rules and its ``id_mismatch`` check apply
+        to a tracked target exactly as they do for ``start()``/``stop()``.
+        If that raises ``WorktreeNotFoundError`` (the checkout exists but
+        has no persisted record -- an untracked linked worktree, or a
+        never-started primary), falls back to ``self.list_repo()`` --
+        reusing ``list_repo()``'s own id synthesis so the id this method
+        (and thus ``remove()``) reports back is, by construction, the same
+        id ``environment_list``/``list_repo()`` displayed for that checkout.
+        """
+        if checkout_path is None:
+            if worktree_id is None:
+                raise CheckoutTargetError(
+                    worktree_id=None, checkout_path=None, reason="missing"
+                )
+            record = self.state.get(worktree_id)
+            if record is None:
+                if _UNTRACKED_ID_RE.search(worktree_id):
+                    raise WorktreeNotFoundError(
+                        f"'{worktree_id}' is a synthesised id for an "
+                        f"untracked checkout and is not a state-store key; "
+                        f"pass checkout_path=... instead."
+                    )
+                raise WorktreeNotFoundError(
+                    f"No worktree tracked with id '{worktree_id}'"
+                )
+            return record, True
+
+        try:
+            record = self._resolve_target(worktree_id, checkout_path, materialise=False)
+            return record, True
+        except WorktreeNotFoundError:
+            pass
+
+        # Untracked fallback: the checkout exists on disk but has no
+        # persisted record. Reuse list_repo()'s own join/synthesis rather
+        # than re-implementing it, so the id is guaranteed consistent with
+        # what environment_list already showed for this checkout.
+        listing = self.list_repo(checkout_path)
+        # is_current already implements the same containment rule
+        # (checkout_path == entry path, or a subdirectory of it) that
+        # _resolve_target() uses for tracked targets above; picking the
+        # deepest/most-specific match mirrors _resolve_target()'s own
+        # longest-match rule so a nested worktree isn't shadowed.
+        candidates = [e for e in listing.entries if e.is_current]
+        if not candidates:
+            raise WorktreeNotFoundError(
+                f"No tracked worktree at '{checkout_path}'. "
+                f"Use adopt() to import it first."
+            )
+        best_entry = max(candidates, key=lambda e: len(Path(e.record.path).parts))
+
+        if best_entry.record.backing == "primary":
+            # Improvement over the pre-#88 behaviour: a never-started
+            # primary addressed by checkout_path now gets the correct
+            # structural refusal instead of a confusing not-found.
+            raise PrimaryCheckoutError(best_entry.record.id)
+
+        if worktree_id is not None and worktree_id != best_entry.record.id:
+            raise CheckoutTargetError(
+                worktree_id=worktree_id,
+                checkout_path=str(checkout_path),
+                resolved_id=best_entry.record.id,
+                reason="id_mismatch",
+            )
+
+        return best_entry.record, best_entry.tracked
 
     # ---- seams for later phases ----
 
@@ -1404,4 +1538,5 @@ __all__ = (
     "ProcessNotRunningError",
     "classify_checkout",
     "primary_id_for",
+    "untracked_id_for",
 )

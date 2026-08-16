@@ -16,7 +16,7 @@ structure — never mutating state:
    memory (never writing to the store) for the primary checkout and for any
    linked worktree that is on disk but not yet adopted. See
    ``EnvironmentEntry``'s docstring for the untracked-linked-worktree id
-   convention (``record.id == ""``).
+   convention (``untracked_id_for(path)``, ticket #88).
 
 This module imports only ``_exceptions``, ``_git_utils`` and ``state`` —
 never ``manager`` — so it cannot introduce an import cycle; ``manager.py``
@@ -134,6 +134,25 @@ def primary_id_for(repo_root: "Path | str") -> str:
     return f"{_slug(resolved.name)}-root-{digest}"
 
 
+def untracked_id_for(checkout_path: "Path | str") -> str:
+    """Deterministic, location-hashed id for an untracked linked worktree.
+
+    Mirrors ``primary_id_for()`` in shape and guarantees (stable across
+    repeated calls for the same path, including a non-normalised/relative
+    spelling; distinct per location), but is scoped to a *linked worktree*
+    checkout path rather than a repo root, and the ``-untracked-`` infix is
+    a readability marker only -- it does **not** make this a state-store
+    key. Unlike a real ``WorktreeRecord.id`` minted by ``create()``/
+    ``adopt()``, this id cannot be resolved back to a path without
+    re-scanning the repo (there is no store entry to look it up in), so it
+    is resolvable only via ``checkout_path`` -- see
+    ``WorktreeManager.remove(checkout_path=...)`` (ticket #88).
+    """
+    resolved = Path(checkout_path).expanduser().resolve()
+    digest = hashlib.sha256(resolved.as_posix().encode("utf-8")).hexdigest()[:8]
+    return f"{_slug(resolved.name)}-untracked-{digest}"
+
+
 # ---------------------------------------------------------------------------
 # EnvironmentEntry / RepoListing / list_repo
 # ---------------------------------------------------------------------------
@@ -153,15 +172,18 @@ class EnvironmentEntry:
     ``primary_id_for(repo_root)`` -- stable across calls, so it round-trips
     correctly once the primary is later materialised by ``start()``.
 
-    For a synthesised **linked-worktree** entry there is no such deterministic
-    id (unlike the primary, a linked worktree has no canonical identity until
-    ``adopt()``/``create()`` mints one), so ``record.id`` is set to the empty
-    string ``""``. An empty id can never collide with a real tracked id --
-    every id minted by ``create()``/``adopt()``/``primary_id_for()`` is
-    non-empty by construction -- but callers must not treat the id as the
-    discriminator for "is this tracked": always check ``tracked`` instead.
-    Other fields (``path``, ``branch``, ``repo_root``, ``backing``) are
-    populated from git's porcelain output where available.
+    For a synthesised **linked-worktree** entry, ``record.id`` is
+    ``untracked_id_for(path)`` (ticket #88) -- a deterministic,
+    location-hashed id, stable across calls and distinct per path, so the
+    id ``environment_list``/``list_repo()`` displays is the same id
+    ``remove(checkout_path=...)`` reports back. It is display/correlation
+    only, **not** a state-store key: unlike a real tracked id it cannot be
+    resolved back to a path without re-scanning the repo, so it cannot be
+    passed as ``worktree_id`` to ``remove()`` (pass ``checkout_path``
+    instead). Callers must not treat the id as the discriminator for "is
+    this tracked": always check ``tracked`` instead. Other fields
+    (``path``, ``branch``, ``repo_root``, ``backing``) are populated from
+    git's porcelain output where available.
     """
 
     record: WorktreeRecord
@@ -224,8 +246,12 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
     synthesised (``tracked=False``) when no persisted record exists for them
     yet -- the primary materialises via the first ``WorktreeManager.start()``
     call, a linked worktree via ``adopt()``. See ``EnvironmentEntry`` for the
-    id convention used for a synthesised linked-worktree entry. Entries are
-    ordered primary-first, then linked worktrees sorted by path.
+    id convention used for a synthesised linked-worktree entry: since
+    ticket #88, an untracked linked worktree's id is
+    ``untracked_id_for(path)`` (not ``""``), and such an entry can be torn
+    down directly with ``WorktreeManager.remove(checkout_path=entry.record.path)``
+    without needing ``adopt()`` first. Entries are ordered primary-first,
+    then linked worktrees sorted by path.
 
     Raises ``InvalidRepoError`` if the ``git worktree list --porcelain`` call
     itself fails (e.g. a damaged repo or a transient git error) -- consistent
@@ -306,12 +332,14 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
             else:
                 # On disk but not (yet) adopted: still a real, listable
                 # environment -- synthesise it as untracked rather than
-                # dropping it, so a caller can discover it and call adopt().
-                # No deterministic id exists for a linked worktree (unlike
-                # the primary), so id="" -- see EnvironmentEntry's docstring
-                # for why that can never collide with a real tracked id.
+                # dropping it, so a caller can discover it and either
+                # call adopt() to import it, or remove(checkout_path=...)
+                # to tear it down directly (ticket #88). id is a
+                # deterministic, location-hashed id (see
+                # EnvironmentEntry's docstring) -- display/correlation
+                # only, not a state-store key.
                 record = WorktreeRecord(
-                    id="",
+                    id=untracked_id_for(wt_path),
                     repo_root=repo_root_str,
                     branch=block.get("branch"),
                     path=wt_path.as_posix(),
@@ -339,4 +367,5 @@ __all__ = [
     "classify_checkout",
     "list_repo",
     "primary_id_for",
+    "untracked_id_for",
 ]
