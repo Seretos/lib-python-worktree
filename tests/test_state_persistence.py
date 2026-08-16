@@ -1149,6 +1149,11 @@ def test_find_by_branch_skips_primary_records_yaml(state_dir: Path):
 # TestPidAliveWindowsAccessDenied -- ticket #95, R4
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="_pid_alive_windows exercises win32-only ctypes APIs "
+    "(ctypes.get_last_error/set_last_error, kernel32 bindings)",
+)
 class TestPidAliveWindowsAccessDenied:
     """R4 (ticket #95): ``_pid_alive_windows`` must not read ACCESS_DENIED as
     dead.
@@ -1258,7 +1263,6 @@ class TestPidAliveWindowsAccessDenied:
         ):
             assert _pid_alive_windows(42) is False
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only sanity check")
     def test_real_own_pid_is_alive(self):
         """End-to-end sanity check against a real Windows process: our own
         PID must read as alive."""
