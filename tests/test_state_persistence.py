@@ -315,6 +315,49 @@ def test_reconcile_dead_pid(state_dir: Path, tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# reconcile(): "stop_incomplete" status must survive a dead-role reconcile
+# (ticket #87 follow-up, finding B2)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_preserves_stop_incomplete_status(state_dir: Path, tmp_path: Path):
+    """A record already marked 'stop_incomplete' (process_lifecycle.stop()'s
+    honest "something I tried to kill may still be alive" status) must not be
+    silently flipped back to 'stopped' just because reconcile() also finds a
+    *different*, unrelated dead role on the same record.
+
+    Regression scenario: a multi-role worktree where stop(role="main") could
+    not confirm a leaked grandchild had died and set status="stop_incomplete",
+    while record.pids still holds a live "worker" role. When that worker
+    later dies for an unrelated reason and reconcile() runs, the dead-role
+    branch must not discard the stop_incomplete guarantee."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-stop-incomplete"
+    wt_path.mkdir()
+    dead_pid = 99999999  # extremely unlikely to be alive
+
+    rec = _make_record(
+        id="wt-stop-incomplete",
+        path=str(wt_path),
+        status="stop_incomplete",
+        pids={"worker": dead_pid},
+    )
+    store.add(rec)
+
+    assert not _pid_alive(dead_pid), "test assumption: pid 99999999 must not be alive"
+
+    report = reconcile(store)
+
+    assert "wt-stop-incomplete" in report.stopped
+    updated = store.get("wt-stop-incomplete")
+    assert updated is not None
+    assert "worker" not in updated.pids
+    assert updated.status == "stop_incomplete", (
+        "reconcile() must not overwrite an existing 'stop_incomplete' status "
+        "back to 'stopped' when it also clears an unrelated dead role"
+    )
+
+
+# ---------------------------------------------------------------------------
 # reconcile(): live PID unchanged
 # ---------------------------------------------------------------------------
 

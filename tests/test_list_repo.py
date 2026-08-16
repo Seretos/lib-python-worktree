@@ -12,7 +12,7 @@ import pytest
 
 from lib_python_worktree.core._exceptions import InvalidRepoError
 from lib_python_worktree.core.checkout import list_repo as _list_repo
-from lib_python_worktree.core.checkout import primary_id_for
+from lib_python_worktree.core.checkout import primary_id_for, untracked_id_for
 from lib_python_worktree.core.manager import ManagerConfig, WorktreeManager
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 from lib_python_worktree.core.yaml_store import YamlStateStore
@@ -188,9 +188,11 @@ def test_list_repo_untracked_linked_worktree_appears_tracked_false(
     linked_entries = [e for e in listing.entries if e.record.backing == "worktree"]
     assert len(linked_entries) == 1
     assert linked_entries[0].tracked is False
-    # No deterministic id exists for a linked worktree -- pinned contract:
-    # the empty string, never mistaken for a real tracked id.
-    assert linked_entries[0].record.id == ""
+    # Ticket #88: a deterministic, location-hashed id -- not "" -- so the
+    # entry environment_list displays is addressable via
+    # remove(checkout_path=...).
+    assert linked_entries[0].record.id == untracked_id_for(linked_worktree)
+    assert linked_entries[0].record.id
     assert linked_entries[0].record.path == linked_worktree.resolve().as_posix()
     assert linked_entries[0].record.branch == "feature/alpha"
     assert linked_entries[0].record.repo_root == git_repo.resolve().as_posix()
@@ -231,7 +233,7 @@ def test_list_repo_tracked_and_untracked_linked_worktrees_mixed(
 
         untracked_entry = linked_entries[linked_worktree.resolve().as_posix()]
         assert untracked_entry.tracked is False
-        assert untracked_entry.record.id == ""
+        assert untracked_entry.record.id == untracked_id_for(linked_worktree)
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(other_wt)],
@@ -287,3 +289,206 @@ def test_pure_list_repo_function_no_manager(git_repo: Path):
     assert len(listing.entries) == 1
     assert listing.entries[0].tracked is True
     assert listing.entries[0].record.id == "hand-built-primary"
+
+
+# ---------------------------------------------------------------------------
+# Ticket #85 -- tracked-entry branch freshness
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_list_repo_tracked_linked_worktree_branch_reflects_live_checkout(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Driving test: a tracked linked worktree's branch reflects git's live
+    view (per `git worktree list --porcelain`), not the value last persisted
+    to state.yaml -- e.g. after a manual `git checkout` inside the
+    worktree."""
+    records = [
+        WorktreeRecord(
+            id="tracked-linked-85",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/alpha",
+            path=linked_worktree.resolve().as_posix(),
+            backing="worktree",
+        )
+    ]
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/switched"],
+        cwd=linked_worktree, check=True, capture_output=True,
+    )
+
+    listing = _list_repo(git_repo, records)
+
+    linked_entry = next(e for e in listing.entries if e.record.backing == "worktree")
+    assert linked_entry.tracked is True
+    assert linked_entry.record.branch == "feature/switched"
+
+
+@pytest.mark.requires_git
+def test_list_repo_tracked_linked_worktree_branch_unchanged_when_in_sync(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Edge case: when the stored branch already matches git's live view,
+    list_repo() must not needlessly copy the record -- entry.record stays
+    identical (by identity) to the record object passed in."""
+    records = [
+        WorktreeRecord(
+            id="tracked-linked-85-sync",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/alpha",
+            path=linked_worktree.resolve().as_posix(),
+            backing="worktree",
+        )
+    ]
+
+    listing = _list_repo(git_repo, records)
+
+    linked_entry = next(e for e in listing.entries if e.record.backing == "worktree")
+    assert linked_entry.record.branch == "feature/alpha"
+    assert linked_entry.record is records[0]
+
+
+@pytest.mark.requires_git
+def test_list_repo_branch_refresh_does_not_mutate_caller_record_or_store(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Driving test: the in-memory branch refresh must never be persisted --
+    state.yaml stays byte-identical and a fresh store.list() still reports
+    the stale stored branch; only the returned RepoListing carries the live
+    value. Against the pure function directly, the caller's own record
+    object must also be left untouched (dataclasses.replace(), never
+    in-place mutation)."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+    rec = WorktreeRecord(
+        id="tracked-linked-85-persist",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+    )
+    store.add(rec)
+
+    state_bytes_before = (state_dir / "state.yaml").read_bytes()
+
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/switched"],
+        cwd=linked_worktree, check=True, capture_output=True,
+    )
+
+    listing = mgr.list_repo(str(git_repo))
+    linked_entry = next(e for e in listing.entries if e.record.backing == "worktree")
+    assert linked_entry.record.branch == "feature/switched"
+
+    assert (state_dir / "state.yaml").read_bytes() == state_bytes_before
+    reloaded = next(r for r in store.list() if r.id == rec.id)
+    assert reloaded.branch == "feature/alpha"
+
+    # Against the pure function with a plain records list: the caller's own
+    # record object is untouched, and the returned entry is a different
+    # object (dataclasses.replace(), not in-place mutation).
+    plain_records = [
+        WorktreeRecord(
+            id="tracked-linked-85-persist",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/alpha",
+            path=linked_worktree.resolve().as_posix(),
+            backing="worktree",
+        )
+    ]
+    pure_listing = _list_repo(git_repo, plain_records)
+    pure_entry = next(e for e in pure_listing.entries if e.record.backing == "worktree")
+    assert plain_records[0].branch == "feature/alpha"
+    assert pure_entry.record is not plain_records[0]
+
+
+@pytest.mark.requires_git
+def test_list_repo_branch_refresh_does_not_mutate_in_memory_store_record(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Edge case: InMemoryStateStore.list() hands out its live record
+    objects, not copies -- list_repo() must use dataclasses.replace(), never
+    in-place mutation, or this would silently corrupt the in-memory store."""
+    store = InMemoryStateStore()
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+    rec = WorktreeRecord(
+        id="tracked-linked-85-inmem",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+    )
+    store.add(rec)
+
+    subprocess.run(
+        ["git", "checkout", "-b", "feature/switched"],
+        cwd=linked_worktree, check=True, capture_output=True,
+    )
+
+    listing = mgr.list_repo(str(git_repo))
+    linked_entry = next(e for e in listing.entries if e.record.backing == "worktree")
+    assert linked_entry.record.branch == "feature/switched"
+
+    # The store's own record object must be untouched.
+    assert store.get("tracked-linked-85-inmem").branch == "feature/alpha"
+    assert rec.branch == "feature/alpha"
+
+
+@pytest.mark.requires_git
+def test_list_repo_tracked_linked_worktree_detached_head_keeps_stored_branch(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Guard test: a detached-HEAD linked worktree's porcelain block has no
+    `branch` line, so the refresh must keep the stored (last-known) branch
+    rather than blanking it to None."""
+    records = [
+        WorktreeRecord(
+            id="tracked-linked-85-detached",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/alpha",
+            path=linked_worktree.resolve().as_posix(),
+            backing="worktree",
+        )
+    ]
+    subprocess.run(
+        ["git", "checkout", "--detach"],
+        cwd=linked_worktree, check=True, capture_output=True,
+    )
+
+    listing = _list_repo(git_repo, records)
+
+    linked_entry = next(e for e in listing.entries if e.record.backing == "worktree")
+    assert linked_entry.tracked is True
+    assert linked_entry.record.branch == "feature/alpha"
+    assert linked_entry.record.branch is not None
+
+
+@pytest.mark.requires_git
+def test_list_repo_tracked_primary_branch_stays_none_after_start(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Guard test: a tracked primary entry's branch must stay None (#84
+    decision) even though its porcelain block reports the live branch (e.g.
+    main) -- the refresh applies only to linked worktrees, never the
+    primary."""
+    store = YamlStateStore(state_dir=tmp_path / "state")
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+    mgr.start(checkout_path=str(git_repo))
+
+    listing = mgr.list_repo(str(git_repo))
+    primary_entry = next(e for e in listing.entries if e.record.backing == "primary")
+    assert primary_entry.tracked is True
+    assert primary_entry.record.branch is None

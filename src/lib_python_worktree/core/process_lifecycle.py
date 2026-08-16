@@ -6,11 +6,18 @@ Public API
   Spawns a detached process, persists ``pids[role]`` and ``status="running"``
   to the state store, returns the updated ``WorktreeRecord``.
 
-- ``stop(worktree_id, *, store, role="main", timeout=10.0)``
+- ``stop(worktree_id, *, store, role="main", timeout=10.0, kill_orphans=False)``
   Gracefully terminates the process (SIGTERM/CTRL_BREAK), waits up to
-  ``timeout`` seconds, then force-kills if still alive.  Clears
-  ``pids[role]``; sets ``status="stopped"`` only when no other roles
-  remain.  Returns the updated ``WorktreeRecord``.
+  ``timeout`` seconds, then force-kills if still alive.  Also snapshots and
+  kills the tracked PID's whole descendant process tree (ticket #87) so a
+  grandchild spawned by a nested shell (e.g. a ``run:`` step whose command
+  itself invokes another shell) cannot survive by being reparented once the
+  tracked PID dies -- this tree kill is unconditional, not gated on
+  ``kill_orphans``.  Clears ``pids[role]``; sets ``status="stopped"`` only
+  when no other roles remain AND nothing this call tried to kill is still
+  alive -- otherwise ``status="stop_incomplete"`` and a warning is logged
+  naming the survivor PIDs, so a leaked process is never silently reported
+  as stopped.  Returns the updated ``WorktreeRecord``.
 
 Platform differences
 --------------------
@@ -28,6 +35,7 @@ No ``mcp`` imports; returns plain dataclasses (``WorktreeRecord``).
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -39,6 +47,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .state import StateStore, WorktreeRecord
 from .yaml_store import _pid_alive
+
+_logger = logging.getLogger(__name__)
 
 # The role key used when the caller does not supply an explicit role.
 DEFAULT_ROLE = "main"
@@ -87,6 +97,31 @@ _HANDLE_QUERY_TIMEOUT_SEC = 0.01
 # the scan from ever independently consuming up to this ceiling *on top of*
 # a caller-supplied ``timeout`` (e.g. ``stop(timeout=...)``).
 _HANDLE_SCAN_BUDGET_SEC = 15.0
+
+# Ticket #87: cap on how many descendant processes _process_tree will ever
+# collect for a single root pid. Defense in depth against a pathological or
+# cyclic process tree turning a single stop() call into an unbounded scan.
+_MAX_TREE_NODES = 256
+
+# Ticket #87: hard ceiling (seconds) on _find_blocking_processes' own
+# discovery cost -- Pass 1 (cwd), Pass 1b (cmdline tokens), Pass 1c (Windows
+# handle-table scan), and Pass 2 (open files) combined. Before this fix,
+# these passes had no cap of their own beyond Pass 1c's per-call budget --
+# a large/slow ambient process list (observed ~75s of CPU for a single call
+# that found nothing) could make discovery alone blow through whatever
+# timeout the caller (e.g. stop(timeout=...)) requested. _DISCOVERY_MAX_SEC
+# bounds discovery independent of any caller-supplied deadline; when a
+# deadline *is* supplied, discovery is bounded by whichever of the two is
+# tighter (see _find_blocking_processes).
+_DISCOVERY_MAX_SEC = 20.0
+
+# Ticket #87: seconds of the caller's deadline reserved (not spent on
+# discovery) so that time remains for the actual signal/kill step once
+# discovery completes. Shrunk to at most 20% of whatever time remains when
+# the caller's deadline itself leaves less than this much room, so the
+# reserve can never itself consume the entire budget on a very tight
+# deadline.
+_DISCOVERY_RESERVE_SEC = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +350,341 @@ class KilledProcessInfo:
     pid: int
     name: str
     cmdline: List[str] = field(default_factory=list)
+
+
+def _process_tree(pid: int) -> List[KilledProcessInfo]:
+    """Return the descendant process tree of *pid*, deepest-first (ticket #87).
+
+    This is the fix for the double-shell-nesting problem: ``stop()`` used to
+    only ever signal the single PID it tracked, so a grandchild spawned by a
+    nested shell (e.g. ``run: powershell ... -Command "..."`` where the
+    ``run:`` string itself invokes another shell) survived being reparented
+    once the tracked PID died, along with any ports it held. Snapshotting the
+    *whole* tree while the root is still alive means reparenting after the
+    kill can no longer hide anything.
+
+    Primary implementation: ``psutil.Process(pid).children(recursive=True)``.
+    Falls back to a manual ``ppid``-walk via
+    ``psutil.process_iter(["pid", "ppid"])`` when the primary call raises or
+    returns nothing -- e.g. because psutil's own recursive walk lost a race
+    with a process exiting mid-scan.
+
+    Ordering is deepest-first: a node whose parent is also in the collected
+    set sorts after that parent, so callers can signal/kill children before
+    their own ancestors without orphaning a node mid-walk. Depth is derived
+    purely from each collected node's own ``ppid()`` relative to the other
+    *collected* nodes -- no extra ``psutil.Process`` calls beyond what was
+    already gathered.
+
+    Capped at ``_MAX_TREE_NODES`` entries. The host process (our own PID) and
+    all of its OS-level ancestors are always excluded, even if they somehow
+    appear as a "descendant" (e.g. PID reuse) -- this function must never
+    target the caller's own lineage.
+
+    Truncation is never silent (ticket #87 follow-up, finding F2): when the
+    cap is actually hit -- i.e. more descendants exist than the cap allows,
+    not merely "exactly ``_MAX_TREE_NODES`` found, no more" -- a ``warning``
+    is logged naming *pid* and the cap, so an operator can tell from the
+    logs alone that a snapshot may be incomplete. Callers that need to know
+    this programmatically (rather than just log it) -- e.g. ``stop()``,
+    which must not report a clean ``"stopped"`` purely on the strength of a
+    capped snapshot -- treat ``len(result) >= _MAX_TREE_NODES`` as "cannot
+    guarantee completeness": that check is a cheap, self-contained proxy for
+    the same condition this warning logs, with no need to change this
+    function's return type (and no risk of the boundary case where the tree
+    happens to have *exactly* ``_MAX_TREE_NODES`` descendants and no more --
+    that case is, conservatively, still treated as "not guaranteed
+    complete").
+
+    Never raises: ``NoSuchProcess``/``AccessDenied``/anything else degrades
+    to a best-effort partial list, or ``[]`` if nothing could be gathered.
+    ``pid <= 0`` (including ``None``) returns ``[]`` immediately.
+    """
+    if not pid or pid <= 0:
+        return []
+
+    import psutil
+
+    host_pid = os.getpid()
+    excluded: "set[int]" = {host_pid}
+    try:
+        for ancestor in psutil.Process(host_pid).parents():
+            excluded.add(ancestor.pid)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        pass
+
+    descendants: list = []
+    truncated = False
+    try:
+        descendants = list(psutil.Process(pid).children(recursive=True))
+    except Exception:  # noqa: BLE001 -- e.g. NoSuchProcess/AccessDenied
+        descendants = []
+
+    # Only attempt the (expensive, full-system) ppid-walk fallback when *pid*
+    # plausibly still exists. A dead/nonexistent pid cannot have live
+    # descendants reachable via a ppid-walk either (any children it once had
+    # are already reparented elsewhere by the time it is gone), so spending
+    # a full psutil.process_iter() sweep on that case would be pure waste --
+    # this is also the common case (an already-dead root, or a
+    # blocking-process pid supplied by _kill_blocking_processes that turns
+    # out not to exist), so skipping it here matters for real wall-clock
+    # cost, not just a theoretical corner case. psutil.pid_exists() is a
+    # single cheap existence check, not an enumeration.
+    if not descendants and psutil.pid_exists(pid):
+        # Fallback: manual ppid-walk. Covers the case where
+        # children(recursive=True) itself raised or returned nothing (e.g.
+        # a race with a process exiting mid-scan) even though *pid* is
+        # still alive.
+        try:
+            by_ppid: Dict[int, List[int]] = {}
+            for proc in psutil.process_iter(["pid", "ppid"]):
+                try:
+                    ppid = proc.info.get("ppid")
+                except Exception:  # noqa: BLE001
+                    continue
+                if ppid is None:
+                    continue
+                by_ppid.setdefault(ppid, []).append(proc.info["pid"])
+            frontier = [pid]
+            seen_pids: "set[int]" = set()
+            while frontier and len(seen_pids) < _MAX_TREE_NODES:
+                next_frontier: List[int] = []
+                for parent_pid in frontier:
+                    for child_pid in by_ppid.get(parent_pid, []):
+                        if child_pid == pid or child_pid in seen_pids:
+                            continue
+                        seen_pids.add(child_pid)
+                        next_frontier.append(child_pid)
+                frontier = next_frontier
+            if frontier:
+                # The while loop above exited with unexplored children still
+                # queued in `frontier` -- it stopped because `seen_pids` hit
+                # the cap, not because the tree was exhausted. The true tree
+                # is larger than what was collected (finding F2).
+                truncated = True
+            for child_pid in seen_pids:
+                try:
+                    descendants.append(psutil.Process(child_pid))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001 -- best-effort, never propagate
+            pass
+
+    # De-duplicate by pid, drop the host process / its ancestors (defensive
+    # -- should never legitimately appear), cap at _MAX_TREE_NODES. Unlike a
+    # `break` once the cap is hit, this keeps scanning the (already
+    # in-memory, cheap -- no further psutil calls) remainder of *descendants*
+    # so `truncated` accurately reflects whether more than the cap actually
+    # existed (finding F2), not just "cap coincidentally == count found".
+    by_pid: Dict[int, object] = {}
+    for proc in descendants:
+        try:
+            proc_pid = proc.pid
+        except Exception:  # noqa: BLE001
+            continue
+        if proc_pid in excluded or proc_pid in by_pid:
+            continue
+        if len(by_pid) >= _MAX_TREE_NODES:
+            truncated = True
+            continue
+        by_pid[proc_pid] = proc
+
+    known_pids = set(by_pid)
+    depth_cache: Dict[int, int] = {}
+
+    def _depth(proc_pid: int) -> int:
+        if proc_pid in depth_cache:
+            return depth_cache[proc_pid]
+        depth_cache[proc_pid] = 0  # cycle guard while this node is computing
+        proc = by_pid[proc_pid]
+        try:
+            parent_pid = proc.ppid()
+        except Exception:  # noqa: BLE001
+            parent_pid = None
+        if parent_pid in known_pids and parent_pid != proc_pid:
+            depth = 1 + _depth(parent_pid)
+        else:
+            depth = 0
+        depth_cache[proc_pid] = depth
+        return depth
+
+    ordered_pids = sorted(by_pid, key=_depth, reverse=True)
+
+    result: List[KilledProcessInfo] = []
+    for proc_pid in ordered_pids:
+        proc = by_pid[proc_pid]
+        name = ""
+        cmdline: List[str] = []
+        try:
+            name = proc.name() or ""
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cmdline = proc.cmdline() or []
+        except Exception:  # noqa: BLE001
+            pass
+        result.append(KilledProcessInfo(pid=proc_pid, name=name, cmdline=cmdline))
+
+    if truncated:
+        # Ticket #87 follow-up, finding F2: make the cap's effect observable
+        # instead of silently dropping the excess. `len(result) ==
+        # _MAX_TREE_NODES` here always -- see the corresponding
+        # `len(...) >= _MAX_TREE_NODES` proxy check callers (e.g. stop())
+        # use to treat this snapshot as "cannot guarantee completeness".
+        _logger.warning(
+            "_process_tree(pid=%s): descendant tree truncated at %s nodes -- "
+            "the true tree is larger than what was collected; some "
+            "descendants were not snapshotted and will not be signalled or "
+            "killed by this pass",
+            pid, _MAX_TREE_NODES,
+        )
+
+    return result
+
+
+def _signal_process_group(pid: int, *, force: bool = False) -> bool:
+    """POSIX-only: signal the process group of *pid* if it is the leader.
+
+    ``start_new_session=True`` (used by ``_spawn_detached`` on POSIX) makes
+    the spawned process the leader of its own new session and process group
+    (``pgid == pid``). When that holds, this signals the *whole group* in one
+    shot via ``os.killpg`` -- catching descendants that already detached into
+    that same group even before an individual-PID tree snapshot could see
+    them.
+
+    Returns ``True`` if a signal was actually sent, ``False`` otherwise:
+    always ``False`` on Windows (no process groups in the POSIX sense);
+    ``False`` when *pid* no longer exists; ``False`` when *pid* is not the
+    leader of its own group (``os.getpgid(pid) != pid``) -- signalling a
+    group we did not create could hit unrelated processes; and ``False`` when
+    that group is our *own* group (``os.getpgid(0)``) -- this function must
+    never be able to signal the caller's own process group.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return False
+    if pgid != pid:
+        return False
+    try:
+        own_pgid = os.getpgid(0)
+    except OSError:
+        own_pgid = None
+    if own_pgid is not None and pgid == own_pgid:
+        return False
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        return False
+    return True
+
+
+def _process_group_members(pid: int) -> List[int]:
+    """POSIX-only: snapshot the PIDs sharing *pid*'s process group.
+
+    Companion to :func:`_signal_process_group` -- ticket #87 follow-up
+    (finding B3): that function fires a single ``os.killpg`` SIGTERM at
+    *pid*'s whole process group, catching a descendant that already
+    detached out of *pid*'s ppid lineage (so it is absent from
+    :func:`_process_tree`) but still shares *pid*'s pgid. Nothing folded
+    those group members into the subsequent force-kill step or the final
+    survivor re-probe, so a stubborn same-group descendant that ignored
+    that one SIGTERM could survive ``stop()`` while it still reported
+    ``"stopped"``. Callers snapshot this list BEFORE
+    :func:`_signal_process_group` is invoked -- same rationale as
+    :func:`_process_tree` being snapshotted before any signal -- then fold
+    the result into both the force-kill path and the candidate PIDs
+    checked by the survivor re-probe.
+
+    Mirrors :func:`_signal_process_group`'s own guards exactly, so this only
+    ever returns members in the same situations that function would actually
+    signal the group: ``[]`` on Windows; ``[]`` when *pid* is not the leader
+    of its own group (``os.getpgid(pid) != pid``); ``[]`` when that group is
+    our own process group. The host process, its ancestors, and *pid* itself
+    are always excluded from the result -- callers already handle *pid*
+    separately.
+
+    Never raises: any psutil/OS failure degrades to a best-effort partial (or
+    empty) list rather than propagating out of ``stop()``.
+    """
+    if sys.platform == "win32":
+        return []
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return []
+    if pgid != pid:
+        return []
+    try:
+        own_pgid = os.getpgid(0)
+    except OSError:
+        own_pgid = None
+    if own_pgid is not None and pgid == own_pgid:
+        return []
+
+    import psutil
+
+    host_pid = os.getpid()
+    excluded: "set[int]" = {host_pid, pid}
+    try:
+        for ancestor in psutil.Process(host_pid).parents():
+            excluded.add(ancestor.pid)
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        pass
+
+    members: List[int] = []
+    try:
+        for proc in psutil.process_iter(["pid"]):
+            member_pid = proc.info.get("pid")
+            if member_pid is None or member_pid in excluded or member_pid in members:
+                continue
+            try:
+                if os.getpgid(member_pid) == pgid:
+                    members.append(member_pid)
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001 -- best-effort, never propagate
+        return members
+
+    return members
+
+
+def _kill_process_tree(
+    tree: List[KilledProcessInfo], *, timeout: float
+) -> List[KilledProcessInfo]:
+    """Gracefully signal, then wait/force-kill, every node in *tree*.
+
+    *tree* is expected to already be in deepest-first order (see
+    :func:`_process_tree`) so a child is always signalled before its own
+    ancestor. Mirrors the budget discipline of :func:`_kill_blocking_processes`:
+    each node is signalled immediately, then the remaining *timeout* budget is
+    split evenly across the nodes for the subsequent wait/force-kill step;
+    once the shared deadline passes, any remaining nodes are still signalled
+    but no longer waited on.
+
+    Returns *tree* unchanged so callers can use it for a post-hoc survivor
+    check.
+    """
+    if not tree:
+        return tree
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    n = len(tree)
+
+    for info in tree:
+        _send_graceful_signal(info.pid)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Budget exhausted -- signal already sent; skip the wait for this
+            # node and all subsequent ones (they will also only be signalled).
+            continue
+        per_pid_budget = min(remaining, timeout / n)
+        _wait_or_kill(info.pid, timeout=per_pid_budget)
+
+    return tree
 
 
 def _win_handle_holders(
@@ -746,8 +1116,11 @@ def _find_blocking_processes(
         fixed ``_HANDLE_SCAN_BUDGET_SEC`` ceiling on top of everything else.
         ``None`` (the default, used by direct/test callers) means "use the
         full ``_HANDLE_SCAN_BUDGET_SEC`` ceiling, no external deadline".
-        Passes 1, 1b, and 2 are unaffected by *deadline* — they are existing,
-        already-fast linear scans with no comparable per-call cost.
+        Passes 1, 1b, and 2 are now ALSO bounded by *deadline* (ticket #87):
+        before this fix they were unbounded linear scans, and against a
+        large/slow ambient process list that measured ~75s of CPU for a
+        single call that found nothing. See ``_DISCOVERY_MAX_SEC`` /
+        ``_DISCOVERY_RESERVE_SEC`` below.
     """
     import psutil
 
@@ -761,39 +1134,73 @@ def _find_blocking_processes(
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         pass
 
+    # Ticket #87: hard-bound the wall-clock cost of discovery as a whole
+    # (Pass 1, 1b, 1c, 2 combined), independent of any per-pass cost of its
+    # own. `scan_stop` is computed once, at entry, from two ceilings:
+    #  - `_DISCOVERY_MAX_SEC`, an absolute cap that applies even with no
+    #    caller-supplied *deadline* at all;
+    #  - when *deadline* IS supplied, `deadline` minus a small reserve, so
+    #    that discovery never eats into the time the caller needs afterward
+    #    for the actual signal/kill step. The reserve shrinks to at most 20%
+    #    of whatever time remains on a very tight deadline, so it can never
+    #    by itself consume the whole budget.
+    # Checked at the top of every pass and inside every per-process loop
+    # below so a slow ambient process list degrades gracefully to "whatever
+    # was found so far" instead of blowing through the caller's budget.
+    entry_ts = time.monotonic()
+    if deadline is None:
+        scan_stop = entry_ts + _DISCOVERY_MAX_SEC
+    else:
+        # Clamp to 0 (ticket #87 follow-up, finding B4): when *deadline* has
+        # already elapsed by entry (remaining < 0), the un-clamped algebra
+        # below still resolves to a scan_stop at or before entry_ts -- so
+        # every pass's own `time.monotonic() <= scan_stop` guard already
+        # skips it, and this is not a live bug -- but leaving `remaining`
+        # negative makes that non-obvious from the arithmetic alone. Clamping
+        # here makes the "no discovery once the deadline is already gone"
+        # intent unambiguous without changing behaviour.
+        remaining = max(0.0, deadline - entry_ts)
+        reserve = min(_DISCOVERY_RESERVE_SEC, 0.2 * remaining)
+        scan_stop = min(entry_ts + _DISCOVERY_MAX_SEC, deadline - reserve)
+
     seen_pids: set[int] = set()
     result: List[KilledProcessInfo] = []
 
     # Pass 1: CWD match.
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            pid = proc.info["pid"]
-            if pid in excluded_pids:
-                continue
+    if time.monotonic() <= scan_stop:
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            if time.monotonic() > scan_stop:
+                break
             try:
-                cwd = proc.cwd()
+                pid = proc.info["pid"]
+                if pid in excluded_pids:
+                    continue
+                try:
+                    cwd = proc.cwd()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    continue
+                norm_cwd = os.path.normcase(os.path.normpath(cwd))
+                # Match if the process cwd equals the target path or is under it.
+                if norm_cwd == normalized or norm_cwd.startswith(normalized + os.sep):
+                    seen_pids.add(pid)
+                    result.append(
+                        KilledProcessInfo(
+                            pid=pid,
+                            name=proc.info["name"] or "",
+                            cmdline=proc.info["cmdline"] or [],
+                        )
+                    )
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 continue
-            norm_cwd = os.path.normcase(os.path.normpath(cwd))
-            # Match if the process cwd equals the target path or is under it.
-            if norm_cwd == normalized or norm_cwd.startswith(normalized + os.sep):
-                seen_pids.add(pid)
-                result.append(
-                    KilledProcessInfo(
-                        pid=pid,
-                        name=proc.info["name"] or "",
-                        cmdline=proc.info["cmdline"] or [],
-                    )
-                )
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
-            continue
 
     # Pass 1b (Windows only): cmdline token scan.
     # proc.cwd() raises AccessDenied for almost all foreign processes on Windows.
     # Scan cmdline tokens as a fallback: if any token resolves to a path under
     # the worktree directory, treat the process as blocking.
-    if sys.platform == "win32":
+    if sys.platform == "win32" and time.monotonic() <= scan_stop:
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            if time.monotonic() > scan_stop:
+                break
             try:
                 pid = proc.info["pid"]
                 if pid in excluded_pids or pid in seen_pids:
@@ -828,7 +1235,7 @@ def _find_blocking_processes(
     # time remains at all, the scan is skipped outright rather than spending
     # any of the remaining time on a scan that has no chance to report back
     # before the deadline is needed elsewhere (Pass 2 / the kill/wait step).
-    if sys.platform == "win32":
+    if sys.platform == "win32" and time.monotonic() <= scan_stop:
         if deadline is None:
             handle_scan_budget = _HANDLE_SCAN_BUDGET_SEC
         else:
@@ -865,29 +1272,32 @@ def _find_blocking_processes(
 
     # Pass 2: open file handles — catches daemons that have changed their cwd
     # away from the worktree but still hold file locks inside it.
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            pid = proc.info["pid"]
-            if pid in excluded_pids or pid in seen_pids:
-                continue
+    if time.monotonic() <= scan_stop:
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            if time.monotonic() > scan_stop:
+                break
             try:
-                open_files = proc.open_files()
+                pid = proc.info["pid"]
+                if pid in excluded_pids or pid in seen_pids:
+                    continue
+                try:
+                    open_files = proc.open_files()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    continue
+                for finfo in open_files:
+                    norm_fpath = os.path.normcase(os.path.normpath(finfo.path))
+                    if norm_fpath.startswith(normalized + os.sep) or norm_fpath == normalized:
+                        seen_pids.add(pid)
+                        result.append(
+                            KilledProcessInfo(
+                                pid=pid,
+                                name=proc.info["name"] or "",
+                                cmdline=proc.info["cmdline"] or [],
+                            )
+                        )
+                        break
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 continue
-            for finfo in open_files:
-                norm_fpath = os.path.normcase(os.path.normpath(finfo.path))
-                if norm_fpath.startswith(normalized + os.sep) or norm_fpath == normalized:
-                    seen_pids.add(pid)
-                    result.append(
-                        KilledProcessInfo(
-                            pid=pid,
-                            name=proc.info["name"] or "",
-                            cmdline=proc.info["cmdline"] or [],
-                        )
-                    )
-                    break
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
-            continue
 
     return result
 
@@ -926,11 +1336,46 @@ def _kill_blocking_processes(
         may still spend a small, unavoidable amount of time (e.g. Pass 1/1b/2
         scans), but Pass 1c is skipped outright since no budget remains for
         it.
+
+    Lineage expansion (ticket #87)
+    -------------------------------
+    Each blocker found by :func:`_find_blocking_processes` (a path-heuristic
+    match) has its own descendant tree collected via :func:`_process_tree`
+    and folded into the result (de-duplicated by PID) before any signalling
+    happens. This catches a blocker's own children even when they evade the
+    path heuristics themselves (e.g. a grandchild that changed its cwd away
+    from the worktree and holds no matching open file handle).
+
+    This loop is itself bounded by the same *deadline* as everything else in
+    this function (ticket #87 follow-up, finding F1): before that fix it ran
+    AFTER discovery with no budget check of its own, so a host with many
+    path-heuristic blockers could make this loop alone blow through the
+    caller's *timeout* -- contradicting the "total runtime ... is bounded by
+    *timeout* seconds" guarantee above. Once the deadline passes, expansion
+    stops issuing further :func:`_process_tree` calls and degrades
+    gracefully to whatever lineage was already expanded so far -- the same
+    pattern :func:`_find_blocking_processes` already uses for its own Pass
+    1/1b/1c/2 discovery loops.
     """
     deadline = time.monotonic() + timeout
     found = _find_blocking_processes(path, os.getpid(), deadline=deadline)
     if not found:
         return found
+
+    seen_pids = {info.pid for info in found}
+    expanded: List[KilledProcessInfo] = list(found)
+    for info in found:
+        if time.monotonic() >= deadline:
+            # Budget exhausted -- stop issuing further _process_tree() calls;
+            # whatever lineage was expanded so far is kept, not discarded.
+            break
+        for descendant in _process_tree(info.pid):
+            if descendant.pid in seen_pids:
+                continue
+            seen_pids.add(descendant.pid)
+            expanded.append(descendant)
+    found = expanded
+
     n = len(found)
     for info in found:
         # Always send the graceful signal, even if the budget is exhausted.
@@ -1046,21 +1491,77 @@ def stop(
 
     Sends a graceful signal, waits up to *timeout* seconds, then force-kills
     if the process is still alive.  Clears ``pids[role]``; sets
-    ``status="stopped"`` only when no other roles remain in ``pids``.
+    ``status="stopped"`` only when no other roles remain in ``pids`` AND
+    nothing this call tried to kill is still alive.
 
     If the PID is already dead, clears the record gracefully without raising.
 
-    When *kill_orphans* is ``True``, a second pass using
-    :func:`_kill_blocking_processes` is run against ``record.path`` after the
-    primary signal/wait step.  This terminates grandchild processes that were
-    reparented away from the shell wrapper (e.g. via ``CREATE_NEW_PROCESS_GROUP``
-    on Windows or ``start_new_session=True`` on POSIX) and therefore would not
-    be caught by signalling the tracked PID alone.
+    Process-tree kill (ticket #87)
+    -------------------------------
+    Before any signal is sent, the tracked PID's descendant process tree is
+    snapshotted via :func:`_process_tree` -- this is what makes a grandchild
+    spawned by a nested shell (e.g. a ``run:`` step whose command string
+    itself invokes another shell) reachable: once the tracked (wrapper) PID
+    is killed, the OS would otherwise reparent that grandchild away, making
+    it invisible to anything that only looks at the tracked PID. On POSIX,
+    :func:`_signal_process_group` additionally signals the tracked PID's
+    whole process group in one shot when it is the group's leader (as
+    ``start_new_session=True`` guarantees for processes this module spawns);
+    :func:`_process_group_members` snapshots that group's *other* member
+    PIDs before that signal is sent, so a same-group descendant absent from
+    the ppid-tree snapshot (e.g. already detached out of the tracked PID's
+    lineage) is not just signalled once and forgotten -- it is folded into
+    the tree-kill step below (force-killed if it ignores the graceful
+    signal) and into the final survivor re-probe. After the tracked PID
+    itself is handled, the snapshotted tree -- plus those process-group-only
+    members -- is killed via :func:`_kill_process_tree` -- this step is
+    UNCONDITIONAL (it runs regardless of *kill_orphans*): killing the
+    tree/group of the process we ourselves spawned is the meaning of "stop",
+    not orphan-hunting.
 
-    The *timeout* budget is shared across both the primary signal/wait step and
-    the orphan scan: the orphan scan receives only the time that remains after
-    the primary step completes, so the total operation is always bounded by
-    *timeout* seconds.
+    When *kill_orphans* is ``True``, a further pass using
+    :func:`_kill_blocking_processes` is run against ``record.path`` after the
+    tree kill.  This is the path-heuristic (cwd/cmdline/open-file) orphan
+    scan for processes that detached far enough (e.g. into their own
+    session/process group) to evade even the tree snapshot.
+
+    The *timeout* budget is shared across the primary signal/wait step, the
+    tree kill, and the optional orphan scan: each later step receives only
+    the time that remains after the previous one completes, so the total
+    operation is always bounded by *timeout* seconds.
+
+    Status honesty (ticket #87)
+    -----------------------------
+    After every kill step, liveness of the tracked PID, every node in the
+    snapshotted tree, and everything the orphan scan (if run) reported is
+    re-probed. If anything survived, ``status`` is set to
+    ``"stop_incomplete"`` (sticky until the next ``start()``) and a warning
+    naming the survivor PIDs is logged -- ``stop()`` must never report
+    ``"stopped"`` while a process it was responsible for is demonstrably
+    still running. ``pids[role]`` is still cleared either way -- retaining a
+    possibly-dead/reused PID there would be worse (see the module-level
+    docstring / ticket for the postcondition this preserves).
+
+    A capped tree snapshot is likewise never trusted as clean (ticket #87
+    follow-up, finding F2): when the pre-kill :func:`_process_tree` snapshot
+    collected exactly ``_MAX_TREE_NODES`` entries, this call cannot
+    guarantee it saw the whole tree -- the excess beyond the cap was never
+    even examined, let alone killed -- so ``status`` is set to
+    ``"stop_incomplete"`` (with its own warning) even when every collected
+    PID came back dead. Reporting ``"stopped"`` purely on the strength of a
+    capped snapshot would reintroduce exactly the false-positive class this
+    ticket exists to eliminate.
+
+    Known limitation -- PID reuse (out of scope for this ticket): the
+    tracked PID is trusted as-is, with no identity check against the
+    process it originally belonged to. If the OS has recycled that PID
+    number for an unrelated process by the time ``stop()`` runs, this call
+    will signal/kill *that* process's tree/group instead, believing it to
+    be the one it started. A ``psutil.Process(pid).create_time()`` comparison
+    against a start-time recorded by :func:`start` would close this gap; it
+    is a known, pre-existing follow-up, not introduced by this ticket, and
+    intentionally not implemented here (it would touch the record schema and
+    :func:`start`).
 
     Parameters
     ----------
@@ -1071,13 +1572,13 @@ def stop(
     role:
         Identifies the process within the worktree.
     timeout:
-        Seconds to bound the complete stop operation (primary kill + orphan
-        scan combined).  Graceful exit is attempted first; force-kill is used
-        if the process has not exited by the deadline.
+        Seconds to bound the complete stop operation (primary kill + tree
+        kill + orphan scan combined).  Graceful exit is attempted first;
+        force-kill is used if a process has not exited by the deadline.
     kill_orphans:
-        When ``True``, scan for and kill any orphaned grandchild processes
-        under ``record.path`` after the primary stop signal.  Defaults to
-        ``False`` to preserve backward-compatible behaviour.
+        When ``True``, additionally scan for and kill any orphaned processes
+        under ``record.path`` (path heuristics) after the tree kill.
+        Defaults to ``False`` to preserve backward-compatible behaviour.
 
     Raises
     ------
@@ -1099,29 +1600,120 @@ def stop(
 
     pid = record.pids[role]
 
-    # Compute a shared deadline so that the primary kill step and the optional
-    # orphan scan together never exceed the caller-supplied timeout.
+    # Compute a shared deadline so that the primary kill step, the tree kill,
+    # and the optional orphan scan together never exceed the caller-supplied
+    # timeout.
     deadline = time.monotonic() + timeout
+
+    # Snapshot the descendant tree BEFORE any signal is sent (ticket #87):
+    # once the root dies, a reparented grandchild becomes invisible to
+    # anything that only looks at the tracked PID.
+    tree = _process_tree(pid)
+
+    # Ticket #87 follow-up, finding F2: _process_tree's _MAX_TREE_NODES cap
+    # truncates silently -- a tree with more descendants than the cap allows
+    # leaves the excess neither collected, killed, nor checked below. This
+    # snapshot alone does not distinguish "truncated" from "the caller's
+    # own list" (that would require widening _process_tree's return type --
+    # see its docstring); instead, treat "collected exactly the cap" as
+    # "cannot guarantee completeness": a genuinely smaller real tree would
+    # never have produced this many entries. The only false positive this
+    # can produce is the rare boundary case of a real tree that happens to
+    # be exactly cap-sized with no more descendants -- accepted as the
+    # conservative, cheap trade-off documented on _process_tree.
+    tree_possibly_truncated = len(tree) >= _MAX_TREE_NODES
+
+    # POSIX only, also snapshotted BEFORE any signal (ticket #87 follow-up,
+    # finding B3): the PIDs of any OTHER process sharing *pid*'s process
+    # group. _signal_process_group below fires a single SIGTERM at the whole
+    # group -- this snapshot is what lets a same-group descendant that
+    # ignores that SIGTERM (and is not also reachable via the ppid-tree
+    # snapshot above, e.g. because it already detached out of *pid*'s
+    # lineage) still get force-killed and checked by the survivor re-probe,
+    # instead of silently surviving while stop() still reports "stopped".
+    group_member_pids = _process_group_members(pid)
+
+    # POSIX only: if *pid* is itself the leader of its own process group (as
+    # start_new_session=True guarantees for processes we spawned), signal
+    # the whole group in one shot. No-op on Windows, when *pid* is not a
+    # group leader, or when doing so would signal our own group.
+    _signal_process_group(pid, force=False)
 
     if _pid_alive(pid):
         _send_graceful_signal(pid)
         _wait_or_kill(pid, max(0.0, deadline - time.monotonic()))
 
-    # Orphan scan: kill grandchild processes that survived because the shell
-    # wrapper already exited (they were reparented away from the tracked PID).
-    # Run this whether the shell was alive or dead — it's a no-op when there
-    # are no orphans.  Pass remaining budget so the scan is also bounded.
+    # Kill the snapshotted descendant tree, plus any process-group members
+    # not already covered by it (finding B3) -- both get the identical
+    # signal/wait/force-kill treatment via _kill_process_tree. This is
+    # UNCONDITIONAL -- not gated on kill_orphans -- because it is completing
+    # "stop" for the process tree/group we ourselves are responsible for,
+    # not orphan-hunting.
+    tree_pids = {info.pid for info in tree}
+    group_only_infos = [
+        KilledProcessInfo(pid=gpid, name="", cmdline=[])
+        for gpid in group_member_pids
+        if gpid not in tree_pids and gpid != pid
+    ]
+    killed_tree = tree + group_only_infos
+    _kill_process_tree(killed_tree, timeout=max(0.0, deadline - time.monotonic()))
+
+    # Orphan scan: kill processes that survived because they detached far
+    # enough (e.g. into their own session/process group) to evade both the
+    # tree snapshot above and the primary signal. Run this whether the
+    # tracked PID was alive or dead -- it's a no-op when there are no
+    # orphans. Pass remaining budget so the scan is also bounded.
+    orphan_found: List[KilledProcessInfo] = []
     if kill_orphans:
         orphan_budget = max(0.0, deadline - time.monotonic())
-        _kill_blocking_processes(record.path, timeout=orphan_budget)
+        orphan_found = _kill_blocking_processes(record.path, timeout=orphan_budget)
+
+    # Never report a false "stopped" (ticket #87): re-probe liveness of
+    # everything this call attempted to kill. Any survivor means the
+    # environment is not actually torn down, even though the tracked pid
+    # entry is about to be cleared below.
+    candidate_pids = [pid] + [info.pid for info in killed_tree] + [info.pid for info in orphan_found]
+    survivor_pids = [p for p in candidate_pids if _pid_alive(p)]
 
     # Clear the role regardless of whether the process was alive — the
     # important postcondition is that the record no longer references it.
     del record.pids[role]
-    # Only mark the whole worktree as "stopped" when all roles are gone.
-    # In a multi-role worktree, stopping one role must not mask the fact
-    # that other processes are still alive.
-    if not record.pids:
+
+    if survivor_pids:
+        _logger.warning(
+            "stop(worktree_id=%s, role=%s): process(es) survived termination: %s",
+            worktree_id, role, survivor_pids,
+        )
+        record.status = "stop_incomplete"
+    elif tree_possibly_truncated:
+        # Ticket #87 follow-up, finding F2: every candidate we DID collect
+        # came back dead, but the tree snapshot hit the _MAX_TREE_NODES cap,
+        # so an unknown number of descendants beyond it were never even
+        # examined. Reporting "stopped" here would be exactly the silent
+        # false positive this ticket exists to eliminate.
+        _logger.warning(
+            "stop(worktree_id=%s, role=%s): descendant tree for pid %s was "
+            "truncated at the %s-node cap -- cannot guarantee every "
+            "descendant was found and killed, reporting stop_incomplete "
+            "instead of stopped",
+            worktree_id, role, pid, _MAX_TREE_NODES,
+        )
+        record.status = "stop_incomplete"
+    elif not record.pids and record.status not in ("stop_incomplete", "orphaned"):
+        # Only mark the whole worktree as "stopped" when all roles are gone.
+        # In a multi-role worktree, stopping one role must not mask the fact
+        # that other processes are still alive.
+        #
+        # The status exclusion mirrors yaml_store.reconcile()'s identical
+        # guard (ticket #87 follow-up, finding B2): "stop_incomplete" is a
+        # sticky, deliberately-honest status set by an EARLIER stop() call
+        # (possibly for a different role in this same multi-role worktree)
+        # that could not confirm everything it tried to kill actually died.
+        # This call's own kill being clean does not re-verify that earlier
+        # survivor -- clearing the last pid entry here must not silently
+        # overwrite that guarantee back to "stopped". Likewise "orphaned"
+        # (path gone, set by reconcile()) must not be masked by a stop()
+        # call racing against it.
         record.status = "stopped"
     store.update(record)
 

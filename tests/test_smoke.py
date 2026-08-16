@@ -23,6 +23,7 @@ def test_checkout_classification_surface_importable_from_package_root() -> None:
         "classify_checkout",
         "list_repo",
         "primary_id_for",
+        "untracked_id_for",
         "PrimaryCheckoutError",
         "CheckoutTargetError",
     ]
