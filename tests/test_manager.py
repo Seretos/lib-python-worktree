@@ -64,12 +64,237 @@ def test_create_list_remove_roundtrip(manager: WorktreeManager, git_repo: Path):
     assert manager.list() == []
 
 
+def _make_run_git_spy(monkeypatch: pytest.MonkeyPatch) -> "list[list[str]]":
+    """Monkeypatch ``manager_module._run_git`` with a recording wrapper that
+    delegates to the real implementation, so a test can assert on exactly
+    which git subcommands ``create()`` issued (e.g. that a fetch or a
+    ``rev-parse --abbrev-ref HEAD`` call did/didn't happen)."""
+    calls: "list[list[str]]" = []
+    real_run_git = manager_module._run_git
+
+    def _spy(args, cwd=None, **kwargs):
+        calls.append(list(args))
+        return real_run_git(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_run_git", _spy)
+    return calls
+
+
+# ---------------------------------------------------------------------------
+# Ticket #93: create() defaults an omitted `base` to the branch currently
+# checked out at the main clone, instead of always raising BranchNotFoundError.
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.requires_git
-def test_create_unknown_branch_without_base(
+def test_create_new_branch_without_base_defaults_to_current_branch(
     manager: WorktreeManager, git_repo: Path
 ):
-    with pytest.raises(BranchNotFoundError):
-        manager.create(str(git_repo), "feature/does-not-exist")
+    """git_repo's HEAD is on `main` -- a new branch created without `base`
+    must start from `main`, not raise."""
+    rec = manager.create(str(git_repo), "feature/does-not-exist")
+    assert rec.branch == "feature/does-not-exist"
+    assert Path(rec.path).exists()
+    assert rec.branch_created_by_us is True
+
+    wt_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=rec.path,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert wt_head == main_head
+
+
+@pytest.mark.requires_git
+def test_create_existing_branch_without_base_unaffected(
+    manager: WorktreeManager, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """When `branch` already exists, the new default-base resolution path
+    must not run at all -- no `rev-parse --abbrev-ref HEAD` call issued."""
+    calls = _make_run_git_spy(monkeypatch)
+
+    rec = manager.create(str(git_repo), "feature/alpha")
+    assert rec.branch == "feature/alpha"
+
+    assert ["rev-parse", "--abbrev-ref", "HEAD"] not in calls
+
+
+@pytest.mark.requires_git
+def test_create_without_base_raises_when_head_detached(
+    manager: WorktreeManager, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _git("checkout", "--detach", "HEAD", cwd=git_repo)
+    calls = _make_run_git_spy(monkeypatch)
+
+    with pytest.raises(BranchNotFoundError, match="current branch"):
+        manager.create(str(git_repo), "feature/detached")
+
+    assert not any(c[:2] == ["worktree", "add"] for c in calls)
+
+
+@pytest.mark.requires_git
+def test_create_without_base_raises_when_head_unborn(
+    manager: WorktreeManager, tmp_path: Path, skip_if_no_git  # noqa: ARG001
+):
+    empty_repo = tmp_path / "empty-repo"
+    empty_repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=empty_repo)
+    _git("config", "user.email", "test@example.com", cwd=empty_repo)
+    _git("config", "user.name", "Test", cwd=empty_repo)
+
+    with pytest.raises(BranchNotFoundError, match="current branch"):
+        manager.create(str(empty_repo), "feature/unborn")
+
+
+@pytest.mark.requires_git
+def test_create_without_base_propagates_unexpected_current_branch_failure(
+    manager: WorktreeManager, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A `git rev-parse --abbrev-ref HEAD` failure that is neither the
+    unborn-HEAD case (exit 128) nor the detached-HEAD case (exit 0, stdout
+    "HEAD") is a genuine repo problem (corrupt .git/HEAD, broken refs,
+    permission error, ...), not an expected "no default base available"
+    case. It must propagate as GitCommandError -- NOT get folded into
+    BranchNotFoundError / "detached or unborn HEAD"."""
+    real_run_git = manager_module._run_git
+
+    def _fake_run_git(args, cwd=None, **kwargs):
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=13,
+                stdout="",
+                stderr="fatal: unable to read HEAD: Permission denied",
+            )
+        return real_run_git(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+
+    with pytest.raises(GitCommandError) as excinfo:
+        manager.create(str(git_repo), "feature/other-failure")
+
+    assert excinfo.value.returncode == 13
+    assert "Permission denied" in excinfo.value.stderr
+    # Must not have been misclassified as the "no default base" case.
+    assert not isinstance(excinfo.value, BranchNotFoundError)
+
+
+@pytest.mark.requires_git
+def test_create_without_base_propagates_128_with_non_unborn_stderr(
+    manager: WorktreeManager, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-2 reviewer finding (codex, [blocking]): exit code 128 alone is
+    not a precise-enough signal for "unborn HEAD" -- git also returns 128
+    for other failures (e.g. corrupt refs, "not a git repository"). A 128
+    exit whose stderr does NOT contain the unborn-HEAD signature ("unknown
+    revision or path not in the working tree") must propagate as
+    GitCommandError, not be silently folded into the "" / unborn-HEAD
+    bucket."""
+    real_run_git = manager_module._run_git
+
+    def _fake_run_git(args, cwd=None, **kwargs):
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout="",
+                stderr="fatal: not a git repository (or any parent up to mount point /)",
+            )
+        return real_run_git(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+
+    with pytest.raises(GitCommandError) as excinfo:
+        manager.create(str(git_repo), "feature/128-not-unborn")
+
+    assert excinfo.value.returncode == 128
+    assert "not a git repository" in excinfo.value.stderr
+    # Must not have been misclassified as the "no default base" case.
+    assert not isinstance(excinfo.value, BranchNotFoundError)
+
+
+@pytest.mark.requires_git
+def test_create_without_base_skips_fetch_and_uses_local_ref(
+    manager: WorktreeManager, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """git_repo has no `origin` remote. Defaulting `base` (fetch left at its
+    default True) must not attempt any network fetch and must branch from
+    the local `main` ref."""
+    calls = _make_run_git_spy(monkeypatch)
+
+    rec = manager.create(str(git_repo), "feature/offline-default")
+
+    assert not any(c and c[0] == "fetch" for c in calls)
+    assert not any("origin/main" in c for c in calls)
+
+    wt_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=rec.path,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert wt_head == main_head
+
+
+@pytest.mark.requires_git
+def test_create_without_base_with_fetch_false_is_equivalent(
+    manager: WorktreeManager, git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls = _make_run_git_spy(monkeypatch)
+
+    rec = manager.create(str(git_repo), "feature/offline-default-2", fetch=False)
+
+    assert not any(c and c[0] == "fetch" for c in calls)
+    assert not any("origin/main" in c for c in calls)
+
+    wt_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=rec.path,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert wt_head == main_head
+
+
+@pytest.mark.requires_git
+def test_create_without_base_from_linked_worktree_uses_main_clone_branch(
+    manager: WorktreeManager, git_repo: Path, linked_worktree: Path
+):
+    """linked_worktree is checked out on `feature/alpha`; git_repo (the main
+    clone) is on `main`. Calling create() with repo_root pointing INSIDE the
+    linked worktree must still default `base` to the main clone's branch
+    (`main`), not the linked worktree's (`feature/alpha`)."""
+    # Advance `main` so its tip differs from `feature/alpha`'s -- otherwise
+    # the SHAs coincide and the test can't discriminate between the two.
+    (git_repo / "extra.txt").write_text("second commit\n", encoding="utf-8")
+    _git("add", "-A", cwd=git_repo)
+    _git("commit", "-q", "-m", "second commit on main", cwd=git_repo)
+
+    rec = manager.create(str(linked_worktree), "feature/from-linked")
+
+    assert rec.repo_root == git_repo.resolve().as_posix()
+
+    wt_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=rec.path,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    main_head = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    alpha_head = subprocess.run(
+        ["git", "rev-parse", "feature/alpha"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert wt_head == main_head
+    assert wt_head != alpha_head
 
 
 @pytest.mark.requires_git

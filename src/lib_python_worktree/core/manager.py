@@ -313,6 +313,64 @@ def _effective_branch(record: "WorktreeRecord") -> str:
     return short_proc.stdout.strip()
 
 
+def _current_branch(repo_path: Path) -> str:
+    """Return the branch currently checked out at *repo_path*, or ``""``.
+
+    Used by ``WorktreeManager.create()`` to default an omitted ``base`` to
+    the branch checked out at the main clone. Unlike ``_effective_branch``,
+    this value feeds a **correctness gate** (it becomes the actual branch
+    start point for a new worktree), not a cosmetic env-var value -- so,
+    deliberately, there is no short-SHA fallback for a detached HEAD here.
+    ``create()`` treats an empty return as "could not determine a default
+    base" and raises ``BranchNotFoundError`` accordingly; this helper never
+    decides that policy itself, and never raises on its own account for the
+    two *expected* "no default base available" cases (a ``GitTimeoutError``
+    from ``_run_git`` still propagates naturally, as always):
+
+    * **Unborn HEAD** (no commits yet) -- ``git rev-parse --abbrev-ref HEAD``
+      exits 128 and prints git's standard "ambiguous argument 'HEAD':
+      unknown revision or path not in the working tree" message to stderr
+      in this case (verified directly: ``git init`` + ``git rev-parse
+      --abbrev-ref HEAD`` on this system).
+    * **Detached HEAD** -- exits 0 but prints the literal ``"HEAD"``.
+
+    Any *other* non-zero exit (corrupt ``.git/HEAD``, broken refs,
+    permission error, ...) is a genuine repo problem, not a "no default
+    base" situation -- it is raised as ``GitCommandError`` so it surfaces to
+    the caller instead of being silently folded into the "detached or
+    unborn HEAD" bucket. Exit code 128 alone is not a precise-enough signal
+    for "unborn HEAD" (git also uses 128 for e.g. "not a git repository" or
+    corrupt-ref failures), so the unborn-HEAD branch additionally requires
+    the stderr text above -- mirroring the stderr-substring pattern used
+    elsewhere in this module for disambiguating an exit code that git
+    overloads across multiple distinct failures (see the
+    ``"is not a working tree"`` / lock-signal checks in ``remove()``).
+    Note: in the actual ``create()`` call path, ``_validate_repo()`` /
+    ``classify_checkout()`` already runs an equivalent ``git rev-parse
+    --git-dir --git-common-dir`` probe before this function is ever
+    reached, and it fails identically on a corrupted repo -- so a
+    corrupted-repo 128 is normally intercepted upstream as
+    ``InvalidRepoError`` and never reaches here. The stderr check below is
+    still applied so this function is correct standalone, independent of
+    that upstream gate.
+    """
+    proc = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+    if proc.returncode != 0:
+        if proc.returncode == 128 and (
+            "unknown revision or path not in the working tree" in proc.stderr
+        ):
+            return ""  # unborn HEAD: no commits yet
+        raise GitCommandError(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            proc.returncode,
+            proc.stderr,
+        )
+    ref = (proc.stdout or "").strip()  # `or ""` guards mocked/patched _run_git
+    if not ref or ref == "HEAD":
+        return ""  # detached HEAD prints "HEAD" at exit 0
+    return ref
+
+
 def _build_worktree_env(
     record: "WorktreeRecord",
     caller_env: "Optional[Dict[str, str]]",
@@ -399,6 +457,30 @@ class WorktreeManager:
         *,
         fetch: bool = True,
     ) -> WorktreeRecord:
+        """Create a new worktree for *branch*, creating the branch if needed.
+
+        If *branch* already exists, a worktree is checked out on it directly
+        and *base*/*fetch* are ignored for branch-creation purposes.
+
+        If *branch* does not exist and *base* is given explicitly, the new
+        branch is created from *base*. When ``fetch=True`` (the default),
+        ``origin/<base>`` is fetched first and used as the start point, so
+        the new branch reflects the latest remote tip rather than a possibly
+        stale local ref. Pass ``fetch=False`` to branch from the local ref
+        without any network call.
+
+        If *branch* does not exist and *base* is omitted (``None``), it
+        defaults to the branch currently checked out at the main clone (the
+        repo resolved from *repo_root* by ``_validate_repo()`` -- not
+        whichever linked worktree *repo_root* may point into). This defaulted
+        base is always resolved from the **local** ref and never fetched,
+        regardless of *fetch*, since HEAD's local ref is already the answer
+        -- there is no "stale" remote counterpart to catch up to. Raises
+        ``BranchNotFoundError`` if the main clone's HEAD is detached or
+        unborn (no commits yet), since no sensible default branch can be
+        determined in either case; pass `base` explicitly to create the
+        branch in that situation.
+        """
         repo_path = self._validate_repo(repo_root)
 
         branch = branch.strip()
@@ -413,22 +495,36 @@ class WorktreeManager:
             )
 
         branch_exists = self._branch_exists(repo_path, branch)
+        base_defaulted = False
         if not branch_exists and base is None:
-            raise BranchNotFoundError(
-                f"Branch '{branch}' does not exist in {repo_path}. "
-                "Pass `base` to create it."
-            )
-        if not branch_exists and base is not None and not self._branch_exists(
-            repo_path, base
+            base = _current_branch(repo_path)
+            if not base:
+                raise BranchNotFoundError(
+                    f"Branch '{branch}' does not exist in {repo_path} and the "
+                    "current branch could not be determined (detached or "
+                    "unborn HEAD). Pass `base` to create it."
+                )
+            base_defaulted = True
+        if (
+            not branch_exists
+            and not base_defaulted
+            and base is not None
+            and not self._branch_exists(repo_path, base)
         ):
             raise BranchNotFoundError(
                 f"Base branch '{base}' does not exist in {repo_path}."
             )
 
+        # A defaulted base (the branch already checked out at the main
+        # clone) is resolved locally and never fetched: there is no remote
+        # ref to fetch from -- HEAD's already-local ref *is* the freshest
+        # answer. An explicit base keeps today's fetch-from-origin behavior.
+        fetch_base = fetch and not base_defaulted
+
         # When creating a new branch from a base and fetch=True, fetch the
         # base branch from origin so the new worktree starts from the latest
         # remote commit rather than a potentially stale local ref.
-        if not branch_exists and base is not None and fetch:
+        if not branch_exists and base is not None and fetch_base:
             fetch_proc = _run_git(["fetch", "origin", base], cwd=repo_path)
             if fetch_proc.returncode != 0:
                 raise GitCommandError(
@@ -445,7 +541,7 @@ class WorktreeManager:
         if not branch_exists:
             # When fetch=True use origin/<base> so the new branch starts from
             # the freshly-fetched remote tip, not the (possibly stale) local ref.
-            base_ref = f"origin/{base}" if fetch else base
+            base_ref = f"origin/{base}" if fetch_base else base
             git_args += ["-b", branch, str(target_path), base_ref]  # type: ignore[list-item]
         else:
             git_args += [str(target_path), branch]
