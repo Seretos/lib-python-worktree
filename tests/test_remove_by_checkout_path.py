@@ -157,6 +157,31 @@ def test_remove_untracked_linked_worktree_dirty_no_force_raises(
 
 
 @pytest.mark.requires_git
+def test_remove_untracked_linked_worktree_contract_copy_no_force_succeeds(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #100: the same untracked-`.seretos/`-copy exemption applies on
+    the untracked/orphan `remove(checkout_path=...)` path (ticket #88), not
+    just the tracked-record path -- both go through the same `_teardown()`
+    call site, but this pins that both are actually covered."""
+    contract_dir = linked_worktree / ".seretos"
+    contract_dir.mkdir()
+    (contract_dir / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+
+    removed = mgr.remove(checkout_path=str(linked_worktree), force=False)
+
+    assert removed.status == "removed"
+    assert not linked_worktree.exists()
+
+
+@pytest.mark.requires_git
 def test_remove_untracked_linked_worktree_matching_id_and_checkout_path_succeeds(
     tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
 ):

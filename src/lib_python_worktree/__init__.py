@@ -69,8 +69,10 @@ from .core.process_lifecycle import (
 from .core.plugin_install import PluginInstallResult, install_enabled_plugins
 from .core.port_allocator import PortAllocator
 from .core.state import (
+    SHADOW_REASONS,
     STOP_REASONS,
     InMemoryStateStore,
+    ShadowedContract,
     StateStore,
     StopDetail,
     WorktreeRecord,
@@ -130,6 +132,8 @@ __all__ = [
     "InMemoryStateStore",
     "StopDetail",
     "STOP_REASONS",
+    "ShadowedContract",
+    "SHADOW_REASONS",
     # yaml state store (W7)
     "YamlStateStore",
     "ReconcileReport",

@@ -38,7 +38,9 @@ records = m.list()
 m.start(rec_y.id, ["python", "server.py"])
 m.stop(rec_y.id)
 
-# Remove a worktree (pass force=True to remove despite uncommitted changes):
+# Remove a worktree (pass force=True to remove despite uncommitted changes).
+# An untracked `.seretos/` convenience copy left in the checkout does NOT
+# require force=True -- see "DirtyWorktreeError" below.
 removed = m.remove(rec_y.id)
 
 # Adopt worktrees that exist on disk but are not yet tracked:
@@ -311,7 +313,7 @@ Exception
 ├── RuntimeError
 │   ├── WorktreeError                    (base for all engine errors)
 │   │   ├── GitTimeoutError              (git subprocess exceeded WORKTREE_GIT_TIMEOUT_SEC; carries .network, .subcommand)
-│   │   ├── DirtyWorktreeError           (remove refused; pass force=True)
+│   │   ├── DirtyWorktreeError           (remove refused; pass force=True -- an untracked-only `.seretos/` copy is exempt, see below)
 │   │   ├── BranchNotFoundError
 │   │   ├── BranchAlreadyCheckedOutError (carries .branch, .path, .prunable)
 │   │   ├── DuplicateWorktreeError
@@ -327,6 +329,36 @@ Exception
 ```
 
 All public exception classes are re-exported from `lib_python_worktree`.
+
+### `DirtyWorktreeError` and the `.seretos/` convenience copy
+
+The `agent-worktree` plugin copies the whole `.seretos/` directory into every
+new checkout right after `create()` returns, purely as a convenience so the
+checkout has its own readable copy of the contract that created it. That copy
+is untracked, and `remove(force=False)` no longer treats its mere presence as
+"uncommitted changes": if the checkout's **only** dirt (per `git status`) is
+untracked content under `.seretos/`, `_teardown` auto-escalates to
+`git worktree remove --force` on the caller's behalf, so a plain
+`create()` -> `remove()` cycle with zero real edits succeeds without ever
+passing `force=True`. Any other dirt -- an untracked file elsewhere, or a
+**modified** (tracked) file anywhere including inside `.seretos/` -- still
+raises `DirtyWorktreeError` exactly as before.
+
+This is a deliberate, documented trade-off, and the exemption covers **any**
+untracked content under `.seretos/`, not merely the copied contract file --
+the plugin copies the whole directory, not a single file, and an agent may
+itself drop other untracked material there (notes, a cache directory, ...).
+The exemption is unconditional, so all of that untracked content, including
+a hand-edit an agent made only to the checkout-local contract copy, is
+discarded along with the checkout on `remove()`, without a prompt -- exactly
+as an explicit `force=True` would discard it. That is safe precisely because
+none of it is read by `start()`/setup in the first place (see "Shadowed
+checkout-local contract" below); it holds no engine-authoritative state. The
+discard is not silent: `_teardown` emits a `WARNING`-level log line naming
+the exact untracked path(s) it discarded, so it is observable after the
+fact even though `remove()` does not prompt or fail. The shadowed-contract
+warning below is what surfaces the contract-specific case of that divergence
+to the agent, much earlier in its workflow than removal time.
 
 ## Cross-platform notes
 
@@ -410,6 +442,35 @@ is cleared as soon as the record's status moves away from
 PID reuse (trusting a stale PID number without a process-identity check
 against its recorded start time) remains a known limitation, out of scope
 here; see ticket #87.
+
+### Shadowed checkout-local contract
+
+`start()` always reads the live contract from
+`<repo_root>/.seretos/worktree-setup.yml` — never from a linked worktree's
+own checkout-local copy (see the `.seretos/` convenience copy note above).
+If an agent edits only the checkout-local file, that edit is silently never
+read. To surface this footgun, every `start()` call sets a transient
+`shadowed_contract` (a `ShadowedContract`, or `None`) on the returned
+`WorktreeRecord` whenever a checkout-local copy exists and would actually
+change behaviour:
+
+| `reason` | Meaning |
+|---|---|
+| `differs` | The checkout-local copy parses cleanly but is a different contract from the one actually used. |
+| `unreadable` | The checkout-local copy exists but fails to parse/validate — this never raises through `start()` itself; only the *used* (repo-root) contract's own load failures do. |
+
+`shadowed_contract` is `None` when there is no checkout-local copy, when it
+is identical to the contract actually used (the plugin copies `.seretos/`
+into *every* checkout, so the identical case is not a footgun and would
+otherwise be pure per-`start()` noise), or for a primary checkout (which has
+no separate checkout-local copy at all). The identical message string is
+also logged at `WARNING`. Like `killed_pids` (and unlike the persisted
+`stop_detail`), `shadowed_contract` is **not** persisted to `state.yaml` — it
+is a live observation recomputed on every `start()` call, not a stored
+verdict. That guarantee comes from `YamlStateStore`'s round-trip specifically;
+an `InMemoryStateStore`-backed manager stores records by reference, so a
+`shadowed_contract` (or `killed_pids`) value can keep showing up on later
+`get()`/`list()` calls until the next `start()` recomputes it.
 
 ## Release
 

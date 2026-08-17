@@ -39,6 +39,16 @@ STOP_REASONS: Tuple[str, ...] = (
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
 )
 
+# Reason vocabulary for ``ShadowedContract.reason`` (ticket #100) -- one tag
+# per branch in ``manager._detect_shadowed_contract``.
+SHADOW_REASON_DIFFERS = "differs"
+SHADOW_REASON_UNREADABLE = "unreadable"
+
+SHADOW_REASONS: Tuple[str, ...] = (
+    SHADOW_REASON_DIFFERS,
+    SHADOW_REASON_UNREADABLE,
+)
+
 
 @dataclass(frozen=True)
 class StopDetail:
@@ -112,6 +122,49 @@ class StopDetail:
     kill_orphans_may_help: bool = False
 
 
+@dataclass(frozen=True)
+class ShadowedContract:
+    """A checkout-local contract copy that ``start()`` did NOT read (ticket
+    #100).
+
+    ``start()`` always reads the live contract from
+    ``<repo_root>/.seretos/worktree-setup.yml`` -- never from a linked
+    worktree's own checkout-local copy (the ``agent-worktree`` plugin's
+    convenience copy dropped into every new checkout, see ``manager.create``'s
+    docstring). When that checkout-local copy exists and parses to a
+    *different* ``WorktreeContract`` than the one actually used, an agent that
+    edited only the checkout-local file gets a clean-looking no-op
+    ``status="ready"`` with no hint that its edit was never read. This
+    dataclass is the machine-readable flag surfaced on the ``WorktreeRecord``
+    :func:`~.manager.WorktreeManager.start` returns, so a caller (e.g. the
+    ``environment_start`` MCP tool) can warn the agent explicitly.
+
+    ``path`` is the checkout-local contract file that was found but not read;
+    ``used_path`` is the repo-root file actually read (both forward-slash
+    strings). ``reason`` is always one of :data:`SHADOW_REASONS`:
+
+    - ``"differs"``: the checkout-local copy parses to a contract whose model
+      fields differ from the one that was used.
+    - ``"unreadable"``: the checkout-local copy exists but could not be
+      parsed/validated (``ContractError``/``ContractValidationError``/
+      ``OSError``) -- ``start()`` itself never raises for this; only the used
+      (repo-root) contract's own load failures propagate.
+
+    ``message`` is the exact human-readable string also passed to
+    ``_logger.warning(...)`` for the same detection, so the log line and this
+    field can never drift apart (mirrors :class:`StopDetail`'s message-parity
+    convention).
+
+    Deliberately **not** persisted to ``state.yaml`` -- see
+    ``WorktreeRecord.shadowed_contract``'s docstring for why.
+    """
+
+    path: str
+    used_path: str
+    reason: str
+    message: str
+
+
 @dataclass
 class WorktreeRecord:
     """A single tracked worktree (or, since ticket #84, a primary checkout).
@@ -139,6 +192,14 @@ class WorktreeRecord:
     pids: Dict[str, int] = field(default_factory=dict)
     branch_created_by_us: bool = False
     killed_pids: List["KilledProcessInfo"] = field(default_factory=list)
+    """Ticket #95: PIDs ``start()`` killed and retried past, describing an
+    *attempt* rather than a verdict. Deliberately transient, like
+    ``shadowed_contract``: never persisted through ``state.yaml`` (unlike
+    ``stop_detail``). For an ``InMemoryStateStore``-backed manager this field
+    is subject to the same store-reference caveat as ``shadowed_contract`` --
+    ``InMemoryStateStore.update()`` stores the record by reference (no copy),
+    so a value set by one call can keep appearing on later ``get()``/
+    ``list()`` calls until the next call that assigns it overwrites it."""
     returncode: Optional[int] = None
     start_log_path: Optional[str] = None
     backing: str = "worktree"
@@ -175,6 +236,32 @@ class WorktreeRecord:
     ``state.yaml`` (unlike the transient ``killed_pids``) so the reason
     survives a host restart -- a legacy record with no ``stop_detail`` key
     deserialises to ``None``."""
+
+    shadowed_contract: Optional[ShadowedContract] = None
+    """Ticket #100: set by ``start()`` when a checkout-local
+    ``.seretos/worktree-setup.yml`` copy exists and would differ from (or
+    fails to parse against) the repo-root contract that was actually read.
+    See :class:`ShadowedContract`'s own docstring for the full rationale.
+
+    Deliberately **transient**, like ``killed_pids`` and unlike the persisted
+    ``stop_detail``: this is a live observation recomputed on every
+    ``start()`` call, not a stored verdict -- a persisted copy would go stale
+    the moment the agent fixes or deletes the shadow file. ``_record_to_dict``
+    in ``yaml_store.py`` never serialises this field, so a record round-
+    tripped through ``YamlStateStore`` always comes back with
+    ``shadowed_contract is None``, which is correct: nothing here needs a
+    key in ``state.yaml`` for old records to remain compatible with.
+
+    The transient guarantee above is delivered specifically by
+    ``YamlStateStore``'s serialise/deserialise round-trip, not by this field
+    itself. ``InMemoryStateStore.update()`` stores the record object by
+    reference (no copy), so for an ``InMemoryStateStore``-backed manager a
+    ``shadowed_contract`` set by one ``start()`` call can keep appearing on
+    later ``get()``/``list()`` calls -- even after the checkout-local
+    contract is fixed or deleted -- until the next ``start()`` recomputes it.
+    This is an accepted limitation of the in-memory store, not a property of
+    this field, and it applies equally to ``killed_pids`` (see that field's
+    own docstring)."""
 
 
 class StateStore(Protocol):
@@ -236,6 +323,8 @@ class InMemoryStateStore:
 
 __all__: Iterable[str] = (
     "InMemoryStateStore",
+    "ShadowedContract",
+    "SHADOW_REASONS",
     "StateStore",
     "StopDetail",
     "STOP_REASONS",
