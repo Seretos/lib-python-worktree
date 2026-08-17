@@ -1176,6 +1176,39 @@ def test_remove_dirty_no_force_raises_dirty_error(
     assert "--force" not in msg
 
 
+# ---------------------------------------------------------------------------
+# Ticket #100: an untracked `.seretos/` convenience copy must not force
+# force=True on a plain create() -> remove() cycle with zero real edits.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+def test_remove_untracked_contract_copy_no_force_succeeds(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Driving test (ticket #100): remove(force=False) must succeed on a
+    checkout whose ONLY dirt is the untracked `.seretos/` copy the
+    agent-worktree plugin drops into every new checkout after create()
+    returns. Before the fix this always raised DirtyWorktreeError."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+    wt_path = Path(rec.path)
+
+    # Simulate the plugin's post-create convenience copy: an untracked
+    # `.seretos/worktree-setup.yml` inside the checkout, with zero other
+    # edits anywhere.
+    contract_dir = wt_path / ".seretos"
+    contract_dir.mkdir()
+    (contract_dir / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    result = manager.remove(rec.id, force=False)
+
+    assert result.status == "removed"
+    assert not wt_path.exists()
+    assert manager.state.get(rec.id) is None
+
+
 def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
     """DirtyWorktreeError message must contain 'force=True' and must not
     contain '--force' or '128' (no git internals leaked).
@@ -1563,6 +1596,214 @@ def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
     mock_start.assert_not_called()
     assert result.status == "ready"
     assert result.pids == {}
+
+
+# ---------------------------------------------------------------------------
+# Ticket #100: start() flags a checkout-local contract copy it never reads.
+# ---------------------------------------------------------------------------
+
+
+def test_start_flags_shadowed_checkout_contract(tmp_path: Path, caplog):
+    """Driving test (ticket #100): a checkout-local `.seretos/worktree-
+    setup.yml` that would yield a DIFFERENT contract than the repo-root one
+    actually read must be flagged on the returned record's
+    `shadowed_contract`, and the identical message must be logged at
+    WARNING. Before the fix, `WorktreeRecord` had no such attribute at all."""
+    import logging as _logging
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    # Repo root has no start: step -> no-op ready path.
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+    # Checkout-local copy DOES have a start: step -> different contract.
+    _write_contract(
+        checkout,
+        "version: 1\nisolation: full\nstart:\n  - run: npm run dev\n",
+    )
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.pids == {}
+    assert result.shadowed_contract is not None
+    shadow = result.shadowed_contract
+    assert shadow.reason == "differs"
+    assert Path(shadow.path) == (checkout / ".seretos" / "worktree-setup.yml")
+    assert Path(shadow.used_path) == (repo_root / ".seretos" / "worktree-setup.yml")
+    assert any(rec.message == shadow.message for rec in caplog.records), (
+        "the logged WARNING message must be identical to shadow.message"
+    )
+
+
+def test_start_no_shadow_when_checkout_contract_identical(tmp_path: Path):
+    """A checkout-local copy that parses to the SAME contract as the one
+    actually used must not be flagged -- since the plugin copies `.seretos/`
+    into every checkout, an unconditional flag would fire on every single
+    start() and be pure noise."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    contract_text = "version: 1\nisolation: none\n"
+    _write_contract(repo_root, contract_text)
+    _write_contract(checkout, contract_text)
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.shadowed_contract is None
+
+
+def test_start_no_shadow_when_no_checkout_contract(tmp_path: Path):
+    """No checkout-local `.seretos/` copy at all -> no flag."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.shadowed_contract is None
+
+
+def test_start_shadow_reason_unreadable_on_malformed_checkout_contract(
+    tmp_path: Path,
+):
+    """A checkout-local copy that exists but fails to parse/validate must be
+    flagged with reason="unreadable" -- and, unlike a malformed REPO-ROOT
+    contract (which raises through start(), see the ticket #70 tests below),
+    start() itself must still return normally."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+    _write_contract(checkout, "version: 1\n  bad: indent: here\n")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.shadowed_contract is not None
+    assert result.shadowed_contract.reason == "unreadable"
+
+
+def test_start_shadow_reason_unreadable_on_dangling_symlink_checkout_contract(
+    tmp_path: Path,
+):
+    """A checkout-local `.seretos/worktree-setup.yml` that is a broken/
+    dangling symlink must be flagged with reason="unreadable", not silently
+    treated as "no checkout-local contract at all". `Path.exists()` follows
+    symlinks and would report False for a dangling link -- indistinguishable
+    from "nothing there" -- which is why the implementation must use
+    `os.path.lexists()` for the presence check instead. start() must still
+    return normally without raising.
+
+    Symlink creation on Windows normally requires elevation/Developer Mode,
+    so this is skipped rather than failed on an unprivileged runner.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+
+    shadow_dir = checkout / ".seretos"
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    shadow_file = shadow_dir / "worktree-setup.yml"
+    try:
+        os.symlink(shadow_dir / "does-not-exist.yml", shadow_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this machine")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.shadowed_contract is not None
+    assert result.shadowed_contract.reason == "unreadable"
+
+
+def test_start_flags_shadowed_contract_on_real_spawn_exit_path(tmp_path: Path):
+    """Blocking-finding-2 follow-up (ticket #100): the shadowed-contract flag
+    must also survive the REAL-SPAWN exit path (repo-root contract HAS a
+    `start:` step, so start() calls `_lifecycle_start(...)` rather than
+    taking the no-op `status="ready"` shortcut).
+
+    `_lifecycle_start` hands back a freshly store-loaded record that never
+    carries the transient `shadowed_contract` field (see the comment at the
+    `result.shadowed_contract = shadowed_contract` assignment in
+    `manager.start()`), so start() must assign it explicitly onto whatever
+    `_lifecycle_start` returns. Every OTHER shadowed_contract test in this
+    file uses a contract with no `start:` step, so they only ever exercise
+    the no-op branch's own (separate) assignment -- this is the only test
+    that pins the real-spawn branch's assignment specifically. Uses a
+    distinct `spawned_record` object (not the same instance as `record`,
+    and with `shadowed_contract` left at its default) so the assertion can
+    only pass via the explicit assignment onto the object `_lifecycle_start`
+    returns, not by accident via shared identity with `record`."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    # Repo root HAS a start: step -> real-spawn path (not the no-op "ready" one).
+    _write_contract(repo_root, "version: 1\nisolation: full\nstart:\n  - run: npm run dev\n")
+    # Checkout-local copy differs -> shadowed_contract must be populated.
+    _write_contract(
+        checkout,
+        "version: 1\nisolation: none\n",
+    )
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    spawned_record = _make_wt_record(
+        wt_id=record.id,
+        repo_root=str(repo_root),
+        path=str(checkout),
+        status="running",
+        pids={"main": 4242},
+    )
+    assert spawned_record.shadowed_contract is None
+    assert spawned_record is not record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        return_value=spawned_record,
+    ) as mock_start:
+        result = mgr.start(record.id)
+
+    mock_start.assert_called_once()
+    assert result is spawned_record
+    assert result.status == "running"
+    assert result.shadowed_contract is not None
+    shadow = result.shadowed_contract
+    assert shadow.reason == "differs"
+    assert Path(shadow.path) == (checkout / ".seretos" / "worktree-setup.yml")
+    assert Path(shadow.used_path) == (repo_root / ".seretos" / "worktree-setup.yml")
 
 
 # ---------------------------------------------------------------------------

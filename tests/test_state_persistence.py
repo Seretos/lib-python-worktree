@@ -277,6 +277,68 @@ def test_worktree_record_with_returncode_and_start_log_path_roundtrip(
 
 
 # ---------------------------------------------------------------------------
+# Ticket #100: shadowed_contract is transient -- never persisted to
+# state.yaml, mirroring the killed_pids precedent (test_process_lifecycle.py
+# ::test_stop_populates_killed_pids_with_tree_and_orphans).
+# ---------------------------------------------------------------------------
+
+
+def test_shadowed_contract_not_serialised_to_dict():
+    """`_record_to_dict` must never write a `shadowed_contract` key."""
+    from lib_python_worktree.core.state import ShadowedContract
+    from lib_python_worktree.core.yaml_store import _record_to_dict
+
+    rec = _make_record(id="rec-shadow")
+    rec.shadowed_contract = ShadowedContract(
+        path="/checkout/.seretos/worktree-setup.yml",
+        used_path="/repo/.seretos/worktree-setup.yml",
+        reason="differs",
+        message="start(): checkout-local contract differs",
+    )
+
+    assert "shadowed_contract" not in _record_to_dict(rec)
+
+
+def test_record_from_dict_legacy_dict_has_no_shadowed_contract_key():
+    """A legacy dict with no `shadowed_contract` key at all (any state.yaml
+    written before this field existed) must deserialise with `None`, not
+    raise."""
+    from lib_python_worktree.core.yaml_store import _record_from_dict
+
+    legacy = {
+        "id": "rec-legacy",
+        "repo_root": "/repos/myrepo",
+        "branch": "main",
+        "path": "/store/myrepo/rec-legacy",
+    }
+
+    rec = _record_from_dict(legacy)
+
+    assert rec.shadowed_contract is None
+
+
+def test_shadowed_contract_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
+    """A real YamlStateStore add/get cycle must drop `shadowed_contract`
+    rather than persisting a stale copy -- it is a live observation
+    recomputed on every start(), never a stored verdict."""
+    from lib_python_worktree.core.state import ShadowedContract
+
+    rec = _make_record(id="rec-shadow-roundtrip")
+    rec.shadowed_contract = ShadowedContract(
+        path="/checkout/.seretos/worktree-setup.yml",
+        used_path="/repo/.seretos/worktree-setup.yml",
+        reason="unreadable",
+        message="start(): checkout-local contract could not be read",
+    )
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-shadow-roundtrip")
+
+    assert retrieved is not None
+    assert retrieved.shadowed_contract is None
+
+
+# ---------------------------------------------------------------------------
 # reconcile(): orphaned path
 # ---------------------------------------------------------------------------
 

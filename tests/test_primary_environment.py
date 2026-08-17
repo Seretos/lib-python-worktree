@@ -334,6 +334,23 @@ def test_start_no_start_step_is_noop_ready_and_still_materialises(
 
 
 @pytest.mark.requires_git
+def test_start_primary_checkout_never_flags_shadowed_contract(
+    yaml_manager, git_repo: Path
+):
+    """Ticket #100: a primary checkout has no separate checkout-local
+    contract copy at all -- its own contract IS the repo-root one -- so
+    `_detect_shadowed_contract` must always return None for it, regardless
+    of what the contract says."""
+    _write_contract(git_repo, "version: 1\nisolation: none\n")
+    mgr = yaml_manager()
+
+    record = mgr.start(checkout_path=str(git_repo))
+
+    assert record.backing == "primary"
+    assert record.shadowed_contract is None
+
+
+@pytest.mark.requires_git
 def test_stop_never_started_role_is_graceful_noop(yaml_manager, git_repo: Path):
     mgr = yaml_manager()
     record = mgr.start(checkout_path=str(git_repo))  # no-op ready start
