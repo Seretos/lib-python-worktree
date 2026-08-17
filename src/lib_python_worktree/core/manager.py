@@ -9,6 +9,7 @@ will hook in around ``WorktreeManager`` later — the seams are documented at
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -17,15 +18,21 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
 # `subprocess` is kept for CompletedProcess / DEVNULL references inside this
 # module even though _run_git now lives in _git_utils.
 
-from ..contract.loader import CONTRACT_FILENAME, load as _load_contract
+from ..contract.loader import (
+    CONTRACT_FILENAME,
+    ContractError,
+    ContractValidationError,
+    load as _load_contract,
+)
 from ._env_utils import _get_user_profile_env
-from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, VariantResolutionError, WorktreeDirLockedError, WorktreeError, WorktreeRemovalBlockedError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .checkout import (
     CheckoutInfo,
@@ -47,14 +54,33 @@ from .process_lifecycle import (
     start as _lifecycle_start,
     stop as _lifecycle_stop,
 )
-from .state import InMemoryStateStore, StateStore, WorktreeRecord
+from .state import (
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUS_FAILED,
+    SETUP_STATUS_SKIPPED,
+    SHADOW_REASON_DIFFERS,
+    SHADOW_REASON_UNREADABLE,
+    InMemoryStateStore,
+    SetupOutcome,
+    ShadowedContract,
+    StateStore,
+    WorktreeRecord,
+)
 from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
+
+_logger = logging.getLogger(__name__)
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Matches the synthesised-id suffix minted by checkout.untracked_id_for()
 # (ticket #88), so remove()'s id-only path can name the right remedy
 # (checkout_path=...) instead of a generic "not found" for this case.
 _UNTRACKED_ID_RE = re.compile(r"-untracked-[0-9a-f]{8}$")
+# Top-level directory segment of CONTRACT_FILENAME (".seretos"), derived
+# rather than hardcoded a second time (ticket #100). The agent-worktree
+# plugin copies this whole directory into every new checkout as a
+# convenience; it is untracked there, and its mere presence makes a plain
+# `git worktree remove` refuse. See `_contract_copy_dirt_paths`.
+_CONTRACT_DIR = PurePosixPath(CONTRACT_FILENAME).parts[0]
 _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
 _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
@@ -275,6 +301,371 @@ def _is_path_prunable(repo_path: Path, target_path: str) -> Optional[bool]:
             current_prunable = True
     _flush()
     return found
+
+
+def _status_entries(record: "WorktreeRecord") -> Optional[List[str]]:
+    """Run ``git status --porcelain -z`` in *record*'s checkout and return
+    the non-empty NUL-split entries, or ``None`` when the probe is
+    inconclusive.
+
+    Split out of the former ``_contract_copy_dirt_paths`` (ticket #103) so
+    both the ``.seretos/``-exemption classifier and the new "is there any
+    real (non-exempt) dirt at all?" predicate (:func:`_real_dirt_paths`)
+    share one probe and one defensive contract, instead of running
+    ``git status`` twice or duplicating the defensive matrix.
+
+    Returns ``None`` (never an empty list for "inconclusive") on: a
+    non-zero exit, a non-``str`` ``stdout`` (defensive -- some tests patch
+    ``_run_git`` with a blanket ``MagicMock`` whose ``.stdout`` is itself a
+    ``MagicMock``), an empty result (inconsistent with git having just
+    refused the removal for being dirty), or any exception (including
+    ``GitTimeoutError``). Callers must never invent a blocking condition
+    from an inconclusive probe.
+    """
+    try:
+        proc = _run_git(["status", "--porcelain", "-z"], cwd=Path(record.path))
+    except Exception:  # noqa: BLE001 -- includes GitTimeoutError; never block removal
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    stdout = proc.stdout
+    if not isinstance(stdout, str):
+        return None
+
+    entries = [e for e in stdout.split("\0") if e]
+    if not entries:
+        # Empty status while git refused the remove is inconsistent with the
+        # "only benign dirt" story -- never treat as conclusive.
+        return None
+
+    return entries
+
+
+def _is_exempt_untracked(entry: str) -> bool:
+    """Return ``True`` iff *entry* (one NUL-split ``git status --porcelain
+    -z`` record) is untracked (``??``) content living at ``.seretos`` or
+    under ``.seretos/`` -- the agent-worktree plugin's benign convenience
+    copy (ticket #100).
+
+    A **modified tracked** file under ``.seretos/`` (status code other than
+    ``??``) is real work and is never exempt. No path normalisation is
+    performed: a literal backslash in an entry name (e.g. ``.seretos\\
+    notes.txt``) is part of the filename itself (git always reports ``/``
+    as the separator, even on Windows) and stays non-exempt, and a
+    ``.seretos``-*prefixed sibling* directory (e.g. ``.seretos-backup/``) is
+    not ``.seretos`` itself or a path under it, so it also stays non-exempt.
+    """
+    if len(entry) < 3 or entry[:2] != "??":
+        return False
+    path = entry[3:]
+    contract_prefix = f"{_CONTRACT_DIR}/"
+    return path == _CONTRACT_DIR or path.startswith(contract_prefix)
+
+
+def _contract_copy_dirt_paths(
+    record: "WorktreeRecord", *, entries: Optional[List[str]] = None
+) -> Optional[List[str]]:
+    """Return the untracked path(s) iff *record*'s checkout's only "dirt"
+    (per ``git status``) lives under the ``.seretos/`` convenience copy
+    (ticket #100); ``None`` (falsy, same as an empty list) otherwise.
+
+    The ``agent-worktree`` plugin copies the whole ``.seretos/`` directory
+    into every new checkout after ``create()`` returns -- purely a
+    convenience so the checkout has its own readable copy of the contract
+    that created it. Everything under that directory is untracked, so its
+    mere presence makes a plain ``git worktree remove`` (``force=False``)
+    refuse with "contains modified or untracked files" even when the agent
+    made zero real edits. This helper lets ``_teardown`` recognise that
+    specific, benign case and auto-escalate to ``--force`` rather than
+    surfacing ``DirtyWorktreeError`` on every single removal.
+
+    This intentionally exempts **any** untracked content under ``.seretos/``,
+    not merely the copied contract file -- the plugin copies the directory,
+    not a single file, and an agent may itself drop other untracked material
+    there (notes, caches, ...). That is a deliberate, documented trade-off:
+    such content is discarded here exactly as an explicit ``force=True``
+    would discard it. The caller is expected to warning-log the returned
+    paths so the discard is observable rather than silent.
+
+    Reimplemented (ticket #103) on top of :func:`_status_entries` and
+    :func:`_is_exempt_untracked`; semantics and the "empty/inconclusive
+    status ⇒ ``None``" rule are unchanged. Returns the matched paths only
+    when **every** reported entry is exempt untracked ``.seretos/`` dirt;
+    any other entry anywhere, or an inconclusive probe, returns ``None`` so
+    the ordinary ``DirtyWorktreeError`` path is unaffected.
+
+    *entries* is an optional pre-fetched result of :func:`_status_entries`
+    (ticket #103) -- ``_teardown`` passes its memoised probe result here so
+    a single ``git status`` call can serve both this classifier and
+    :func:`_real_dirt_paths` within one removal attempt. Defaults to
+    ``None``, which fetches fresh exactly as before -- every existing
+    caller/test that calls ``_contract_copy_dirt_paths(record)`` with no
+    second argument is unaffected.
+    """
+    if entries is None:
+        entries = _status_entries(record)
+    if entries is None:
+        return None
+
+    matched: List[str] = []
+    for entry in entries:
+        if not _is_exempt_untracked(entry):
+            return None
+        matched.append(entry[3:])
+    return matched
+
+
+def _real_dirt_paths(
+    record: "WorktreeRecord", *, entries: Optional[List[str]] = None
+) -> List[str]:
+    """Return the non-exempt (real) dirty paths for *record*'s checkout, or
+    ``[]`` when clean, when the only dirt is the benign ``.seretos/``
+    convenience copy (ticket #100), or when the ``git status`` probe is
+    inconclusive (ticket #103).
+
+    This is the "is there any real dirt that would block removal?"
+    predicate consumed by the combined lock+dirt reporting added by ticket
+    #103 -- unlike :func:`_contract_copy_dirt_paths`, which answers "is
+    *all* dirt benign?" and returns ``None`` for clean, real-dirt, AND
+    inconclusive alike, this always returns a list and never invents a
+    blocking condition from an inconclusive probe: an empty result here
+    means "do not report a dirty-tree condition", not "confirmed clean".
+
+    *entries*: see :func:`_contract_copy_dirt_paths` -- same optional
+    pre-fetched-result seam, used by ``_teardown``'s memoised probe.
+    """
+    if entries is None:
+        entries = _status_entries(record)
+    if entries is None:
+        return []
+    return [entry[3:] for entry in entries if not _is_exempt_untracked(entry)]
+
+
+def _is_lock_signal(stderr: str) -> bool:
+    """Classify a failed ``git worktree remove`` attempt's stderr as an
+    OS-level directory-lock signal (ticket #72, Befund 2) rather than some
+    other git failure.
+
+    Windows: ``"Permission denied"`` or ``"Invalid argument"`` in stderr
+    (both are NTFS/Win32 delete-failure strings). No exit-code requirement
+    -- real-world Win32 lock failures have been observed on exit codes other
+    than 255.
+
+    POSIX: ``"lock"`` in stderr (case-insensitive) -- git worktree reports a
+    held directory as "locked" / "unable to lock" / "cannot lock" /
+    "worktree is locked". Unrelated git failures (broken metadata, network
+    FS errors, "not a git repository", etc.) match neither arm.
+
+    Shared by both call sites in ``_teardown`` that can hit a genuine
+    directory lock: the primary ``git worktree remove`` attempt, and the
+    ``.seretos/``-exemption auto-force retry (ticket #100) -- a lock can
+    just as easily be held during the retry (e.g. an AV scanner grabs a
+    handle on a file under ``.seretos/`` exactly when the forced delete
+    runs), and it must be classified identically at either site.
+    """
+    return (
+        sys.platform == "win32"
+        and ("Permission denied" in stderr or "Invalid argument" in stderr)
+    ) or (
+        sys.platform != "win32"
+        and "lock" in stderr.lower()
+    )
+
+
+def _resolve_lock_or_raise(
+    args: List[str],
+    record: "WorktreeRecord",
+    kill_blocking_processes: bool,
+    phantom_cleanup,
+    *,
+    dirt_probe,
+) -> bool:
+    """Apply the kill-and-retry directory-lock remedy (ticket #51/#72) for a
+    ``git worktree remove`` invocation (*args*) whose failure was already
+    classified as a lock signal by :func:`_is_lock_signal`, or raise
+    :class:`WorktreeDirLockedError` (single condition) /
+    :class:`WorktreeRemovalBlockedError` (lock AND real dirt, ticket #103).
+
+    Shared by both lock-signal call sites in ``_teardown``: the primary
+    removal attempt and the ``.seretos/``-exemption auto-force retry
+    (ticket #100) -- both need the SAME remedy instead of the retry site
+    leaking git internals via a bare ``GitCommandError``.
+
+    - ``kill_blocking_processes=False``: no remedy was opted into. Raises
+      immediately, naming ``kill_blocking_processes=True`` as the way to
+      retry (``kill_attempted=False``). No kill or retry is attempted.
+    - ``kill_blocking_processes=True``: kills the blocking processes
+      (recording ``record.killed_pids``) and retries *args* up to
+      ``_POST_KILL_RETRIES`` times, sleeping ``_POST_KILL_SLEEP`` seconds
+      between attempts. A retry that fails with "is not a working tree"
+      (git deregistered the worktree mid-retry -- phantom-state) is treated
+      as success via *phantom_cleanup*, a zero-arg callable that removes the
+      leftover directory and prunes stale git metadata. Raises on exhausted
+      retries (see below).
+
+    *dirt_probe* is a zero-arg callable (``_teardown``'s memoised,
+    force-gated ``_dirt_probe`` closure -- see ``_real_dirt_paths``) that
+    returns the non-exempt dirty paths, or ``[]`` when clean/benign/
+    inconclusive/``force=True``. At each raise site, ``bool(dirt_probe())``
+    decides between the single-condition ``WorktreeDirLockedError`` (no
+    real dirt) and the combined ``WorktreeRemovalBlockedError`` (real dirt
+    too) -- both name every currently-blocking condition and remedy in one
+    raise so a single informed retry suffices.
+
+    Returns ``True`` (the caller's ``kill_attempted`` flag) on any
+    non-raising exit; the caller falls through to the long-path fallback /
+    step 4 exactly as the ordinary success path does.
+    """
+    if not kill_blocking_processes:
+        dirt = dirt_probe()
+        if dirt:
+            raise WorktreeRemovalBlockedError(
+                record.id, killed=[], kill_attempted=False, dirty_paths=dirt
+            )
+        raise WorktreeDirLockedError(record.id, killed=[], kill_attempted=False)
+
+    killed = _kill_blocking_processes(record.path)
+    record.killed_pids = killed
+    retry_result = None
+    phantom_on_retry = False
+    for attempt in range(_POST_KILL_RETRIES):
+        retry_result = _run_git(args, cwd=Path(record.repo_root))
+        if retry_result.returncode == 0:
+            break
+        if (
+            retry_result.returncode == 128
+            and "is not a working tree" in retry_result.stderr
+        ):
+            phantom_cleanup()
+            phantom_on_retry = True
+            break
+        if attempt < _POST_KILL_RETRIES - 1:
+            time.sleep(_POST_KILL_SLEEP)
+    if not phantom_on_retry and (retry_result is None or retry_result.returncode != 0):
+        dirt = dirt_probe()
+        if dirt:
+            raise WorktreeRemovalBlockedError(
+                record.id, killed=killed, kill_attempted=True, dirty_paths=dirt
+            )
+        raise WorktreeDirLockedError(record.id, killed=killed)
+    return True
+
+
+def _detect_shadowed_contract(
+    record: "WorktreeRecord", used_contract: "object"
+) -> Optional[ShadowedContract]:
+    """Return a :class:`ShadowedContract` when *record*'s checkout carries a
+    checkout-local ``.seretos/worktree-setup.yml`` copy that ``start()``
+    never reads and that would actually change behaviour (ticket #100).
+
+    ``start()`` always loads the live contract from
+    ``<repo_root>/.seretos/worktree-setup.yml`` -- never from a linked
+    worktree's own checkout-local copy (the ``agent-worktree`` plugin's
+    convenience copy, see ``create()``'s docstring). An agent that edits only
+    the checkout-local file gets a clean-looking no-op ``status="ready"``
+    with no hint the edit was never read. This flags exactly that footgun.
+
+    Returns ``None`` (no flag) when:
+    - *record* is a primary checkout (``backing == "primary"``) or its
+      checkout path resolves to the same directory as ``repo_root`` --
+      nothing is shadowed because there is no separate checkout-local copy.
+    - no ``.seretos/worktree-setup.yml`` exists inside the checkout at all.
+    - the checkout-local copy parses to a ``WorktreeContract`` equal to
+      *used_contract* -- since the plugin copies ``.seretos/`` into *every*
+      checkout, an unconditional flag would fire on every single ``start()``
+      and be pure noise; the identical-copy case is not a footgun.
+
+    Returns a ``ShadowedContract`` with ``reason="unreadable"`` when the
+    checkout-local copy exists but fails to parse/validate
+    (``ContractError``/``ContractValidationError``, or an ``OSError``
+    reading it) -- this never raises through ``start()``; only the *used*
+    (repo-root) contract's own load failures propagate there. A dangling
+    symlink at the checkout-local path is also treated as "unreadable"
+    (checked via ``os.path.lexists``, not ``Path.exists``, precisely so a
+    broken symlink is not misread as "no checkout-local contract at all").
+
+    Returns a ``ShadowedContract`` with ``reason="differs"`` when the
+    checkout-local copy parses cleanly but is a different contract (Pydantic
+    model ``==``, not raw bytes, so line-ending/formatting differences alone
+    never trigger a false positive).
+
+    The whole body is wrapped so that detection can never make ``start()``
+    fail -- same defensive posture as ``_teardown()``'s contract-load blocks.
+    """
+    try:
+        if record.backing == "primary":
+            return None
+        checkout_path = Path(record.path).resolve()
+        repo_root_path = Path(record.repo_root).resolve()
+        if checkout_path == repo_root_path:
+            return None
+
+        shadow_file = Path(record.path) / CONTRACT_FILENAME
+        if not os.path.lexists(shadow_file):
+            # lexists (not exists) so a broken symlink still counts as
+            # "present" here -- exists() follows symlinks and would report
+            # False for a dangling link, which would wrongly read as "no
+            # checkout-local contract at all" instead of falling through to
+            # the unreadable-contract handling below.
+            return None
+
+        used_path = (Path(record.repo_root) / CONTRACT_FILENAME).as_posix()
+        shadow_path = shadow_file.as_posix()
+
+        if not shadow_file.exists():
+            # Present per lexists() but exists() (which follows symlinks)
+            # says otherwise -- a dangling symlink. _load_contract()/loader
+            # .load() has its own `exists()` guard that would silently treat
+            # this as "no file" (implicit isolation: none) rather than
+            # raising, so it is handled explicitly here instead of being
+            # handed to _load_contract.
+            message = (
+                f"start(): checkout-local contract '{shadow_path}' exists "
+                f"but could not be read (broken symlink); the contract "
+                f"actually used is '{used_path}'."
+            )
+            return ShadowedContract(
+                path=shadow_path,
+                used_path=used_path,
+                reason=SHADOW_REASON_UNREADABLE,
+                message=message,
+            )
+
+        try:
+            shadow_contract = _load_contract(shadow_file)
+        except (ContractError, OSError) as exc:
+            # ContractValidationError is a ContractError subclass, so this
+            # arm covers both parse and schema failures.
+            message = (
+                f"start(): checkout-local contract '{shadow_path}' exists "
+                f"but could not be read ({exc}); the contract actually used "
+                f"is '{used_path}'."
+            )
+            return ShadowedContract(
+                path=shadow_path,
+                used_path=used_path,
+                reason=SHADOW_REASON_UNREADABLE,
+                message=message,
+            )
+
+        if shadow_contract == used_contract:
+            return None
+
+        message = (
+            f"start(): checkout-local contract '{shadow_path}' differs from "
+            f"the contract actually used ('{used_path}'); the checkout-local "
+            f"copy is never read by start()."
+        )
+        return ShadowedContract(
+            path=shadow_path,
+            used_path=used_path,
+            reason=SHADOW_REASON_DIFFERS,
+            message=message,
+        )
+    except Exception:  # noqa: BLE001 -- detection must never fail start()
+        return None
 
 
 def _effective_branch(record: "WorktreeRecord") -> str:
@@ -617,22 +1008,72 @@ class WorktreeManager:
         # On step failure: leave the worktree, ports, and state record intact
         # for user inspection; update status to "setup_failed" and re-raise
         # SetupFailedError so the caller knows setup did not complete.
+        #
+        # Ticket #105: every one of the three branches below (completed /
+        # failed / skipped) also records a `SetupOutcome` verdict on
+        # `record.setup_outcome` -- a first-class, persisted record of the
+        # setup: hook's own outcome, independent of `record.status` (which
+        # start()/stop()/reconcile() continuously rewrite for unrelated
+        # reasons afterwards).
         _setup_contract = _load_contract(repo_path / CONTRACT_FILENAME)
         if _setup_contract.setup:
-            from ..setup.runner import SetupRunner  # noqa: PLC0415
+            from ..setup.runner import SetupFailedError, SetupRunner  # noqa: PLC0415
             _setup_runner = SetupRunner()
             try:
-                _setup_runner.run(
+                _setup_result = _setup_runner.run(
                     setup=_setup_contract.setup,
                     worktree_id=record.id,
                     worktree_path=Path(record.path),
                     branch=_effective_branch(record),
                     port_mapping=record.ports,
                 )
-            except Exception:  # noqa: BLE001
+            except SetupFailedError as _setup_exc:
                 record.status = "setup_failed"
+                record.setup_outcome = SetupOutcome(
+                    status=SETUP_STATUS_FAILED,
+                    message=str(_setup_exc),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    failed_step_index=_setup_exc.step_index,
+                    failed_step_name=_setup_exc.step_name,
+                    log_path=Path(_setup_exc.log_path).as_posix(),
+                    returncode=_setup_exc.returncode,
+                    timed_out=_setup_exc.timeout is not None,
+                )
                 self.state.update(record)
                 raise
+            except Exception as _setup_exc:  # noqa: BLE001
+                # Never crash inside this handler; always re-raise the
+                # original exception unchanged. Any exception type other
+                # than SetupFailedError carries no step-level detail, so the
+                # step fields stay at their None/0 defaults.
+                record.status = "setup_failed"
+                record.setup_outcome = SetupOutcome(
+                    status=SETUP_STATUS_FAILED,
+                    message=f"{type(_setup_exc).__name__}: {_setup_exc}",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self.state.update(record)
+                raise
+            else:
+                record.setup_outcome = SetupOutcome(
+                    status=SETUP_STATUS_COMPLETED,
+                    message=f"setup: completed {len(_setup_result.steps)} step(s)",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    steps_run=len(_setup_result.steps),
+                )
+        else:
+            record.setup_outcome = SetupOutcome(
+                status=SETUP_STATUS_SKIPPED,
+                message="no setup: steps in contract",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        # Completed and skipped share one write here (the success path
+        # previously performed no write at all). Placed BEFORE the
+        # best-effort plugin-install block below so a plugin-install hiccup
+        # can never lose the setup verdict. The failure path above already
+        # performed its own update() inside its except block before
+        # re-raising.
+        self.state.update(record)
 
         # Install the worktree's enabledPlugins so that project-scoped
         # plugins are active without a manual /reload-plugins. Clone-first
@@ -817,6 +1258,23 @@ class WorktreeManager:
           a ``WorktreeError`` and a ``ValueError``, so callers may catch
           either base.
 
+        ``role`` vs ``variant`` (ticket #104)
+        --------------------------------------
+        *role* is the tracking/addressing key under which the spawned
+        process's pid is recorded (``record.pids[role]``); it defaults to
+        ``"main"`` **regardless of which** *variant* was requested. *variant*
+        only selects which contract ``start:`` step is run. The two are
+        independent: two variants started concurrently against the same
+        worktree must be given two distinct *role*s, or the second call
+        raises ``ProcessAlreadyRunningError`` (a role already has a live pid).
+        Whichever *variant* actually started a given *role* is recorded under
+        ``record.variants[role]`` -- this is exactly what
+        ``WorktreeManager.stop(variant=...)`` resolves against, so a caller
+        that started ``variant="web"`` under some role can later stop it
+        without separately tracking which role it used. The no-op "ready"
+        start below (no ``start:`` step configured) spawns nothing and
+        therefore records no variant for *role*.
+
         When no ``start:`` step is configured at all (missing
         ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
         nothing meaningful to run.  Rather than erroring, this is treated as a
@@ -843,6 +1301,15 @@ class WorktreeManager:
 
         contract = _load_contract(Path(record.repo_root) / CONTRACT_FILENAME)
 
+        # Ticket #100: detect a checkout-local contract copy that this
+        # start() call never reads (the plugin's convenience copy) and that
+        # would actually change behaviour. Computed once, before either
+        # return path, and logged immediately so the warning always fires
+        # regardless of which branch below returns.
+        shadowed_contract = _detect_shadowed_contract(record, contract)
+        if shadowed_contract is not None:
+            _logger.warning(shadowed_contract.message)
+
         if contract.ports:
             missing = [s.name for s in contract.ports if s.name not in record.ports]
             if missing:
@@ -855,6 +1322,7 @@ class WorktreeManager:
             # start so worktree creation + start works without a contract:
             # mark the worktree usable and return without spawning a process.
             record.status = "ready"
+            record.shadowed_contract = shadowed_contract
             self.state.update(record)
             return record
 
@@ -879,21 +1347,29 @@ class WorktreeManager:
         from ..setup.runner import _resolve_shell
         cmd = [*_resolve_shell(step.shell), step.run]
 
-        return _lifecycle_start(
+        result = _lifecycle_start(
             record.id,
             cmd,
             store=self.state,
             role=role,
+            variant=variant,
             env=_build_worktree_env(record, env),
             cwd=cwd if cwd is not None else record.path,
         )
+        # _lifecycle_start() hands back a store-loaded record (a fresh
+        # deserialisation for YamlStateStore), which never carries this
+        # transient field -- assign it here, mirroring how killed_pids is
+        # propagated explicitly elsewhere for the same reason.
+        result.shadowed_contract = shadowed_contract
+        return result
 
     def stop(
         self,
         worktree_id: Optional[str] = None,
         *,
         checkout_path: Optional[str] = None,
-        role: str = "main",
+        role: Optional[str] = None,
+        variant: Optional[str] = None,
         timeout: float = 10.0,
         kill_orphans: bool = False,
     ) -> WorktreeRecord:
@@ -906,6 +1382,43 @@ class WorktreeManager:
         unknown-id contract, and it keeps "a primary record is written only
         by the first ``start()``" literally true.
 
+        ``role`` vs ``variant`` (ticket #104)
+        --------------------------------------
+        *role* defaults to ``"main"`` -- **``role=None`` (the parameter's
+        actual default) means "use ``main``"**, not "no role" / a no-op.
+        This mirrors ``start()``'s ``role="main"`` default exactly; the
+        sentinel exists only so this method can tell "the caller didn't pass
+        ``role``" apart from "the caller explicitly passed ``role="main"``"
+        when *variant* is also given (see below). Existing callers of
+        ``stop(id)`` or ``stop(id, role="web")`` are unaffected -- both
+        behave byte-for-byte as before.
+
+        *variant* resolves to the ``role`` that was started with it, via
+        ``record.variants`` (populated by ``start(variant=...)``, see that
+        method's docstring), so a caller that started ``variant="web"``
+        under some role does not need to separately remember which role it
+        used:
+
+        - ``variant=None`` (the default): no resolution; *role* alone
+          selects the target, defaulting to ``"main"`` as described above.
+        - ``variant`` given and it matches no currently-running role's
+          recorded variant: ``VariantResolutionError`` is raised (covers an
+          unknown/typo'd variant, and a role started before this ticket
+          shipped with no recorded variant).
+        - ``variant`` given and it matches more than one currently-running
+          role: ``VariantResolutionError`` is raised (ambiguous) -- pass
+          ``role=`` to disambiguate.
+        - ``variant`` given and it matches exactly one role: that role is
+          used. If *role* was also given explicitly and disagrees with the
+          resolved role, ``VariantResolutionError`` is raised rather than
+          silently picking one -- mirroring ``_resolve_target()``'s existing
+          "*worktree_id* and *checkout_path*, if both given, must agree"
+          rule.
+
+        This resolution happens immediately after ``_resolve_target()`` and
+        before the best-effort contract ``stop:`` steps below, so a
+        resolution failure raises before anything has been attempted.
+
         If the contract defines ``stop:`` steps, they are run (best-effort,
         errors are swallowed) before sending the stop signal.
 
@@ -914,11 +1427,12 @@ class WorktreeManager:
         survived because the tracked shell wrapper already exited and they were
         reparented away from it.
 
-        When no process is recorded for *role* (e.g. after a no-op ``"ready"``
-        start with no ``start:`` step — ticket #41), stopping is a graceful
-        no-op: contract ``stop:`` steps are still run best-effort, but no
-        signal is sent and ``ProcessNotRunningError`` is *not* raised.  The
-        worktree is marked ``"stopped"`` when no other roles remain.
+        When no process is recorded for the resolved role (e.g. after a
+        no-op ``"ready"`` start with no ``start:`` step — ticket #41),
+        stopping is a graceful no-op: contract ``stop:`` steps are still run
+        best-effort, but no signal is sent and ``ProcessNotRunningError`` is
+        *not* raised.  The worktree is marked ``"stopped"`` when no other
+        roles remain.
 
         This is the engine's documented and intentional behavior (ticket
         #41) and this method's return type is fixed: it always returns a
@@ -934,8 +1448,33 @@ class WorktreeManager:
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         Ports are deliberately **not** released here — see ``start()``'s
         docstring and ``reconcile()``'s per-owner rule (ticket #84, R9).
+
+        Ticket #99: when the delegated ``process_lifecycle.stop`` call
+        reports ``status="stop_incomplete"``, the returned record's
+        ``stop_detail`` (a ``state.StopDetail``) carries a machine-readable
+        ``reason`` and evidence for why — see that function's own docstring.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=False)
+
+        # Ticket #104: resolve variant -> role before any side effect (the
+        # best-effort contract stop: steps below), so a resolution failure
+        # raises cleanly with nothing having been attempted yet. See this
+        # method's docstring ("role vs variant") for the full algorithm.
+        if variant is None:
+            effective_role = role if role is not None else "main"
+        else:
+            matches = sorted(r for r, v in record.variants.items() if v == variant)
+            if not matches or len(matches) > 1:
+                running_roles = sorted(record.pids.keys())
+                raise VariantResolutionError(
+                    variant, matches, requested_role=role, running_roles=running_roles
+                )
+            resolved = matches[0]
+            if role is not None and role != resolved:
+                raise VariantResolutionError(
+                    variant, matches, requested_role=role, running_roles=sorted(record.pids.keys())
+                )
+            effective_role = resolved
 
         # Run contract stop: steps (best-effort — a failure must not prevent
         # the SIGTERM from being sent).
@@ -961,7 +1500,13 @@ class WorktreeManager:
         # No process recorded for this role → graceful no-op (symmetric with
         # the no-op "ready" start).  Avoid delegating to _lifecycle_stop, which
         # would raise ProcessNotRunningError.
-        if role not in record.pids:
+        if effective_role not in record.pids:
+            # Ticket #104: keep the set(variants) <= set(pids) invariant
+            # intact even on this no-op path -- a stale variants[role] entry
+            # left over from a role that never got a pid recorded (or whose
+            # pid entry was already cleared by a previous stop/reconcile)
+            # must not survive here.
+            record.variants.pop(effective_role, None)
             if not record.pids and record.status not in ("stop_incomplete", "orphaned"):
                 # Ticket #95, finding 6: mirror process_lifecycle.stop()'s own
                 # guard (see its identical exclusion). "stop_incomplete" and
@@ -970,13 +1515,19 @@ class WorktreeManager:
                 # clearing the last pid entry for an unrelated role must not
                 # silently overwrite that guarantee back to "stopped".
                 record.status = "stopped"
+                # Ticket #99: status is actually transitioning to "stopped"
+                # here (the guard above already excludes the sticky
+                # "stop_incomplete"/"orphaned" cases) -- clear any stale
+                # stop_detail in lockstep, mirroring
+                # process_lifecycle.stop()'s own clean-"stopped" branch.
+                record.stop_detail = None
             self.state.update(record)
             return record
 
         return _lifecycle_stop(
             record.id,
             store=self.state,
-            role=role,
+            role=effective_role,
             timeout=timeout,
             kill_orphans=kill_orphans,
         )
@@ -1324,6 +1875,31 @@ class WorktreeManager:
             # create().
             pass
 
+        # Dirt probe (ticket #103): a memoised, force-gated closure shared by
+        # every site below that may need to know about real dirt -- the
+        # Step 2b preflight, both `_resolve_lock_or_raise` raise sites, AND
+        # the `.seretos/`-exemption classifier in the dirty-phrase branch
+        # further down -- so that a single removal attempt never issues more
+        # than one `git status` call no matter how many of those sites run
+        # (e.g. preflight probe -> git remove fails with the dirty phrase ->
+        # exemption classifier), and never runs at all when force=True (real
+        # dirt cannot block a forced removal, so there is nothing to report
+        # -- this is what keeps the happy-path and force=True preflight
+        # tests free of any status call).
+        _status_cache: List[Optional[List[str]]] = [None]
+        _status_fetched = [False]
+
+        def _cached_status_entries() -> Optional[List[str]]:
+            if not _status_fetched[0]:
+                _status_cache[0] = _status_entries(record)
+                _status_fetched[0] = True
+            return _status_cache[0]
+
+        def _dirt_probe() -> List[str]:
+            if force:
+                return []
+            return _real_dirt_paths(record, entries=_cached_status_entries())
+
         # Step 2b (Windows only, ticket #76): pre-flight blocking-process check
         # BEFORE the destructive `git worktree remove` call below.
         #
@@ -1353,6 +1929,19 @@ class WorktreeManager:
         if sys.platform == "win32":
             _preflight_blockers = _find_blocking_processes(record.path, os.getpid())
             if _preflight_blockers:
+                # Q2 (ticket #103): probe for real dirt BEFORE taking any
+                # irreversible action -- including the kill below. If real
+                # dirt is ALSO present, this removal cannot succeed on this
+                # attempt no matter what kill_blocking_processes says (git
+                # worktree remove will still refuse for being dirty), so
+                # report both conditions now, with nothing killed and
+                # nothing removed, rather than killing a process for a
+                # removal that was always going to fail.
+                _dirt = _dirt_probe()
+                if _dirt:
+                    raise WorktreeRemovalBlockedError(
+                        record.id, killed=[], kill_attempted=False, dirty_paths=_dirt
+                    )
                 if kill_blocking_processes:
                     killed = _kill_blocking_processes(record.path)
                     record.killed_pids = killed
@@ -1412,81 +2001,111 @@ class WorktreeManager:
                 # never be misread as a dirty working tree just because
                 # git's dirty-tree phrase happens to also be present in
                 # stderr (e.g. a stale git error string bundled alongside
-                # a Win32 delete-failure string).
-                # Windows: "Permission denied" or "Invalid argument" in
-                #   stderr (both are NTFS/Win32 delete-failure strings).
-                #   No exit-code requirement — real-world Win32 lock
-                #   failures have been observed on exit codes other than
-                #   255, so the strict `returncode == 255` check has been
-                #   dropped (ticket #72, Befund 2).
-                # POSIX: "lock" in stderr (case-insensitive) — git worktree
-                #   reports a held directory as "locked" / "unable to lock" /
-                #   "cannot lock" / "worktree is locked".  All variants contain
-                #   the substring "lock".  Unrelated git failures (broken
-                #   metadata, network FS errors, "not a git repository", etc.)
-                #   match neither arm, so they fall through past the
-                #   dirty-tree check to GitCommandError unchanged.
-                _is_lock_signal = (
-                    sys.platform == "win32"
-                    and (
-                        "Permission denied" in proc.stderr
-                        or "Invalid argument" in proc.stderr
-                    )
-                ) or (
-                    sys.platform != "win32"
-                    and "lock" in proc.stderr.lower()
-                )
-                if _is_lock_signal:
+                # a Win32 delete-failure string). Classification and remedy
+                # are factored into module-level helpers (_is_lock_signal /
+                # _resolve_lock_or_raise) so the SAME logic also covers the
+                # `.seretos/`-exemption auto-force retry below (ticket #100).
+                if _is_lock_signal(proc.stderr):
                     # A lock's remedy (kill_blocking_processes=True) is
                     # independent of --force, so this branch applies for
                     # BOTH force=True and force=False (ticket #72, Befund 2).
-                    if kill_blocking_processes:
-                        killed = _kill_blocking_processes(record.path)
-                        record.killed_pids = killed
-                        kill_attempted = True
-                        retry_result = None
-                        _phantom_on_retry = False
-                        for _attempt in range(_POST_KILL_RETRIES):
-                            retry_result = _run_git(args, cwd=Path(record.repo_root))
-                            if retry_result.returncode == 0:
-                                break
-                            if (
-                                retry_result.returncode == 128
-                                and "is not a working tree" in retry_result.stderr
-                            ):
-                                # git deregistered the worktree between the kill
-                                # and this retry (phantom-state mid-loop).  Treat
-                                # as already-gone and fall through to port release.
-                                _phantom_state_cleanup()
-                                _phantom_on_retry = True
-                                break
-                            if _attempt < _POST_KILL_RETRIES - 1:
-                                time.sleep(_POST_KILL_SLEEP)
-                        if not _phantom_on_retry and (
-                            retry_result is None or retry_result.returncode != 0
-                        ):
-                            raise WorktreeDirLockedError(record.id, killed=killed)
-                        # Retry succeeded (or phantom-state cleanup ran) —
-                        # fall through to long-path check then step 4.
-                    else:
-                        # Lock detected but the caller did not opt into the
-                        # kill-and-retry remedy: raise a clean domain error
-                        # naming the remedy (kill_blocking_processes=True)
-                        # rather than leaking git's raw stderr via a bare
-                        # GitCommandError (ticket #72, Befund 2). No kill is
-                        # attempted and no retry is performed.
-                        raise WorktreeDirLockedError(
-                            record.id, killed=[], kill_attempted=False
-                        )
+                    kill_attempted = _resolve_lock_or_raise(
+                        args,
+                        record,
+                        kill_blocking_processes,
+                        _phantom_state_cleanup,
+                        dirt_probe=_dirt_probe,
+                    )
+                    # Retry succeeded (or phantom-state cleanup ran) —
+                    # fall through to long-path check then step 4.
                 elif (
                     proc.returncode == 128
                     and not force
                     and "contains modified or untracked files" in proc.stderr
                 ):
-                    # git refused because the worktree has uncommitted changes.
-                    # Surface a structured error naming only the engine parameter
-                    # (force=True), not the raw git command, path, or exit code.
-                    raise DirtyWorktreeError(record.id)
+                    # git refused because the worktree has uncommitted
+                    # changes. Before surfacing DirtyWorktreeError, check
+                    # whether the ONLY dirt is untracked content under
+                    # `.seretos/` -- the convenience copy the agent-worktree
+                    # plugin drops into every checkout after create() returns
+                    # (ticket #100), or anything else an agent left there.
+                    # None of that is ever read by start()/setup (see
+                    # _detect_shadowed_contract) -- it holds no engine-
+                    # authoritative state -- yet its mere presence would
+                    # otherwise force force=True on every single plain
+                    # create() -> remove() cycle with zero real edits.
+                    dirt_paths = _contract_copy_dirt_paths(
+                        record, entries=_cached_status_entries()
+                    )
+                    if dirt_paths:
+                        # Deliberate, documented trade-off (ticket #100):
+                        # this auto-escalation is unconditional and exempts
+                        # ANY untracked content under `.seretos/`, not merely
+                        # the copied contract file -- an agent's own
+                        # hand-added notes/cache/etc. dropped there are
+                        # discarded here too, without a prompt, exactly as an
+                        # explicit force=True would discard them. Half 2's
+                        # start()-time shadowed-contract warning surfaces the
+                        # contract-specific case of that divergence much
+                        # earlier in the agent's workflow than removal time.
+                        # The discard itself is warning-logged below, naming
+                        # the actual paths, so it is observable rather than
+                        # silent.
+                        _logger.warning(
+                            "_teardown: worktree '%s' removed without "
+                            "force=True; discarding untracked path(s) under "
+                            "%s/ that were the only dirty-tree refusal "
+                            "cause: %s",
+                            record.id, _CONTRACT_DIR, ", ".join(dirt_paths),
+                        )
+                        retry_args = ["worktree", "remove", "--force", record.path]
+                        retry_result = _run_git(retry_args, cwd=Path(record.repo_root))
+                        if retry_result.returncode != 0:
+                            if (
+                                retry_result.returncode == 128
+                                and "is not a working tree" in retry_result.stderr
+                            ):
+                                # git deregistered the worktree between the
+                                # first refusal and this retry (phantom-state
+                                # mid-retry). Treat as already-gone and fall
+                                # through to port release.
+                                _phantom_state_cleanup()
+                                # Fall through to step 4.
+                            elif _is_lock_signal(retry_result.stderr):
+                                # The retry itself hit a genuine directory
+                                # lock (e.g. an AV scanner/editor holding a
+                                # handle on a file under `.seretos/` exactly
+                                # when the forced delete runs). Route through
+                                # the SAME lock remedy as the primary removal
+                                # attempt above, rather than falling through
+                                # to a bare GitCommandError that would leak
+                                # git internals and skip kill_blocking_processes
+                                # entirely (ticket #100 follow-up).
+                                kill_attempted = _resolve_lock_or_raise(
+                                    retry_args,
+                                    record,
+                                    kill_blocking_processes,
+                                    _phantom_state_cleanup,
+                                    dirt_probe=_dirt_probe,
+                                )
+                                # Retry succeeded (or phantom-state cleanup
+                                # ran) — fall through to long-path check
+                                # then step 4.
+                            else:
+                                raise GitCommandError(
+                                    ["git", *retry_args],
+                                    retry_result.returncode,
+                                    retry_result.stderr,
+                                )
+                        # Retry succeeded (or phantom-state cleanup ran) —
+                        # fall through to the long-path fallback then step 4,
+                        # exactly as the ordinary success path does.
+                    else:
+                        # Real dirt beyond the benign contract copy. Surface
+                        # a structured error naming only the engine
+                        # parameter (force=True), not the raw git command,
+                        # path, or exit code.
+                        raise DirtyWorktreeError(record.id)
                 else:
                     raise GitCommandError(
                         ["git", *args], proc.returncode, proc.stderr
@@ -1630,6 +2249,7 @@ __all__ = (
     "PrimaryCheckoutError",
     "RepoListing",
     "UnknownVariantError",
+    "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeManager",

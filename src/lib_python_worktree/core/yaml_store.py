@@ -39,7 +39,7 @@ import portalocker
 import yaml
 
 from ._git_utils import _run_git
-from .state import WorktreeRecord
+from .state import SetupOutcome, StopDetail, WorktreeRecord, _STOP_DETAIL_MAX_PIDS
 
 _STATE_FILE = "state.yaml"
 _PORTS_FILE = "ports.yaml"
@@ -184,6 +184,106 @@ def _pid_alive_windows(pid: int) -> bool:
 # Internal helpers: serialise / deserialise WorktreeRecord
 # ---------------------------------------------------------------------------
 
+def _stop_detail_to_dict(detail: Optional[StopDetail]) -> Optional[Dict[str, Any]]:
+    """Serialise a :class:`~.state.StopDetail` to a plain nested dict of
+    scalars/lists (ticket #99), or ``None`` when *detail* is ``None``.
+
+    ``survivor_pids`` is written as a plain ``list`` (YAML has no tuple type);
+    re-capped defensively at :data:`_STOP_DETAIL_MAX_PIDS` even though the
+    dataclass is already constructed within that cap, so a hand-edited or
+    future-version state.yaml can never blow past it on the way back in via
+    :func:`_stop_detail_from_dict`.
+    """
+    if detail is None:
+        return None
+    return {
+        "reason": detail.reason,
+        "message": detail.message,
+        "role": detail.role,
+        "survivor_pids": list(detail.survivor_pids)[:_STOP_DETAIL_MAX_PIDS],
+        "survivor_count": detail.survivor_count,
+        "truncated_at": detail.truncated_at,
+        "skipped_passes": list(detail.skipped_passes),
+        "kill_orphans_may_help": detail.kill_orphans_may_help,
+    }
+
+
+def _stop_detail_from_dict(d: Optional[Dict[str, Any]]) -> Optional[StopDetail]:
+    """Reconstruct a :class:`~.state.StopDetail` from its serialised dict, or
+    ``None`` when *d* is ``None``/absent/empty (ticket #99).
+
+    Field-by-field with defaults for missing keys -- deliberately NOT
+    ``StopDetail(**d)`` -- so a legacy record with no ``stop_detail`` key at
+    all, or a state.yaml written by a future engine version carrying extra
+    keys this version does not know about, both deserialise without raising:
+    unknown keys are silently ignored, missing keys fall back to the same
+    defaults :class:`~.state.StopDetail` itself uses. ``reason`` is preserved
+    verbatim even if it is not a value in ``state.STOP_REASONS`` -- forward
+    compatibility with a reason vocabulary this version predates.
+    """
+    if not d:
+        return None
+    return StopDetail(
+        reason=d.get("reason", ""),
+        message=d.get("message", ""),
+        role=d.get("role"),
+        survivor_pids=tuple(d.get("survivor_pids") or ())[:_STOP_DETAIL_MAX_PIDS],
+        survivor_count=d.get("survivor_count", 0),
+        truncated_at=d.get("truncated_at"),
+        skipped_passes=tuple(d.get("skipped_passes") or ()),
+        kill_orphans_may_help=bool(d.get("kill_orphans_may_help", False)),
+    )
+
+
+def _setup_outcome_to_dict(outcome: Optional[SetupOutcome]) -> Optional[Dict[str, Any]]:
+    """Serialise a :class:`~.state.SetupOutcome` to a plain dict of scalars
+    (ticket #105), or ``None`` when *outcome* is ``None``. Mirrors
+    :func:`_stop_detail_to_dict`.
+    """
+    if outcome is None:
+        return None
+    return {
+        "status": outcome.status,
+        "message": outcome.message,
+        "completed_at": outcome.completed_at,
+        "steps_run": outcome.steps_run,
+        "failed_step_index": outcome.failed_step_index,
+        "failed_step_name": outcome.failed_step_name,
+        "log_path": outcome.log_path,
+        "returncode": outcome.returncode,
+        "timed_out": outcome.timed_out,
+    }
+
+
+def _setup_outcome_from_dict(d: Optional[Dict[str, Any]]) -> Optional[SetupOutcome]:
+    """Reconstruct a :class:`~.state.SetupOutcome` from its serialised dict,
+    or ``None`` when *d* is ``None``/absent/empty (ticket #105).
+
+    Field-by-field with defaults for missing keys -- deliberately NOT
+    ``SetupOutcome(**d)`` -- so a legacy record with no ``setup_outcome`` key
+    at all, or a state.yaml written by a future engine version carrying extra
+    keys this version does not know about, both deserialise without raising:
+    unknown keys are silently ignored, missing keys fall back to the same
+    defaults :class:`~.state.SetupOutcome` itself uses. ``status`` is
+    preserved verbatim even if it is not a value in ``state.SETUP_STATUSES``
+    -- forward compatibility with a status vocabulary this version predates.
+    Mirrors :func:`_stop_detail_from_dict`.
+    """
+    if not d:
+        return None
+    return SetupOutcome(
+        status=d.get("status", ""),
+        message=d.get("message", ""),
+        completed_at=d.get("completed_at"),
+        steps_run=d.get("steps_run", 0),
+        failed_step_index=d.get("failed_step_index"),
+        failed_step_name=d.get("failed_step_name"),
+        log_path=d.get("log_path"),
+        returncode=d.get("returncode"),
+        timed_out=bool(d.get("timed_out", False)),
+    )
+
+
 def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
     return {
         "id": rec.id,
@@ -198,6 +298,9 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "start_log_path": rec.start_log_path,
         "backing": rec.backing,
         "job_names": dict(rec.job_names),
+        "variants": dict(rec.variants),
+        "stop_detail": _stop_detail_to_dict(rec.stop_detail),
+        "setup_outcome": _setup_outcome_to_dict(rec.setup_outcome),
     }
 
 
@@ -223,6 +326,9 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         start_log_path=d.get("start_log_path"),
         backing=d.get("backing", "worktree"),
         job_names=dict(d.get("job_names") or {}),
+        variants=dict(d.get("variants") or {}),
+        stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
+        setup_outcome=_setup_outcome_from_dict(d.get("setup_outcome")),
     )
 
 
@@ -517,6 +623,11 @@ def reconcile(
                         wt_id, rec.path,
                     )
                     rec.status = "orphaned"
+                    # Ticket #99: "orphaned" supersedes "stop_incomplete"
+                    # (the path itself is gone, so no earlier "process may
+                    # still be alive" reason remains actionable) -- clear any
+                    # stale stop_detail in lockstep with the status change.
+                    rec.stop_detail = None
                     changed = True
                 report.orphaned.append(wt_id)
 
@@ -526,6 +637,12 @@ def reconcile(
             ]
             for role in dead_roles:
                 pid = rec.pids.pop(role)
+                # Ticket #104: mirrors set(variants) <= set(pids) invariant --
+                # a role whose process died on its own must lose its variant
+                # entry here too, or a stale mapping could later produce a
+                # phantom / ambiguous stop(variant=...) match against a role
+                # that no longer has a live pid.
+                rec.variants.pop(role, None)
                 _log.warning(
                     "reconcile: worktree '%s' PID %d (role '%s') is dead → removed",
                     wt_id, pid, role,
@@ -540,6 +657,12 @@ def reconcile(
                 # the default "stopped" outcome of this branch.
                 if rec.status not in ("orphaned", "stop_incomplete"):
                     rec.status = "stopped"
+                    # Ticket #99: this branch only runs when status is
+                    # actually transitioning to "stopped" (the guard above
+                    # already excludes the sticky "stop_incomplete" case) --
+                    # clear stop_detail in lockstep, mirroring
+                    # process_lifecycle.stop()'s own clean-"stopped" branch.
+                    rec.stop_detail = None
                 if wt_id not in report.stopped:
                     report.stopped.append(wt_id)
 

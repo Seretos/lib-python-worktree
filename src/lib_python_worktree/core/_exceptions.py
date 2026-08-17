@@ -22,6 +22,56 @@ class WorktreeError(RuntimeError):
     """Base class for all worktree-engine errors surfaced to MCP clients."""
 
 
+_NETWORK_SUBCOMMANDS = frozenset({"clone", "fetch", "ls-remote", "pull", "push"})
+"""Git subcommands that talk to a remote and are worth retrying on timeout.
+
+Deliberately excludes ``remote`` and ``submodule``: both are local in their
+common invocations (``git remote -v``, ``git submodule status``), and
+flagging them as network would produce a false retry signal.
+"""
+
+
+def _git_subcommand(command: List[str]) -> Optional[str]:
+    """Best-effort extraction of the git subcommand from an argv list.
+
+    Skips a leading ``"git"`` token (if present) and any leading global
+    options -- ``-c key=val``, ``--no-pager``, ``-C <dir>``, ``--git-dir
+    <path>``, or any other ``-``/``--`` prefixed token (consuming its value
+    when one is expected, but only when that value is a SEPARATE token --
+    an ``=``-joined form like ``--git-dir=/path`` is a single token and
+    never consumes the next one) -- then returns the first remaining bare
+    token. Returns ``None`` for an empty or all-options command rather than
+    raising, so a malformed/empty ``command`` never breaks exception
+    construction.
+    """
+    tokens = list(command)
+    if tokens and tokens[0] == "git":
+        tokens = tokens[1:]
+
+    # Global options that take a separate (space-delimited) value argument.
+    # https://git-scm.com/docs/git#_options
+    _takes_value = {
+        "-c",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+    }
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("-"):
+            i += 1
+            if tok in _takes_value and i < len(tokens):
+                i += 1
+            continue
+        return tok
+    return None
+
+
 class GitTimeoutError(WorktreeError):
     """Raised when a ``git`` subprocess exceeds the configured timeout.
 
@@ -30,12 +80,35 @@ class GitTimeoutError(WorktreeError):
     ``_run_git`` now closes stdin, runs via ``Popen.communicate(timeout=...)``,
     and raises this on overrun so the MCP tool can surface a real error rather
     than blocking the client forever.
+
+    Ticket #102: a single E2E sweep observed one ``git fetch`` timeout that
+    didn't reproduce on retry, suggesting transient network contention rather
+    than a genuine hang. There was no way for a caller to tell "this timeout
+    was on a network operation, retrying may help" from "this timeout was on
+    a purely local command, retrying won't help" -- so this now also derives
+    (or accepts an explicit override for) a ``.network`` flag and the
+    ``.subcommand`` it was derived from, purely as a diagnostic signal. No
+    retry/backoff behaviour is implemented here.
     """
 
-    def __init__(self, command: List[str], elapsed: float) -> None:
-        super().__init__(
-            f"git command timed out after {elapsed:.1f}s: {' '.join(command)}"
+    def __init__(
+        self,
+        command: List[str],
+        elapsed: float,
+        *,
+        network: Optional[bool] = None,
+    ) -> None:
+        self.subcommand = _git_subcommand(command)
+        self.network = (
+            network if network is not None else self.subcommand in _NETWORK_SUBCOMMANDS
         )
+        message = f"git command timed out after {elapsed:.1f}s: {' '.join(command)}"
+        if self.network:
+            message += (
+                " (network operation -- this may be transient remote/network "
+                "contention; retrying may succeed)"
+            )
+        super().__init__(message)
         self.command = command
         self.elapsed = elapsed
 
@@ -125,6 +198,78 @@ class WorktreeDirLockedError(WorktreeError):
         self.kill_attempted = kill_attempted
 
 
+class WorktreeRemovalBlockedError(WorktreeDirLockedError, DirtyWorktreeError):
+    """Raised when TWO OR MORE conditions are simultaneously blocking a
+    ``remove()`` call -- currently: an OS-level directory lock AND real
+    uncommitted/untracked changes (not merely the benign ``.seretos/``
+    convenience copy exempted by ticket #100).
+
+    Ticket #103: without this, a caller who hits both conditions has to
+    discover each one via a separate round-trip -- plain ``remove()`` ->
+    ``WorktreeDirLockedError`` -> retry with ``kill_blocking_processes=True``
+    -> ``DirtyWorktreeError`` -> retry with ``force=True`` too. This
+    exception instead names EVERY condition currently blocking removal and
+    the flag needed to clear each, in a single raise, so one informed retry
+    suffices.
+
+    Deliberately inherits from both ``WorktreeDirLockedError`` and
+    ``DirtyWorktreeError`` (MRO: ``WorktreeRemovalBlockedError`` ->
+    ``WorktreeDirLockedError`` -> ``DirtyWorktreeError`` -> ``WorktreeError``
+    -> ``RuntimeError``; C3-valid since both parents derive only from
+    ``WorktreeError``) so existing ``except WorktreeDirLockedError:`` and
+    ``except DirtyWorktreeError:`` call sites both keep catching it without
+    any change on their part.
+
+    The constructor bypasses both parents' ``__init__`` -- neither accepts
+    ``**kwargs`` or forwards cooperatively, so a ``super()`` chain would
+    either double-set the message or raise ``TypeError`` -- and instead
+    calls ``WorktreeError.__init__`` directly, then sets all four
+    structured attributes explicitly: ``worktree_id``, ``killed``,
+    ``kill_attempted`` (mirroring ``WorktreeDirLockedError``) plus the new
+    ``dirty_paths`` (the non-exempt untracked/modified paths ``git status``
+    reported). The human-readable message itself stays free of filesystem
+    paths -- it names only engine-level flags and the worktree id; a caller
+    that wants the actual paths reads the structured ``dirty_paths``
+    attribute.
+
+    Raised only when two or more conditions block removal at once; a
+    single blocking condition keeps raising the existing single-condition
+    exception (``WorktreeDirLockedError`` or ``DirtyWorktreeError``)
+    unchanged.
+    """
+
+    def __init__(
+        self,
+        worktree_id: str,
+        killed: "List[KilledProcessInfo]",
+        *,
+        kill_attempted: bool = False,
+        dirty_paths: "Optional[List[str]]" = None,
+    ) -> None:
+        if kill_attempted:
+            n = len(killed)
+            message = (
+                f"worktree '{worktree_id}' cannot be removed: 2 conditions "
+                f"are blocking it. The directory is still locked after "
+                f"killing {n} blocking process(es) (retry with "
+                f"kill_blocking_processes=True) and it has uncommitted "
+                f"changes (pass force=True)."
+            )
+        else:
+            message = (
+                f"worktree '{worktree_id}' cannot be removed: 2 conditions "
+                f"are blocking it. The directory is locked by another "
+                f"process (pass kill_blocking_processes=True) and it has "
+                f"uncommitted changes (pass force=True). Pass both to "
+                f"remove it in a single retry."
+            )
+        WorktreeError.__init__(self, message)
+        self.worktree_id = worktree_id
+        self.killed = list(killed)
+        self.kill_attempted = kill_attempted
+        self.dirty_paths = list(dirty_paths or [])
+
+
 class UnknownVariantError(WorktreeError, ValueError):
     """Raised when ``WorktreeManager.start()`` is given a ``variant`` that
     does not match any ``start:`` step name in the contract.
@@ -146,6 +291,69 @@ class UnknownVariantError(WorktreeError, ValueError):
         )
         self.variant = variant
         self.available = available
+
+
+class VariantResolutionError(WorktreeError, ValueError):
+    """Raised when ``WorktreeManager.stop(variant=...)`` cannot uniquely
+    resolve *variant* to the ``role`` that started it (ticket #104).
+
+    ``record.variants`` maps ``role -> variant`` for every currently-running
+    role (see ``WorktreeRecord.variants``'s docstring). This error covers the
+    three ways that lookup can fail to produce a single, unambiguous role:
+
+    * **zero match** -- no currently-running role was started with
+      *variant*. ``roles`` is ``[]``. This also covers a role started before
+      this ticket shipped (a live pid but no ``variants`` entry) and a typo'd
+      variant name; the message points the caller at ``role=`` and names the
+      roles that *are* currently running (``running_roles``) so a legacy
+      record remains actionable.
+    * **multiple match** -- more than one currently-running role was started
+      with *variant*. ``roles`` lists every matching role (sorted).
+    * **disagreement** -- the caller passed an explicit ``role=`` alongside
+      ``variant=`` and they do not agree: *variant* resolves to exactly one
+      role, but it is not the one the caller named. ``roles`` is that single
+      resolved role (as a one-element list) and ``requested_role`` is the
+      role the caller explicitly asked for.
+
+    Callers can distinguish the three modes programmatically via
+    ``len(e.roles)`` (``0`` → zero match, ``>1`` → ambiguous) and
+    ``e.requested_role`` (non-``None`` with ``len(e.roles) == 1`` →
+    disagreement).
+    """
+
+    def __init__(
+        self,
+        variant: str,
+        roles: "List[str]",
+        *,
+        requested_role: "Optional[str]" = None,
+        running_roles: "Optional[List[str]]" = None,
+    ) -> None:
+        self.variant = variant
+        self.roles = roles
+        self.requested_role = requested_role
+
+        if requested_role is not None and len(roles) == 1:
+            message = (
+                f"variant='{variant}' resolves to role='{roles[0]}', which "
+                f"disagrees with the explicitly requested role="
+                f"'{requested_role}' -- when both role and variant are "
+                f"given they must agree"
+            )
+        elif len(roles) > 1:
+            message = (
+                f"variant='{variant}' is ambiguous: it was used to start "
+                f"multiple currently-running roles {roles} -- pass "
+                f"role=<one of these> to disambiguate"
+            )
+        else:
+            running = running_roles if running_roles is not None else []
+            message = (
+                f"no currently-running role was started with variant="
+                f"'{variant}' -- pass role=<role name> instead "
+                f"(currently-running roles: {running})"
+            )
+        super().__init__(message)
 
 
 class PrimaryCheckoutError(WorktreeError):
@@ -219,6 +427,8 @@ __all__ = [
     "InvalidRepoError",
     "PrimaryCheckoutError",
     "UnknownVariantError",
+    "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeError",
+    "WorktreeRemovalBlockedError",
 ]

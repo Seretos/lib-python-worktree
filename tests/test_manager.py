@@ -26,6 +26,7 @@ from lib_python_worktree.core.manager import (
     GitTimeoutError,
     ManagerConfig,
     UnknownVariantError,
+    VariantResolutionError,
     WorktreeError,
     WorktreeManager,
     GitCommandError,
@@ -33,7 +34,12 @@ from lib_python_worktree.core.manager import (
     _is_path_prunable,
     _run_git,
 )
-from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+from lib_python_worktree.core.state import (
+    STOP_REASON_SURVIVORS,
+    InMemoryStateStore,
+    StopDetail,
+    WorktreeRecord,
+)
 from lib_python_worktree.core.yaml_store import YamlStateStore
 
 
@@ -546,6 +552,195 @@ def test_run_git_closes_stdin(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #102: GitTimeoutError network-vs-local classification
+# ---------------------------------------------------------------------------
+
+
+def test_run_git_timeout_on_fetch_flags_network_operation(monkeypatch):
+    """R1: a timed-out network git command (fetch) is flagged .network=True,
+    and the message names it as a network operation for retry-worthiness.
+    """
+
+    class _HangingPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=timeout)
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _HangingPopen)
+
+    with pytest.raises(GitTimeoutError) as excinfo:
+        _run_git(["fetch", "origin", "main"], timeout=0.05)
+
+    err = excinfo.value
+    assert err.network is True
+    assert err.command == ["git", "fetch", "origin", "main"]
+    assert "network operation" in str(err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["git", "-c", "protocol.version=2", "fetch", "origin", "main"],
+        ["git", "--no-pager", "fetch", "origin", "main"],
+        ["fetch", "origin", "main"],  # no leading "git" token
+    ],
+)
+def test_git_subcommand_classifies_fetch_variants_as_network(command):
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == "fetch"
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        (["git", "-C", "repo", "fetch", "origin"], "fetch"),
+        (["git", "--git-dir", "repo", "fetch", "origin"], "fetch"),
+        (["git", "--work-tree", "wt", "fetch", "origin"], "fetch"),
+        (["git", "--namespace", "ns", "push", "origin"], "push"),
+        (["git", "--super-prefix", "prefix/", "pull", "origin"], "pull"),
+        (
+            ["git", "--config-env", "http.extraHeader=AUTH", "clone", "url"],
+            "clone",
+        ),
+    ],
+)
+def test_git_subcommand_skips_space_separated_global_option_values(command, expected):
+    """Reviewer finding #1: global options that take a SEPARATE (space-
+    delimited) value token -- not just ``-c``/``-C`` -- must have that value
+    token skipped rather than mistaken for the subcommand. Without this,
+    e.g. ``git --git-dir repo fetch origin`` misclassifies as subcommand
+    ``"repo"`` instead of ``"fetch"``, silently defeating the network
+    signal for a genuine timeout on such an invocation.
+    """
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        (["git", "--git-dir=repo", "fetch", "origin"], "fetch"),
+        (["git", "--work-tree=wt", "fetch", "origin"], "fetch"),
+        (["git", "--namespace=ns", "push", "origin"], "push"),
+        (["git", "--super-prefix=prefix/", "pull", "origin"], "pull"),
+        (
+            ["git", "--config-env=http.extraHeader=AUTH", "clone", "url"],
+            "clone",
+        ),
+    ],
+)
+def test_git_subcommand_equals_joined_global_options_do_not_consume_next_token(
+    command, expected
+):
+    """The ``=``-joined form of a value-taking global option (e.g.
+    ``--git-dir=/path``) is a single token and must NOT consume the
+    following token as a value -- only the space-separated form does.
+    """
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command, expected_subcommand, expected_network",
+    [
+        # Bare `--exec-path` takes no separate value per real git behaviour
+        # (verified against git 2.53.0.windows.1: `git --exec-path rev-parse
+        # --is-bare-repository` prints only the exec path and never runs
+        # `rev-parse`), so it must stay OUT of `_takes_value` -- the next
+        # bare token is the subcommand, not a consumed value.
+        (["git", "--exec-path", "rev-parse"], "rev-parse", False),
+        (["git", "--exec-path=/some/path", "fetch", "origin"], "fetch", True),
+    ],
+)
+def test_git_subcommand_exec_path_does_not_take_a_separate_value(
+    command, expected_subcommand, expected_network
+):
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == expected_subcommand
+    err = GitTimeoutError(command, 1.0)
+    assert err.network is expected_network
+
+
+@pytest.mark.parametrize("command", [["git"], []])
+def test_git_subcommand_handles_degenerate_commands_without_raising(command):
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) is None
+    err = GitTimeoutError(command, 1.0)
+    assert err.network is False
+
+
+def test_run_git_timeout_on_local_command_is_not_network(monkeypatch):
+    """R2: a timed-out local git command (worktree list) is NOT flagged as
+    network, and the message text is unchanged (exact-match regression guard).
+    """
+
+    class _HangingPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd=["git", "worktree"], timeout=timeout)
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _HangingPopen)
+
+    with pytest.raises(GitTimeoutError) as excinfo:
+        _run_git(["worktree", "list", "--porcelain"], timeout=0.05)
+
+    err = excinfo.value
+    assert err.network is False
+    assert str(err) == (
+        f"git command timed out after {err.elapsed:.1f}s: "
+        f"git worktree list --porcelain"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["git", "remote", "-v"],
+        ["git", "submodule", "status"],
+    ],
+)
+def test_git_subcommand_remote_and_submodule_are_not_network(command):
+    from lib_python_worktree.core._exceptions import _git_subcommand, _NETWORK_SUBCOMMANDS
+
+    assert _git_subcommand(command) not in _NETWORK_SUBCOMMANDS
+
+
+def test_git_timeout_error_construction_is_backwards_compatible():
+    """R3: positional construction still works, still subclasses
+    WorktreeError, and the ``network`` kwarg override wins over derivation.
+    """
+
+    err = GitTimeoutError(["git", "rev-parse"], 30.0)
+    assert isinstance(err, WorktreeError)
+    assert err.command == ["git", "rev-parse"]
+    assert err.elapsed == 30.0
+    assert err.network is False
+
+    # Explicit override wins: force a normally-local command to be flagged...
+    forced_true = GitTimeoutError(["git", "rev-parse"], 30.0, network=True)
+    assert forced_true.network is True
+
+    # ...and suppress it on a normally-network command.
+    forced_false = GitTimeoutError(["git", "fetch", "origin"], 30.0, network=False)
+    assert forced_false.network is False
+
+
+# ---------------------------------------------------------------------------
 # Ticket #1: worktree_remove must delete the branch it created
 # ---------------------------------------------------------------------------
 
@@ -800,6 +995,52 @@ def test_manager_adopt_discovers_out_of_band_worktree(
         assert rec.branch == "feature/alpha"
         assert rec.ports == {}
         assert rec.pids == {}
+        # Ticket #105: adopt() never runs the setup: hook, so the adopted
+        # record's setup_outcome must stay None -- distinct from
+        # status="skipped", which only create() ever sets.
+        assert rec.setup_outcome is None
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(oot_path)],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+
+@pytest.mark.requires_git
+def test_manager_list_repo_synthesised_untracked_entry_setup_outcome_is_none(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #105: an untracked linked worktree synthesised by list_repo()
+    (no persisted WorktreeRecord yet, tracked=False) must have
+    setup_outcome is None -- it never went through create()'s setup: hook."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    oot_path = tmp_path / "oot-wt-listrepo"
+    subprocess.run(
+        ["git", "worktree", "add", str(oot_path), "feature/alpha"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        listing = mgr.list_repo(str(git_repo))
+        # Untracked entries include both the synthesised primary (never
+        # start()-ed) and the synthesised linked worktree created above --
+        # every one of them must have setup_outcome is None, since none of
+        # them ever went through create()'s setup: hook.
+        untracked = [e for e in listing.entries if not e.tracked]
+        assert len(untracked) >= 1, "expected at least one synthesised untracked entry"
+        assert all(e.record.setup_outcome is None for e in untracked)
+        linked = [e for e in untracked if e.record.backing == "worktree"]
+        assert len(linked) == 1, "expected exactly one synthesised untracked linked worktree"
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(oot_path)],
@@ -980,6 +1221,39 @@ def test_remove_dirty_no_force_raises_dirty_error(
     msg = str(excinfo.value)
     assert "force=True" in msg
     assert "--force" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Ticket #100: an untracked `.seretos/` convenience copy must not force
+# force=True on a plain create() -> remove() cycle with zero real edits.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+def test_remove_untracked_contract_copy_no_force_succeeds(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Driving test (ticket #100): remove(force=False) must succeed on a
+    checkout whose ONLY dirt is the untracked `.seretos/` copy the
+    agent-worktree plugin drops into every new checkout after create()
+    returns. Before the fix this always raised DirtyWorktreeError."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+    wt_path = Path(rec.path)
+
+    # Simulate the plugin's post-create convenience copy: an untracked
+    # `.seretos/worktree-setup.yml` inside the checkout, with zero other
+    # edits anywhere.
+    contract_dir = wt_path / ".seretos"
+    contract_dir.mkdir()
+    (contract_dir / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    result = manager.remove(rec.id, force=False)
+
+    assert result.status == "removed"
+    assert not wt_path.exists()
+    assert manager.state.get(rec.id) is None
 
 
 def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
@@ -1349,6 +1623,8 @@ def test_manager_start_empty_contract_is_noop_ready(tmp_path: Path):
     assert result.status == "ready"
     assert result.pids == {}
     assert mgr.state.get(record.id).status == "ready"
+    # Ticket #104: no process was spawned, so no variant is recorded either.
+    assert result.variants == {}
 
 
 def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
@@ -1369,6 +1645,214 @@ def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
     mock_start.assert_not_called()
     assert result.status == "ready"
     assert result.pids == {}
+
+
+# ---------------------------------------------------------------------------
+# Ticket #100: start() flags a checkout-local contract copy it never reads.
+# ---------------------------------------------------------------------------
+
+
+def test_start_flags_shadowed_checkout_contract(tmp_path: Path, caplog):
+    """Driving test (ticket #100): a checkout-local `.seretos/worktree-
+    setup.yml` that would yield a DIFFERENT contract than the repo-root one
+    actually read must be flagged on the returned record's
+    `shadowed_contract`, and the identical message must be logged at
+    WARNING. Before the fix, `WorktreeRecord` had no such attribute at all."""
+    import logging as _logging
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    # Repo root has no start: step -> no-op ready path.
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+    # Checkout-local copy DOES have a start: step -> different contract.
+    _write_contract(
+        checkout,
+        "version: 1\nisolation: full\nstart:\n  - run: npm run dev\n",
+    )
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.pids == {}
+    assert result.shadowed_contract is not None
+    shadow = result.shadowed_contract
+    assert shadow.reason == "differs"
+    assert Path(shadow.path) == (checkout / ".seretos" / "worktree-setup.yml")
+    assert Path(shadow.used_path) == (repo_root / ".seretos" / "worktree-setup.yml")
+    assert any(rec.message == shadow.message for rec in caplog.records), (
+        "the logged WARNING message must be identical to shadow.message"
+    )
+
+
+def test_start_no_shadow_when_checkout_contract_identical(tmp_path: Path):
+    """A checkout-local copy that parses to the SAME contract as the one
+    actually used must not be flagged -- since the plugin copies `.seretos/`
+    into every checkout, an unconditional flag would fire on every single
+    start() and be pure noise."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    contract_text = "version: 1\nisolation: none\n"
+    _write_contract(repo_root, contract_text)
+    _write_contract(checkout, contract_text)
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.shadowed_contract is None
+
+
+def test_start_no_shadow_when_no_checkout_contract(tmp_path: Path):
+    """No checkout-local `.seretos/` copy at all -> no flag."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.shadowed_contract is None
+
+
+def test_start_shadow_reason_unreadable_on_malformed_checkout_contract(
+    tmp_path: Path,
+):
+    """A checkout-local copy that exists but fails to parse/validate must be
+    flagged with reason="unreadable" -- and, unlike a malformed REPO-ROOT
+    contract (which raises through start(), see the ticket #70 tests below),
+    start() itself must still return normally."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+    _write_contract(checkout, "version: 1\n  bad: indent: here\n")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.shadowed_contract is not None
+    assert result.shadowed_contract.reason == "unreadable"
+
+
+def test_start_shadow_reason_unreadable_on_dangling_symlink_checkout_contract(
+    tmp_path: Path,
+):
+    """A checkout-local `.seretos/worktree-setup.yml` that is a broken/
+    dangling symlink must be flagged with reason="unreadable", not silently
+    treated as "no checkout-local contract at all". `Path.exists()` follows
+    symlinks and would report False for a dangling link -- indistinguishable
+    from "nothing there" -- which is why the implementation must use
+    `os.path.lexists()` for the presence check instead. start() must still
+    return normally without raising.
+
+    Symlink creation on Windows normally requires elevation/Developer Mode,
+    so this is skipped rather than failed on an unprivileged runner.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+
+    shadow_dir = checkout / ".seretos"
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    shadow_file = shadow_dir / "worktree-setup.yml"
+    try:
+        os.symlink(shadow_dir / "does-not-exist.yml", shadow_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this machine")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.shadowed_contract is not None
+    assert result.shadowed_contract.reason == "unreadable"
+
+
+def test_start_flags_shadowed_contract_on_real_spawn_exit_path(tmp_path: Path):
+    """Blocking-finding-2 follow-up (ticket #100): the shadowed-contract flag
+    must also survive the REAL-SPAWN exit path (repo-root contract HAS a
+    `start:` step, so start() calls `_lifecycle_start(...)` rather than
+    taking the no-op `status="ready"` shortcut).
+
+    `_lifecycle_start` hands back a freshly store-loaded record that never
+    carries the transient `shadowed_contract` field (see the comment at the
+    `result.shadowed_contract = shadowed_contract` assignment in
+    `manager.start()`), so start() must assign it explicitly onto whatever
+    `_lifecycle_start` returns. Every OTHER shadowed_contract test in this
+    file uses a contract with no `start:` step, so they only ever exercise
+    the no-op branch's own (separate) assignment -- this is the only test
+    that pins the real-spawn branch's assignment specifically. Uses a
+    distinct `spawned_record` object (not the same instance as `record`,
+    and with `shadowed_contract` left at its default) so the assertion can
+    only pass via the explicit assignment onto the object `_lifecycle_start`
+    returns, not by accident via shared identity with `record`."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    # Repo root HAS a start: step -> real-spawn path (not the no-op "ready" one).
+    _write_contract(repo_root, "version: 1\nisolation: full\nstart:\n  - run: npm run dev\n")
+    # Checkout-local copy differs -> shadowed_contract must be populated.
+    _write_contract(
+        checkout,
+        "version: 1\nisolation: none\n",
+    )
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    spawned_record = _make_wt_record(
+        wt_id=record.id,
+        repo_root=str(repo_root),
+        path=str(checkout),
+        status="running",
+        pids={"main": 4242},
+    )
+    assert spawned_record.shadowed_contract is None
+    assert spawned_record is not record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        return_value=spawned_record,
+    ) as mock_start:
+        result = mgr.start(record.id)
+
+    mock_start.assert_called_once()
+    assert result is spawned_record
+    assert result.status == "running"
+    assert result.shadowed_contract is not None
+    shadow = result.shadowed_contract
+    assert shadow.reason == "differs"
+    assert Path(shadow.path) == (checkout / ".seretos" / "worktree-setup.yml")
+    assert Path(shadow.used_path) == (repo_root / ".seretos" / "worktree-setup.yml")
 
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1972,32 @@ def test_manager_start_named_variant_selected(tmp_path: Path):
 
     call_kwargs = mock_start.call_args
     assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_forwards_variant_to_lifecycle_start(tmp_path: Path):
+    """Ticket #104: start(variant="headless") forwards variant="headless"
+    to the delegated process_lifecycle.start call, so it can be recorded
+    under record.variants[role]."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    headless_step = Step(run="python server.py --headless", name="headless")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[headless_step],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="headless")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["variant"] == "headless"
 
 
 def test_manager_start_backward_compat_single_unnamed_step(tmp_path: Path):
@@ -1894,6 +2404,339 @@ class TestManagerStopStickyStatus:
         mock_runner_instance.run.assert_called_once()
         mock_lc_stop.assert_not_called()
         assert result.status == "stop_incomplete"
+
+    def test_no_pid_for_role_clears_stop_detail_when_marking_stopped(self, tmp_path: Path):
+        """Ticket #99 (B2 edge case): mirrors
+        test_no_pid_for_role_running_still_becomes_stopped -- when the no-op
+        branch actually transitions a non-sticky status to "stopped", any
+        stale stop_detail left over on the record must be cleared too."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        stale_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS, message="stale", role="main",
+        )
+        record = _make_wt_record(status="running", stop_detail=stale_detail)  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stopped"
+        assert result.stop_detail is None
+        assert mgr.state.get(record.id).stop_detail is None
+
+    def test_no_pid_for_role_preserves_stop_detail_when_sticky(self, tmp_path: Path):
+        """Ticket #99 (B2 edge case): mirrors
+        test_no_pid_for_role_does_not_clobber_stop_incomplete -- the sticky
+        guard preserving status must also preserve the stop_detail attached
+        to it; the no-op branch must not touch stop_detail when it does not
+        touch status."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        sticky_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS, message="sticky", role="main",
+        )
+        record = _make_wt_record(
+            status="stop_incomplete", stop_detail=sticky_detail,
+        )  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail == sticky_detail
+        assert mgr.state.get(record.id).stop_detail == sticky_detail
+
+
+# ---------------------------------------------------------------------------
+# TestManagerStopByVariant -- ticket #104 (B3)
+# ---------------------------------------------------------------------------
+
+class TestManagerStopByVariant:
+    """B3 (ticket #104): stop(variant=...) resolves to the role that
+    started it via record.variants, symmetric with start(variant=...)."""
+
+    def test_manager_stop_by_variant_resolves_role(self, tmp_path: Path):
+        """Driving test: stop(variant="web") delegates to _lifecycle_stop
+        with role="web" resolved from record.variants."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111, "web": 222},
+            variants={"main": "default", "web": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, variant="web")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="web",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_without_variant_unchanged(self, tmp_path: Path):
+        """Bare stop(id) still targets 'main' when variant is not given."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111, "web": 222},
+            variants={"main": "default", "web": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id)
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_role_none_defaults_to_main(self, tmp_path: Path):
+        """Explicit role=None is the same as omitting it entirely -- the
+        sentinel default is not itself a no-op."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"main": 111})
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, role=None)
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_role_and_variant_agree(self, tmp_path: Path):
+        """role="web", variant="web" where variants={"web": "web"} resolves
+        and delegates with role="web" (the pair agrees; no error)."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"web": 222}, variants={"web": "web"})
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, role="web", variant="web")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="web",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_by_variant_after_reload(self, tmp_path: Path):
+        """End-to-end through YamlStateStore: a record with a persisted
+        variants mapping survives a fresh WorktreeManager instance
+        (simulating a host restart), and stop(variant=...) still resolves
+        correctly."""
+        state_dir = tmp_path / "state"
+        store1 = YamlStateStore(state_dir=state_dir)
+        record = _make_wt_record(pids={"web": 222}, variants={"web": "web"})
+        store1.add(record)
+
+        mgr2 = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=YamlStateStore(state_dir=state_dir),
+            reconcile_on_init=False,
+        )
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr2.stop(record.id, variant="web")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr2.state,
+            role="web",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestManagerStopVariantResolutionErrors -- ticket #104 (B4)
+# ---------------------------------------------------------------------------
+
+class TestManagerStopVariantResolutionErrors:
+    """B4 (ticket #104): an unknown, ambiguous, or role-disagreeing variant
+    raises a clear VariantResolutionError, and nothing is attempted (no
+    contract stop: steps, no _lifecycle_stop call) before that error is
+    raised."""
+
+    def test_manager_stop_ambiguous_variant_raises(self, tmp_path: Path):
+        """Driving test: two roles both mapped to variant="web" -- stop()
+        raises VariantResolutionError naming both candidates, and nothing
+        was attempted (no _lifecycle_stop call, no contract stop: steps)."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"web1": 111, "web2": 222},
+            variants={"web1": "web", "web2": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="echo stopping")],
+        )
+        mock_runner_instance = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="web")
+
+        mock_lc_stop.assert_not_called()
+        mock_runner_instance.run.assert_not_called()
+        err = exc_info.value
+        assert err.roles == ["web1", "web2"]
+        assert err.requested_role is None
+
+    def test_manager_stop_unknown_variant_raises(self, tmp_path: Path):
+        """Zero match: no currently-running role was started with this
+        variant. The message points at role= and names running roles."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"main": 111}, variants={"main": "default"})
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="nope")
+
+        mock_lc_stop.assert_not_called()
+        err = exc_info.value
+        assert err.roles == []
+        message = str(err)
+        assert "role=" in message
+        assert "main" in message
+
+    def test_manager_stop_legacy_record_zero_match_names_running_roles(self, tmp_path: Path):
+        """A record with a live pid but no variants entry (started before
+        this ticket shipped) hits the zero-match branch and names the
+        running role, while stop() and stop(role="main") still work
+        unchanged."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"main": 111})  # variants == {}
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="default")
+
+        mock_lc_stop.assert_not_called()
+        assert "main" in str(exc_info.value)
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop2,
+        ):
+            mock_lc_stop2.return_value = record
+            mgr.stop(record.id)
+
+        mock_lc_stop2.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_role_conflicts_with_variant_raises(self, tmp_path: Path):
+        """An explicit role= that disagrees with the role variant= resolves
+        to raises rather than silently picking one."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111, "web": 222},
+            variants={"web": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, role="main", variant="web")
+
+        mock_lc_stop.assert_not_called()
+        err = exc_info.value
+        assert err.requested_role == "main"
+        assert err.roles == ["web"]
+
+    def test_variant_resolution_error_is_worktree_error_and_valueerror(self):
+        assert issubclass(VariantResolutionError, WorktreeError)
+        assert issubclass(VariantResolutionError, ValueError)
+
+    def test_variant_resolution_error_importable_and_exported(self):
+        import lib_python_worktree as top
+
+        assert top.VariantResolutionError is VariantResolutionError
+        assert "VariantResolutionError" in top.__all__
+        assert "VariantResolutionError" in manager_module.__all__
 
 
 # ---------------------------------------------------------------------------

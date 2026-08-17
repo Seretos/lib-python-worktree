@@ -27,7 +27,18 @@ import yaml
 
 import subprocess
 
-from lib_python_worktree.core.state import WorktreeRecord
+from lib_python_worktree.core.state import (
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUS_FAILED,
+    STOP_REASON_SURVIVORS,
+    SetupOutcome,
+    StopDetail,
+    WorktreeRecord,
+    _STOP_DETAIL_MAX_PIDS,
+)
+from lib_python_worktree.core.process_lifecycle import start as _lifecycle_start
+from lib_python_worktree.core.process_lifecycle import stop as _lifecycle_stop
+from lib_python_worktree.core.process_lifecycle import _force_kill
 from lib_python_worktree.core.yaml_store import (
     AdoptReport,
     ReconcileReport,
@@ -272,6 +283,68 @@ def test_worktree_record_with_returncode_and_start_log_path_roundtrip(
 
 
 # ---------------------------------------------------------------------------
+# Ticket #100: shadowed_contract is transient -- never persisted to
+# state.yaml, mirroring the killed_pids precedent (test_process_lifecycle.py
+# ::test_stop_populates_killed_pids_with_tree_and_orphans).
+# ---------------------------------------------------------------------------
+
+
+def test_shadowed_contract_not_serialised_to_dict():
+    """`_record_to_dict` must never write a `shadowed_contract` key."""
+    from lib_python_worktree.core.state import ShadowedContract
+    from lib_python_worktree.core.yaml_store import _record_to_dict
+
+    rec = _make_record(id="rec-shadow")
+    rec.shadowed_contract = ShadowedContract(
+        path="/checkout/.seretos/worktree-setup.yml",
+        used_path="/repo/.seretos/worktree-setup.yml",
+        reason="differs",
+        message="start(): checkout-local contract differs",
+    )
+
+    assert "shadowed_contract" not in _record_to_dict(rec)
+
+
+def test_record_from_dict_legacy_dict_has_no_shadowed_contract_key():
+    """A legacy dict with no `shadowed_contract` key at all (any state.yaml
+    written before this field existed) must deserialise with `None`, not
+    raise."""
+    from lib_python_worktree.core.yaml_store import _record_from_dict
+
+    legacy = {
+        "id": "rec-legacy",
+        "repo_root": "/repos/myrepo",
+        "branch": "main",
+        "path": "/store/myrepo/rec-legacy",
+    }
+
+    rec = _record_from_dict(legacy)
+
+    assert rec.shadowed_contract is None
+
+
+def test_shadowed_contract_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
+    """A real YamlStateStore add/get cycle must drop `shadowed_contract`
+    rather than persisting a stale copy -- it is a live observation
+    recomputed on every start(), never a stored verdict."""
+    from lib_python_worktree.core.state import ShadowedContract
+
+    rec = _make_record(id="rec-shadow-roundtrip")
+    rec.shadowed_contract = ShadowedContract(
+        path="/checkout/.seretos/worktree-setup.yml",
+        used_path="/repo/.seretos/worktree-setup.yml",
+        reason="unreadable",
+        message="start(): checkout-local contract could not be read",
+    )
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-shadow-roundtrip")
+
+    assert retrieved is not None
+    assert retrieved.shadowed_contract is None
+
+
+# ---------------------------------------------------------------------------
 # reconcile(): orphaned path
 # ---------------------------------------------------------------------------
 
@@ -316,6 +389,27 @@ def test_reconcile_dead_pid(state_dir: Path, tmp_path: Path):
     assert "server" not in updated.pids
 
 
+def test_reconcile_dead_pid_pops_variant_entry(state_dir: Path, tmp_path: Path):
+    """Ticket #104: a dead role discovered by reconcile() must also lose its
+    ``variants`` entry, keeping ``set(variants) <= set(pids)`` intact."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-variant-dead"
+    wt_path.mkdir()
+    dead_pid = 99999999  # extremely unlikely to be alive
+
+    rec = _make_record(id="wt-variant-dead", path=str(wt_path), pids={"server": dead_pid})
+    rec.variants = {"server": "web"}
+    store.add(rec)
+
+    assert not _pid_alive(dead_pid), "test assumption: pid 99999999 must not be alive"
+
+    reconcile(store)
+
+    updated = store.get("wt-variant-dead")
+    assert updated is not None
+    assert "server" not in updated.variants
+
+
 # ---------------------------------------------------------------------------
 # reconcile(): "stop_incomplete" status must survive a dead-role reconcile
 # (ticket #87 follow-up, finding B2)
@@ -357,6 +451,56 @@ def test_reconcile_preserves_stop_incomplete_status(state_dir: Path, tmp_path: P
         "reconcile() must not overwrite an existing 'stop_incomplete' status "
         "back to 'stopped' when it also clears an unrelated dead role"
     )
+
+
+# ---------------------------------------------------------------------------
+# reconcile(): stop_detail is cleared in lockstep with status transitions
+# (ticket #99, B2 edge cases)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_orphaned_clears_stop_detail(state_dir: Path, tmp_path: Path):
+    """reconcile()'s orphaned-path branch must clear any stale stop_detail
+    in lockstep with the status transition to "orphaned"."""
+    store = YamlStateStore(state_dir=state_dir)
+    non_existent = str(tmp_path / "gone" / "wt-orphan-detail")
+    rec = _make_record(id="wt-orphan-detail", path=non_existent)
+    rec.stop_detail = StopDetail(
+        reason=STOP_REASON_SURVIVORS, message="stale", role="main",
+    )
+    store.add(rec)
+
+    report = reconcile(store)
+
+    assert "wt-orphan-detail" in report.orphaned
+    updated = store.get("wt-orphan-detail")
+    assert updated is not None
+    assert updated.status == "orphaned"
+    assert updated.stop_detail is None
+
+
+def test_reconcile_dead_pid_stopped_clears_stop_detail(state_dir: Path, tmp_path: Path):
+    """reconcile()'s dead-PID branch, when it actually transitions status to
+    "stopped", must clear any stale stop_detail left on the record."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-dead-detail"
+    wt_path.mkdir()
+    dead_pid = 99999999  # extremely unlikely to be alive
+
+    rec = _make_record(id="wt-dead-detail", path=str(wt_path), pids={"server": dead_pid})
+    rec.stop_detail = StopDetail(
+        reason=STOP_REASON_SURVIVORS, message="stale", role="server",
+    )
+    store.add(rec)
+
+    assert not _pid_alive(dead_pid), "test assumption: pid 99999999 must not be alive"
+
+    report = reconcile(store)
+
+    assert "wt-dead-detail" in report.stopped
+    updated = store.get("wt-dead-detail")
+    assert updated is not None
+    assert updated.status == "stopped"
+    assert updated.stop_detail is None
 
 
 # ---------------------------------------------------------------------------
@@ -1328,3 +1472,387 @@ class TestJobNameRoundTrip:
         legacy = store.get("legacy-wt-job")
         assert legacy is not None
         assert legacy.job_names == {}
+
+
+# ---------------------------------------------------------------------------
+# TestVariantsRoundTrip -- ticket #104
+# ---------------------------------------------------------------------------
+
+class TestVariantsRoundTrip:
+    """B1 (ticket #104): ``WorktreeRecord.variants`` (per-role mapping of
+    role -> the variant that started it) persists through ``state.yaml``,
+    and a pre-fix record with no ``variants`` key at all still deserialises
+    (defaulting to ``{}``)."""
+
+    def test_variants_round_trip(self, state_dir: Path):
+        """Driving test: a record with a real per-role variants mapping
+        round-trips through a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-variants")
+        record.variants = {"main": "default", "web": "web"}
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-variants")
+        assert reloaded is not None
+        assert reloaded.variants == {"main": "default", "web": "web"}
+
+    def test_legacy_record_without_variants_key_defaults_to_empty(self, state_dir: Path):
+        """A pre-fix state.yaml entry with no `variants` key at all must
+        still deserialise, defaulting variants to an empty dict."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-variants": {
+                    "id": "legacy-wt-variants",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-variants",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    # no "variants" key at all -- simulates a pre-fix
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-variants")
+        assert legacy is not None
+        assert legacy.variants == {}
+
+
+# ---------------------------------------------------------------------------
+# TestStopDetailPersistence -- ticket #99
+# ---------------------------------------------------------------------------
+
+class TestStopDetailPersistence:
+    """B3 (ticket #99): ``stop_detail`` survives a host restart (persisted
+    through ``state.yaml``), a legacy record with no ``stop_detail`` key
+    still loads, and an unrecognised key inside it is silently ignored."""
+
+    def test_stop_detail_round_trips(self, state_dir: Path):
+        """Driving test: a record with a real StopDetail round-trips through
+        a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-stop-detail", status="stop_incomplete")
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message=(
+                "stop(worktree_id=wt-stop-detail, role=main): process(es) "
+                "survived termination: [31337]"
+            ),
+            role="main",
+            survivor_pids=(31337,),
+            survivor_count=1,
+            kill_orphans_may_help=True,
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-stop-detail")
+        assert reloaded is not None
+        assert reloaded.stop_detail == record.stop_detail
+
+    def test_legacy_record_without_stop_detail_key_defaults_to_none(self, state_dir: Path):
+        """A pre-#99 state.yaml entry with no `stop_detail` key at all must
+        still deserialise, defaulting stop_detail to None."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-stop": {
+                    "id": "legacy-wt-stop",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-stop",
+                    "status": "stop_incomplete",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    # no "stop_detail" key at all -- simulates a pre-#99
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-stop")
+        assert legacy is not None
+        assert legacy.stop_detail is None
+
+    def test_unknown_stop_detail_key_is_ignored(self, state_dir: Path):
+        """Forward compat: a state.yaml written by a future engine version
+        may carry extra keys inside stop_detail this version does not know
+        about -- they must be silently ignored, not raise."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "future-wt-stop": {
+                    "id": "future-wt-stop",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/future-wt-stop",
+                    "status": "stop_incomplete",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "stop_detail": {
+                        "reason": "survivors",
+                        "message": "future msg",
+                        "role": "main",
+                        "survivor_pids": [123],
+                        "survivor_count": 1,
+                        "truncated_at": None,
+                        "skipped_passes": [],
+                        "kill_orphans_may_help": True,
+                        "future_field_this_version_predates": "surprise",
+                    },
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        future = store.get("future-wt-stop")
+        assert future is not None
+        assert future.stop_detail is not None
+        assert future.stop_detail.reason == "survivors"
+        assert future.stop_detail.survivor_pids == (123,)
+
+    def test_survivor_pids_capped_in_persisted_detail(self, state_dir: Path):
+        """A StopDetail carrying more than _STOP_DETAIL_MAX_PIDS survivor
+        pids (e.g. constructed by a future engine version) is capped on the
+        way to disk (and again on the way back); survivor_count still holds
+        the true total."""
+        store = YamlStateStore(state_dir=state_dir)
+        many_pids = tuple(range(1000, 1100))  # 100 pids, well over the cap
+        record = _make_record(id="wt-many-survivors", status="stop_incomplete")
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message="many survivors",
+            role="main",
+            survivor_pids=many_pids,
+            survivor_count=len(many_pids),
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-many-survivors")
+        assert reloaded is not None
+        assert reloaded.stop_detail is not None
+        assert len(reloaded.stop_detail.survivor_pids) == _STOP_DETAIL_MAX_PIDS
+        assert reloaded.stop_detail.survivor_count == 100
+
+
+# ---------------------------------------------------------------------------
+# TestSetupOutcomePersistence -- ticket #105
+# ---------------------------------------------------------------------------
+
+class TestSetupOutcomePersistence:
+    """``setup_outcome`` persists through ``state.yaml`` exactly like
+    ``stop_detail``: a legacy record with no ``setup_outcome`` key still
+    loads (defaulting to ``None``), and an unrecognised status / extra key
+    inside it is silently forward-compatible."""
+
+    def test_setup_outcome_round_trips(self, state_dir: Path):
+        """Driving test: a record with a fully-populated SetupOutcome
+        round-trips through a fresh YamlStateStore load, field-by-field,
+        including timed_out and the forward-slash log_path."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-setup-outcome")
+        record.setup_outcome = SetupOutcome(
+            status=SETUP_STATUS_FAILED,
+            message=(
+                "setup step 0 ('build') for worktree 'wt-setup-outcome' "
+                "failed with exit code 1. See log: C:/logs/0-build.log"
+            ),
+            completed_at="2026-08-17T12:00:00+00:00",
+            steps_run=0,
+            failed_step_index=0,
+            failed_step_name="build",
+            log_path="C:/logs/setup/wt-setup-outcome/0-build.log",
+            returncode=1,
+            timed_out=True,
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-setup-outcome")
+        assert reloaded is not None
+        assert reloaded.setup_outcome == record.setup_outcome
+        assert reloaded.setup_outcome.log_path == "C:/logs/setup/wt-setup-outcome/0-build.log"
+        assert reloaded.setup_outcome.timed_out is True
+
+    def test_legacy_record_without_setup_outcome_key_defaults_to_none(self, state_dir: Path):
+        """A pre-#105 state.yaml entry with no `setup_outcome` key at all
+        must still deserialise, defaulting setup_outcome to None."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-setup": {
+                    "id": "legacy-wt-setup",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-setup",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    # no "setup_outcome" key at all -- simulates a pre-#105
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-setup")
+        assert legacy is not None
+        assert legacy.setup_outcome is None
+
+    def test_unknown_setup_outcome_status_and_extra_key_preserved(self, state_dir: Path):
+        """Forward compat: a state.yaml written by a future engine version
+        may carry an unrecognised `status` value and extra keys inside
+        `setup_outcome` this version does not know about -- both must be
+        handled without raising; the extra key is silently ignored and the
+        unrecognised status is preserved verbatim."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "future-wt-setup": {
+                    "id": "future-wt-setup",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/future-wt-setup",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "setup_outcome": {
+                        "status": "partially_completed",
+                        "message": "future msg",
+                        "completed_at": "2099-01-01T00:00:00+00:00",
+                        "steps_run": 3,
+                        "future_field_this_version_predates": "surprise",
+                    },
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        future = store.get("future-wt-setup")
+        assert future is not None
+        assert future.setup_outcome is not None
+        assert future.setup_outcome.status == "partially_completed"
+        assert future.setup_outcome.steps_run == 3
+
+    @pytest.mark.parametrize("raw_value", [None, {}])
+    def test_setup_outcome_null_and_empty_dict_deserialize_to_none(
+        self, state_dir: Path, raw_value
+    ):
+        """`setup_outcome: null` and `setup_outcome: {}` both deserialise to
+        None, mirroring `stop_detail`'s falsy-dict handling."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "wt-falsy-setup": {
+                    "id": "wt-falsy-setup",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/wt-falsy-setup",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "setup_outcome": raw_value,
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        rec = store.get("wt-falsy-setup")
+        assert rec is not None
+        assert rec.setup_outcome is None
+
+
+# ---------------------------------------------------------------------------
+# TestSetupOutcomeSurvivesLifecycle -- ticket #105
+# ---------------------------------------------------------------------------
+
+class TestSetupOutcomeSurvivesLifecycle:
+    """``setup_outcome`` must be left untouched by ``start()``/``stop()`` --
+    only ``create()``'s ``setup:`` hook block ever assigns it. Uses
+    ``YamlStateStore`` (not ``InMemoryStateStore``) specifically because an
+    in-memory store keeps a record by reference and would hide a missing-
+    serialisation regression."""
+
+    def test_setup_outcome_survives_start_stop_cycle(
+        self, state_dir: Path, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-setup-lifecycle")
+        record.setup_outcome = SetupOutcome(
+            status=SETUP_STATUS_COMPLETED,
+            message="setup: completed 1 step(s)",
+            completed_at="2026-08-17T12:00:00+00:00",
+            steps_run=1,
+        )
+        store.add(record)
+        original_outcome = record.setup_outcome
+
+        started = _lifecycle_start(
+            "wt-setup-lifecycle",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+        assert started.status == "running"
+        assert started.setup_outcome == original_outcome
+        pid = started.pids["main"]
+
+        try:
+            stopped = _lifecycle_stop("wt-setup-lifecycle", store=store)
+        finally:
+            try:
+                if _pid_alive(pid):
+                    _force_kill(pid)
+            except Exception:  # noqa: BLE001
+                pass
+
+        assert stopped.status == "stopped"
+        assert stopped.setup_outcome == original_outcome, (
+            "setup_outcome must be byte-identical before/after the "
+            "start/stop cycle -- status changed, setup_outcome must not."
+        )
+
+        # Reload from a fresh store instance -- this is the assertion that
+        # actually catches a missing-serialisation regression (an
+        # InMemoryStateStore-backed check would hide it).
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-setup-lifecycle")
+        assert reloaded is not None
+        assert reloaded.status == "stopped"
+        assert reloaded.setup_outcome == original_outcome

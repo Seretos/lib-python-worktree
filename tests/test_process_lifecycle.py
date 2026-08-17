@@ -53,7 +53,15 @@ from lib_python_worktree.core.process_lifecycle import (
     stop,
 )
 from lib_python_worktree.core.manager import WorktreeNotFoundError
-from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+from lib_python_worktree.core.state import (
+    STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
+    STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
+    STOP_REASON_SURVIVORS,
+    STOP_REASON_TREE_TRUNCATED,
+    InMemoryStateStore,
+    StopDetail,
+    WorktreeRecord,
+)
 
 # Generous budget_sec for real (non-mocked) TestWinHandleHoldersReal scans that
 # assert *correctness* rather than deadline bail-out behaviour. The production
@@ -259,6 +267,45 @@ class TestStart:
             _force_kill(pid)
         except Exception:  # noqa: BLE001
             pass
+
+    def test_start_records_variant_for_role(self):
+        """Ticket #104: start(variant=...) records which variant started
+        this role under record.variants[role], and the store-reloaded
+        record agrees."""
+        record = _make_record("wt-variant")
+        store = _make_store(record)
+
+        result = start(
+            "wt-variant",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+            role="web",
+            variant="web",
+        )
+        try:
+            assert result.variants == {"web": "web"}
+            reloaded = store.get("wt-variant")
+            assert reloaded is not None
+            assert reloaded.variants == {"web": "web"}
+        finally:
+            _force_kill(result.pids["web"])
+
+    def test_start_without_variant_pops_stale_variant_entry(self):
+        """A pre-seeded variants["main"] entry is removed when start() is
+        called again for that role with variant=None (the default)."""
+        record = _make_record("wt-variant-stale")
+        record.variants["main"] = "default"
+        store = _make_store(record)
+
+        result = start(
+            "wt-variant-stale",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+        try:
+            assert "main" not in result.variants
+        finally:
+            _force_kill(result.pids[DEFAULT_ROLE])
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +593,37 @@ class TestStop:
             "status must not become 'stopped' while other roles are still alive"
         )
         assert result.status == "running"
+
+    def test_stop_pops_variant_entry(self):
+        """Ticket #104: stop() clears record.variants[role] alongside
+        record.pids[role] -- set(variants) <= set(pids) must hold after."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine")
+
+        record = _make_record("wt-stop-variant", pids={"web": 99999999})
+        record.variants["web"] = "web"
+        store = _make_store(record)
+
+        result = stop("wt-stop-variant", store=store, role="web", timeout=1.0)
+        assert "web" not in result.variants
+
+    def test_stop_does_not_touch_other_roles_variant(self):
+        """Stopping one role must not remove another role's variants entry."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine")
+
+        record = _make_record(
+            "wt-stop-variant-multi",
+            pids={"main": os.getpid(), "worker": 99999999},
+            status="running",
+        )
+        record.variants["main"] = "default"
+        record.variants["worker"] = "web"
+        store = _make_store(record)
+
+        result = stop("wt-stop-variant-multi", store=store, role="worker", timeout=1.0)
+        assert "worker" not in result.variants
+        assert result.variants.get("main") == "default"
 
 
 # ---------------------------------------------------------------------------
@@ -4389,6 +4467,332 @@ class TestStopStatusHonesty:
 
 
 # ---------------------------------------------------------------------------
+# TestStopDetail -- ticket #99
+# ---------------------------------------------------------------------------
+
+class TestStopDetail:
+    """Regression tests for ticket #99: every ``stop_incomplete`` branch in
+    ``stop()`` must attach a machine-readable ``StopDetail`` to
+    ``record.stop_detail``, not just log a warning."""
+
+    def test_survivor_sets_stop_detail_reason(self):
+        """B1 driving test: a survivor pid populates a StopDetail with
+        reason="survivors", the survivor pid tuple, count, role, and a
+        message naming the pid -- on both the returned record and the
+        persisted one."""
+        fake_pid = 31337
+        record = _make_record("wt-survivor-detail", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+        ):
+            result = stop("wt-survivor-detail", store=store, timeout=0.3)
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_SURVIVORS
+        assert detail.survivor_pids == (fake_pid,)
+        assert detail.survivor_count == 1
+        assert detail.role == DEFAULT_ROLE
+        assert str(fake_pid) in detail.message
+        assert detail.kill_orphans_may_help is True
+
+        stored = store.get("wt-survivor-detail")
+        assert stored is not None
+        assert stored.stop_detail == detail
+
+    def test_tree_truncation_sets_reason_tree_truncated(self):
+        """Edge case: a capped tree snapshot sets reason="tree_truncated"
+        with truncated_at == the patched cap."""
+        fake_pid = 41200
+        record = _make_record("wt-tree-detail", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        capped_tree = [
+            KilledProcessInfo(pid=42200 + i, name="child", cmdline=["child"])
+            for i in range(3)
+        ]
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle._MAX_TREE_NODES", 3),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=capped_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-tree-detail", store=store, timeout=1.0)
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_TREE_TRUNCATED
+        assert detail.truncated_at == 3
+        assert detail.survivor_pids == ()
+        assert detail.kill_orphans_may_help is True
+
+    def test_job_member_truncation_sets_reason_job_member_list_truncated(self):
+        """Edge case: a truncated Job Object member list sets
+        reason="job_member_list_truncated" with truncated_at ==
+        _JOB_MEMBER_LIST_MAX_SLOTS."""
+        fake_pid = 81400
+        record = _make_record(
+            "wt-job-truncated-detail",
+            pids={DEFAULT_ROLE: fake_pid},
+            job_names={DEFAULT_ROLE: "Local\\fake-job"},
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([], complete=False),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+        ):
+            result = stop("wt-job-truncated-detail", store=store, timeout=1.0)
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_JOB_MEMBER_LIST_TRUNCATED
+        assert detail.truncated_at == _pl._JOB_MEMBER_LIST_MAX_SLOTS
+
+    def test_orphan_scan_incomplete_sets_reason_and_skipped_passes(self):
+        """Edge case: an incomplete orphan-scan discovery pass sets
+        reason="orphan_scan_incomplete" and carries the skipped_passes
+        tags, with kill_orphans_may_help forced False (that pass already
+        ran -- the remediation is a larger timeout, stated in message)."""
+        fake_pid = 61100
+        record = _make_record(
+            "wt-orphan-incomplete-detail", pids={DEFAULT_ROLE: fake_pid},
+        )
+        store = _make_store(record)
+
+        partial = _pl._PartialList(
+            [], complete=False, skipped_passes=("handle_scan:skipped",)
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=partial,
+            ),
+        ):
+            result = stop(
+                "wt-orphan-incomplete-detail",
+                store=store,
+                kill_orphans=True,
+                timeout=5.0,
+            )
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        assert detail.skipped_passes == ("handle_scan:skipped",)
+        assert detail.kill_orphans_may_help is False
+
+    def test_branch_precedence_survivors_wins_over_truncation(self):
+        """Edge case: survivors and a truncated tree simultaneously must
+        still yield reason="survivors" -- pinning the unchanged if/elif
+        precedence from before this ticket."""
+        fake_pid = 41300
+        record = _make_record("wt-precedence", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        capped_tree = [
+            KilledProcessInfo(pid=42300 + i, name="child", cmdline=["child"])
+            for i in range(3)
+        ]
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle._MAX_TREE_NODES", 3),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=capped_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-precedence", store=store, timeout=0.3)
+
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail is not None
+        assert result.stop_detail.reason == STOP_REASON_SURVIVORS
+
+    def test_stop_detail_cleared_when_later_stop_is_clean(self):
+        """B2 driving test: a record left with status='stop_incomplete' and
+        a stale stop_detail from an earlier stop() call must have
+        stop_detail cleared once start() runs for that role and flips
+        status away from stop_incomplete."""
+        stale_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message="stale",
+            role=DEFAULT_ROLE,
+            survivor_pids=(999,),
+            survivor_count=1,
+        )
+        record = _make_record(
+            "wt-clear-on-start",
+            status="stop_incomplete",
+            stop_detail=stale_detail,
+        )
+        store = _make_store(record)
+
+        result = start(
+            "wt-clear-on-start",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+
+        assert result.status == "running"
+        assert result.stop_detail is None
+
+        stored = store.get("wt-clear-on-start")
+        assert stored is not None
+        assert stored.stop_detail is None
+
+        # Cleanup
+        pid = result.pids.get(DEFAULT_ROLE, 0)
+        try:
+            _force_kill(pid)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def test_sticky_stop_incomplete_preserves_earlier_stop_detail(self):
+        """Edge case (B2): mirrors
+        test_stop_clean_role_does_not_clobber_sticky_stop_incomplete -- an
+        earlier stop(role="main") already left status="stop_incomplete" and
+        a StopDetail on the record; a later, clean stop(role="worker") must
+        not erase that detail even though it empties record.pids as a side
+        effect."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        earlier_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message="earlier survivor",
+            role="main",
+            survivor_pids=(31337,),
+            survivor_count=1,
+        )
+        record = _make_record(
+            "wt-sticky-detail-cross-role",
+            pids={"worker": 99999999},
+            status="stop_incomplete",
+            stop_detail=earlier_detail,
+        )
+        store = _make_store(record)
+
+        result = stop(
+            "wt-sticky-detail-cross-role", store=store, role="worker", timeout=1.0,
+        )
+
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail == earlier_detail
+
+        stored = store.get("wt-sticky-detail-cross-role")
+        assert stored is not None
+        assert stored.stop_detail == earlier_detail
+
+    def test_kill_orphans_hint_set_when_orphan_pass_never_ran(self):
+        """B4: kill_orphans_may_help is True when the orphan-scan pass
+        never ran (kill_orphans=False) for a survivors outcome -- retrying
+        with kill_orphans=True might still catch it."""
+        fake_pid = 31338
+        record = _make_record("wt-hint-may-help", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+        ):
+            result = stop(
+                "wt-hint-may-help", store=store, timeout=0.3, kill_orphans=False,
+            )
+
+        assert result.stop_detail is not None
+        assert result.stop_detail.kill_orphans_may_help is True
+
+    def test_kill_orphans_hint_false_when_orphan_scan_already_ran(self):
+        """B4: kill_orphans_may_help is False for a survivors outcome when
+        kill_orphans=True was already passed on this call -- there is no
+        further remediation this hint can point to."""
+        fake_pid = 31339
+        record = _make_record("wt-hint-no-help", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([]),
+            ),
+        ):
+            result = stop(
+                "wt-hint-no-help", store=store, timeout=0.3, kill_orphans=True,
+            )
+
+        assert result.stop_detail is not None
+        assert result.stop_detail.kill_orphans_may_help is False
+
+
+# ---------------------------------------------------------------------------
 # TestDiscoveryBudget -- ticket #87
 # ---------------------------------------------------------------------------
 
@@ -4946,26 +5350,109 @@ class TestDiscoveryCompleteness:
         assert result.complete is False
 
     # -- N2/N3: worker-cap / per-query ABANDONED-CAPPED leave complete=True
+    #
+    # Ticket #106: budget_sec alone cannot force the CAPPED/ABANDONED early
+    # break-out. scan_deadline is armed before the handle-table dump/parse
+    # even starts (see the comment near the top of _win_handle_holders'
+    # scan loop), so a *small* budget just makes the scan die on its own
+    # deadline -- the genuine D5 truncation path -- without ever reaching a
+    # single _bounded_query call. Both tests below instead patch
+    # _BoundedQueryWorker.submit directly so the very first query returns
+    # the verdict under test, and use the generous _REAL_SCAN_TEST_BUDGET_SEC
+    # budget so the deadline can never be the thing that ends the scan. Each
+    # also asserts the fake submit was actually invoked and that the scan
+    # returned fast, so a false pass (complete=True for the wrong reason)
+    # cannot slip through.
 
     @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
     def test_worker_cap_hit_leaves_complete_true(self, monkeypatch):
         """N2: hitting the process-wide wedged-worker cap mid-scan is an
         internal degradation (the table was still enumerated up to that
         point) -- it must NOT be reported as handle_scan:truncated. Forced
-        by patching _wedged_slot_available to always report "no room", which
-        makes the very first ABANDONED query become CAPPED immediately."""
-        monkeypatch.setattr(
-            "lib_python_worktree.core.process_lifecycle._wedged_slot_available",
-            lambda: False,
-        )
-        # A generous budget so this exercises the CAPPED path, not the
-        # deadline path -- but there is nothing to actually scan against a
-        # bogus path, so this call is expected to complete quickly and
-        # cleanly regardless (no live handle will ever match).
+        by patching _BoundedQueryWorker.submit so the very first query this
+        scan issues returns CAPPED, driving _bounded_query straight to its
+        _STOP branch (process_lifecycle.py, _bounded_query).
+
+        This test is deliberately integration-level: it pins
+        _win_handle_holders' *reaction* to a _STOP/CAPPED verdict (that it
+        must NOT be folded into handle_scan:truncated), not submit()'s own
+        cap-detection arithmetic (the _wedged_worker_count vs
+        _MAX_WEDGED_HANDLE_WORKERS comparison that decides CAPPED vs
+        ABANDONED in the first place) -- submit is stubbed here specifically
+        to bypass that. The real, unmocked arithmetic is already covered by
+        TestBoundedQueryWorker::test_submit_at_cap_returns_capped_without_raising
+        and test_capped_outcome_still_counts_and_releases_its_slot.
+
+        No wall-clock assertion is used here: the deadline check in each
+        loop head always runs strictly *before* the call to
+        _process_handle/submit, and stop_scan is always checked strictly
+        before the deadline check on every subsequent iteration (see the
+        loop in _win_handle_holders). So once the fake submit's CAPPED
+        verdict sets stop_scan=True on the first handle processed,
+        deadline_truncated can no longer be set afterwards -- the loop
+        breaks on the stop_scan check before it ever reaches the deadline
+        check again. `calls` being non-empty together with
+        `result.complete is True` therefore already proves the CAPPED
+        break-out fired, not the deadline path -- a timing threshold would
+        be redundant and, worse, flaky on a loaded CI runner."""
+        calls = []
+
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.CAPPED, None)
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
+        wedged_before = _pl._wedged_worker_count
         result = _win_handle_holders(
-            "C:/nonexistent-worktree-path", set(), budget_sec=2.0
+            "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
         )
+
         assert result.complete is True
+        assert calls, "fake submit was never invoked -- did not exercise the CAPPED path"
+        assert list(result) == []
+        # The fake submit never touches _wedged_worker_count, so this test
+        # itself must leave no process-wide residue behind (compared against
+        # the pre-call value, not an absolute 0 -- other tests in the same
+        # session legitimately leave the global non-zero).
+        assert _pl._wedged_worker_count == wedged_before
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_abandoned_with_no_replacement_capacity_leaves_complete_true(self, monkeypatch):
+        """N3: _bounded_query's other _STOP branch -- ABANDONED with no
+        replacement-worker capacity left (_wedged_slot_available() False,
+        process_lifecycle.py lines ~1819-1838) -- is the same internal-
+        degradation class as CAPPED and must likewise leave complete=True,
+        never handle_scan:truncated.
+
+        Like N2, this test is deliberately integration-level: it pins
+        _win_handle_holders' *reaction* to a _STOP/ABANDONED verdict, not
+        submit()'s own unmocked ABANDONED/slot-release bookkeeping, which is
+        already covered by
+        TestBoundedQueryWorker::test_wedged_worker_count_restored_after_retired_worker_exits
+        and its neighbours.
+
+        No wall-clock assertion is used, for the same reason documented in
+        N2 above: `calls` non-empty plus `result.complete is True` already
+        proves the ABANDONED break-out (not the deadline) ended the scan,
+        since stop_scan is always checked before the deadline on every
+        iteration after the first _STOP verdict."""
+        calls = []
+
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.ABANDONED, None)
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+        monkeypatch.setattr(_pl, "_wedged_slot_available", lambda: False)
+
+        result = _win_handle_holders(
+            "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
+        )
+
+        assert result.complete is True
+        assert calls, "fake submit was never invoked -- did not exercise the ABANDONED path"
+        assert list(result) == []
 
     # -- D8: lineage-expansion loop truncated by the deadline ---------------
 

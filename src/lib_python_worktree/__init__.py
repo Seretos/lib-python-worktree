@@ -55,10 +55,12 @@ from .core.manager import (
     PortAllocationError,
     PrimaryCheckoutError,
     UnknownVariantError,
+    VariantResolutionError,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
+    WorktreeRemovalBlockedError,
 )
 from .core.process_lifecycle import (
     KilledProcessInfo,
@@ -68,7 +70,20 @@ from .core.process_lifecycle import (
 )
 from .core.plugin_install import PluginInstallResult, install_enabled_plugins
 from .core.port_allocator import PortAllocator
-from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
+from .core.state import (
+    SETUP_STATUSES,
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUS_FAILED,
+    SETUP_STATUS_SKIPPED,
+    SHADOW_REASONS,
+    STOP_REASONS,
+    InMemoryStateStore,
+    SetupOutcome,
+    ShadowedContract,
+    StateStore,
+    StopDetail,
+    WorktreeRecord,
+)
 from .core.yaml_store import AdoptReport, ReconcileReport, YamlStateStore, adopt, reconcile
 from .setup import (
     SetupFailedError,
@@ -96,7 +111,9 @@ __all__ = [
     "GitCommandError",
     "GitTimeoutError",
     "UnknownVariantError",
+    "VariantResolutionError",
     "WorktreeDirLockedError",
+    "WorktreeRemovalBlockedError",
     # checkout classification (ticket #84)
     "CheckoutInfo",
     "CheckoutTargetError",
@@ -122,6 +139,15 @@ __all__ = [
     "WorktreeRecord",
     "StateStore",
     "InMemoryStateStore",
+    "StopDetail",
+    "STOP_REASONS",
+    "SetupOutcome",
+    "SETUP_STATUSES",
+    "SETUP_STATUS_COMPLETED",
+    "SETUP_STATUS_FAILED",
+    "SETUP_STATUS_SKIPPED",
+    "ShadowedContract",
+    "SHADOW_REASONS",
     # yaml state store (W7)
     "YamlStateStore",
     "ReconcileReport",

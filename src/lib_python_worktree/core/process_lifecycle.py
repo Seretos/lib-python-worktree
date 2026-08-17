@@ -17,7 +17,14 @@ Public API
   when no other roles remain AND nothing this call tried to kill is still
   alive -- otherwise ``status="stop_incomplete"`` and a warning is logged
   naming the survivor PIDs, so a leaked process is never silently reported
-  as stopped.  Returns the updated ``WorktreeRecord``.
+  as stopped.  Ticket #99: whenever ``status`` is set to
+  ``"stop_incomplete"``, ``record.stop_detail`` (a
+  ``state.StopDetail``) is populated with the same information as the
+  warning -- a machine-readable ``reason`` (one of ``state.STOP_REASONS``),
+  the formatted ``message``, and reason-specific evidence (survivor PIDs, the
+  truncation cap hit, or the orphan scan's skipped passes) -- so a caller
+  does not have to parse log lines to learn why.  Returns the updated
+  ``WorktreeRecord``.
 
 Platform differences
 --------------------
@@ -56,7 +63,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .state import StateStore, WorktreeRecord
+from .state import (
+    STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
+    STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
+    STOP_REASON_SURVIVORS,
+    STOP_REASON_TREE_TRUNCATED,
+    StateStore,
+    StopDetail,
+    WorktreeRecord,
+    _STOP_DETAIL_MAX_PIDS,
+)
 from .yaml_store import _pid_alive
 
 _logger = logging.getLogger(__name__)
@@ -1898,6 +1914,17 @@ def _win_handle_holders(
     # stop_scan is not ALSO already true (i.e. the deadline is the actual
     # reason this iteration stopped, not a cap hit on a prior handle that
     # would have broken the loop already).
+    #
+    # Ticket #106: a *small* budget_sec cannot be used to reliably exercise
+    # the CAPPED/ABANDONED stop_scan path in a test. scan_deadline is armed
+    # at the top of this function, before the handle-table dump and the
+    # pure-Python parse loop above even run -- so on a loaded machine a
+    # tight budget is spent (or overspent) by the dump/parse alone, before
+    # the per-handle loop below starts, and the scan ends up here via
+    # deadline_truncated instead. A test that wants the CAPPED/ABANDONED
+    # branch must force the query *outcome* (patch
+    # ``_BoundedQueryWorker.submit``), not starve the *budget* -- see
+    # ``TestDiscoveryCompleteness`` N2/N3 in test_process_lifecycle.py.
     deadline_truncated = False
     try:
         for pid, handle_entries in by_pid.items():
@@ -2334,6 +2361,7 @@ def start(
     *,
     store: StateStore,
     role: str = DEFAULT_ROLE,
+    variant: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[str] = None,
 ) -> WorktreeRecord:
@@ -2349,6 +2377,14 @@ def start(
         The active ``StateStore`` instance (carries ``WorktreeRecord``).
     role:
         Identifies the process within the worktree (e.g. ``"main"``).
+    variant:
+        The name of the ``start:`` contract step that produced *cmd*, if
+        any. Recorded under ``record.variants[role]`` so a later
+        ``stop(variant=...)`` can resolve back to this *role* -- see
+        ``WorktreeRecord.variants``'s docstring. ``None`` (the default)
+        means no variant is being tracked for this call, and any stale
+        entry left over from a previous ``start()`` of this same *role* is
+        cleared.
     env:
         Full environment for the child process.  ``None`` inherits the
         current process environment.
@@ -2404,6 +2440,12 @@ def start(
 
     record.pids[role] = proc.pid
     record.status = status
+    # Ticket #99: status is unconditionally overwritten above (it always was,
+    # even before this ticket -- a start() for any role has always reset the
+    # record-wide status), so any stop_detail attached by an earlier
+    # stop_incomplete outcome is now stale by the same invariant: stop_detail
+    # is not None implies status == "stop_incomplete". Clear it in lockstep.
+    record.stop_detail = None
     record.returncode = returncode
     record.start_log_path = str(log_path)
     # Ticket #95, R5 (fix cycle: per-role, not a record-wide scalar --
@@ -2420,6 +2462,14 @@ def start(
         record.job_names[role] = spawned_job_name
     else:
         record.job_names.pop(role, None)
+    # Ticket #104: mirrors job_names' role-keyed, no-None-value convention --
+    # record which variant started this role so stop(variant=...) can
+    # resolve back to it, and clear any stale entry from a previous start()
+    # of this same role when no variant is given this time.
+    if variant is not None:
+        record.variants[role] = variant
+    else:
+        record.variants.pop(role, None)
     store.update(record)
 
     return record
@@ -2514,6 +2564,22 @@ def stop(
     still running. ``pids[role]`` is still cleared either way -- retaining a
     possibly-dead/reused PID there would be worse (see the module-level
     docstring / ticket for the postcondition this preserves).
+
+    Ticket #99 (reporting half of #99, mechanical half already closed by
+    #95's Job Object containment): every one of the four branches below that
+    sets ``status = "stop_incomplete"`` also attaches a
+    ``state.StopDetail`` to ``record.stop_detail`` -- ``reason`` names
+    exactly which branch fired (``"survivors"``, ``"tree_truncated"``,
+    ``"job_member_list_truncated"``, or ``"orphan_scan_incomplete"``, in that
+    if/elif precedence order, unchanged from before this ticket), ``message``
+    is the identical string also passed to ``_logger.warning(...)`` so the
+    log and the field can never drift, and ``kill_orphans_may_help`` hints
+    whether re-calling with ``kill_orphans=True`` might resolve it. The
+    field is cleared (``None``) the moment ``status`` is set to anything
+    other than ``"stop_incomplete"`` by this function or by
+    ``start()``/``manager.WorktreeManager.stop()``/``yaml_store.reconcile()``,
+    and is otherwise left untouched (sticky, exactly like ``status`` itself)
+    -- see ``state.StopDetail``'s own docstring for the full invariant.
 
     A capped tree snapshot is likewise never trusted as clean (ticket #87
     follow-up, finding F2): when the pre-kill :func:`_process_tree` snapshot
@@ -2785,40 +2851,69 @@ def stop(
     # outside of stop() itself -- there is nothing left that depends on this
     # entry surviving a stop.
     record.job_names.pop(role, None)
+    # Ticket #104: mirror the job_names[role] clear immediately above --
+    # once this role's pid entry is gone, the variant that started it is no
+    # longer meaningful and would otherwise leave the
+    # set(variants) <= set(pids) invariant violated.
+    record.variants.pop(role, None)
 
     if survivor_pids:
-        _logger.warning(
-            "stop(worktree_id=%s, role=%s): process(es) survived termination: %s",
-            worktree_id, role, survivor_pids,
+        message = (
+            f"stop(worktree_id={worktree_id}, role={role}): process(es) "
+            f"survived termination: {survivor_pids}"
         )
+        _logger.warning(message)
         record.status = "stop_incomplete"
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message=message,
+            role=role,
+            survivor_pids=tuple(survivor_pids[:_STOP_DETAIL_MAX_PIDS]),
+            survivor_count=len(survivor_pids),
+            kill_orphans_may_help=not kill_orphans,
+        )
     elif tree_possibly_truncated:
         # Ticket #87 follow-up, finding F2: every candidate we DID collect
         # came back dead, but the tree snapshot hit the _MAX_TREE_NODES cap,
         # so an unknown number of descendants beyond it were never even
         # examined. Reporting "stopped" here would be exactly the silent
         # false positive this ticket exists to eliminate.
-        _logger.warning(
-            "stop(worktree_id=%s, role=%s): descendant tree for pid %s was "
-            "truncated at the %s-node cap -- cannot guarantee every "
-            "descendant was found and killed, reporting stop_incomplete "
-            "instead of stopped",
-            worktree_id, role, pid, _MAX_TREE_NODES,
+        message = (
+            f"stop(worktree_id={worktree_id}, role={role}): descendant tree "
+            f"for pid {pid} was truncated at the {_MAX_TREE_NODES}-node cap "
+            f"-- cannot guarantee every descendant was found and killed, "
+            f"reporting stop_incomplete instead of stopped"
         )
+        _logger.warning(message)
         record.status = "stop_incomplete"
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_TREE_TRUNCATED,
+            message=message,
+            role=role,
+            truncated_at=_MAX_TREE_NODES,
+            kill_orphans_may_help=not kill_orphans,
+        )
     elif job_list_truncated:
         # Ticket #95, R5: same class as tree_possibly_truncated above --
         # every candidate we DID collect came back dead, but the Job
         # Object's member list hit the _JOB_MEMBER_LIST_MAX_SLOTS cap, so an
         # unknown number of members beyond it were never even examined.
-        _logger.warning(
-            "stop(worktree_id=%s, role=%s): Job Object '%s' member list was "
-            "truncated at the %s-slot cap -- cannot guarantee every job "
-            "member was found and killed, reporting stop_incomplete instead "
-            "of stopped",
-            worktree_id, role, job_name, _JOB_MEMBER_LIST_MAX_SLOTS,
+        message = (
+            f"stop(worktree_id={worktree_id}, role={role}): Job Object "
+            f"'{job_name}' member list was truncated at the "
+            f"{_JOB_MEMBER_LIST_MAX_SLOTS}-slot cap -- cannot guarantee "
+            f"every job member was found and killed, reporting "
+            f"stop_incomplete instead of stopped"
         )
+        _logger.warning(message)
         record.status = "stop_incomplete"
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
+            message=message,
+            role=role,
+            truncated_at=_JOB_MEMBER_LIST_MAX_SLOTS,
+            kill_orphans_may_help=not kill_orphans,
+        )
     elif kill_orphans and not getattr(orphan_found, "complete", True):
         # Ticket #95, finding 3: every candidate we DID collect came back
         # dead, but the orphan scan itself did not have full discovery
@@ -2827,13 +2922,26 @@ def stop(
         # rules). "Found nothing" and "never looked" used to be
         # indistinguishable ([] either way); reporting "stopped" here would
         # reintroduce exactly that silent false positive.
-        _logger.warning(
-            "stop(worktree_id=%s, role=%s): orphan scan discovery was "
-            "incomplete (skipped_passes=%s) -- cannot guarantee no orphans "
-            "were missed, reporting stop_incomplete instead of stopped",
-            worktree_id, role, getattr(orphan_found, "skipped_passes", ()),
+        skipped_passes = getattr(orphan_found, "skipped_passes", ())
+        message = (
+            f"stop(worktree_id={worktree_id}, role={role}): orphan scan "
+            f"discovery was incomplete (skipped_passes={skipped_passes}) -- "
+            f"cannot guarantee no orphans were missed, reporting "
+            f"stop_incomplete instead of stopped"
         )
+        _logger.warning(message)
         record.status = "stop_incomplete"
+        # Ticket #99: this pass already ran (and was starved) -- unlike the
+        # other three reasons, retrying with kill_orphans=True again offers
+        # no new information; the remediation (a larger timeout) is stated
+        # in `message` instead.
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
+            message=message,
+            role=role,
+            skipped_passes=tuple(skipped_passes),
+            kill_orphans_may_help=False,
+        )
     elif not record.pids and record.status not in ("stop_incomplete", "orphaned"):
         # Only mark the whole worktree as "stopped" when all roles are gone.
         # In a multi-role worktree, stopping one role must not mask the fact
@@ -2850,6 +2958,14 @@ def stop(
         # (path gone, set by reconcile()) must not be masked by a stop()
         # call racing against it.
         record.status = "stopped"
+        # Ticket #99: this call's own kill was clean and every other role is
+        # gone too -- status is genuinely leaving "stop_incomplete" (if it
+        # was ever set), so any stale reason from an earlier incomplete stop
+        # no longer applies. Safe unconditionally: the sticky-preserve paths
+        # never reach this branch -- they hit one of the elif arms above, or
+        # fail the `record.status not in (...)` guard and fall through
+        # untouched.
+        record.stop_detail = None
     store.update(record)
 
     return record
