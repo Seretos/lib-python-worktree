@@ -1020,8 +1020,16 @@ class TestContractCopyDirtExemption:
         """Lock-signal precedence (pre-existing #72 ordering; pinned here
         explicitly per the plan's checklist for this class): a stderr that
         is BOTH a lock signal (Windows 'Permission denied') AND contains the
-        dirty-tree phrase must still raise WorktreeDirLockedError -- never
-        reach the `.seretos/`-only exemption path added by this ticket."""
+        dirty-tree phrase must still raise WorktreeDirLockedError (not the
+        `.seretos/`-only exemption path) as the PRIMARY classification.
+
+        Ticket #103: unlike before, the dirt probe now DOES run on this
+        path (folded into `_resolve_lock_or_raise` so a genuinely combined
+        lock+dirt condition can be reported in one shot) -- but this mock
+        returns rc=128 for every call, including the status probe, so the
+        probe is inconclusive and no dirt is ever claimed. The result stays
+        a plain single-condition WorktreeDirLockedError, not the combined
+        WorktreeRemovalBlockedError."""
         from lib_python_worktree.core.manager import WorktreeDirLockedError
 
         manager = _make_manager(tmp_path)
@@ -1048,7 +1056,7 @@ class TestContractCopyDirtExemption:
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
-            with pytest.raises(WorktreeDirLockedError):
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
                 manager._teardown(
                     record,
                     force=False,
@@ -1056,9 +1064,14 @@ class TestContractCopyDirtExemption:
                     _lifecycle_module=mock_lifecycle,
                 )
 
-        assert not any(_is_status_call(c) for c in calls), (
-            "lock-signal precedence must short-circuit before the "
-            "dirt-classifier status probe ever runs"
+        assert type(excinfo.value) is WorktreeDirLockedError, (
+            "an inconclusive dirt probe (rc=128 on the status call too) "
+            "must never escalate to the combined WorktreeRemovalBlockedError"
+        )
+        assert any(_is_status_call(c) for c in calls), (
+            "ticket #103: the dirt probe must now run on the lock-signal "
+            "path so a genuinely combined lock+dirt condition can be "
+            "detected -- it just stays inconclusive here"
         )
 
     def test_seretos_backup_sibling_not_exempted_still_raises_dirty_error(
@@ -3152,3 +3165,521 @@ class TestRobocopyTimeoutBounding:
         assert err.kill_attempted is False
         assert err.killed == []
         assert err.worktree_id == "wt-preflight-nokill-regression"
+
+
+# ---------------------------------------------------------------------------
+# TestCombinedBlockingConditions -- ticket #103
+# ---------------------------------------------------------------------------
+
+class TestCombinedBlockingConditions:
+    """Ticket #103: when TWO OR MORE conditions are simultaneously blocking
+    a removal -- an OS-level directory lock AND real (non-`.seretos/`)
+    uncommitted/untracked changes -- _teardown must report every currently-
+    blocking condition and the flag needed to clear each in a SINGLE raise
+    (`WorktreeRemovalBlockedError`), so one informed retry (force=True AND
+    kill_blocking_processes=True) suffices instead of up to three
+    round-trips. A single blocking condition must keep raising the existing
+    single-condition exception unchanged."""
+
+    @pytest.mark.parametrize("kill_blocking_processes", [False, True])
+    def test_preflight_lock_and_real_dirt_reports_both_conditions(
+        self, tmp_path, kill_blocking_processes
+    ):
+        """Windows preflight (Step 2b) finds a blocker, force=False, and a
+        real (non-`.seretos/`) dirt probe finds real dirt: ONE
+        WorktreeRemovalBlockedError names both conditions and both
+        remedies, with NO kill attempted and NO destructive `git worktree
+        remove` call -- regardless of kill_blocking_processes, since the
+        removal cannot succeed on this attempt either way (git would still
+        refuse for being dirty even after a successful kill)."""
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-preflight", path="/fake/store/wt-combined-preflight"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=8888, name="node.exe", cmdline=["node"])]
+        calls = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            calls.append(list(args))
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? real.txt\0", stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes"
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=kill_blocking_processes,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        msg = str(err)
+        assert "kill_blocking_processes=True" in msg
+        assert "force=True" in msg
+        assert err.dirty_paths == ["real.txt"]
+        assert err.kill_attempted is False
+        assert err.killed == []
+        mock_kill.assert_not_called()
+        assert not any(
+            _is_plain_remove_call(c) or _is_force_remove_call(c) for c in calls
+        ), "no destructive git worktree remove call may run for a removal that cannot succeed"
+
+    def test_preflight_lock_force_true_unaffected_no_status_call(self, tmp_path):
+        """force=True: real dirt cannot block a forced removal, so the dirt
+        probe must never run at all -- unchanged single-condition
+        WorktreeDirLockedError, zero `git status` calls."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-force-true", path="/fake/store/wt-combined-force-true"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=7654, name="node.exe", cmdline=["node"])]
+        calls = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            calls.append(list(args))
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert type(excinfo.value) is WorktreeDirLockedError
+        assert not any(_is_status_call(c) for c in calls)
+
+    def test_preflight_lock_inconclusive_status_unaffected(self, tmp_path):
+        """Windows preflight finds a blocker, force=False, but the status
+        probe returns an empty/inconclusive result (per the established
+        convention this is NEVER read as "confirmed clean", but it must
+        equally never be read as dirty): still the unchanged single-
+        condition WorktreeDirLockedError -- the message and type must not
+        regress just because the probe now runs."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-clean", path="/fake/store/wt-combined-clean"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=1212, name="node.exe", cmdline=["node"])]
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert type(err) is WorktreeDirLockedError
+        assert err.kill_attempted is False
+        assert "kill_blocking_processes=True" in str(err)
+
+    def test_lock_signal_flag_off_with_real_dirt_reports_both(self, tmp_path):
+        """Windows: primary `git worktree remove` fails with a lock signal
+        (kill_blocking_processes=False), and a real dirt probe finds real
+        dirt: `_resolve_lock_or_raise`'s kill_attempted=False raise site
+        also escalates to WorktreeRemovalBlockedError, naming both
+        remedies."""
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-lock-flagoff", path="/fake/store/wt-combined-lock-flagoff"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? scratch.txt\0", stderr="")
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert err.kill_attempted is False
+        assert err.dirty_paths == ["scratch.txt"]
+        msg = str(err)
+        assert "kill_blocking_processes=True" in msg
+        assert "force=True" in msg
+
+    def test_posix_lock_stderr_with_real_dirt_reports_both(self, tmp_path):
+        """POSIX sibling of the Windows case above: primary `git worktree
+        remove` fails with a lock signal (kill_blocking_processes=False),
+        and the status probe finds real dirt: same
+        WorktreeRemovalBlockedError escalation. POSIX has no Step 2b
+        preflight, so this exercises `_resolve_lock_or_raise`'s
+        kill_attempted=False site directly."""
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-lock-posix", path="/fake/store/wt-combined-lock-posix"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? scratch.txt\0", stderr="")
+            return MagicMock(returncode=128, stderr="error: unable to lock worktree")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert err.kill_attempted is False
+        assert err.dirty_paths == ["scratch.txt"]
+
+    def test_still_locked_after_retry_with_real_dirt_reports_both(self, tmp_path):
+        """kill_blocking_processes=True: kill+retry exhausts every attempt
+        (still locked), and a real dirt probe finds real dirt: the
+        exhausted-retry site (kill_attempted=True) ALSO escalates to
+        WorktreeRemovalBlockedError, preserving the "after killing N"
+        phrasing inside the combined message."""
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-stilllocked", path="/fake/store/wt-combined-stilllocked"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_killed = [KilledProcessInfo(pid=3333, name="claude", cmdline=["claude"])]
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? scratch.txt\0", stderr="")
+            return MagicMock(returncode=255, stderr="Permission denied")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=fake_killed,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.time"),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_called_once_with(record.path)
+        err = excinfo.value
+        assert err.kill_attempted is True
+        assert err.killed == fake_killed
+        assert err.dirty_paths == ["scratch.txt"]
+        assert "after killing 1 blocking process(es)" in str(err)
+        assert "force=True" in str(err)
+
+    def test_seretos_retry_lock_signal_type_is_plain_not_combined(self, tmp_path):
+        """The `.seretos/`-exemption auto-force retry site (ticket #100)
+        routes through the SAME `_resolve_lock_or_raise` helper. When the
+        retry itself hits a lock signal but ALL dirt is the benign
+        `.seretos/` copy (the only way this branch is even reached), the
+        raise must stay the PLAIN WorktreeDirLockedError -- exact type, not
+        merely isinstance (which would also accept the combined subclass)
+        -- and must not name force=True."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-seretos-retry", path="/fake/store/wt-combined-seretos-retry"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? .seretos/\0", stderr="")
+            if _is_force_remove_call(args):
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.shutil"),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert type(err) is WorktreeDirLockedError
+        assert "force=True" not in str(err)
+
+    def test_lock_with_seretos_only_dirt_reports_lock_only(self, tmp_path):
+        """A `.seretos/`-only untracked tree (ticket #100's benign
+        exemption) alongside a Step-2b-preflight-detected lock must NOT be
+        reported as a blocking dirty condition -- plain
+        WorktreeDirLockedError (exact type), not the combined
+        WorktreeRemovalBlockedError, and no force=True in the message."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-combined-seretos-only", path="/fake/store/wt-combined-seretos-only"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=2121, name="node.exe", cmdline=["node"])]
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(
+                    returncode=0,
+                    stdout="?? .seretos/worktree-setup.yml\0",
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert type(err) is WorktreeDirLockedError
+        assert "force=True" not in str(err)
+
+    @pytest.mark.parametrize(
+        "status_side_effect",
+        ["rc_nonzero", "git_timeout", "non_str_stdout", "empty_stdout"],
+    )
+    def test_inconclusive_dirt_probe_never_escalates_lock_only(
+        self, tmp_path, status_side_effect
+    ):
+        """A failed/inconclusive `git status` probe (non-zero exit, a
+        GitTimeoutError, a non-str stdout, or an empty result) must never
+        be misread as real dirt -- it must degrade to the single-condition
+        WorktreeDirLockedError (exact type), never fabricate the combined
+        WorktreeRemovalBlockedError. Mirrors the defensive matrix already
+        pinned for the `.seretos/`-exemption classifier
+        (TestContractCopyDirtExemption, lines 663-760)."""
+        from lib_python_worktree.core.manager import GitTimeoutError, WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            f"wt-combined-inconclusive-{status_side_effect}",
+            path=f"/fake/store/wt-combined-inconclusive-{status_side_effect}",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        fake_blockers = [KilledProcessInfo(pid=4321, name="node.exe", cmdline=["node"])]
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                if status_side_effect == "rc_nonzero":
+                    return MagicMock(returncode=1, stdout="", stderr="fatal: boom")
+                if status_side_effect == "git_timeout":
+                    raise GitTimeoutError(["git", *args], 30.0)
+                if status_side_effect == "non_str_stdout":
+                    return MagicMock(returncode=0, stderr="")  # .stdout stays a MagicMock
+                return MagicMock(returncode=0, stdout="", stderr="")  # empty_stdout
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=fake_blockers,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        err = excinfo.value
+        assert type(err) is WorktreeDirLockedError
+        assert "force=True" not in str(err)
+
+    def test_combined_error_is_catchable_as_both_legacy_types(self):
+        """`isinstance` checks against BOTH legacy single-condition types
+        succeed, and all four structured attributes (worktree_id, killed,
+        kill_attempted, dirty_paths) are populated -- verifying the
+        hand-written __init__ really set both parents' attributes without
+        relying on a cooperative super() chain."""
+        from lib_python_worktree.core.manager import (
+            DirtyWorktreeError,
+            WorktreeDirLockedError,
+            WorktreeRemovalBlockedError,
+        )
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        killed = [KilledProcessInfo(pid=42, name="node.exe", cmdline=["node"])]
+        err = WorktreeRemovalBlockedError(
+            "wt-combined-isinstance",
+            killed=killed,
+            kill_attempted=True,
+            dirty_paths=["a.txt", "b.txt"],
+        )
+
+        assert isinstance(err, WorktreeDirLockedError)
+        assert isinstance(err, DirtyWorktreeError)
+        assert err.worktree_id == "wt-combined-isinstance"
+        assert err.killed == killed
+        assert err.kill_attempted is True
+        assert err.dirty_paths == ["a.txt", "b.txt"]
+
+    def test_combined_message_leaks_no_git_internals(self):
+        """Mirrors test_manager.py's DirtyWorktreeError leak-check plus the
+        Q3 contract: no path from dirty_paths appears in the free-text
+        message -- a caller who wants the actual paths must read the
+        structured `dirty_paths` attribute instead."""
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+
+        err = WorktreeRemovalBlockedError(
+            "wt-combined-nogitleaks",
+            killed=[],
+            kill_attempted=False,
+            dirty_paths=["secret/path/to/file.txt"],
+        )
+        msg = str(err)
+
+        assert "--force" not in msg
+        assert "128" not in msg
+        assert "secret/path/to/file.txt" not in msg
+
+    def test_worktree_removal_blocked_error_exported(self):
+        """WorktreeRemovalBlockedError is importable from the top-level
+        package and listed in __all__."""
+        import lib_python_worktree
+
+        assert hasattr(lib_python_worktree, "WorktreeRemovalBlockedError")
+        assert "WorktreeRemovalBlockedError" in lib_python_worktree.__all__

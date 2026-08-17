@@ -31,7 +31,7 @@ from ..contract.loader import (
     load as _load_contract,
 )
 from ._env_utils import _get_user_profile_env
-from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, WorktreeDirLockedError, WorktreeError  # noqa: F401 — re-exported
+from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, WorktreeDirLockedError, WorktreeError, WorktreeRemovalBlockedError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .checkout import (
     CheckoutInfo,
@@ -298,7 +298,70 @@ def _is_path_prunable(repo_path: Path, target_path: str) -> Optional[bool]:
     return found
 
 
-def _contract_copy_dirt_paths(record: "WorktreeRecord") -> Optional[List[str]]:
+def _status_entries(record: "WorktreeRecord") -> Optional[List[str]]:
+    """Run ``git status --porcelain -z`` in *record*'s checkout and return
+    the non-empty NUL-split entries, or ``None`` when the probe is
+    inconclusive.
+
+    Split out of the former ``_contract_copy_dirt_paths`` (ticket #103) so
+    both the ``.seretos/``-exemption classifier and the new "is there any
+    real (non-exempt) dirt at all?" predicate (:func:`_real_dirt_paths`)
+    share one probe and one defensive contract, instead of running
+    ``git status`` twice or duplicating the defensive matrix.
+
+    Returns ``None`` (never an empty list for "inconclusive") on: a
+    non-zero exit, a non-``str`` ``stdout`` (defensive -- some tests patch
+    ``_run_git`` with a blanket ``MagicMock`` whose ``.stdout`` is itself a
+    ``MagicMock``), an empty result (inconsistent with git having just
+    refused the removal for being dirty), or any exception (including
+    ``GitTimeoutError``). Callers must never invent a blocking condition
+    from an inconclusive probe.
+    """
+    try:
+        proc = _run_git(["status", "--porcelain", "-z"], cwd=Path(record.path))
+    except Exception:  # noqa: BLE001 -- includes GitTimeoutError; never block removal
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    stdout = proc.stdout
+    if not isinstance(stdout, str):
+        return None
+
+    entries = [e for e in stdout.split("\0") if e]
+    if not entries:
+        # Empty status while git refused the remove is inconsistent with the
+        # "only benign dirt" story -- never treat as conclusive.
+        return None
+
+    return entries
+
+
+def _is_exempt_untracked(entry: str) -> bool:
+    """Return ``True`` iff *entry* (one NUL-split ``git status --porcelain
+    -z`` record) is untracked (``??``) content living at ``.seretos`` or
+    under ``.seretos/`` -- the agent-worktree plugin's benign convenience
+    copy (ticket #100).
+
+    A **modified tracked** file under ``.seretos/`` (status code other than
+    ``??``) is real work and is never exempt. No path normalisation is
+    performed: a literal backslash in an entry name (e.g. ``.seretos\\
+    notes.txt``) is part of the filename itself (git always reports ``/``
+    as the separator, even on Windows) and stays non-exempt, and a
+    ``.seretos``-*prefixed sibling* directory (e.g. ``.seretos-backup/``) is
+    not ``.seretos`` itself or a path under it, so it also stays non-exempt.
+    """
+    if len(entry) < 3 or entry[:2] != "??":
+        return False
+    path = entry[3:]
+    contract_prefix = f"{_CONTRACT_DIR}/"
+    return path == _CONTRACT_DIR or path.startswith(contract_prefix)
+
+
+def _contract_copy_dirt_paths(
+    record: "WorktreeRecord", *, entries: Optional[List[str]] = None
+) -> Optional[List[str]]:
     """Return the untracked path(s) iff *record*'s checkout's only "dirt"
     (per ``git status``) lives under the ``.seretos/`` convenience copy
     (ticket #100); ``None`` (falsy, same as an empty list) otherwise.
@@ -321,46 +384,58 @@ def _contract_copy_dirt_paths(record: "WorktreeRecord") -> Optional[List[str]]:
     would discard it. The caller is expected to warning-log the returned
     paths so the discard is observable rather than silent.
 
-    Runs ``git status --porcelain -z`` in the checkout and returns the
-    matched paths only when **every** reported entry is untracked (``??``)
-    and its path is ``.seretos`` or lives under ``.seretos/``. A **modified
-    tracked** file under ``.seretos/`` is real work and must still block --
-    this only ever exempts untracked dirt. Any other untracked path
-    anywhere, a non-zero exit, an empty result (inconsistent with git having
-    just refused the removal), a non-``str`` ``stdout`` (defensive -- some
-    tests patch ``_run_git`` with a blanket ``MagicMock`` whose ``.stdout``
-    is itself a ``MagicMock``), or any exception (including
-    ``GitTimeoutError``) all return ``None`` so the ordinary
-    ``DirtyWorktreeError`` path is unaffected.
+    Reimplemented (ticket #103) on top of :func:`_status_entries` and
+    :func:`_is_exempt_untracked`; semantics and the "empty/inconclusive
+    status ⇒ ``None``" rule are unchanged. Returns the matched paths only
+    when **every** reported entry is exempt untracked ``.seretos/`` dirt;
+    any other entry anywhere, or an inconclusive probe, returns ``None`` so
+    the ordinary ``DirtyWorktreeError`` path is unaffected.
+
+    *entries* is an optional pre-fetched result of :func:`_status_entries`
+    (ticket #103) -- ``_teardown`` passes its memoised probe result here so
+    a single ``git status`` call can serve both this classifier and
+    :func:`_real_dirt_paths` within one removal attempt. Defaults to
+    ``None``, which fetches fresh exactly as before -- every existing
+    caller/test that calls ``_contract_copy_dirt_paths(record)`` with no
+    second argument is unaffected.
     """
-    try:
-        proc = _run_git(["status", "--porcelain", "-z"], cwd=Path(record.path))
-    except Exception:  # noqa: BLE001 -- includes GitTimeoutError; never block removal
+    if entries is None:
+        entries = _status_entries(record)
+    if entries is None:
         return None
 
-    if proc.returncode != 0:
-        return None
-
-    stdout = proc.stdout
-    if not isinstance(stdout, str):
-        return None
-
-    entries = [e for e in stdout.split("\0") if e]
-    if not entries:
-        # Empty status while git refused the remove is inconsistent with the
-        # "only benign dirt" story -- never auto-force in that case.
-        return None
-
-    contract_prefix = f"{_CONTRACT_DIR}/"
     matched: List[str] = []
     for entry in entries:
-        if len(entry) < 3 or entry[:2] != "??":
+        if not _is_exempt_untracked(entry):
             return None
-        path = entry[3:]
-        if path != _CONTRACT_DIR and not path.startswith(contract_prefix):
-            return None
-        matched.append(path)
+        matched.append(entry[3:])
     return matched
+
+
+def _real_dirt_paths(
+    record: "WorktreeRecord", *, entries: Optional[List[str]] = None
+) -> List[str]:
+    """Return the non-exempt (real) dirty paths for *record*'s checkout, or
+    ``[]`` when clean, when the only dirt is the benign ``.seretos/``
+    convenience copy (ticket #100), or when the ``git status`` probe is
+    inconclusive (ticket #103).
+
+    This is the "is there any real dirt that would block removal?"
+    predicate consumed by the combined lock+dirt reporting added by ticket
+    #103 -- unlike :func:`_contract_copy_dirt_paths`, which answers "is
+    *all* dirt benign?" and returns ``None`` for clean, real-dirt, AND
+    inconclusive alike, this always returns a list and never invents a
+    blocking condition from an inconclusive probe: an empty result here
+    means "do not report a dirty-tree condition", not "confirmed clean".
+
+    *entries*: see :func:`_contract_copy_dirt_paths` -- same optional
+    pre-fetched-result seam, used by ``_teardown``'s memoised probe.
+    """
+    if entries is None:
+        entries = _status_entries(record)
+    if entries is None:
+        return []
+    return [entry[3:] for entry in entries if not _is_exempt_untracked(entry)]
 
 
 def _is_lock_signal(stderr: str) -> bool:
@@ -399,11 +474,14 @@ def _resolve_lock_or_raise(
     record: "WorktreeRecord",
     kill_blocking_processes: bool,
     phantom_cleanup,
+    *,
+    dirt_probe,
 ) -> bool:
     """Apply the kill-and-retry directory-lock remedy (ticket #51/#72) for a
     ``git worktree remove`` invocation (*args*) whose failure was already
     classified as a lock signal by :func:`_is_lock_signal`, or raise
-    :class:`WorktreeDirLockedError`.
+    :class:`WorktreeDirLockedError` (single condition) /
+    :class:`WorktreeRemovalBlockedError` (lock AND real dirt, ticket #103).
 
     Shared by both lock-signal call sites in ``_teardown``: the primary
     removal attempt and the ``.seretos/``-exemption auto-force retry
@@ -419,15 +497,28 @@ def _resolve_lock_or_raise(
       between attempts. A retry that fails with "is not a working tree"
       (git deregistered the worktree mid-retry -- phantom-state) is treated
       as success via *phantom_cleanup*, a zero-arg callable that removes the
-      leftover directory and prunes stale git metadata. Raises
-      ``WorktreeDirLockedError`` if the retries are exhausted without
-      success.
+      leftover directory and prunes stale git metadata. Raises on exhausted
+      retries (see below).
+
+    *dirt_probe* is a zero-arg callable (``_teardown``'s memoised,
+    force-gated ``_dirt_probe`` closure -- see ``_real_dirt_paths``) that
+    returns the non-exempt dirty paths, or ``[]`` when clean/benign/
+    inconclusive/``force=True``. At each raise site, ``bool(dirt_probe())``
+    decides between the single-condition ``WorktreeDirLockedError`` (no
+    real dirt) and the combined ``WorktreeRemovalBlockedError`` (real dirt
+    too) -- both name every currently-blocking condition and remedy in one
+    raise so a single informed retry suffices.
 
     Returns ``True`` (the caller's ``kill_attempted`` flag) on any
     non-raising exit; the caller falls through to the long-path fallback /
     step 4 exactly as the ordinary success path does.
     """
     if not kill_blocking_processes:
+        dirt = dirt_probe()
+        if dirt:
+            raise WorktreeRemovalBlockedError(
+                record.id, killed=[], kill_attempted=False, dirty_paths=dirt
+            )
         raise WorktreeDirLockedError(record.id, killed=[], kill_attempted=False)
 
     killed = _kill_blocking_processes(record.path)
@@ -448,6 +539,11 @@ def _resolve_lock_or_raise(
         if attempt < _POST_KILL_RETRIES - 1:
             time.sleep(_POST_KILL_SLEEP)
     if not phantom_on_retry and (retry_result is None or retry_result.returncode != 0):
+        dirt = dirt_probe()
+        if dirt:
+            raise WorktreeRemovalBlockedError(
+                record.id, killed=killed, kill_attempted=True, dirty_paths=dirt
+            )
         raise WorktreeDirLockedError(record.id, killed=killed)
     return True
 
@@ -1641,6 +1737,31 @@ class WorktreeManager:
             # create().
             pass
 
+        # Dirt probe (ticket #103): a memoised, force-gated closure shared by
+        # every site below that may need to know about real dirt -- the
+        # Step 2b preflight, both `_resolve_lock_or_raise` raise sites, AND
+        # the `.seretos/`-exemption classifier in the dirty-phrase branch
+        # further down -- so that a single removal attempt never issues more
+        # than one `git status` call no matter how many of those sites run
+        # (e.g. preflight probe -> git remove fails with the dirty phrase ->
+        # exemption classifier), and never runs at all when force=True (real
+        # dirt cannot block a forced removal, so there is nothing to report
+        # -- this is what keeps the happy-path and force=True preflight
+        # tests free of any status call).
+        _status_cache: List[Optional[List[str]]] = [None]
+        _status_fetched = [False]
+
+        def _cached_status_entries() -> Optional[List[str]]:
+            if not _status_fetched[0]:
+                _status_cache[0] = _status_entries(record)
+                _status_fetched[0] = True
+            return _status_cache[0]
+
+        def _dirt_probe() -> List[str]:
+            if force:
+                return []
+            return _real_dirt_paths(record, entries=_cached_status_entries())
+
         # Step 2b (Windows only, ticket #76): pre-flight blocking-process check
         # BEFORE the destructive `git worktree remove` call below.
         #
@@ -1670,6 +1791,19 @@ class WorktreeManager:
         if sys.platform == "win32":
             _preflight_blockers = _find_blocking_processes(record.path, os.getpid())
             if _preflight_blockers:
+                # Q2 (ticket #103): probe for real dirt BEFORE taking any
+                # irreversible action -- including the kill below. If real
+                # dirt is ALSO present, this removal cannot succeed on this
+                # attempt no matter what kill_blocking_processes says (git
+                # worktree remove will still refuse for being dirty), so
+                # report both conditions now, with nothing killed and
+                # nothing removed, rather than killing a process for a
+                # removal that was always going to fail.
+                _dirt = _dirt_probe()
+                if _dirt:
+                    raise WorktreeRemovalBlockedError(
+                        record.id, killed=[], kill_attempted=False, dirty_paths=_dirt
+                    )
                 if kill_blocking_processes:
                     killed = _kill_blocking_processes(record.path)
                     record.killed_pids = killed
@@ -1738,7 +1872,11 @@ class WorktreeManager:
                     # independent of --force, so this branch applies for
                     # BOTH force=True and force=False (ticket #72, Befund 2).
                     kill_attempted = _resolve_lock_or_raise(
-                        args, record, kill_blocking_processes, _phantom_state_cleanup
+                        args,
+                        record,
+                        kill_blocking_processes,
+                        _phantom_state_cleanup,
+                        dirt_probe=_dirt_probe,
                     )
                     # Retry succeeded (or phantom-state cleanup ran) —
                     # fall through to long-path check then step 4.
@@ -1758,7 +1896,9 @@ class WorktreeManager:
                     # authoritative state -- yet its mere presence would
                     # otherwise force force=True on every single plain
                     # create() -> remove() cycle with zero real edits.
-                    dirt_paths = _contract_copy_dirt_paths(record)
+                    dirt_paths = _contract_copy_dirt_paths(
+                        record, entries=_cached_status_entries()
+                    )
                     if dirt_paths:
                         # Deliberate, documented trade-off (ticket #100):
                         # this auto-escalation is unconditional and exempts
@@ -1808,6 +1948,7 @@ class WorktreeManager:
                                     record,
                                     kill_blocking_processes,
                                     _phantom_state_cleanup,
+                                    dirt_probe=_dirt_probe,
                                 )
                                 # Retry succeeded (or phantom-state cleanup
                                 # ran) — fall through to long-path check

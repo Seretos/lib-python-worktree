@@ -59,6 +59,7 @@ from .core.manager import (
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
+    WorktreeRemovalBlockedError,
 )
 from .core.process_lifecycle import (
     KilledProcessInfo,
@@ -105,6 +106,7 @@ __all__ = [
     "GitTimeoutError",
     "UnknownVariantError",
     "WorktreeDirLockedError",
+    "WorktreeRemovalBlockedError",
     # checkout classification (ticket #84)
     "CheckoutInfo",
     "CheckoutTargetError",
