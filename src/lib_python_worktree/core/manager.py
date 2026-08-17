@@ -934,6 +934,11 @@ class WorktreeManager:
         Delegates to ``process_lifecycle.stop`` with ``store=self.state``.
         Ports are deliberately **not** released here — see ``start()``'s
         docstring and ``reconcile()``'s per-owner rule (ticket #84, R9).
+
+        Ticket #99: when the delegated ``process_lifecycle.stop`` call
+        reports ``status="stop_incomplete"``, the returned record's
+        ``stop_detail`` (a ``state.StopDetail``) carries a machine-readable
+        ``reason`` and evidence for why — see that function's own docstring.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=False)
 
@@ -970,6 +975,12 @@ class WorktreeManager:
                 # clearing the last pid entry for an unrelated role must not
                 # silently overwrite that guarantee back to "stopped".
                 record.status = "stopped"
+                # Ticket #99: status is actually transitioning to "stopped"
+                # here (the guard above already excludes the sticky
+                # "stop_incomplete"/"orphaned" cases) -- clear any stale
+                # stop_detail in lockstep, mirroring
+                # process_lifecycle.stop()'s own clean-"stopped" branch.
+                record.stop_detail = None
             self.state.update(record)
             return record
 

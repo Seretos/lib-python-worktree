@@ -190,7 +190,7 @@ at construction to clean up stale records.
 | `adopt` | `(repo_root: str)` | `AdoptReport` | Import untracked on-disk worktrees into the state store. Requires `YamlStateStore`. |
 | `prune` | `(repo_root: str)` | `None` | Run `git worktree prune --expire=now` to clear stale git metadata. |
 | `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID. |
-| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role`; force-kills if it does not exit within `timeout` seconds. |
+| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role`; force-kills if it does not exit within `timeout` seconds. On `status="stop_incomplete"`, see `stop_detail` below. |
 
 ### Orphan worktree recovery
 
@@ -339,6 +339,30 @@ Process detachment on Windows uses `CREATE_NEW_PROCESS_GROUP` so that
 `CTRL_BREAK_EVENT` can be delivered for graceful stop. On POSIX,
 `start_new_session=True` is used and `SIGTERM` / `SIGKILL` are used for
 graceful and force stops respectively.
+
+### Stop status and `stop_detail`
+
+When `stop()` cannot confirm that everything it tried to kill actually died,
+it reports `status="stop_incomplete"` instead of `"stopped"` and attaches a
+`stop_detail` (a `StopDetail`) to the returned `WorktreeRecord` naming why:
+
+| `reason` | Meaning |
+|---|---|
+| `survivors` | One or more tracked PIDs were still alive after every kill attempt (`survivor_pids`, capped at 32, plus the true `survivor_count`). |
+| `tree_truncated` | The descendant-process-tree snapshot hit its node cap, so some descendants were never even examined. |
+| `job_member_list_truncated` | Windows-only: the Job Object's member list hit its slot cap. |
+| `orphan_scan_incomplete` | `kill_orphans=True` was passed but the orphan scan's own discovery pass was starved before finishing. |
+
+`stop_detail.kill_orphans_may_help` hints whether retrying with
+`kill_orphans=True` might resolve it — `False` for `orphan_scan_incomplete`,
+since that pass already ran. `stop_detail` is persisted to `state.yaml` and
+is cleared as soon as the record's status moves away from
+`"stop_incomplete"`.
+
+`stop_detail` does not address *which* process the tracked PID identifies —
+PID reuse (trusting a stale PID number without a process-identity check
+against its recorded start time) remains a known limitation, out of scope
+here; see ticket #87.
 
 ## Release
 

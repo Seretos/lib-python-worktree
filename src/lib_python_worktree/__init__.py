@@ -68,7 +68,13 @@ from .core.process_lifecycle import (
 )
 from .core.plugin_install import PluginInstallResult, install_enabled_plugins
 from .core.port_allocator import PortAllocator
-from .core.state import InMemoryStateStore, StateStore, WorktreeRecord
+from .core.state import (
+    STOP_REASONS,
+    InMemoryStateStore,
+    StateStore,
+    StopDetail,
+    WorktreeRecord,
+)
 from .core.yaml_store import AdoptReport, ReconcileReport, YamlStateStore, adopt, reconcile
 from .setup import (
     SetupFailedError,
@@ -122,6 +128,8 @@ __all__ = [
     "WorktreeRecord",
     "StateStore",
     "InMemoryStateStore",
+    "StopDetail",
+    "STOP_REASONS",
     # yaml state store (W7)
     "YamlStateStore",
     "ReconcileReport",
