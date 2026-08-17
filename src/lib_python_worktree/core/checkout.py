@@ -184,6 +184,25 @@ class EnvironmentEntry:
     this tracked": always check ``tracked`` instead. Other fields
     (``path``, ``branch``, ``repo_root``, ``backing``) are populated from
     git's porcelain output where available.
+
+    **Two distinct "orphan" flavours (ticket #101), told apart by the same
+    fields a consumer already reads:**
+
+    - **Flavour A -- untracked but on disk** (above): ``tracked=False``,
+      ``record.id`` is the display-only ``untracked_id_for(path)``. Recover
+      with ``remove(checkout_path=...)``, or ``adopt()`` to import it.
+    - **Flavour B -- tracked but deregistered outside this tool**: a
+      worktree this library created, whose git registration is gone (the
+      checkout may or may not still exist on disk) -- e.g. a manual ``git
+      worktree remove --force <path>`` in a shell, its administrative
+      ``.git/worktrees/<id>`` directory deleted directly, or the checkout
+      directory deleted so its porcelain block reads ``prunable``. Such an
+      entry has ``tracked=True`` **and** ``record.status == "orphaned"``,
+      and its id **is** a real state-store key -- recover with
+      ``remove(worktree_id=...)``. There is no dedicated boolean field for
+      this; the discriminator is ``record.status``, checked alongside
+      ``tracked``. ``record.path`` for such an entry may not exist on disk,
+      so a consumer that stats it must tolerate ``FileNotFoundError``.
     """
 
     record: WorktreeRecord
@@ -275,6 +294,28 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
       branch instead of being refreshed to ``None``.
     - **Untracked linked worktree:** ``record.branch`` comes from porcelain
       by construction, same as always (unchanged by this ticket).
+
+    **Deregistered tracked worktrees (ticket #101):** the listing is the
+    *union* of git's live porcelain view and the repo's persisted records,
+    not just the former. A persisted record with no live (non-``prunable``)
+    porcelain block -- because the checkout's git registration is gone,
+    whether or not the checkout directory itself still exists on disk (e.g.
+    a manual ``git worktree remove --force <path>``, its administrative
+    ``.git/worktrees/<id>`` directory deleted directly, or the checkout
+    directory deleted so its block reads ``prunable``) -- is still emitted,
+    with ``tracked=True`` and an **in-memory** ``status="orphaned"``
+    override (unconditional for every record reaching this pass, since
+    reaching it already means git no longer has a live block for it --
+    that IS the definition of orphaned here, independent of on-disk
+    existence). This is a read view only, exactly like the branch-refresh
+    above: nothing is written back to the state store, so a non-YAML store
+    or ``reconcile_on_init=False`` still gets the correct status here.
+    ``backing="primary"`` records are skipped in this pass -- a repo's own
+    primary is always resolved from ``blocks[0]``, so any stale-path
+    ``"primary"`` record under the same ``repo_root`` is dropped to
+    preserve the "exactly one primary entry" invariant several callers
+    rely on. The primary-first, then-path-sorted ordering contract is
+    unchanged.
     """
     info = classify_checkout(path)
     repo_root_str = info.repo_root.as_posix()
@@ -295,6 +336,7 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
     primary_path = Path(blocks[0]["path"]).resolve() if blocks else info.repo_root
 
     entries: List[EnvironmentEntry] = []
+    live_paths: "set[Path]" = set()
     for block in blocks:
         wt_path_raw = block.get("path")
         if not wt_path_raw:
@@ -352,6 +394,39 @@ def list_repo(path: "Path | str", records: List[WorktreeRecord]) -> RepoListing:
                 record=record,
                 is_current=_path_contains(wt_path, info.checkout_path),
                 tracked=tracked,
+            )
+        )
+        live_paths.add(wt_path)
+
+    # Second pass (ticket #101): a persisted record whose path was never
+    # visited above -- because git's porcelain view no longer lists it at
+    # all (deregistered outside this tool, e.g. a manual `git worktree
+    # remove --force <path>`), or because its block was skipped as
+    # `prunable` -- must still surface as a tracked, orphaned entry rather
+    # than silently vanishing. One rule covers both cases, with no second
+    # git call. `backing="primary"` records are skipped here: a repo's own
+    # primary is always `blocks[0]` (already handled above), so the only way
+    # a primary-backed record could reach this loop is a stale-path primary
+    # record under the same repo_root, and adding a second primary entry
+    # would violate the "exactly one primary entry" invariant several
+    # existing call sites rely on (see the docstring).
+    for wt_path, rec in records_by_path.items():
+        if wt_path in live_paths or rec.backing == "primary":
+            continue
+        # Reaching this point already means the record has no live,
+        # non-prunable porcelain block -- that IS "orphaned" for flavour B,
+        # regardless of whether the checkout directory itself still exists
+        # (e.g. its `.git/worktrees/<id>` administrative directory was
+        # deleted directly, or the block was `prunable`). Only skip the
+        # replace() when the status is already "orphaned", to preserve
+        # object identity (same discipline as the branch-refresh above):
+        # in-memory-only override, never written back to the store.
+        record = rec if rec.status == "orphaned" else replace(rec, status="orphaned")
+        entries.append(
+            EnvironmentEntry(
+                record=record,
+                is_current=_path_contains(wt_path, info.checkout_path),
+                tracked=True,
             )
         )
 

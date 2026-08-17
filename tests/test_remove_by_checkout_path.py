@@ -69,9 +69,15 @@ def test_remove_untracked_linked_worktree_by_checkout_path(
 
     listing = mgr.list_repo(str(git_repo))
     linked_entries = [e for e in listing.entries if e.record.backing == "worktree"]
-    assert len(linked_entries) == 1
-    assert linked_entries[0].tracked is False
-    orphan_id = linked_entries[0].record.id
+    # Ticket #101: "unrelated-tracked" points at a path that was never a
+    # real worktree, so it now also surfaces as a tracked, orphaned entry
+    # (list_repo() no longer silently drops a persisted record with no live
+    # git registration) -- that is this ticket's fix, not a regression here.
+    # Narrow down to the untracked entry this test is actually about.
+    assert len(linked_entries) == 2
+    untracked_entries = [e for e in linked_entries if not e.tracked]
+    assert len(untracked_entries) == 1
+    orphan_id = untracked_entries[0].record.id
     assert orphan_id == untracked_id_for(linked_worktree)
 
     state_bytes_before = (state_dir / "state.yaml").read_bytes()
@@ -238,6 +244,39 @@ def test_remove_tracked_worktree_by_checkout_path(
         cwd=git_repo, capture_output=True,
     )
     assert proc.returncode != 0, "owned branch must be deleted"
+
+
+@pytest.mark.requires_git
+def test_remove_by_checkout_path_unaffected_by_orphan_entries(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Ticket #101 guard: the presence of a vanished (orphaned) tracked
+    record for a different checkout must not confuse
+    remove(checkout_path=...) resolution for a live, untracked linked
+    worktree -- an orphan entry is always is_current=False, so
+    _resolve_removal_target()'s containment-based fallback must still land
+    on the live checkout, not the vanished one."""
+    vanished_path = git_repo.parent / "vanished-checkout-101"
+    manager.state.add(
+        WorktreeRecord(
+            id="vanished-101",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/vanished",
+            path=vanished_path.as_posix(),
+            backing="worktree",
+        )
+    )
+
+    live_wt = git_repo.parent / "live-untracked-101"
+    subprocess.run(
+        ["git", "worktree", "add", str(live_wt), "-b", "feature/live-101"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    removed = manager.remove(checkout_path=str(live_wt), force=True)
+
+    assert removed.status == "removed"
+    assert not live_wt.exists()
 
 
 @pytest.mark.requires_git
