@@ -50,6 +50,21 @@ SHADOW_REASONS: Tuple[str, ...] = (
 )
 
 
+# Status vocabulary for ``SetupOutcome.status`` (ticket #105) -- one tag per
+# verdict ``WorktreeManager.create()`` reaches for the contract ``setup:``
+# hook: it ran and every step succeeded, it ran and a step failed, or there
+# were no ``setup:`` steps to run at all.
+SETUP_STATUS_COMPLETED = "completed"
+SETUP_STATUS_FAILED = "failed"
+SETUP_STATUS_SKIPPED = "skipped"
+
+SETUP_STATUSES: Tuple[str, ...] = (
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUS_FAILED,
+    SETUP_STATUS_SKIPPED,
+)
+
+
 @dataclass(frozen=True)
 class StopDetail:
     """Machine-readable reason a ``stop()`` call reported
@@ -163,6 +178,79 @@ class ShadowedContract:
     used_path: str
     reason: str
     message: str
+
+
+@dataclass(frozen=True)
+class SetupOutcome:
+    """Machine-readable verdict of the contract ``setup:`` hook run by
+    ``WorktreeManager.create()`` (ticket #105).
+
+    Orthogonal to the overloaded ``WorktreeRecord.status`` field, mirroring
+    the relationship ``StopDetail`` has to ``status``. ``record.status`` is
+    continuously rewritten by ``create``/``start``/``stop``/``reconcile`` for
+    entirely different purposes (e.g. ``"created"``, ``"running"``,
+    ``"stopped"``, ``"setup_failed"``), so it cannot answer "did the
+    ``setup:`` hook itself ever run, and how did it end?" once later calls
+    have moved ``status`` on. ``setup_outcome`` answers exactly that question
+    and only that question -- it is written once, by ``create()``'s
+    ``setup:`` hook block, and never touched again by any other call site.
+
+    ``status`` is always one of :data:`SETUP_STATUSES`, except when loaded
+    from a ``state.yaml`` written by a *future* engine version, in which case
+    an unrecognised value is preserved verbatim rather than rejected (forward
+    compatibility -- see ``yaml_store._setup_outcome_from_dict``, mirroring
+    :class:`StopDetail`'s convention):
+
+    - ``"completed"``: the contract had ``setup:`` steps and every one of
+      them succeeded.
+    - ``"failed"``: the contract had ``setup:`` steps and one of them raised
+      (a :class:`~..setup.runner.SetupFailedError` or any other exception).
+    - ``"skipped"``: the contract had no ``setup:`` steps at all (missing
+      contract, empty contract, or an explicit ``setup: []``) -- ``create()``
+      still ran and reached this decision, it just had nothing to execute.
+
+    ``message`` is the exact human-readable string describing the outcome --
+    for ``"failed"`` this is ``str()`` of the exception that was raised,
+    mirroring :class:`StopDetail`'s message-parity convention.
+
+    ``completed_at`` is an ISO-8601 UTC timestamp (via
+    ``datetime.now(timezone.utc).isoformat()``), set for all three statuses.
+
+    ``steps_run`` is the number of ``setup:`` steps that ran -- the length of
+    the underlying ``SetupResult.steps`` on a ``"completed"`` run; always
+    ``0`` for ``"skipped"``.
+
+    ``failed_step_index``, ``failed_step_name``, ``log_path`` (a forward-slash
+    string, like other path fields on :class:`WorktreeRecord`), ``returncode``,
+    and ``timed_out`` are populated for ``"failed"`` only (and only when the
+    failure was a :class:`~..setup.runner.SetupFailedError`, which is the only
+    exception type that carries this detail) -- left at their defaults
+    otherwise. ``timed_out`` is ``True`` when the failing step was killed by
+    its own timeout rather than exiting non-zero.
+
+    Deliberately **distinct** from ``None``: ``record.setup_outcome is None``
+    means the ``setup:`` hook was never reached at all (a record predating
+    this field, an adopted record, or a ``list_repo()``-synthesised entry),
+    whereas ``status="skipped"`` means ``create()`` ran and positively
+    determined there was nothing to run. Persisted through ``state.yaml``
+    (mirrors ``stop_detail``, unlike the transient ``killed_pids``/
+    ``shadowed_contract``) -- a legacy record with no ``setup_outcome`` key
+    deserialises to ``None``.
+
+    Invariant: only the ``setup:`` hook block in ``WorktreeManager.create()``
+    ever assigns ``WorktreeRecord.setup_outcome``. ``start()``, ``stop()``,
+    ``reconcile()``, ``adopt()``, and ``remove()`` never read or write it.
+    """
+
+    status: str
+    message: str = ""
+    completed_at: Optional[str] = None
+    steps_run: int = 0
+    failed_step_index: Optional[int] = None
+    failed_step_name: Optional[str] = None
+    log_path: Optional[str] = None
+    returncode: Optional[int] = None
+    timed_out: bool = False
 
 
 @dataclass
@@ -285,6 +373,21 @@ class WorktreeRecord:
     this field, and it applies equally to ``killed_pids`` (see that field's
     own docstring)."""
 
+    setup_outcome: Optional[SetupOutcome] = None
+    """Ticket #105: machine-readable verdict of the contract ``setup:`` hook
+    run by ``WorktreeManager.create()``, or ``None``. See
+    :class:`SetupOutcome`'s own docstring for the full invariant -- in short:
+    written ONLY by the ``setup:`` hook block in ``create()``; orthogonal to
+    ``status`` (which ``start``/``stop``/``reconcile`` continuously rewrite
+    for unrelated reasons); never touched by ``start``/``stop``/
+    ``reconcile``/``adopt``/``remove``. Persisted through ``state.yaml``
+    (mirrors ``stop_detail``) -- a legacy record with no ``setup_outcome``
+    key deserialises to ``None``. ``None`` deliberately means "the ``setup:``
+    hook was never reached" (record predates this field, was ``adopt()``-ed,
+    or was synthesised by ``list_repo()``) -- distinct from
+    ``status="skipped"``, which means ``create()`` ran and found no
+    ``setup:`` steps to run."""
+
 
 class StateStore(Protocol):
     """Interface that W7 will re-implement against a persistent backing store."""
@@ -345,6 +448,11 @@ class InMemoryStateStore:
 
 __all__: Iterable[str] = (
     "InMemoryStateStore",
+    "SetupOutcome",
+    "SETUP_STATUSES",
+    "SETUP_STATUS_COMPLETED",
+    "SETUP_STATUS_FAILED",
+    "SETUP_STATUS_SKIPPED",
     "ShadowedContract",
     "SHADOW_REASONS",
     "StateStore",
