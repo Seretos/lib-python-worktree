@@ -39,7 +39,7 @@ import portalocker
 import yaml
 
 from ._git_utils import _run_git
-from .state import WorktreeRecord
+from .state import StopDetail, WorktreeRecord, _STOP_DETAIL_MAX_PIDS
 
 _STATE_FILE = "state.yaml"
 _PORTS_FILE = "ports.yaml"
@@ -184,6 +184,57 @@ def _pid_alive_windows(pid: int) -> bool:
 # Internal helpers: serialise / deserialise WorktreeRecord
 # ---------------------------------------------------------------------------
 
+def _stop_detail_to_dict(detail: Optional[StopDetail]) -> Optional[Dict[str, Any]]:
+    """Serialise a :class:`~.state.StopDetail` to a plain nested dict of
+    scalars/lists (ticket #99), or ``None`` when *detail* is ``None``.
+
+    ``survivor_pids`` is written as a plain ``list`` (YAML has no tuple type);
+    re-capped defensively at :data:`_STOP_DETAIL_MAX_PIDS` even though the
+    dataclass is already constructed within that cap, so a hand-edited or
+    future-version state.yaml can never blow past it on the way back in via
+    :func:`_stop_detail_from_dict`.
+    """
+    if detail is None:
+        return None
+    return {
+        "reason": detail.reason,
+        "message": detail.message,
+        "role": detail.role,
+        "survivor_pids": list(detail.survivor_pids)[:_STOP_DETAIL_MAX_PIDS],
+        "survivor_count": detail.survivor_count,
+        "truncated_at": detail.truncated_at,
+        "skipped_passes": list(detail.skipped_passes),
+        "kill_orphans_may_help": detail.kill_orphans_may_help,
+    }
+
+
+def _stop_detail_from_dict(d: Optional[Dict[str, Any]]) -> Optional[StopDetail]:
+    """Reconstruct a :class:`~.state.StopDetail` from its serialised dict, or
+    ``None`` when *d* is ``None``/absent/empty (ticket #99).
+
+    Field-by-field with defaults for missing keys -- deliberately NOT
+    ``StopDetail(**d)`` -- so a legacy record with no ``stop_detail`` key at
+    all, or a state.yaml written by a future engine version carrying extra
+    keys this version does not know about, both deserialise without raising:
+    unknown keys are silently ignored, missing keys fall back to the same
+    defaults :class:`~.state.StopDetail` itself uses. ``reason`` is preserved
+    verbatim even if it is not a value in ``state.STOP_REASONS`` -- forward
+    compatibility with a reason vocabulary this version predates.
+    """
+    if not d:
+        return None
+    return StopDetail(
+        reason=d.get("reason", ""),
+        message=d.get("message", ""),
+        role=d.get("role"),
+        survivor_pids=tuple(d.get("survivor_pids") or ())[:_STOP_DETAIL_MAX_PIDS],
+        survivor_count=d.get("survivor_count", 0),
+        truncated_at=d.get("truncated_at"),
+        skipped_passes=tuple(d.get("skipped_passes") or ()),
+        kill_orphans_may_help=bool(d.get("kill_orphans_may_help", False)),
+    )
+
+
 def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
     return {
         "id": rec.id,
@@ -198,6 +249,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "start_log_path": rec.start_log_path,
         "backing": rec.backing,
         "job_names": dict(rec.job_names),
+        "stop_detail": _stop_detail_to_dict(rec.stop_detail),
     }
 
 
@@ -223,6 +275,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         start_log_path=d.get("start_log_path"),
         backing=d.get("backing", "worktree"),
         job_names=dict(d.get("job_names") or {}),
+        stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
     )
 
 
@@ -517,6 +570,11 @@ def reconcile(
                         wt_id, rec.path,
                     )
                     rec.status = "orphaned"
+                    # Ticket #99: "orphaned" supersedes "stop_incomplete"
+                    # (the path itself is gone, so no earlier "process may
+                    # still be alive" reason remains actionable) -- clear any
+                    # stale stop_detail in lockstep with the status change.
+                    rec.stop_detail = None
                     changed = True
                 report.orphaned.append(wt_id)
 
@@ -540,6 +598,12 @@ def reconcile(
                 # the default "stopped" outcome of this branch.
                 if rec.status not in ("orphaned", "stop_incomplete"):
                     rec.status = "stopped"
+                    # Ticket #99: this branch only runs when status is
+                    # actually transitioning to "stopped" (the guard above
+                    # already excludes the sticky "stop_incomplete" case) --
+                    # clear stop_detail in lockstep, mirroring
+                    # process_lifecycle.stop()'s own clean-"stopped" branch.
+                    rec.stop_detail = None
                 if wt_id not in report.stopped:
                     report.stopped.append(wt_id)
 

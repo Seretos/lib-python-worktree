@@ -33,7 +33,12 @@ from lib_python_worktree.core.manager import (
     _is_path_prunable,
     _run_git,
 )
-from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+from lib_python_worktree.core.state import (
+    STOP_REASON_SURVIVORS,
+    InMemoryStateStore,
+    StopDetail,
+    WorktreeRecord,
+)
 from lib_python_worktree.core.yaml_store import YamlStateStore
 
 
@@ -1894,6 +1899,59 @@ class TestManagerStopStickyStatus:
         mock_runner_instance.run.assert_called_once()
         mock_lc_stop.assert_not_called()
         assert result.status == "stop_incomplete"
+
+    def test_no_pid_for_role_clears_stop_detail_when_marking_stopped(self, tmp_path: Path):
+        """Ticket #99 (B2 edge case): mirrors
+        test_no_pid_for_role_running_still_becomes_stopped -- when the no-op
+        branch actually transitions a non-sticky status to "stopped", any
+        stale stop_detail left over on the record must be cleared too."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        stale_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS, message="stale", role="main",
+        )
+        record = _make_wt_record(status="running", stop_detail=stale_detail)  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stopped"
+        assert result.stop_detail is None
+        assert mgr.state.get(record.id).stop_detail is None
+
+    def test_no_pid_for_role_preserves_stop_detail_when_sticky(self, tmp_path: Path):
+        """Ticket #99 (B2 edge case): mirrors
+        test_no_pid_for_role_does_not_clobber_stop_incomplete -- the sticky
+        guard preserving status must also preserve the stop_detail attached
+        to it; the no-op branch must not touch stop_detail when it does not
+        touch status."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        sticky_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS, message="sticky", role="main",
+        )
+        record = _make_wt_record(
+            status="stop_incomplete", stop_detail=sticky_detail,
+        )  # no pids
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            result = mgr.stop(record.id)
+
+        mock_lc_stop.assert_not_called()
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail == sticky_detail
+        assert mgr.state.get(record.id).stop_detail == sticky_detail
 
 
 # ---------------------------------------------------------------------------

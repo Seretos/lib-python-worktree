@@ -53,7 +53,15 @@ from lib_python_worktree.core.process_lifecycle import (
     stop,
 )
 from lib_python_worktree.core.manager import WorktreeNotFoundError
-from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+from lib_python_worktree.core.state import (
+    STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
+    STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
+    STOP_REASON_SURVIVORS,
+    STOP_REASON_TREE_TRUNCATED,
+    InMemoryStateStore,
+    StopDetail,
+    WorktreeRecord,
+)
 
 # Generous budget_sec for real (non-mocked) TestWinHandleHoldersReal scans that
 # assert *correctness* rather than deadline bail-out behaviour. The production
@@ -4386,6 +4394,332 @@ class TestStopStatusHonesty:
             result = stop("wt-under-cap-tree", store=store, timeout=1.0)
 
         assert result.status == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# TestStopDetail -- ticket #99
+# ---------------------------------------------------------------------------
+
+class TestStopDetail:
+    """Regression tests for ticket #99: every ``stop_incomplete`` branch in
+    ``stop()`` must attach a machine-readable ``StopDetail`` to
+    ``record.stop_detail``, not just log a warning."""
+
+    def test_survivor_sets_stop_detail_reason(self):
+        """B1 driving test: a survivor pid populates a StopDetail with
+        reason="survivors", the survivor pid tuple, count, role, and a
+        message naming the pid -- on both the returned record and the
+        persisted one."""
+        fake_pid = 31337
+        record = _make_record("wt-survivor-detail", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+        ):
+            result = stop("wt-survivor-detail", store=store, timeout=0.3)
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_SURVIVORS
+        assert detail.survivor_pids == (fake_pid,)
+        assert detail.survivor_count == 1
+        assert detail.role == DEFAULT_ROLE
+        assert str(fake_pid) in detail.message
+        assert detail.kill_orphans_may_help is True
+
+        stored = store.get("wt-survivor-detail")
+        assert stored is not None
+        assert stored.stop_detail == detail
+
+    def test_tree_truncation_sets_reason_tree_truncated(self):
+        """Edge case: a capped tree snapshot sets reason="tree_truncated"
+        with truncated_at == the patched cap."""
+        fake_pid = 41200
+        record = _make_record("wt-tree-detail", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        capped_tree = [
+            KilledProcessInfo(pid=42200 + i, name="child", cmdline=["child"])
+            for i in range(3)
+        ]
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle._MAX_TREE_NODES", 3),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=capped_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-tree-detail", store=store, timeout=1.0)
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_TREE_TRUNCATED
+        assert detail.truncated_at == 3
+        assert detail.survivor_pids == ()
+        assert detail.kill_orphans_may_help is True
+
+    def test_job_member_truncation_sets_reason_job_member_list_truncated(self):
+        """Edge case: a truncated Job Object member list sets
+        reason="job_member_list_truncated" with truncated_at ==
+        _JOB_MEMBER_LIST_MAX_SLOTS."""
+        fake_pid = 81400
+        record = _make_record(
+            "wt-job-truncated-detail",
+            pids={DEFAULT_ROLE: fake_pid},
+            job_names={DEFAULT_ROLE: "Local\\fake-job"},
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([], complete=False),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+        ):
+            result = stop("wt-job-truncated-detail", store=store, timeout=1.0)
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_JOB_MEMBER_LIST_TRUNCATED
+        assert detail.truncated_at == _pl._JOB_MEMBER_LIST_MAX_SLOTS
+
+    def test_orphan_scan_incomplete_sets_reason_and_skipped_passes(self):
+        """Edge case: an incomplete orphan-scan discovery pass sets
+        reason="orphan_scan_incomplete" and carries the skipped_passes
+        tags, with kill_orphans_may_help forced False (that pass already
+        ran -- the remediation is a larger timeout, stated in message)."""
+        fake_pid = 61100
+        record = _make_record(
+            "wt-orphan-incomplete-detail", pids={DEFAULT_ROLE: fake_pid},
+        )
+        store = _make_store(record)
+
+        partial = _pl._PartialList(
+            [], complete=False, skipped_passes=("handle_scan:skipped",)
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=partial,
+            ),
+        ):
+            result = stop(
+                "wt-orphan-incomplete-detail",
+                store=store,
+                kill_orphans=True,
+                timeout=5.0,
+            )
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        assert detail.skipped_passes == ("handle_scan:skipped",)
+        assert detail.kill_orphans_may_help is False
+
+    def test_branch_precedence_survivors_wins_over_truncation(self):
+        """Edge case: survivors and a truncated tree simultaneously must
+        still yield reason="survivors" -- pinning the unchanged if/elif
+        precedence from before this ticket."""
+        fake_pid = 41300
+        record = _make_record("wt-precedence", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        capped_tree = [
+            KilledProcessInfo(pid=42300 + i, name="child", cmdline=["child"])
+            for i in range(3)
+        ]
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle._MAX_TREE_NODES", 3),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=capped_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-precedence", store=store, timeout=0.3)
+
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail is not None
+        assert result.stop_detail.reason == STOP_REASON_SURVIVORS
+
+    def test_stop_detail_cleared_when_later_stop_is_clean(self):
+        """B2 driving test: a record left with status='stop_incomplete' and
+        a stale stop_detail from an earlier stop() call must have
+        stop_detail cleared once start() runs for that role and flips
+        status away from stop_incomplete."""
+        stale_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message="stale",
+            role=DEFAULT_ROLE,
+            survivor_pids=(999,),
+            survivor_count=1,
+        )
+        record = _make_record(
+            "wt-clear-on-start",
+            status="stop_incomplete",
+            stop_detail=stale_detail,
+        )
+        store = _make_store(record)
+
+        result = start(
+            "wt-clear-on-start",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+
+        assert result.status == "running"
+        assert result.stop_detail is None
+
+        stored = store.get("wt-clear-on-start")
+        assert stored is not None
+        assert stored.stop_detail is None
+
+        # Cleanup
+        pid = result.pids.get(DEFAULT_ROLE, 0)
+        try:
+            _force_kill(pid)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def test_sticky_stop_incomplete_preserves_earlier_stop_detail(self):
+        """Edge case (B2): mirrors
+        test_stop_clean_role_does_not_clobber_sticky_stop_incomplete -- an
+        earlier stop(role="main") already left status="stop_incomplete" and
+        a StopDetail on the record; a later, clean stop(role="worker") must
+        not erase that detail even though it empties record.pids as a side
+        effect."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine — skipping")
+
+        earlier_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message="earlier survivor",
+            role="main",
+            survivor_pids=(31337,),
+            survivor_count=1,
+        )
+        record = _make_record(
+            "wt-sticky-detail-cross-role",
+            pids={"worker": 99999999},
+            status="stop_incomplete",
+            stop_detail=earlier_detail,
+        )
+        store = _make_store(record)
+
+        result = stop(
+            "wt-sticky-detail-cross-role", store=store, role="worker", timeout=1.0,
+        )
+
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail == earlier_detail
+
+        stored = store.get("wt-sticky-detail-cross-role")
+        assert stored is not None
+        assert stored.stop_detail == earlier_detail
+
+    def test_kill_orphans_hint_set_when_orphan_pass_never_ran(self):
+        """B4: kill_orphans_may_help is True when the orphan-scan pass
+        never ran (kill_orphans=False) for a survivors outcome -- retrying
+        with kill_orphans=True might still catch it."""
+        fake_pid = 31338
+        record = _make_record("wt-hint-may-help", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+        ):
+            result = stop(
+                "wt-hint-may-help", store=store, timeout=0.3, kill_orphans=False,
+            )
+
+        assert result.stop_detail is not None
+        assert result.stop_detail.kill_orphans_may_help is True
+
+    def test_kill_orphans_hint_false_when_orphan_scan_already_ran(self):
+        """B4: kill_orphans_may_help is False for a survivors outcome when
+        kill_orphans=True was already passed on this call -- there is no
+        further remediation this hint can point to."""
+        fake_pid = 31339
+        record = _make_record("wt-hint-no-help", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([]),
+            ),
+        ):
+            result = stop(
+                "wt-hint-no-help", store=store, timeout=0.3, kill_orphans=True,
+            )
+
+        assert result.stop_detail is not None
+        assert result.stop_detail.kill_orphans_may_help is False
 
 
 # ---------------------------------------------------------------------------

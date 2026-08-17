@@ -27,7 +27,12 @@ import yaml
 
 import subprocess
 
-from lib_python_worktree.core.state import WorktreeRecord
+from lib_python_worktree.core.state import (
+    STOP_REASON_SURVIVORS,
+    StopDetail,
+    WorktreeRecord,
+    _STOP_DETAIL_MAX_PIDS,
+)
 from lib_python_worktree.core.yaml_store import (
     AdoptReport,
     ReconcileReport,
@@ -357,6 +362,56 @@ def test_reconcile_preserves_stop_incomplete_status(state_dir: Path, tmp_path: P
         "reconcile() must not overwrite an existing 'stop_incomplete' status "
         "back to 'stopped' when it also clears an unrelated dead role"
     )
+
+
+# ---------------------------------------------------------------------------
+# reconcile(): stop_detail is cleared in lockstep with status transitions
+# (ticket #99, B2 edge cases)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_orphaned_clears_stop_detail(state_dir: Path, tmp_path: Path):
+    """reconcile()'s orphaned-path branch must clear any stale stop_detail
+    in lockstep with the status transition to "orphaned"."""
+    store = YamlStateStore(state_dir=state_dir)
+    non_existent = str(tmp_path / "gone" / "wt-orphan-detail")
+    rec = _make_record(id="wt-orphan-detail", path=non_existent)
+    rec.stop_detail = StopDetail(
+        reason=STOP_REASON_SURVIVORS, message="stale", role="main",
+    )
+    store.add(rec)
+
+    report = reconcile(store)
+
+    assert "wt-orphan-detail" in report.orphaned
+    updated = store.get("wt-orphan-detail")
+    assert updated is not None
+    assert updated.status == "orphaned"
+    assert updated.stop_detail is None
+
+
+def test_reconcile_dead_pid_stopped_clears_stop_detail(state_dir: Path, tmp_path: Path):
+    """reconcile()'s dead-PID branch, when it actually transitions status to
+    "stopped", must clear any stale stop_detail left on the record."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-dead-detail"
+    wt_path.mkdir()
+    dead_pid = 99999999  # extremely unlikely to be alive
+
+    rec = _make_record(id="wt-dead-detail", path=str(wt_path), pids={"server": dead_pid})
+    rec.stop_detail = StopDetail(
+        reason=STOP_REASON_SURVIVORS, message="stale", role="server",
+    )
+    store.add(rec)
+
+    assert not _pid_alive(dead_pid), "test assumption: pid 99999999 must not be alive"
+
+    report = reconcile(store)
+
+    assert "wt-dead-detail" in report.stopped
+    updated = store.get("wt-dead-detail")
+    assert updated is not None
+    assert updated.status == "stopped"
+    assert updated.stop_detail is None
 
 
 # ---------------------------------------------------------------------------
@@ -1328,3 +1383,132 @@ class TestJobNameRoundTrip:
         legacy = store.get("legacy-wt-job")
         assert legacy is not None
         assert legacy.job_names == {}
+
+
+# ---------------------------------------------------------------------------
+# TestStopDetailPersistence -- ticket #99
+# ---------------------------------------------------------------------------
+
+class TestStopDetailPersistence:
+    """B3 (ticket #99): ``stop_detail`` survives a host restart (persisted
+    through ``state.yaml``), a legacy record with no ``stop_detail`` key
+    still loads, and an unrecognised key inside it is silently ignored."""
+
+    def test_stop_detail_round_trips(self, state_dir: Path):
+        """Driving test: a record with a real StopDetail round-trips through
+        a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-stop-detail", status="stop_incomplete")
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message=(
+                "stop(worktree_id=wt-stop-detail, role=main): process(es) "
+                "survived termination: [31337]"
+            ),
+            role="main",
+            survivor_pids=(31337,),
+            survivor_count=1,
+            kill_orphans_may_help=True,
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-stop-detail")
+        assert reloaded is not None
+        assert reloaded.stop_detail == record.stop_detail
+
+    def test_legacy_record_without_stop_detail_key_defaults_to_none(self, state_dir: Path):
+        """A pre-#99 state.yaml entry with no `stop_detail` key at all must
+        still deserialise, defaulting stop_detail to None."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-stop": {
+                    "id": "legacy-wt-stop",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-stop",
+                    "status": "stop_incomplete",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    # no "stop_detail" key at all -- simulates a pre-#99
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-stop")
+        assert legacy is not None
+        assert legacy.stop_detail is None
+
+    def test_unknown_stop_detail_key_is_ignored(self, state_dir: Path):
+        """Forward compat: a state.yaml written by a future engine version
+        may carry extra keys inside stop_detail this version does not know
+        about -- they must be silently ignored, not raise."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "future-wt-stop": {
+                    "id": "future-wt-stop",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/future-wt-stop",
+                    "status": "stop_incomplete",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "stop_detail": {
+                        "reason": "survivors",
+                        "message": "future msg",
+                        "role": "main",
+                        "survivor_pids": [123],
+                        "survivor_count": 1,
+                        "truncated_at": None,
+                        "skipped_passes": [],
+                        "kill_orphans_may_help": True,
+                        "future_field_this_version_predates": "surprise",
+                    },
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        future = store.get("future-wt-stop")
+        assert future is not None
+        assert future.stop_detail is not None
+        assert future.stop_detail.reason == "survivors"
+        assert future.stop_detail.survivor_pids == (123,)
+
+    def test_survivor_pids_capped_in_persisted_detail(self, state_dir: Path):
+        """A StopDetail carrying more than _STOP_DETAIL_MAX_PIDS survivor
+        pids (e.g. constructed by a future engine version) is capped on the
+        way to disk (and again on the way back); survivor_count still holds
+        the true total."""
+        store = YamlStateStore(state_dir=state_dir)
+        many_pids = tuple(range(1000, 1100))  # 100 pids, well over the cap
+        record = _make_record(id="wt-many-survivors", status="stop_incomplete")
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_SURVIVORS,
+            message="many survivors",
+            role="main",
+            survivor_pids=many_pids,
+            survivor_count=len(many_pids),
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-many-survivors")
+        assert reloaded is not None
+        assert reloaded.stop_detail is not None
+        assert len(reloaded.stop_detail.survivor_pids) == _STOP_DETAIL_MAX_PIDS
+        assert reloaded.stop_detail.survivor_count == 100
