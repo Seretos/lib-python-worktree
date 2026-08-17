@@ -271,7 +271,7 @@ Runs steps sequentially; raises `SetupFailedError` on the first non-zero exit.
 Exception
 ├── RuntimeError
 │   ├── WorktreeError                    (base for all engine errors)
-│   │   ├── GitTimeoutError              (git subprocess exceeded WORKTREE_GIT_TIMEOUT_SEC)
+│   │   ├── GitTimeoutError              (git subprocess exceeded WORKTREE_GIT_TIMEOUT_SEC; carries .network, .subcommand)
 │   │   ├── DirtyWorktreeError           (remove refused; pass force=True)
 │   │   ├── BranchNotFoundError
 │   │   ├── BranchAlreadyCheckedOutError (carries .branch, .path, .prunable)
@@ -312,6 +312,14 @@ Per-step overrides (the `shell:` field):
 `WORKTREE_GIT_TIMEOUT_SEC` controls how long each `git` subprocess may run
 before being killed and raising `GitTimeoutError`. Default: `30.0` seconds.
 Set to an empty string to disable the timeout entirely (diagnostic use only).
+
+`GitTimeoutError` also carries two programmatic diagnostic attributes,
+derived from the timed-out command: `.subcommand` (the git subcommand, e.g.
+`"fetch"`, or `None` if it couldn't be determined) and `.network` (`bool`,
+`True` for remote-talking subcommands -- `clone`, `fetch`, `ls-remote`,
+`pull`, `push`). A network timeout's message also gains a suffix noting it
+may be transient and worth retrying. This is a diagnostic signal only --
+the engine does not itself retry or change timeout behaviour based on it.
 
 ### Setup timeout
 
