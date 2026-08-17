@@ -383,6 +383,27 @@ def test_reconcile_dead_pid(state_dir: Path, tmp_path: Path):
     assert "server" not in updated.pids
 
 
+def test_reconcile_dead_pid_pops_variant_entry(state_dir: Path, tmp_path: Path):
+    """Ticket #104: a dead role discovered by reconcile() must also lose its
+    ``variants`` entry, keeping ``set(variants) <= set(pids)`` intact."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-variant-dead"
+    wt_path.mkdir()
+    dead_pid = 99999999  # extremely unlikely to be alive
+
+    rec = _make_record(id="wt-variant-dead", path=str(wt_path), pids={"server": dead_pid})
+    rec.variants = {"server": "web"}
+    store.add(rec)
+
+    assert not _pid_alive(dead_pid), "test assumption: pid 99999999 must not be alive"
+
+    reconcile(store)
+
+    updated = store.get("wt-variant-dead")
+    assert updated is not None
+    assert "server" not in updated.variants
+
+
 # ---------------------------------------------------------------------------
 # reconcile(): "stop_incomplete" status must survive a dead-role reconcile
 # (ticket #87 follow-up, finding B2)
@@ -1445,6 +1466,59 @@ class TestJobNameRoundTrip:
         legacy = store.get("legacy-wt-job")
         assert legacy is not None
         assert legacy.job_names == {}
+
+
+# ---------------------------------------------------------------------------
+# TestVariantsRoundTrip -- ticket #104
+# ---------------------------------------------------------------------------
+
+class TestVariantsRoundTrip:
+    """B1 (ticket #104): ``WorktreeRecord.variants`` (per-role mapping of
+    role -> the variant that started it) persists through ``state.yaml``,
+    and a pre-fix record with no ``variants`` key at all still deserialises
+    (defaulting to ``{}``)."""
+
+    def test_variants_round_trip(self, state_dir: Path):
+        """Driving test: a record with a real per-role variants mapping
+        round-trips through a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-variants")
+        record.variants = {"main": "default", "web": "web"}
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-variants")
+        assert reloaded is not None
+        assert reloaded.variants == {"main": "default", "web": "web"}
+
+    def test_legacy_record_without_variants_key_defaults_to_empty(self, state_dir: Path):
+        """A pre-fix state.yaml entry with no `variants` key at all must
+        still deserialise, defaulting variants to an empty dict."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-variants": {
+                    "id": "legacy-wt-variants",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-variants",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    # no "variants" key at all -- simulates a pre-fix
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-variants")
+        assert legacy is not None
+        assert legacy.variants == {}
 
 
 # ---------------------------------------------------------------------------

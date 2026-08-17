@@ -55,6 +55,7 @@ from .core.manager import (
     PortAllocationError,
     PrimaryCheckoutError,
     UnknownVariantError,
+    VariantResolutionError,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
@@ -105,6 +106,7 @@ __all__ = [
     "GitCommandError",
     "GitTimeoutError",
     "UnknownVariantError",
+    "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeRemovalBlockedError",
     # checkout classification (ticket #84)

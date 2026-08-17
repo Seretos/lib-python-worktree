@@ -2361,6 +2361,7 @@ def start(
     *,
     store: StateStore,
     role: str = DEFAULT_ROLE,
+    variant: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[str] = None,
 ) -> WorktreeRecord:
@@ -2376,6 +2377,14 @@ def start(
         The active ``StateStore`` instance (carries ``WorktreeRecord``).
     role:
         Identifies the process within the worktree (e.g. ``"main"``).
+    variant:
+        The name of the ``start:`` contract step that produced *cmd*, if
+        any. Recorded under ``record.variants[role]`` so a later
+        ``stop(variant=...)`` can resolve back to this *role* -- see
+        ``WorktreeRecord.variants``'s docstring. ``None`` (the default)
+        means no variant is being tracked for this call, and any stale
+        entry left over from a previous ``start()`` of this same *role* is
+        cleared.
     env:
         Full environment for the child process.  ``None`` inherits the
         current process environment.
@@ -2453,6 +2462,14 @@ def start(
         record.job_names[role] = spawned_job_name
     else:
         record.job_names.pop(role, None)
+    # Ticket #104: mirrors job_names' role-keyed, no-None-value convention --
+    # record which variant started this role so stop(variant=...) can
+    # resolve back to it, and clear any stale entry from a previous start()
+    # of this same role when no variant is given this time.
+    if variant is not None:
+        record.variants[role] = variant
+    else:
+        record.variants.pop(role, None)
     store.update(record)
 
     return record
@@ -2834,6 +2851,11 @@ def stop(
     # outside of stop() itself -- there is nothing left that depends on this
     # entry surviving a stop.
     record.job_names.pop(role, None)
+    # Ticket #104: mirror the job_names[role] clear immediately above --
+    # once this role's pid entry is gone, the variant that started it is no
+    # longer meaningful and would otherwise leave the
+    # set(variants) <= set(pids) invariant violated.
+    record.variants.pop(role, None)
 
     if survivor_pids:
         message = (

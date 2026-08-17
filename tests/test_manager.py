@@ -26,6 +26,7 @@ from lib_python_worktree.core.manager import (
     GitTimeoutError,
     ManagerConfig,
     UnknownVariantError,
+    VariantResolutionError,
     WorktreeError,
     WorktreeManager,
     GitCommandError,
@@ -1576,6 +1577,8 @@ def test_manager_start_empty_contract_is_noop_ready(tmp_path: Path):
     assert result.status == "ready"
     assert result.pids == {}
     assert mgr.state.get(record.id).status == "ready"
+    # Ticket #104: no process was spawned, so no variant is recorded either.
+    assert result.variants == {}
 
 
 def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
@@ -1923,6 +1926,32 @@ def test_manager_start_named_variant_selected(tmp_path: Path):
 
     call_kwargs = mock_start.call_args
     assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_forwards_variant_to_lifecycle_start(tmp_path: Path):
+    """Ticket #104: start(variant="headless") forwards variant="headless"
+    to the delegated process_lifecycle.start call, so it can be recorded
+    under record.variants[role]."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    headless_step = Step(run="python server.py --headless", name="headless")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[headless_step],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="headless")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["variant"] == "headless"
 
 
 def test_manager_start_backward_compat_single_unnamed_step(tmp_path: Path):
@@ -2382,6 +2411,286 @@ class TestManagerStopStickyStatus:
         assert result.status == "stop_incomplete"
         assert result.stop_detail == sticky_detail
         assert mgr.state.get(record.id).stop_detail == sticky_detail
+
+
+# ---------------------------------------------------------------------------
+# TestManagerStopByVariant -- ticket #104 (B3)
+# ---------------------------------------------------------------------------
+
+class TestManagerStopByVariant:
+    """B3 (ticket #104): stop(variant=...) resolves to the role that
+    started it via record.variants, symmetric with start(variant=...)."""
+
+    def test_manager_stop_by_variant_resolves_role(self, tmp_path: Path):
+        """Driving test: stop(variant="web") delegates to _lifecycle_stop
+        with role="web" resolved from record.variants."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111, "web": 222},
+            variants={"main": "default", "web": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, variant="web")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="web",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_without_variant_unchanged(self, tmp_path: Path):
+        """Bare stop(id) still targets 'main' when variant is not given."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111, "web": 222},
+            variants={"main": "default", "web": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id)
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_role_none_defaults_to_main(self, tmp_path: Path):
+        """Explicit role=None is the same as omitting it entirely -- the
+        sentinel default is not itself a no-op."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"main": 111})
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, role=None)
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_role_and_variant_agree(self, tmp_path: Path):
+        """role="web", variant="web" where variants={"web": "web"} resolves
+        and delegates with role="web" (the pair agrees; no error)."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"web": 222}, variants={"web": "web"})
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, role="web", variant="web")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="web",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_by_variant_after_reload(self, tmp_path: Path):
+        """End-to-end through YamlStateStore: a record with a persisted
+        variants mapping survives a fresh WorktreeManager instance
+        (simulating a host restart), and stop(variant=...) still resolves
+        correctly."""
+        state_dir = tmp_path / "state"
+        store1 = YamlStateStore(state_dir=state_dir)
+        record = _make_wt_record(pids={"web": 222}, variants={"web": "web"})
+        store1.add(record)
+
+        mgr2 = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=YamlStateStore(state_dir=state_dir),
+            reconcile_on_init=False,
+        )
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr2.stop(record.id, variant="web")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr2.state,
+            role="web",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestManagerStopVariantResolutionErrors -- ticket #104 (B4)
+# ---------------------------------------------------------------------------
+
+class TestManagerStopVariantResolutionErrors:
+    """B4 (ticket #104): an unknown, ambiguous, or role-disagreeing variant
+    raises a clear VariantResolutionError, and nothing is attempted (no
+    contract stop: steps, no _lifecycle_stop call) before that error is
+    raised."""
+
+    def test_manager_stop_ambiguous_variant_raises(self, tmp_path: Path):
+        """Driving test: two roles both mapped to variant="web" -- stop()
+        raises VariantResolutionError naming both candidates, and nothing
+        was attempted (no _lifecycle_stop call, no contract stop: steps)."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"web1": 111, "web2": 222},
+            variants={"web1": "web", "web2": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="echo stopping")],
+        )
+        mock_runner_instance = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="web")
+
+        mock_lc_stop.assert_not_called()
+        mock_runner_instance.run.assert_not_called()
+        err = exc_info.value
+        assert err.roles == ["web1", "web2"]
+        assert err.requested_role is None
+
+    def test_manager_stop_unknown_variant_raises(self, tmp_path: Path):
+        """Zero match: no currently-running role was started with this
+        variant. The message points at role= and names running roles."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"main": 111}, variants={"main": "default"})
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="nope")
+
+        mock_lc_stop.assert_not_called()
+        err = exc_info.value
+        assert err.roles == []
+        message = str(err)
+        assert "role=" in message
+        assert "main" in message
+
+    def test_manager_stop_legacy_record_zero_match_names_running_roles(self, tmp_path: Path):
+        """A record with a live pid but no variants entry (started before
+        this ticket shipped) hits the zero-match branch and names the
+        running role, while stop() and stop(role="main") still work
+        unchanged."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(pids={"main": 111})  # variants == {}
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="default")
+
+        mock_lc_stop.assert_not_called()
+        assert "main" in str(exc_info.value)
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop2,
+        ):
+            mock_lc_stop2.return_value = record
+            mgr.stop(record.id)
+
+        mock_lc_stop2.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_role_conflicts_with_variant_raises(self, tmp_path: Path):
+        """An explicit role= that disagrees with the role variant= resolves
+        to raises rather than silently picking one."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111, "web": 222},
+            variants={"web": "web"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, role="main", variant="web")
+
+        mock_lc_stop.assert_not_called()
+        err = exc_info.value
+        assert err.requested_role == "main"
+        assert err.roles == ["web"]
+
+    def test_variant_resolution_error_is_worktree_error_and_valueerror(self):
+        assert issubclass(VariantResolutionError, WorktreeError)
+        assert issubclass(VariantResolutionError, ValueError)
+
+    def test_variant_resolution_error_importable_and_exported(self):
+        import lib_python_worktree as top
+
+        assert top.VariantResolutionError is VariantResolutionError
+        assert "VariantResolutionError" in top.__all__
+        assert "VariantResolutionError" in manager_module.__all__
 
 
 # ---------------------------------------------------------------------------

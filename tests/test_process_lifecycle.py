@@ -268,6 +268,45 @@ class TestStart:
         except Exception:  # noqa: BLE001
             pass
 
+    def test_start_records_variant_for_role(self):
+        """Ticket #104: start(variant=...) records which variant started
+        this role under record.variants[role], and the store-reloaded
+        record agrees."""
+        record = _make_record("wt-variant")
+        store = _make_store(record)
+
+        result = start(
+            "wt-variant",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+            role="web",
+            variant="web",
+        )
+        try:
+            assert result.variants == {"web": "web"}
+            reloaded = store.get("wt-variant")
+            assert reloaded is not None
+            assert reloaded.variants == {"web": "web"}
+        finally:
+            _force_kill(result.pids["web"])
+
+    def test_start_without_variant_pops_stale_variant_entry(self):
+        """A pre-seeded variants["main"] entry is removed when start() is
+        called again for that role with variant=None (the default)."""
+        record = _make_record("wt-variant-stale")
+        record.variants["main"] = "default"
+        store = _make_store(record)
+
+        result = start(
+            "wt-variant-stale",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+        try:
+            assert "main" not in result.variants
+        finally:
+            _force_kill(result.pids[DEFAULT_ROLE])
+
 
 # ---------------------------------------------------------------------------
 # start(): output capture + early-exit detection (ticket #81)
@@ -554,6 +593,37 @@ class TestStop:
             "status must not become 'stopped' while other roles are still alive"
         )
         assert result.status == "running"
+
+    def test_stop_pops_variant_entry(self):
+        """Ticket #104: stop() clears record.variants[role] alongside
+        record.pids[role] -- set(variants) <= set(pids) must hold after."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine")
+
+        record = _make_record("wt-stop-variant", pids={"web": 99999999})
+        record.variants["web"] = "web"
+        store = _make_store(record)
+
+        result = stop("wt-stop-variant", store=store, role="web", timeout=1.0)
+        assert "web" not in result.variants
+
+    def test_stop_does_not_touch_other_roles_variant(self):
+        """Stopping one role must not remove another role's variants entry."""
+        if _pid_alive(99999999):
+            pytest.skip("PID 99999999 is alive on this machine")
+
+        record = _make_record(
+            "wt-stop-variant-multi",
+            pids={"main": os.getpid(), "worker": 99999999},
+            status="running",
+        )
+        record.variants["main"] = "default"
+        record.variants["worker"] = "web"
+        store = _make_store(record)
+
+        result = stop("wt-stop-variant-multi", store=store, role="worker", timeout=1.0)
+        assert "worker" not in result.variants
+        assert result.variants.get("main") == "default"
 
 
 # ---------------------------------------------------------------------------
