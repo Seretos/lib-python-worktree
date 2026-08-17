@@ -39,7 +39,7 @@ import portalocker
 import yaml
 
 from ._git_utils import _run_git
-from .state import StopDetail, WorktreeRecord, _STOP_DETAIL_MAX_PIDS
+from .state import SetupOutcome, StopDetail, WorktreeRecord, _STOP_DETAIL_MAX_PIDS
 
 _STATE_FILE = "state.yaml"
 _PORTS_FILE = "ports.yaml"
@@ -235,6 +235,55 @@ def _stop_detail_from_dict(d: Optional[Dict[str, Any]]) -> Optional[StopDetail]:
     )
 
 
+def _setup_outcome_to_dict(outcome: Optional[SetupOutcome]) -> Optional[Dict[str, Any]]:
+    """Serialise a :class:`~.state.SetupOutcome` to a plain dict of scalars
+    (ticket #105), or ``None`` when *outcome* is ``None``. Mirrors
+    :func:`_stop_detail_to_dict`.
+    """
+    if outcome is None:
+        return None
+    return {
+        "status": outcome.status,
+        "message": outcome.message,
+        "completed_at": outcome.completed_at,
+        "steps_run": outcome.steps_run,
+        "failed_step_index": outcome.failed_step_index,
+        "failed_step_name": outcome.failed_step_name,
+        "log_path": outcome.log_path,
+        "returncode": outcome.returncode,
+        "timed_out": outcome.timed_out,
+    }
+
+
+def _setup_outcome_from_dict(d: Optional[Dict[str, Any]]) -> Optional[SetupOutcome]:
+    """Reconstruct a :class:`~.state.SetupOutcome` from its serialised dict,
+    or ``None`` when *d* is ``None``/absent/empty (ticket #105).
+
+    Field-by-field with defaults for missing keys -- deliberately NOT
+    ``SetupOutcome(**d)`` -- so a legacy record with no ``setup_outcome`` key
+    at all, or a state.yaml written by a future engine version carrying extra
+    keys this version does not know about, both deserialise without raising:
+    unknown keys are silently ignored, missing keys fall back to the same
+    defaults :class:`~.state.SetupOutcome` itself uses. ``status`` is
+    preserved verbatim even if it is not a value in ``state.SETUP_STATUSES``
+    -- forward compatibility with a status vocabulary this version predates.
+    Mirrors :func:`_stop_detail_from_dict`.
+    """
+    if not d:
+        return None
+    return SetupOutcome(
+        status=d.get("status", ""),
+        message=d.get("message", ""),
+        completed_at=d.get("completed_at"),
+        steps_run=d.get("steps_run", 0),
+        failed_step_index=d.get("failed_step_index"),
+        failed_step_name=d.get("failed_step_name"),
+        log_path=d.get("log_path"),
+        returncode=d.get("returncode"),
+        timed_out=bool(d.get("timed_out", False)),
+    )
+
+
 def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
     return {
         "id": rec.id,
@@ -251,6 +300,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "job_names": dict(rec.job_names),
         "variants": dict(rec.variants),
         "stop_detail": _stop_detail_to_dict(rec.stop_detail),
+        "setup_outcome": _setup_outcome_to_dict(rec.setup_outcome),
     }
 
 
@@ -278,6 +328,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         job_names=dict(d.get("job_names") or {}),
         variants=dict(d.get("variants") or {}),
         stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
+        setup_outcome=_setup_outcome_from_dict(d.get("setup_outcome")),
     )
 
 

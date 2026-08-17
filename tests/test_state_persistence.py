@@ -28,11 +28,17 @@ import yaml
 import subprocess
 
 from lib_python_worktree.core.state import (
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUS_FAILED,
     STOP_REASON_SURVIVORS,
+    SetupOutcome,
     StopDetail,
     WorktreeRecord,
     _STOP_DETAIL_MAX_PIDS,
 )
+from lib_python_worktree.core.process_lifecycle import start as _lifecycle_start
+from lib_python_worktree.core.process_lifecycle import stop as _lifecycle_stop
+from lib_python_worktree.core.process_lifecycle import _force_kill
 from lib_python_worktree.core.yaml_store import (
     AdoptReport,
     ReconcileReport,
@@ -1648,3 +1654,205 @@ class TestStopDetailPersistence:
         assert reloaded.stop_detail is not None
         assert len(reloaded.stop_detail.survivor_pids) == _STOP_DETAIL_MAX_PIDS
         assert reloaded.stop_detail.survivor_count == 100
+
+
+# ---------------------------------------------------------------------------
+# TestSetupOutcomePersistence -- ticket #105
+# ---------------------------------------------------------------------------
+
+class TestSetupOutcomePersistence:
+    """``setup_outcome`` persists through ``state.yaml`` exactly like
+    ``stop_detail``: a legacy record with no ``setup_outcome`` key still
+    loads (defaulting to ``None``), and an unrecognised status / extra key
+    inside it is silently forward-compatible."""
+
+    def test_setup_outcome_round_trips(self, state_dir: Path):
+        """Driving test: a record with a fully-populated SetupOutcome
+        round-trips through a fresh YamlStateStore load, field-by-field,
+        including timed_out and the forward-slash log_path."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-setup-outcome")
+        record.setup_outcome = SetupOutcome(
+            status=SETUP_STATUS_FAILED,
+            message=(
+                "setup step 0 ('build') for worktree 'wt-setup-outcome' "
+                "failed with exit code 1. See log: C:/logs/0-build.log"
+            ),
+            completed_at="2026-08-17T12:00:00+00:00",
+            steps_run=0,
+            failed_step_index=0,
+            failed_step_name="build",
+            log_path="C:/logs/setup/wt-setup-outcome/0-build.log",
+            returncode=1,
+            timed_out=True,
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-setup-outcome")
+        assert reloaded is not None
+        assert reloaded.setup_outcome == record.setup_outcome
+        assert reloaded.setup_outcome.log_path == "C:/logs/setup/wt-setup-outcome/0-build.log"
+        assert reloaded.setup_outcome.timed_out is True
+
+    def test_legacy_record_without_setup_outcome_key_defaults_to_none(self, state_dir: Path):
+        """A pre-#105 state.yaml entry with no `setup_outcome` key at all
+        must still deserialise, defaulting setup_outcome to None."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-setup": {
+                    "id": "legacy-wt-setup",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-setup",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    # no "setup_outcome" key at all -- simulates a pre-#105
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-setup")
+        assert legacy is not None
+        assert legacy.setup_outcome is None
+
+    def test_unknown_setup_outcome_status_and_extra_key_preserved(self, state_dir: Path):
+        """Forward compat: a state.yaml written by a future engine version
+        may carry an unrecognised `status` value and extra keys inside
+        `setup_outcome` this version does not know about -- both must be
+        handled without raising; the extra key is silently ignored and the
+        unrecognised status is preserved verbatim."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "future-wt-setup": {
+                    "id": "future-wt-setup",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/future-wt-setup",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "setup_outcome": {
+                        "status": "partially_completed",
+                        "message": "future msg",
+                        "completed_at": "2099-01-01T00:00:00+00:00",
+                        "steps_run": 3,
+                        "future_field_this_version_predates": "surprise",
+                    },
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        future = store.get("future-wt-setup")
+        assert future is not None
+        assert future.setup_outcome is not None
+        assert future.setup_outcome.status == "partially_completed"
+        assert future.setup_outcome.steps_run == 3
+
+    @pytest.mark.parametrize("raw_value", [None, {}])
+    def test_setup_outcome_null_and_empty_dict_deserialize_to_none(
+        self, state_dir: Path, raw_value
+    ):
+        """`setup_outcome: null` and `setup_outcome: {}` both deserialise to
+        None, mirroring `stop_detail`'s falsy-dict handling."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "wt-falsy-setup": {
+                    "id": "wt-falsy-setup",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/wt-falsy-setup",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "setup_outcome": raw_value,
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        rec = store.get("wt-falsy-setup")
+        assert rec is not None
+        assert rec.setup_outcome is None
+
+
+# ---------------------------------------------------------------------------
+# TestSetupOutcomeSurvivesLifecycle -- ticket #105
+# ---------------------------------------------------------------------------
+
+class TestSetupOutcomeSurvivesLifecycle:
+    """``setup_outcome`` must be left untouched by ``start()``/``stop()`` --
+    only ``create()``'s ``setup:`` hook block ever assigns it. Uses
+    ``YamlStateStore`` (not ``InMemoryStateStore``) specifically because an
+    in-memory store keeps a record by reference and would hide a missing-
+    serialisation regression."""
+
+    def test_setup_outcome_survives_start_stop_cycle(
+        self, state_dir: Path, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-setup-lifecycle")
+        record.setup_outcome = SetupOutcome(
+            status=SETUP_STATUS_COMPLETED,
+            message="setup: completed 1 step(s)",
+            completed_at="2026-08-17T12:00:00+00:00",
+            steps_run=1,
+        )
+        store.add(record)
+        original_outcome = record.setup_outcome
+
+        started = _lifecycle_start(
+            "wt-setup-lifecycle",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+        assert started.status == "running"
+        assert started.setup_outcome == original_outcome
+        pid = started.pids["main"]
+
+        try:
+            stopped = _lifecycle_stop("wt-setup-lifecycle", store=store)
+        finally:
+            try:
+                if _pid_alive(pid):
+                    _force_kill(pid)
+            except Exception:  # noqa: BLE001
+                pass
+
+        assert stopped.status == "stopped"
+        assert stopped.setup_outcome == original_outcome, (
+            "setup_outcome must be byte-identical before/after the "
+            "start/stop cycle -- status changed, setup_outcome must not."
+        )
+
+        # Reload from a fresh store instance -- this is the assertion that
+        # actually catches a missing-serialisation regression (an
+        # InMemoryStateStore-backed check would hide it).
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-setup-lifecycle")
+        assert reloaded is not None
+        assert reloaded.status == "stopped"
+        assert reloaded.setup_outcome == original_outcome

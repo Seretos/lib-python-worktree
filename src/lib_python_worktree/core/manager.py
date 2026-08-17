@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
@@ -54,9 +55,13 @@ from .process_lifecycle import (
     stop as _lifecycle_stop,
 )
 from .state import (
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUS_FAILED,
+    SETUP_STATUS_SKIPPED,
     SHADOW_REASON_DIFFERS,
     SHADOW_REASON_UNREADABLE,
     InMemoryStateStore,
+    SetupOutcome,
     ShadowedContract,
     StateStore,
     WorktreeRecord,
@@ -1003,22 +1008,72 @@ class WorktreeManager:
         # On step failure: leave the worktree, ports, and state record intact
         # for user inspection; update status to "setup_failed" and re-raise
         # SetupFailedError so the caller knows setup did not complete.
+        #
+        # Ticket #105: every one of the three branches below (completed /
+        # failed / skipped) also records a `SetupOutcome` verdict on
+        # `record.setup_outcome` -- a first-class, persisted record of the
+        # setup: hook's own outcome, independent of `record.status` (which
+        # start()/stop()/reconcile() continuously rewrite for unrelated
+        # reasons afterwards).
         _setup_contract = _load_contract(repo_path / CONTRACT_FILENAME)
         if _setup_contract.setup:
-            from ..setup.runner import SetupRunner  # noqa: PLC0415
+            from ..setup.runner import SetupFailedError, SetupRunner  # noqa: PLC0415
             _setup_runner = SetupRunner()
             try:
-                _setup_runner.run(
+                _setup_result = _setup_runner.run(
                     setup=_setup_contract.setup,
                     worktree_id=record.id,
                     worktree_path=Path(record.path),
                     branch=_effective_branch(record),
                     port_mapping=record.ports,
                 )
-            except Exception:  # noqa: BLE001
+            except SetupFailedError as _setup_exc:
                 record.status = "setup_failed"
+                record.setup_outcome = SetupOutcome(
+                    status=SETUP_STATUS_FAILED,
+                    message=str(_setup_exc),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    failed_step_index=_setup_exc.step_index,
+                    failed_step_name=_setup_exc.step_name,
+                    log_path=Path(_setup_exc.log_path).as_posix(),
+                    returncode=_setup_exc.returncode,
+                    timed_out=_setup_exc.timeout is not None,
+                )
                 self.state.update(record)
                 raise
+            except Exception as _setup_exc:  # noqa: BLE001
+                # Never crash inside this handler; always re-raise the
+                # original exception unchanged. Any exception type other
+                # than SetupFailedError carries no step-level detail, so the
+                # step fields stay at their None/0 defaults.
+                record.status = "setup_failed"
+                record.setup_outcome = SetupOutcome(
+                    status=SETUP_STATUS_FAILED,
+                    message=f"{type(_setup_exc).__name__}: {_setup_exc}",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self.state.update(record)
+                raise
+            else:
+                record.setup_outcome = SetupOutcome(
+                    status=SETUP_STATUS_COMPLETED,
+                    message=f"setup: completed {len(_setup_result.steps)} step(s)",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    steps_run=len(_setup_result.steps),
+                )
+        else:
+            record.setup_outcome = SetupOutcome(
+                status=SETUP_STATUS_SKIPPED,
+                message="no setup: steps in contract",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        # Completed and skipped share one write here (the success path
+        # previously performed no write at all). Placed BEFORE the
+        # best-effort plugin-install block below so a plugin-install hiccup
+        # can never lose the setup verdict. The failure path above already
+        # performed its own update() inside its except block before
+        # re-raising.
+        self.state.update(record)
 
         # Install the worktree's enabledPlugins so that project-scoped
         # plugins are active without a manual /reload-plugins. Clone-first

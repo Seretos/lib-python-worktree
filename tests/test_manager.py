@@ -995,6 +995,52 @@ def test_manager_adopt_discovers_out_of_band_worktree(
         assert rec.branch == "feature/alpha"
         assert rec.ports == {}
         assert rec.pids == {}
+        # Ticket #105: adopt() never runs the setup: hook, so the adopted
+        # record's setup_outcome must stay None -- distinct from
+        # status="skipped", which only create() ever sets.
+        assert rec.setup_outcome is None
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(oot_path)],
+            cwd=git_repo,
+            capture_output=True,
+        )
+
+
+@pytest.mark.requires_git
+def test_manager_list_repo_synthesised_untracked_entry_setup_outcome_is_none(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #105: an untracked linked worktree synthesised by list_repo()
+    (no persisted WorktreeRecord yet, tracked=False) must have
+    setup_outcome is None -- it never went through create()'s setup: hook."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    oot_path = tmp_path / "oot-wt-listrepo"
+    subprocess.run(
+        ["git", "worktree", "add", str(oot_path), "feature/alpha"],
+        cwd=git_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    try:
+        listing = mgr.list_repo(str(git_repo))
+        # Untracked entries include both the synthesised primary (never
+        # start()-ed) and the synthesised linked worktree created above --
+        # every one of them must have setup_outcome is None, since none of
+        # them ever went through create()'s setup: hook.
+        untracked = [e for e in listing.entries if not e.tracked]
+        assert len(untracked) >= 1, "expected at least one synthesised untracked entry"
+        assert all(e.record.setup_outcome is None for e in untracked)
+        linked = [e for e in untracked if e.record.backing == "worktree"]
+        assert len(linked) == 1, "expected exactly one synthesised untracked linked worktree"
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(oot_path)],

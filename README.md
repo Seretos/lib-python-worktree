@@ -544,6 +544,32 @@ an `InMemoryStateStore`-backed manager stores records by reference, so a
 `shadowed_contract` (or `killed_pids`) value can keep showing up on later
 `get()`/`list()` calls until the next `start()` recomputes it.
 
+### Setup outcome and `setup_outcome`
+
+`record.status` is continuously rewritten by `create()`/`start()`/`stop()`/
+`reconcile()` for unrelated reasons (`"created"`, `"running"`, `"stopped"`,
+`"setup_failed"`, ...), so it cannot answer, on its own, "did the contract's
+`setup:` hook ever run, and how did it end?" once later calls have moved
+`status` on. `create()` also sets `setup_outcome` (a `SetupOutcome`, or
+`None`) on the returned/persisted `WorktreeRecord` — written once, by the
+`setup:` hook block only, and never touched again by `start`/`stop`/
+`reconcile`/`adopt`/`remove`:
+
+| `record.setup_outcome` | Meaning |
+|---|---|
+| `None` | The `setup:` hook was never reached — the record predates this field, was `adopt()`-ed, or was synthesised by `list_repo()`. |
+| `status="skipped"` | `create()` ran and found no `setup:` steps to run (missing contract, empty contract, or an explicit `setup: []`). |
+| `status="completed"` | Every `setup:` step succeeded (`steps_run` holds the count). |
+| `status="failed"` | A `setup:` step raised. `message` mirrors the exception's `str()`; for a `SetupFailedError` specifically, `failed_step_index`, `failed_step_name`, `log_path`, `returncode`, and `timed_out` are also populated. |
+
+Consumers should read `setup_outcome.status` directly rather than inferring
+the setup hook's outcome from `record.status` — the latter is overwritten by
+every later lifecycle call and cannot distinguish "setup never ran" from
+"setup ran and succeeded" once, say, `stop()` has since set
+`status="stopped"`. `setup_outcome` is persisted to `state.yaml` (mirrors
+`stop_detail`, unlike the transient `killed_pids`/`shadowed_contract`) — a
+legacy record with no `setup_outcome` key deserialises to `None`.
+
 ## Release
 
 Releases are pipeline-owned (`.github/workflows/release.yml`, manual dispatch
