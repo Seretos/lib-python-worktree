@@ -293,6 +293,69 @@ class UnknownVariantError(WorktreeError, ValueError):
         self.available = available
 
 
+class VariantResolutionError(WorktreeError, ValueError):
+    """Raised when ``WorktreeManager.stop(variant=...)`` cannot uniquely
+    resolve *variant* to the ``role`` that started it (ticket #104).
+
+    ``record.variants`` maps ``role -> variant`` for every currently-running
+    role (see ``WorktreeRecord.variants``'s docstring). This error covers the
+    three ways that lookup can fail to produce a single, unambiguous role:
+
+    * **zero match** -- no currently-running role was started with
+      *variant*. ``roles`` is ``[]``. This also covers a role started before
+      this ticket shipped (a live pid but no ``variants`` entry) and a typo'd
+      variant name; the message points the caller at ``role=`` and names the
+      roles that *are* currently running (``running_roles``) so a legacy
+      record remains actionable.
+    * **multiple match** -- more than one currently-running role was started
+      with *variant*. ``roles`` lists every matching role (sorted).
+    * **disagreement** -- the caller passed an explicit ``role=`` alongside
+      ``variant=`` and they do not agree: *variant* resolves to exactly one
+      role, but it is not the one the caller named. ``roles`` is that single
+      resolved role (as a one-element list) and ``requested_role`` is the
+      role the caller explicitly asked for.
+
+    Callers can distinguish the three modes programmatically via
+    ``len(e.roles)`` (``0`` → zero match, ``>1`` → ambiguous) and
+    ``e.requested_role`` (non-``None`` with ``len(e.roles) == 1`` →
+    disagreement).
+    """
+
+    def __init__(
+        self,
+        variant: str,
+        roles: "List[str]",
+        *,
+        requested_role: "Optional[str]" = None,
+        running_roles: "Optional[List[str]]" = None,
+    ) -> None:
+        self.variant = variant
+        self.roles = roles
+        self.requested_role = requested_role
+
+        if requested_role is not None and len(roles) == 1:
+            message = (
+                f"variant='{variant}' resolves to role='{roles[0]}', which "
+                f"disagrees with the explicitly requested role="
+                f"'{requested_role}' -- when both role and variant are "
+                f"given they must agree"
+            )
+        elif len(roles) > 1:
+            message = (
+                f"variant='{variant}' is ambiguous: it was used to start "
+                f"multiple currently-running roles {roles} -- pass "
+                f"role=<one of these> to disambiguate"
+            )
+        else:
+            running = running_roles if running_roles is not None else []
+            message = (
+                f"no currently-running role was started with variant="
+                f"'{variant}' -- pass role=<role name> instead "
+                f"(currently-running roles: {running})"
+            )
+        super().__init__(message)
+
+
 class PrimaryCheckoutError(WorktreeError):
     """Raised when an operation that would delete a checkout is attempted
     against a primary (main-clone) record.
@@ -364,6 +427,7 @@ __all__ = [
     "InvalidRepoError",
     "PrimaryCheckoutError",
     "UnknownVariantError",
+    "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeRemovalBlockedError",

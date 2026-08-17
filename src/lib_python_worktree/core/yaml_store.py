@@ -249,6 +249,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "start_log_path": rec.start_log_path,
         "backing": rec.backing,
         "job_names": dict(rec.job_names),
+        "variants": dict(rec.variants),
         "stop_detail": _stop_detail_to_dict(rec.stop_detail),
     }
 
@@ -275,6 +276,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         start_log_path=d.get("start_log_path"),
         backing=d.get("backing", "worktree"),
         job_names=dict(d.get("job_names") or {}),
+        variants=dict(d.get("variants") or {}),
         stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
     )
 
@@ -584,6 +586,12 @@ def reconcile(
             ]
             for role in dead_roles:
                 pid = rec.pids.pop(role)
+                # Ticket #104: mirrors set(variants) <= set(pids) invariant --
+                # a role whose process died on its own must lose its variant
+                # entry here too, or a stale mapping could later produce a
+                # phantom / ambiguous stop(variant=...) match against a role
+                # that no longer has a live pid.
+                rec.variants.pop(role, None)
                 _log.warning(
                     "reconcile: worktree '%s' PID %d (role '%s') is dead → removed",
                     wt_id, pid, role,

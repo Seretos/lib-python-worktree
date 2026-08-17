@@ -191,8 +191,8 @@ at construction to clean up stale records.
 | `remove` | `(worktree_id: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False, *, checkout_path: Optional[str] = None)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. Target by `worktree_id` **or** `checkout_path`; a `checkout_path` pointing at an untracked/orphaned linked worktree is removed without needing `adopt()` first (see "Orphan worktree recovery" below — `checkout_path` for an untracked orphan, `worktree_id` for a tracked-but-deregistered one). `force=True` removes despite uncommitted changes; never bypasses the primary-checkout refusal. |
 | `adopt` | `(repo_root: str)` | `AdoptReport` | Import untracked on-disk worktrees into the state store. Requires `YamlStateStore`. |
 | `prune` | `(repo_root: str)` | `None` | Run `git worktree prune --expire=now` to clear stale git metadata. |
-| `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID. |
-| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role`; force-kills if it does not exit within `timeout` seconds. On `status="stop_incomplete"`, see `stop_detail` below. |
+| `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID under `role`, and records the variant under `record.variants[role]`, which is what `stop(variant=...)` resolves against. |
+| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: Optional[str] = None, variant: Optional[str] = None, timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role` (or the role `variant` resolves to); force-kills if it does not exit within `timeout` seconds. `role=None` (the default) means `"main"`, same as `start()`. `variant=` resolves to the role that was started with it via `record.variants`; if `role` is also given, both must agree or `VariantResolutionError` is raised. An unknown or ambiguous `variant` also raises `VariantResolutionError` — see "`role` vs `variant`" below. On `status="stop_incomplete"`, see `stop_detail` below. |
 
 ### Orphan worktree recovery
 
@@ -321,7 +321,9 @@ Exception
 │   │   ├── BranchAlreadyCheckedOutError (carries .branch, .path, .prunable)
 │   │   ├── DuplicateWorktreeError
 │   │   ├── WorktreeNotFoundError
-│   │   └── GitCommandError              (carries .command, .returncode, .stderr)
+│   │   ├── GitCommandError              (carries .command, .returncode, .stderr)
+│   │   ├── UnknownVariantError          (ALSO a ValueError; start(variant=...) matched no start: step -- carries .variant, .available)
+│   │   └── VariantResolutionError       (ALSO a ValueError; stop(variant=...) could not resolve to one role -- carries .variant, .roles, .requested_role)
 │   ├── ProcessLifecycleError            (base for process lifecycle errors)
 │   │   ├── ProcessAlreadyRunningError   (carries .worktree_id, .role, .pid)
 │   │   └── ProcessNotRunningError       (carries .worktree_id, .role)
@@ -456,6 +458,38 @@ Process detachment on Windows uses `CREATE_NEW_PROCESS_GROUP` so that
 `CTRL_BREAK_EVENT` can be delivered for graceful stop. On POSIX,
 `start_new_session=True` is used and `SIGTERM` / `SIGKILL` are used for
 graceful and force stops respectively.
+
+### `role` vs `variant`
+
+`role` is the tracking/addressing key a spawned process's pid is recorded
+under (`record.pids[role]`); it defaults to `"main"` regardless of which
+`variant` was started. `variant` only selects which contract `start:` step
+runs. The two are independent — two variants started concurrently against
+the same worktree need two distinct `role`s, or the second `start()` call
+raises `ProcessAlreadyRunningError`.
+
+Whichever `variant` actually started a given `role` is recorded under
+`record.variants[role]` (persisted through `state.yaml`, mirroring
+`record.pids`/`record.job_names`: one entry per currently-tracked role, no
+entry at all for a role with no known variant). `stop(variant=...)` resolves
+against this mapping so a caller that started `variant="web"` under some
+role does not have to separately track which role it used. Resolution can
+fail three ways, and each raises `VariantResolutionError` (carries
+`.variant`, `.roles`, `.requested_role`) before anything is attempted (no
+contract `stop:` steps run, no process is signalled):
+
+- **unknown** — no currently-running role was started with that variant
+  (`.roles == []`); the message points at `role=` and names the roles that
+  *are* running. This also covers a role started before this mapping
+  existed (a live pid with no `variants` entry).
+- **ambiguous** — more than one currently-running role was started with
+  that variant (`.roles` lists every match); pass `role=` to disambiguate.
+- **disagreement** — an explicit `role=` was also given and it does not
+  match the single role `variant=` resolves to; the pair is never silently
+  resolved one way.
+
+`role=None` (`stop()`'s actual default) means `"main"`, exactly like
+`start()`'s `role="main"` default — it is not a no-op.
 
 ### Stop status and `stop_detail`
 

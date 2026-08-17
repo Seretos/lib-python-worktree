@@ -31,7 +31,7 @@ from ..contract.loader import (
     load as _load_contract,
 )
 from ._env_utils import _get_user_profile_env
-from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, WorktreeDirLockedError, WorktreeError, WorktreeRemovalBlockedError  # noqa: F401 — re-exported
+from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, VariantResolutionError, WorktreeDirLockedError, WorktreeError, WorktreeRemovalBlockedError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .checkout import (
     CheckoutInfo,
@@ -1203,6 +1203,23 @@ class WorktreeManager:
           a ``WorktreeError`` and a ``ValueError``, so callers may catch
           either base.
 
+        ``role`` vs ``variant`` (ticket #104)
+        --------------------------------------
+        *role* is the tracking/addressing key under which the spawned
+        process's pid is recorded (``record.pids[role]``); it defaults to
+        ``"main"`` **regardless of which** *variant* was requested. *variant*
+        only selects which contract ``start:`` step is run. The two are
+        independent: two variants started concurrently against the same
+        worktree must be given two distinct *role*s, or the second call
+        raises ``ProcessAlreadyRunningError`` (a role already has a live pid).
+        Whichever *variant* actually started a given *role* is recorded under
+        ``record.variants[role]`` -- this is exactly what
+        ``WorktreeManager.stop(variant=...)`` resolves against, so a caller
+        that started ``variant="web"`` under some role can later stop it
+        without separately tracking which role it used. The no-op "ready"
+        start below (no ``start:`` step configured) spawns nothing and
+        therefore records no variant for *role*.
+
         When no ``start:`` step is configured at all (missing
         ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
         nothing meaningful to run.  Rather than erroring, this is treated as a
@@ -1280,6 +1297,7 @@ class WorktreeManager:
             cmd,
             store=self.state,
             role=role,
+            variant=variant,
             env=_build_worktree_env(record, env),
             cwd=cwd if cwd is not None else record.path,
         )
@@ -1295,7 +1313,8 @@ class WorktreeManager:
         worktree_id: Optional[str] = None,
         *,
         checkout_path: Optional[str] = None,
-        role: str = "main",
+        role: Optional[str] = None,
+        variant: Optional[str] = None,
         timeout: float = 10.0,
         kill_orphans: bool = False,
     ) -> WorktreeRecord:
@@ -1308,6 +1327,43 @@ class WorktreeManager:
         unknown-id contract, and it keeps "a primary record is written only
         by the first ``start()``" literally true.
 
+        ``role`` vs ``variant`` (ticket #104)
+        --------------------------------------
+        *role* defaults to ``"main"`` -- **``role=None`` (the parameter's
+        actual default) means "use ``main``"**, not "no role" / a no-op.
+        This mirrors ``start()``'s ``role="main"`` default exactly; the
+        sentinel exists only so this method can tell "the caller didn't pass
+        ``role``" apart from "the caller explicitly passed ``role="main"``"
+        when *variant* is also given (see below). Existing callers of
+        ``stop(id)`` or ``stop(id, role="web")`` are unaffected -- both
+        behave byte-for-byte as before.
+
+        *variant* resolves to the ``role`` that was started with it, via
+        ``record.variants`` (populated by ``start(variant=...)``, see that
+        method's docstring), so a caller that started ``variant="web"``
+        under some role does not need to separately remember which role it
+        used:
+
+        - ``variant=None`` (the default): no resolution; *role* alone
+          selects the target, defaulting to ``"main"`` as described above.
+        - ``variant`` given and it matches no currently-running role's
+          recorded variant: ``VariantResolutionError`` is raised (covers an
+          unknown/typo'd variant, and a role started before this ticket
+          shipped with no recorded variant).
+        - ``variant`` given and it matches more than one currently-running
+          role: ``VariantResolutionError`` is raised (ambiguous) -- pass
+          ``role=`` to disambiguate.
+        - ``variant`` given and it matches exactly one role: that role is
+          used. If *role* was also given explicitly and disagrees with the
+          resolved role, ``VariantResolutionError`` is raised rather than
+          silently picking one -- mirroring ``_resolve_target()``'s existing
+          "*worktree_id* and *checkout_path*, if both given, must agree"
+          rule.
+
+        This resolution happens immediately after ``_resolve_target()`` and
+        before the best-effort contract ``stop:`` steps below, so a
+        resolution failure raises before anything has been attempted.
+
         If the contract defines ``stop:`` steps, they are run (best-effort,
         errors are swallowed) before sending the stop signal.
 
@@ -1316,11 +1372,12 @@ class WorktreeManager:
         survived because the tracked shell wrapper already exited and they were
         reparented away from it.
 
-        When no process is recorded for *role* (e.g. after a no-op ``"ready"``
-        start with no ``start:`` step — ticket #41), stopping is a graceful
-        no-op: contract ``stop:`` steps are still run best-effort, but no
-        signal is sent and ``ProcessNotRunningError`` is *not* raised.  The
-        worktree is marked ``"stopped"`` when no other roles remain.
+        When no process is recorded for the resolved role (e.g. after a
+        no-op ``"ready"`` start with no ``start:`` step — ticket #41),
+        stopping is a graceful no-op: contract ``stop:`` steps are still run
+        best-effort, but no signal is sent and ``ProcessNotRunningError`` is
+        *not* raised.  The worktree is marked ``"stopped"`` when no other
+        roles remain.
 
         This is the engine's documented and intentional behavior (ticket
         #41) and this method's return type is fixed: it always returns a
@@ -1343,6 +1400,26 @@ class WorktreeManager:
         ``reason`` and evidence for why — see that function's own docstring.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=False)
+
+        # Ticket #104: resolve variant -> role before any side effect (the
+        # best-effort contract stop: steps below), so a resolution failure
+        # raises cleanly with nothing having been attempted yet. See this
+        # method's docstring ("role vs variant") for the full algorithm.
+        if variant is None:
+            effective_role = role if role is not None else "main"
+        else:
+            matches = sorted(r for r, v in record.variants.items() if v == variant)
+            if not matches or len(matches) > 1:
+                running_roles = sorted(record.pids.keys())
+                raise VariantResolutionError(
+                    variant, matches, requested_role=role, running_roles=running_roles
+                )
+            resolved = matches[0]
+            if role is not None and role != resolved:
+                raise VariantResolutionError(
+                    variant, matches, requested_role=role, running_roles=sorted(record.pids.keys())
+                )
+            effective_role = resolved
 
         # Run contract stop: steps (best-effort — a failure must not prevent
         # the SIGTERM from being sent).
@@ -1368,7 +1445,13 @@ class WorktreeManager:
         # No process recorded for this role → graceful no-op (symmetric with
         # the no-op "ready" start).  Avoid delegating to _lifecycle_stop, which
         # would raise ProcessNotRunningError.
-        if role not in record.pids:
+        if effective_role not in record.pids:
+            # Ticket #104: keep the set(variants) <= set(pids) invariant
+            # intact even on this no-op path -- a stale variants[role] entry
+            # left over from a role that never got a pid recorded (or whose
+            # pid entry was already cleared by a previous stop/reconcile)
+            # must not survive here.
+            record.variants.pop(effective_role, None)
             if not record.pids and record.status not in ("stop_incomplete", "orphaned"):
                 # Ticket #95, finding 6: mirror process_lifecycle.stop()'s own
                 # guard (see its identical exclusion). "stop_incomplete" and
@@ -1389,7 +1472,7 @@ class WorktreeManager:
         return _lifecycle_stop(
             record.id,
             store=self.state,
-            role=role,
+            role=effective_role,
             timeout=timeout,
             kill_orphans=kill_orphans,
         )
@@ -2111,6 +2194,7 @@ __all__ = (
     "PrimaryCheckoutError",
     "RepoListing",
     "UnknownVariantError",
+    "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeManager",

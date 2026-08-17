@@ -33,6 +33,18 @@ def test_worktree_record_default_ports():
     assert rec.ports == {}
 
 
+def test_worktree_record_default_variants():
+    """Ticket #104: a freshly constructed WorktreeRecord has variants == {},
+    and two records do not share the same dict instance (default_factory,
+    not a mutable default)."""
+    rec = _make_record()
+    assert rec.variants == {}
+
+    rec2 = _make_record(id="rec-002")
+    rec.variants["main"] = "web"
+    assert rec2.variants == {}
+
+
 # ---------------------------------------------------------------------------
 # add + get roundtrip
 # ---------------------------------------------------------------------------

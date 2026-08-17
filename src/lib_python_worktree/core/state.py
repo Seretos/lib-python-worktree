@@ -225,6 +225,28 @@ class WorktreeRecord:
     instead. Changed to a per-role dict, consistent with ``pids``, to close
     that cross-role bleed."""
 
+    variants: Dict[str, str] = field(default_factory=dict)
+    """Ticket #104: per-role mapping of ``role`` -> the ``variant`` name that
+    ``start()`` was called with for that role (i.e. which named ``start:``
+    contract step is currently running under that role). Mirrors ``pids`` and
+    ``job_names`` exactly: one entry per currently-tracked role, and a role
+    whose variant is unknown/unset has no key in this dict at all, never a
+    ``None`` value. The invariant to maintain is
+    ``set(record.variants) <= set(record.pids)`` -- an entry exists only
+    while that role has a recorded pid.
+
+    Direction is role -> variant (not the reverse) because two distinct
+    roles can be started from the same variant, and a reverse mapping could
+    not represent that without silently dropping one.
+
+    Used by ``WorktreeManager.stop(variant=...)`` to resolve which ``role``
+    to stop without the caller having to track the role<->variant pairing
+    itself. Persisted through ``state.yaml`` (unlike the transient
+    ``killed_pids``/``shadowed_contract``) so the mapping survives a host
+    restart -- a legacy record with no ``variants`` key deserialises to
+    ``{}``.
+    """
+
     stop_detail: Optional[StopDetail] = None
     """Ticket #99: machine-readable reason the most recent ``stop()`` call
     reported ``status="stop_incomplete"``, or ``None``. See
