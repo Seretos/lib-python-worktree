@@ -1914,6 +1914,17 @@ def _win_handle_holders(
     # stop_scan is not ALSO already true (i.e. the deadline is the actual
     # reason this iteration stopped, not a cap hit on a prior handle that
     # would have broken the loop already).
+    #
+    # Ticket #106: a *small* budget_sec cannot be used to reliably exercise
+    # the CAPPED/ABANDONED stop_scan path in a test. scan_deadline is armed
+    # at the top of this function, before the handle-table dump and the
+    # pure-Python parse loop above even run -- so on a loaded machine a
+    # tight budget is spent (or overspent) by the dump/parse alone, before
+    # the per-handle loop below starts, and the scan ends up here via
+    # deadline_truncated instead. A test that wants the CAPPED/ABANDONED
+    # branch must force the query *outcome* (patch
+    # ``_BoundedQueryWorker.submit``), not starve the *budget* -- see
+    # ``TestDiscoveryCompleteness`` N2/N3 in test_process_lifecycle.py.
     deadline_truncated = False
     try:
         for pid, handle_entries in by_pid.items():

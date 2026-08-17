@@ -5280,26 +5280,109 @@ class TestDiscoveryCompleteness:
         assert result.complete is False
 
     # -- N2/N3: worker-cap / per-query ABANDONED-CAPPED leave complete=True
+    #
+    # Ticket #106: budget_sec alone cannot force the CAPPED/ABANDONED early
+    # break-out. scan_deadline is armed before the handle-table dump/parse
+    # even starts (see the comment near the top of _win_handle_holders'
+    # scan loop), so a *small* budget just makes the scan die on its own
+    # deadline -- the genuine D5 truncation path -- without ever reaching a
+    # single _bounded_query call. Both tests below instead patch
+    # _BoundedQueryWorker.submit directly so the very first query returns
+    # the verdict under test, and use the generous _REAL_SCAN_TEST_BUDGET_SEC
+    # budget so the deadline can never be the thing that ends the scan. Each
+    # also asserts the fake submit was actually invoked and that the scan
+    # returned fast, so a false pass (complete=True for the wrong reason)
+    # cannot slip through.
 
     @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
     def test_worker_cap_hit_leaves_complete_true(self, monkeypatch):
         """N2: hitting the process-wide wedged-worker cap mid-scan is an
         internal degradation (the table was still enumerated up to that
         point) -- it must NOT be reported as handle_scan:truncated. Forced
-        by patching _wedged_slot_available to always report "no room", which
-        makes the very first ABANDONED query become CAPPED immediately."""
-        monkeypatch.setattr(
-            "lib_python_worktree.core.process_lifecycle._wedged_slot_available",
-            lambda: False,
-        )
-        # A generous budget so this exercises the CAPPED path, not the
-        # deadline path -- but there is nothing to actually scan against a
-        # bogus path, so this call is expected to complete quickly and
-        # cleanly regardless (no live handle will ever match).
+        by patching _BoundedQueryWorker.submit so the very first query this
+        scan issues returns CAPPED, driving _bounded_query straight to its
+        _STOP branch (process_lifecycle.py, _bounded_query).
+
+        This test is deliberately integration-level: it pins
+        _win_handle_holders' *reaction* to a _STOP/CAPPED verdict (that it
+        must NOT be folded into handle_scan:truncated), not submit()'s own
+        cap-detection arithmetic (the _wedged_worker_count vs
+        _MAX_WEDGED_HANDLE_WORKERS comparison that decides CAPPED vs
+        ABANDONED in the first place) -- submit is stubbed here specifically
+        to bypass that. The real, unmocked arithmetic is already covered by
+        TestBoundedQueryWorker::test_submit_at_cap_returns_capped_without_raising
+        and test_capped_outcome_still_counts_and_releases_its_slot.
+
+        No wall-clock assertion is used here: the deadline check in each
+        loop head always runs strictly *before* the call to
+        _process_handle/submit, and stop_scan is always checked strictly
+        before the deadline check on every subsequent iteration (see the
+        loop in _win_handle_holders). So once the fake submit's CAPPED
+        verdict sets stop_scan=True on the first handle processed,
+        deadline_truncated can no longer be set afterwards -- the loop
+        breaks on the stop_scan check before it ever reaches the deadline
+        check again. `calls` being non-empty together with
+        `result.complete is True` therefore already proves the CAPPED
+        break-out fired, not the deadline path -- a timing threshold would
+        be redundant and, worse, flaky on a loaded CI runner."""
+        calls = []
+
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.CAPPED, None)
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
+        wedged_before = _pl._wedged_worker_count
         result = _win_handle_holders(
-            "C:/nonexistent-worktree-path", set(), budget_sec=2.0
+            "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
         )
+
         assert result.complete is True
+        assert calls, "fake submit was never invoked -- did not exercise the CAPPED path"
+        assert list(result) == []
+        # The fake submit never touches _wedged_worker_count, so this test
+        # itself must leave no process-wide residue behind (compared against
+        # the pre-call value, not an absolute 0 -- other tests in the same
+        # session legitimately leave the global non-zero).
+        assert _pl._wedged_worker_count == wedged_before
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_abandoned_with_no_replacement_capacity_leaves_complete_true(self, monkeypatch):
+        """N3: _bounded_query's other _STOP branch -- ABANDONED with no
+        replacement-worker capacity left (_wedged_slot_available() False,
+        process_lifecycle.py lines ~1819-1838) -- is the same internal-
+        degradation class as CAPPED and must likewise leave complete=True,
+        never handle_scan:truncated.
+
+        Like N2, this test is deliberately integration-level: it pins
+        _win_handle_holders' *reaction* to a _STOP/ABANDONED verdict, not
+        submit()'s own unmocked ABANDONED/slot-release bookkeeping, which is
+        already covered by
+        TestBoundedQueryWorker::test_wedged_worker_count_restored_after_retired_worker_exits
+        and its neighbours.
+
+        No wall-clock assertion is used, for the same reason documented in
+        N2 above: `calls` non-empty plus `result.complete is True` already
+        proves the ABANDONED break-out (not the deadline) ended the scan,
+        since stop_scan is always checked before the deadline on every
+        iteration after the first _STOP verdict."""
+        calls = []
+
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.ABANDONED, None)
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+        monkeypatch.setattr(_pl, "_wedged_slot_available", lambda: False)
+
+        result = _win_handle_holders(
+            "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
+        )
+
+        assert result.complete is True
+        assert calls, "fake submit was never invoked -- did not exercise the ABANDONED path"
+        assert list(result) == []
 
     # -- D8: lineage-expansion loop truncated by the deadline ---------------
 
