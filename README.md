@@ -314,6 +314,9 @@ Exception
 │   ├── WorktreeError                    (base for all engine errors)
 │   │   ├── GitTimeoutError              (git subprocess exceeded WORKTREE_GIT_TIMEOUT_SEC; carries .network, .subcommand)
 │   │   ├── DirtyWorktreeError           (remove refused; pass force=True -- an untracked-only `.seretos/` copy is exempt, see below)
+│   │   │   └── WorktreeRemovalBlockedError  (ALSO a WorktreeDirLockedError, see below -- multiple inheritance)
+│   │   ├── WorktreeDirLockedError       (remove refused; directory locked by another process -- carries .worktree_id, .killed, .kill_attempted)
+│   │   │   └── WorktreeRemovalBlockedError  (lock AND real dirt both blocking at once; carries .dirty_paths too -- see "Reporting every blocking condition at once" below)
 │   │   ├── BranchNotFoundError
 │   │   ├── BranchAlreadyCheckedOutError (carries .branch, .path, .prunable)
 │   │   ├── DuplicateWorktreeError
@@ -359,6 +362,41 @@ the exact untracked path(s) it discarded, so it is observable after the
 fact even though `remove()` does not prompt or fail. The shadowed-contract
 warning below is what surfaces the contract-specific case of that divergence
 to the agent, much earlier in its workflow than removal time.
+
+### Reporting every blocking condition at once
+
+`remove()` can be blocked by two independent conditions at the same time: an
+OS-level directory lock (another process still has a handle open inside the
+checkout) and real, uncommitted/untracked changes (`force=False`). Without
+special handling, a caller who hits both would have to discover each one via
+a separate round-trip -- a plain `remove()` raises `WorktreeDirLockedError`,
+a retry with `kill_blocking_processes=True` then raises `DirtyWorktreeError`,
+and only a third retry with `force=True` too finally succeeds.
+
+When both conditions are detected at once, `_teardown` instead raises a
+single `WorktreeRemovalBlockedError` naming **both** conditions and the flag
+that clears each, so one retry with `force=True` and
+`kill_blocking_processes=True` suffices. `WorktreeRemovalBlockedError`
+inherits from **both** `WorktreeDirLockedError` and `DirtyWorktreeError`, so
+existing `except WorktreeDirLockedError:` and `except DirtyWorktreeError:`
+call sites keep catching it without any change. It adds one new attribute,
+`.dirty_paths` (`List[str]`), on top of `WorktreeDirLockedError`'s
+`.worktree_id`, `.killed`, and `.kill_attempted` -- the human-readable
+message itself stays free of filesystem paths (it names only the engine-level
+flags and the worktree id), so a caller that wants the actual dirty paths
+reads `.dirty_paths` directly.
+
+This is raised only when the removal genuinely cannot succeed on the current
+attempt for **two or more** reasons at once; a single blocking condition
+still raises the corresponding single-condition exception unchanged. On
+Windows, the combined check runs as part of the Step 2b pre-flight (before
+any process is killed) and at both of `_teardown`'s lock-signal raise sites;
+detecting real dirt never kills a blocking process or attempts the
+destructive `git worktree remove` for a removal that cannot succeed anyway.
+The dirt probe itself is gated on `force=False` (a forced removal can never
+be blocked by dirt, so there is nothing to probe or report) and is
+memoised per removal attempt, so it never issues more than one extra
+`git status` call.
 
 ## Cross-platform notes
 

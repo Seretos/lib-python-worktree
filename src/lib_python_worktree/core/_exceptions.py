@@ -198,6 +198,78 @@ class WorktreeDirLockedError(WorktreeError):
         self.kill_attempted = kill_attempted
 
 
+class WorktreeRemovalBlockedError(WorktreeDirLockedError, DirtyWorktreeError):
+    """Raised when TWO OR MORE conditions are simultaneously blocking a
+    ``remove()`` call -- currently: an OS-level directory lock AND real
+    uncommitted/untracked changes (not merely the benign ``.seretos/``
+    convenience copy exempted by ticket #100).
+
+    Ticket #103: without this, a caller who hits both conditions has to
+    discover each one via a separate round-trip -- plain ``remove()`` ->
+    ``WorktreeDirLockedError`` -> retry with ``kill_blocking_processes=True``
+    -> ``DirtyWorktreeError`` -> retry with ``force=True`` too. This
+    exception instead names EVERY condition currently blocking removal and
+    the flag needed to clear each, in a single raise, so one informed retry
+    suffices.
+
+    Deliberately inherits from both ``WorktreeDirLockedError`` and
+    ``DirtyWorktreeError`` (MRO: ``WorktreeRemovalBlockedError`` ->
+    ``WorktreeDirLockedError`` -> ``DirtyWorktreeError`` -> ``WorktreeError``
+    -> ``RuntimeError``; C3-valid since both parents derive only from
+    ``WorktreeError``) so existing ``except WorktreeDirLockedError:`` and
+    ``except DirtyWorktreeError:`` call sites both keep catching it without
+    any change on their part.
+
+    The constructor bypasses both parents' ``__init__`` -- neither accepts
+    ``**kwargs`` or forwards cooperatively, so a ``super()`` chain would
+    either double-set the message or raise ``TypeError`` -- and instead
+    calls ``WorktreeError.__init__`` directly, then sets all four
+    structured attributes explicitly: ``worktree_id``, ``killed``,
+    ``kill_attempted`` (mirroring ``WorktreeDirLockedError``) plus the new
+    ``dirty_paths`` (the non-exempt untracked/modified paths ``git status``
+    reported). The human-readable message itself stays free of filesystem
+    paths -- it names only engine-level flags and the worktree id; a caller
+    that wants the actual paths reads the structured ``dirty_paths``
+    attribute.
+
+    Raised only when two or more conditions block removal at once; a
+    single blocking condition keeps raising the existing single-condition
+    exception (``WorktreeDirLockedError`` or ``DirtyWorktreeError``)
+    unchanged.
+    """
+
+    def __init__(
+        self,
+        worktree_id: str,
+        killed: "List[KilledProcessInfo]",
+        *,
+        kill_attempted: bool = False,
+        dirty_paths: "Optional[List[str]]" = None,
+    ) -> None:
+        if kill_attempted:
+            n = len(killed)
+            message = (
+                f"worktree '{worktree_id}' cannot be removed: 2 conditions "
+                f"are blocking it. The directory is still locked after "
+                f"killing {n} blocking process(es) (retry with "
+                f"kill_blocking_processes=True) and it has uncommitted "
+                f"changes (pass force=True)."
+            )
+        else:
+            message = (
+                f"worktree '{worktree_id}' cannot be removed: 2 conditions "
+                f"are blocking it. The directory is locked by another "
+                f"process (pass kill_blocking_processes=True) and it has "
+                f"uncommitted changes (pass force=True). Pass both to "
+                f"remove it in a single retry."
+            )
+        WorktreeError.__init__(self, message)
+        self.worktree_id = worktree_id
+        self.killed = list(killed)
+        self.kill_attempted = kill_attempted
+        self.dirty_paths = list(dirty_paths or [])
+
+
 class UnknownVariantError(WorktreeError, ValueError):
     """Raised when ``WorktreeManager.start()`` is given a ``variant`` that
     does not match any ``start:`` step name in the contract.
@@ -294,4 +366,5 @@ __all__ = [
     "UnknownVariantError",
     "WorktreeDirLockedError",
     "WorktreeError",
+    "WorktreeRemovalBlockedError",
 ]
