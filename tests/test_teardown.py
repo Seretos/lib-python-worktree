@@ -1089,6 +1089,38 @@ class TestContractCopyDirtExemption:
         ), patch("lib_python_worktree.core.manager.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
+    def test_literal_backslash_in_path_not_normalised_still_raises_dirty_error(
+        self, tmp_path
+    ):
+        """`git status --porcelain -z` always reports paths with `/` as the
+        separator (git's index format mandates it, on every OS including
+        Windows) -- a literal backslash in an entry is part of the filename
+        itself, not a Windows-style separator that needs normalising. An
+        untracked file literally named `.seretos\\notes.txt` sitting at the
+        repo root (entry `?? .seretos\\notes.txt`) is NOT under `.seretos/`
+        and must not be misclassified as the benign exempt copy."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-literal-backslash")
+        manager.state.add(record)
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            if _is_status_call(args):
+                return MagicMock(
+                    returncode=0, stdout="?? .seretos\\notes.txt\0", stderr=""
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        mock_lifecycle = MagicMock()
+
+        with pytest.raises(DirtyWorktreeError), patch(
+            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.manager.shutil"):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
     def test_happy_path_issues_no_status_call(self, tmp_path):
         """When `git worktree remove` succeeds outright (exit 0), the dirt
         classifier must never run -- no `git status` call at all."""

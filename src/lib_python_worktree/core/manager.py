@@ -356,7 +356,7 @@ def _contract_copy_dirt_paths(record: "WorktreeRecord") -> Optional[List[str]]:
     for entry in entries:
         if len(entry) < 3 or entry[:2] != "??":
             return None
-        path = entry[3:].replace("\\", "/")
+        path = entry[3:]
         if path != _CONTRACT_DIR and not path.startswith(contract_prefix):
             return None
         matched.append(path)
@@ -480,7 +480,10 @@ def _detect_shadowed_contract(
     checkout-local copy exists but fails to parse/validate
     (``ContractError``/``ContractValidationError``, or an ``OSError``
     reading it) -- this never raises through ``start()``; only the *used*
-    (repo-root) contract's own load failures propagate there.
+    (repo-root) contract's own load failures propagate there. A dangling
+    symlink at the checkout-local path is also treated as "unreadable"
+    (checked via ``os.path.lexists``, not ``Path.exists``, precisely so a
+    broken symlink is not misread as "no checkout-local contract at all").
 
     Returns a ``ShadowedContract`` with ``reason="differs"`` when the
     checkout-local copy parses cleanly but is a different contract (Pydantic
@@ -499,11 +502,35 @@ def _detect_shadowed_contract(
             return None
 
         shadow_file = Path(record.path) / CONTRACT_FILENAME
-        if not shadow_file.exists():
+        if not os.path.lexists(shadow_file):
+            # lexists (not exists) so a broken symlink still counts as
+            # "present" here -- exists() follows symlinks and would report
+            # False for a dangling link, which would wrongly read as "no
+            # checkout-local contract at all" instead of falling through to
+            # the unreadable-contract handling below.
             return None
 
         used_path = (Path(record.repo_root) / CONTRACT_FILENAME).as_posix()
         shadow_path = shadow_file.as_posix()
+
+        if not shadow_file.exists():
+            # Present per lexists() but exists() (which follows symlinks)
+            # says otherwise -- a dangling symlink. _load_contract()/loader
+            # .load() has its own `exists()` guard that would silently treat
+            # this as "no file" (implicit isolation: none) rather than
+            # raising, so it is handled explicitly here instead of being
+            # handed to _load_contract.
+            message = (
+                f"start(): checkout-local contract '{shadow_path}' exists "
+                f"but could not be read (broken symlink); the contract "
+                f"actually used is '{used_path}'."
+            )
+            return ShadowedContract(
+                path=shadow_path,
+                used_path=used_path,
+                reason=SHADOW_REASON_UNREADABLE,
+                message=message,
+            )
 
         try:
             shadow_contract = _load_contract(shadow_file)

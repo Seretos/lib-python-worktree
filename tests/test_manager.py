@@ -1707,6 +1707,45 @@ def test_start_shadow_reason_unreadable_on_malformed_checkout_contract(
     assert result.shadowed_contract.reason == "unreadable"
 
 
+def test_start_shadow_reason_unreadable_on_dangling_symlink_checkout_contract(
+    tmp_path: Path,
+):
+    """A checkout-local `.seretos/worktree-setup.yml` that is a broken/
+    dangling symlink must be flagged with reason="unreadable", not silently
+    treated as "no checkout-local contract at all". `Path.exists()` follows
+    symlinks and would report False for a dangling link -- indistinguishable
+    from "nothing there" -- which is why the implementation must use
+    `os.path.lexists()` for the presence check instead. start() must still
+    return normally without raising.
+
+    Symlink creation on Windows normally requires elevation/Developer Mode,
+    so this is skipped rather than failed on an unprivileged runner.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+
+    shadow_dir = checkout / ".seretos"
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    shadow_file = shadow_dir / "worktree-setup.yml"
+    try:
+        os.symlink(shadow_dir / "does-not-exist.yml", shadow_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this machine")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(repo_root=str(repo_root), path=str(checkout))
+    mgr.state.add(record)
+
+    result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.shadowed_contract is not None
+    assert result.shadowed_contract.reason == "unreadable"
+
+
 def test_start_flags_shadowed_contract_on_real_spawn_exit_path(tmp_path: Path):
     """Blocking-finding-2 follow-up (ticket #100): the shadowed-contract flag
     must also survive the REAL-SPAWN exit path (repo-root contract HAS a
