@@ -5,12 +5,15 @@ wraps.
 
 from __future__ import annotations
 
+import dataclasses
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from lib_python_worktree.core._exceptions import InvalidRepoError
+from lib_python_worktree.core.checkout import EnvironmentEntry
 from lib_python_worktree.core.checkout import list_repo as _list_repo
 from lib_python_worktree.core.checkout import primary_id_for, untracked_id_for
 from lib_python_worktree.core.manager import ManagerConfig, WorktreeManager
@@ -492,3 +495,434 @@ def test_list_repo_tracked_primary_branch_stays_none_after_start(
     primary_entry = next(e for e in listing.entries if e.record.backing == "primary")
     assert primary_entry.tracked is True
     assert primary_entry.record.branch is None
+
+
+# ---------------------------------------------------------------------------
+# Ticket #101 -- a worktree deregistered outside the MCP must stay
+# discoverable as a tracked, orphaned entry
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_list_repo_deregistered_tracked_worktree_surfaces_as_orphan_entry(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #101 driving test (behavioural requirement 1): a worktree
+    created through the MCP and then deregistered directly in the shell
+    (`git worktree remove --force <path>`, bypassing this tool) must stay
+    visible in list_repo() -- not vanish -- as a tracked, orphaned entry."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    rec = WorktreeRecord(
+        id="tracked-linked-101",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+    )
+    store.add(rec)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(linked_worktree)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    listing = mgr.list_repo(str(git_repo))
+
+    assert len(listing.entries) == 2
+    orphan = next(e for e in listing.entries if e.record.id == "tracked-linked-101")
+    assert orphan.tracked is True
+    assert orphan.record.status == "orphaned"
+    assert orphan.record.path == linked_worktree.resolve().as_posix()
+    assert orphan.record.branch == "feature/alpha"
+    assert orphan.is_current is False
+
+
+@pytest.mark.requires_git
+def test_list_repo_prunable_block_with_tracked_record_surfaces_once(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Edge case (also currently RED): deleting the worktree directory
+    directly (leaving a `prunable` porcelain block rather than a fully
+    deregistered one) must not create a duplicate entry -- exactly one
+    orphaned entry for that record, not two."""
+    records = [
+        WorktreeRecord(
+            id="tracked-linked-101-prunable",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/alpha",
+            path=linked_worktree.resolve().as_posix(),
+            backing="worktree",
+        )
+    ]
+    shutil.rmtree(linked_worktree, ignore_errors=True)
+
+    listing = _list_repo(git_repo, records)
+
+    matches = [e for e in listing.entries if e.record.id == "tracked-linked-101-prunable"]
+    assert len(matches) == 1
+    assert matches[0].tracked is True
+    assert matches[0].record.status == "orphaned"
+
+
+@pytest.mark.requires_git
+def test_list_repo_deregistered_worktree_with_directory_still_present_is_orphaned(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #101 blocking-finding regression test: a worktree whose git
+    registration is gone but whose checkout *directory is still present on
+    disk* must still surface as `tracked=True` with `record.status ==
+    "orphaned"` -- not only when the directory itself was deleted.
+
+    Deregisters by deleting the worktree's `.git/worktrees/<id>`
+    administrative directory directly and running `git worktree prune`,
+    rather than `git worktree remove --force` (which would delete the
+    checkout directory too) or `shutil.rmtree` (which produces a
+    `prunable` block, not a fully-vanished one) -- so the directory
+    genuinely stays on disk while the porcelain block disappears.
+
+    Before the fix, the second-pass override in `list_repo()` only applied
+    `status="orphaned"` when `Path(rec.path).exists()` was False, so this
+    case kept whatever status was last persisted (typically "created") and
+    was invisible to the documented recovery predicate
+    `e.tracked and e.record.status == "orphaned"`.
+    """
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    rec = WorktreeRecord(
+        id="tracked-linked-101-dir-present",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+        status="created",
+    )
+    store.add(rec)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    admin_dir = git_repo / ".git" / "worktrees" / linked_worktree.name
+    assert admin_dir.is_dir()
+    shutil.rmtree(admin_dir)
+    subprocess.run(
+        ["git", "worktree", "prune", "-v"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    # Sanity: the checkout directory is still on disk, but git's porcelain
+    # view no longer has a block for it at all (not even `prunable`).
+    assert linked_worktree.exists()
+    proc = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=git_repo, check=True, capture_output=True, text=True,
+    )
+    assert linked_worktree.name not in proc.stdout
+
+    listing = mgr.list_repo(str(git_repo))
+
+    orphan = next(
+        e for e in listing.entries if e.record.id == "tracked-linked-101-dir-present"
+    )
+    assert orphan.tracked is True
+    assert orphan.record.status == "orphaned"
+
+    # Selected by the README's documented recovery predicate.
+    selected = [e for e in listing.entries if e.tracked and e.record.status == "orphaned"]
+    assert orphan in selected
+
+    # The recovery flow's remove() step must also succeed for this
+    # deregistration path, where the checkout directory is still present.
+    # `git worktree remove` fails with "is not a working tree" (exit 128)
+    # because the admin dir is gone; `_phantom_state_cleanup()` (ticket #51)
+    # handles that by rmtree-ing the leftover directory, pruning stale git
+    # metadata, then releasing ports and deleting the state record.
+    removed = mgr.remove(orphan.record.id, force=True)
+    assert removed.status == "removed"
+    assert not linked_worktree.exists()
+    assert mgr.state.get("tracked-linked-101-dir-present") is None
+
+
+@pytest.mark.requires_git
+def test_orphan_recovery_flow_end_to_end(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #101 driving test (behavioural requirement 2, the e2e-test
+    label): the documented orphan-recovery flow -- list_repo(), select the
+    entry via the README's D3 predicate (`e.tracked and e.record.status ==
+    "orphaned"`), then remove(id, force=True) -- works end to end for a
+    worktree deregistered outside the tool, across a *fresh* WorktreeManager
+    construction (reconcile_on_init=True, the default) so reconcile() has
+    already flipped the persisted status to "orphaned" before list_repo()
+    ever runs."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+    )
+    rec = mgr.create(str(git_repo), "feature/e2e-101", base="main", fetch=False)
+    wt_path = Path(rec.path)
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    fresh_mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=YamlStateStore(state_dir=state_dir),
+    )
+
+    listing = fresh_mgr.list_repo(str(git_repo))
+    orphan = next(
+        e for e in listing.entries
+        if e.tracked and e.record.status == "orphaned"
+    )
+    assert orphan.record.id == rec.id
+
+    removed = fresh_mgr.remove(orphan.record.id, force=True)
+    assert removed.status == "removed"
+
+    after_listing = fresh_mgr.list_repo(str(git_repo))
+    assert all(e.record.id != rec.id for e in after_listing.entries)
+    assert fresh_mgr.state.get(rec.id) is None
+
+
+@pytest.mark.requires_git
+def test_list_repo_orphan_entries_do_not_mutate_store_or_caller_record(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Guard (mirrors the existing #85 branch-refresh purity test):
+    surfacing a deregistered worktree as an in-memory "orphaned" status must
+    never write back to the store, and must never mutate the caller's own
+    record object."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    rec = WorktreeRecord(
+        id="tracked-linked-101-purity",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+    )
+    store.add(rec)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(linked_worktree)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    state_bytes_before = (state_dir / "state.yaml").read_bytes()
+
+    listing = mgr.list_repo(str(git_repo))
+    orphan = next(e for e in listing.entries if e.record.id == "tracked-linked-101-purity")
+    assert orphan.record.status == "orphaned"
+
+    assert (state_dir / "state.yaml").read_bytes() == state_bytes_before
+    reloaded = store.get("tracked-linked-101-purity")
+    assert reloaded.status == "created"
+
+    # Against InMemoryStateStore (hands out live objects, not copies): the
+    # store's own record must stay untouched, and the returned entry must be
+    # a different object.
+    mem_store = InMemoryStateStore()
+    mem_rec = WorktreeRecord(
+        id="tracked-linked-101-purity-mem",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+    )
+    mem_store.add(mem_rec)
+    pure_listing = _list_repo(git_repo, mem_store.list())
+    pure_orphan = next(e for e in pure_listing.entries if e.record.id == mem_rec.id)
+    assert pure_orphan.record.status == "orphaned"
+    assert mem_store.get(mem_rec.id).status == "created"
+    assert pure_orphan.record is not mem_rec
+
+
+@pytest.mark.requires_git
+def test_list_repo_orphan_status_override_without_reconcile(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """D3 guard: the in-memory status override is a read-view rule applied
+    by list_repo() itself -- it must fire even when reconcile() has never
+    run (reconcile_on_init=False), while the store keeps holding its
+    original persisted status."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    rec = WorktreeRecord(
+        id="tracked-linked-101-noreconcile",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+        status="created",
+    )
+    store.add(rec)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(linked_worktree)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    listing = mgr.list_repo(str(git_repo))
+    orphan = next(e for e in listing.entries if e.record.id == "tracked-linked-101-noreconcile")
+    assert orphan.record.status == "orphaned"
+    assert store.get("tracked-linked-101-noreconcile").status == "created"
+
+
+@pytest.mark.requires_git
+def test_list_repo_orphan_ordering_is_deterministic(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Two vanished records plus one live linked worktree: entries stay
+    primary-first then path-sorted -- no orphan-last third dimension -- and
+    two consecutive calls return an identical id sequence."""
+    other_wt = tmp_path / "other-linked-wt-101"
+    subprocess.run(
+        ["git", "worktree", "add", str(other_wt), "-b", "feature/other-101"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    try:
+        vanished_a = tmp_path / "vanished-a"
+        vanished_b = tmp_path / "vanished-b"
+        records = [
+            WorktreeRecord(
+                id="live-linked-101",
+                repo_root=git_repo.resolve().as_posix(),
+                branch="feature/other-101",
+                path=other_wt.resolve().as_posix(),
+                backing="worktree",
+            ),
+            WorktreeRecord(
+                id="vanished-a-101",
+                repo_root=git_repo.resolve().as_posix(),
+                branch="feature/vanished-a",
+                path=vanished_a.as_posix(),
+                backing="worktree",
+            ),
+            WorktreeRecord(
+                id="vanished-b-101",
+                repo_root=git_repo.resolve().as_posix(),
+                branch="feature/vanished-b",
+                path=vanished_b.as_posix(),
+                backing="worktree",
+            ),
+        ]
+
+        listing_1 = _list_repo(git_repo, records)
+        listing_2 = _list_repo(git_repo, records)
+
+        ids_1 = [e.record.id for e in listing_1.entries]
+        ids_2 = [e.record.id for e in listing_2.entries]
+        assert ids_1 == ids_2
+
+        assert listing_1.entries[0].record.backing == "primary"
+        rest = listing_1.entries[1:]
+        paths = [e.record.path for e in rest]
+        assert paths == sorted(paths)
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(other_wt)],
+            cwd=git_repo, capture_output=True,
+        )
+
+
+@pytest.mark.requires_git
+def test_list_repo_orphan_record_of_other_repo_not_surfaced(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """The repo_root filter must still exclude a foreign repo's vanished
+    record from the new orphan pass, same as it already does for the
+    porcelain-driven first pass."""
+    other_repo_root = (tmp_path / "other-repo-101").as_posix()
+    vanished_path = (tmp_path / "other-repo-101" / "vanished-wt").as_posix()
+    records = [
+        WorktreeRecord(
+            id="other-repo-vanished-101",
+            repo_root=other_repo_root,
+            branch="feature/x",
+            path=vanished_path,
+            backing="worktree",
+        )
+    ]
+
+    listing = _list_repo(git_repo, records)
+    ids = {e.record.id for e in listing.entries}
+    assert "other-repo-vanished-101" not in ids
+
+
+@pytest.mark.requires_git
+def test_list_repo_stale_primary_backed_record_does_not_add_second_primary(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """A stale backing="primary" record under the same repo_root (pointing
+    at a vanished path) must not add a second primary entry -- the
+    single-primary invariant relied on elsewhere (`next(e for e in entries
+    if e.record.backing == "primary")`) must hold."""
+    stale_primary_path = (tmp_path / "stale-primary-101").as_posix()
+    records = [
+        WorktreeRecord(
+            id="stale-primary-101",
+            repo_root=git_repo.resolve().as_posix(),
+            branch=None,
+            path=stale_primary_path,
+            backing="primary",
+        )
+    ]
+
+    listing = _list_repo(git_repo, records)
+
+    primary_entries = [e for e in listing.entries if e.record.backing == "primary"]
+    assert len(primary_entries) == 1
+    assert primary_entries[0].record.id != "stale-primary-101"
+
+
+@pytest.mark.requires_git
+def test_list_repo_healthy_worktree_still_single_entry(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Regression guard: a tracked, still-live linked worktree must not be
+    emitted twice -- once by the porcelain pass, once by the new orphan
+    pass."""
+    records = [
+        WorktreeRecord(
+            id="healthy-linked-101",
+            repo_root=git_repo.resolve().as_posix(),
+            branch="feature/alpha",
+            path=linked_worktree.resolve().as_posix(),
+            backing="worktree",
+        )
+    ]
+
+    listing = _list_repo(git_repo, records)
+
+    matches = [e for e in listing.entries if e.record.id == "healthy-linked-101"]
+    assert len(matches) == 1
+    assert matches[0].record.status != "orphaned"
+
+
+def test_list_repo_orphan_entry_has_no_new_fields():
+    """D3 pin: no new EnvironmentEntry field is introduced to carry the
+    orphan discriminator -- it is `record.status == "orphaned"` combined
+    with `tracked is True`, nothing else."""
+    field_names = {f.name for f in dataclasses.fields(EnvironmentEntry)}
+    assert field_names == {"record", "is_current", "tracked"}

@@ -185,14 +185,24 @@ at construction to clean up stale records.
 |--------|-----------|---------|-------------|
 | `create` | `(repo_root: str, branch: str, base: Optional[str] = None, *, fetch: bool = True)` | `WorktreeRecord` | Add a git worktree, allocate ports per the contract, and persist state. If `branch` doesn't exist, pass `base` to create it from; if `base` is omitted, it defaults to the branch currently checked out at the main clone (local ref only, never fetched). With an explicit `base`, `fetch=True` (default) fetches `origin/<base>` first; `fetch=False` branches from the local ref. Raises `BranchNotFoundError` if `branch` is missing and no `base` is given while the main clone's HEAD is detached or unborn. |
 | `list` | `()` | `List[WorktreeRecord]` | Return all tracked worktree records. |
-| `list_repo` | `(path: str)` | `RepoListing` | Repo-scoped listing (primary + linked worktrees) for any path inside a repo, joining git's live `worktree list --porcelain` view against tracked records. Entries not yet persisted (the primary before its first `start()`, or a linked worktree never `adopt()`-ed) are synthesised with `tracked=False`. |
-| `remove` | `(worktree_id: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False, *, checkout_path: Optional[str] = None)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. Target by `worktree_id` **or** `checkout_path`; a `checkout_path` pointing at an untracked/orphaned linked worktree is removed without needing `adopt()` first (see "Orphan worktree recovery" below). `force=True` removes despite uncommitted changes; never bypasses the primary-checkout refusal. |
+| `list_repo` | `(path: str)` | `RepoListing` | Repo-scoped listing (primary + linked worktrees) for any path inside a repo, joining git's live `worktree list --porcelain` view against tracked records. Entries not yet persisted (the primary before its first `start()`, or a linked worktree never `adopt()`-ed) are synthesised with `tracked=False`. A tracked record whose checkout is no longer registered with git (deregistered outside this tool) is still listed too, as `tracked=True` with `record.status == "orphaned"`. See "Orphan worktree recovery" below for both flavours. |
+| `remove` | `(worktree_id: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False, *, checkout_path: Optional[str] = None)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. Target by `worktree_id` **or** `checkout_path`; a `checkout_path` pointing at an untracked/orphaned linked worktree is removed without needing `adopt()` first (see "Orphan worktree recovery" below — `checkout_path` for an untracked orphan, `worktree_id` for a tracked-but-deregistered one). `force=True` removes despite uncommitted changes; never bypasses the primary-checkout refusal. |
 | `adopt` | `(repo_root: str)` | `AdoptReport` | Import untracked on-disk worktrees into the state store. Requires `YamlStateStore`. |
 | `prune` | `(repo_root: str)` | `None` | Run `git worktree prune --expire=now` to clear stale git metadata. |
 | `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID. |
 | `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role`; force-kills if it does not exit within `timeout` seconds. |
 
 ### Orphan worktree recovery
+
+"Orphan" covers two distinct situations, told apart by an entry's `tracked`
+and `record.status` fields, and recovered differently:
+
+| Flavour | `tracked` | `record.status` | Recover with |
+|---------|-----------|------------------|---------------|
+| A — untracked but on disk | `False` | `"created"` | `remove(checkout_path=...)` or `adopt()` |
+| B — tracked but deregistered outside this tool | `True` | `"orphaned"` | `remove(worktree_id=...)` |
+
+#### Flavour A — untracked but on disk
 
 A linked worktree that was created outside this tool (by hand, or by a
 process that crashed before persisting its record) shows up in
@@ -217,6 +227,35 @@ manager.adopt(repo_root)
 the state store for an untracked target, and never deletes its branch
 (a synthesised record always has `branch_created_by_us=False`) — even with
 `force=True`.
+
+#### Flavour B — tracked but deregistered outside this tool
+
+A worktree this library created, whose git registration is gone — the
+checkout may or may not still exist on disk — e.g. someone ran
+`git worktree remove --force <path>` directly in a shell, deleted its
+`.git/worktrees/<id>` administrative directory directly, or deleted the
+checkout directory so its porcelain block reads `prunable` — stays visible
+rather than silently vanishing from `list_repo()`/`environment_list`. Its
+`WorktreeRecord` survives in
+`state.yaml`; `reconcile()` (which runs by default at `WorktreeManager`
+construction) marks it `status="orphaned"`, and `list_repo()` applies the
+same rule as an in-memory-only read view even when `reconcile()` hasn't run.
+The entry has **`tracked=True`**, and its id **is** a real state-store key:
+
+```python
+listing = manager.list_repo(repo_root)
+orphan = next(
+    e for e in listing.entries
+    if e.tracked and e.record.status == "orphaned"
+)
+manager.remove(orphan.record.id, force=True)
+```
+
+The discriminator is `record.status` — there is no dedicated boolean field
+on `EnvironmentEntry` for this. `record.path` for such an entry may not
+exist on disk, so a consumer that stats it directly must tolerate
+`FileNotFoundError`. Orphan entries of both flavours are always present in
+every `list_repo()` call — there is no opt-in flag to request them.
 
 ### `ManagerConfig`
 
