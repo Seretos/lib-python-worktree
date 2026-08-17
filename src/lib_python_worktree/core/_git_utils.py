@@ -86,6 +86,12 @@ def _run_git(
       don't briefly flash a console window per git call.
     * ``timeout`` defaults from ``WORKTREE_GIT_TIMEOUT_SEC`` (30 s if unset);
       on overrun the process is killed and ``GitTimeoutError`` is raised.
+
+    Ticket #102: the raised ``GitTimeoutError`` self-classifies whether the
+    timed-out command was a network operation (``.network``/``.subcommand``,
+    derived in ``GitTimeoutError.__init__`` from ``cmd``) so a caller has a
+    retry-worthy signal. No retry/backoff or timeout-value change is made
+    here -- diagnostics only.
     """
     effective_timeout = _resolve_git_timeout(timeout)
 

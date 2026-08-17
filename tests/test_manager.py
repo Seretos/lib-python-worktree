@@ -551,6 +551,195 @@ def test_run_git_closes_stdin(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #102: GitTimeoutError network-vs-local classification
+# ---------------------------------------------------------------------------
+
+
+def test_run_git_timeout_on_fetch_flags_network_operation(monkeypatch):
+    """R1: a timed-out network git command (fetch) is flagged .network=True,
+    and the message names it as a network operation for retry-worthiness.
+    """
+
+    class _HangingPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=timeout)
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _HangingPopen)
+
+    with pytest.raises(GitTimeoutError) as excinfo:
+        _run_git(["fetch", "origin", "main"], timeout=0.05)
+
+    err = excinfo.value
+    assert err.network is True
+    assert err.command == ["git", "fetch", "origin", "main"]
+    assert "network operation" in str(err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["git", "-c", "protocol.version=2", "fetch", "origin", "main"],
+        ["git", "--no-pager", "fetch", "origin", "main"],
+        ["fetch", "origin", "main"],  # no leading "git" token
+    ],
+)
+def test_git_subcommand_classifies_fetch_variants_as_network(command):
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == "fetch"
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        (["git", "-C", "repo", "fetch", "origin"], "fetch"),
+        (["git", "--git-dir", "repo", "fetch", "origin"], "fetch"),
+        (["git", "--work-tree", "wt", "fetch", "origin"], "fetch"),
+        (["git", "--namespace", "ns", "push", "origin"], "push"),
+        (["git", "--super-prefix", "prefix/", "pull", "origin"], "pull"),
+        (
+            ["git", "--config-env", "http.extraHeader=AUTH", "clone", "url"],
+            "clone",
+        ),
+    ],
+)
+def test_git_subcommand_skips_space_separated_global_option_values(command, expected):
+    """Reviewer finding #1: global options that take a SEPARATE (space-
+    delimited) value token -- not just ``-c``/``-C`` -- must have that value
+    token skipped rather than mistaken for the subcommand. Without this,
+    e.g. ``git --git-dir repo fetch origin`` misclassifies as subcommand
+    ``"repo"`` instead of ``"fetch"``, silently defeating the network
+    signal for a genuine timeout on such an invocation.
+    """
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        (["git", "--git-dir=repo", "fetch", "origin"], "fetch"),
+        (["git", "--work-tree=wt", "fetch", "origin"], "fetch"),
+        (["git", "--namespace=ns", "push", "origin"], "push"),
+        (["git", "--super-prefix=prefix/", "pull", "origin"], "pull"),
+        (
+            ["git", "--config-env=http.extraHeader=AUTH", "clone", "url"],
+            "clone",
+        ),
+    ],
+)
+def test_git_subcommand_equals_joined_global_options_do_not_consume_next_token(
+    command, expected
+):
+    """The ``=``-joined form of a value-taking global option (e.g.
+    ``--git-dir=/path``) is a single token and must NOT consume the
+    following token as a value -- only the space-separated form does.
+    """
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command, expected_subcommand, expected_network",
+    [
+        # Bare `--exec-path` takes no separate value per real git behaviour
+        # (verified against git 2.53.0.windows.1: `git --exec-path rev-parse
+        # --is-bare-repository` prints only the exec path and never runs
+        # `rev-parse`), so it must stay OUT of `_takes_value` -- the next
+        # bare token is the subcommand, not a consumed value.
+        (["git", "--exec-path", "rev-parse"], "rev-parse", False),
+        (["git", "--exec-path=/some/path", "fetch", "origin"], "fetch", True),
+    ],
+)
+def test_git_subcommand_exec_path_does_not_take_a_separate_value(
+    command, expected_subcommand, expected_network
+):
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) == expected_subcommand
+    err = GitTimeoutError(command, 1.0)
+    assert err.network is expected_network
+
+
+@pytest.mark.parametrize("command", [["git"], []])
+def test_git_subcommand_handles_degenerate_commands_without_raising(command):
+    from lib_python_worktree.core._exceptions import _git_subcommand
+
+    assert _git_subcommand(command) is None
+    err = GitTimeoutError(command, 1.0)
+    assert err.network is False
+
+
+def test_run_git_timeout_on_local_command_is_not_network(monkeypatch):
+    """R2: a timed-out local git command (worktree list) is NOT flagged as
+    network, and the message text is unchanged (exact-match regression guard).
+    """
+
+    class _HangingPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd=["git", "worktree"], timeout=timeout)
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _HangingPopen)
+
+    with pytest.raises(GitTimeoutError) as excinfo:
+        _run_git(["worktree", "list", "--porcelain"], timeout=0.05)
+
+    err = excinfo.value
+    assert err.network is False
+    assert str(err) == (
+        f"git command timed out after {err.elapsed:.1f}s: "
+        f"git worktree list --porcelain"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["git", "remote", "-v"],
+        ["git", "submodule", "status"],
+    ],
+)
+def test_git_subcommand_remote_and_submodule_are_not_network(command):
+    from lib_python_worktree.core._exceptions import _git_subcommand, _NETWORK_SUBCOMMANDS
+
+    assert _git_subcommand(command) not in _NETWORK_SUBCOMMANDS
+
+
+def test_git_timeout_error_construction_is_backwards_compatible():
+    """R3: positional construction still works, still subclasses
+    WorktreeError, and the ``network`` kwarg override wins over derivation.
+    """
+
+    err = GitTimeoutError(["git", "rev-parse"], 30.0)
+    assert isinstance(err, WorktreeError)
+    assert err.command == ["git", "rev-parse"]
+    assert err.elapsed == 30.0
+    assert err.network is False
+
+    # Explicit override wins: force a normally-local command to be flagged...
+    forced_true = GitTimeoutError(["git", "rev-parse"], 30.0, network=True)
+    assert forced_true.network is True
+
+    # ...and suppress it on a normally-network command.
+    forced_false = GitTimeoutError(["git", "fetch", "origin"], 30.0, network=False)
+    assert forced_false.network is False
+
+
+# ---------------------------------------------------------------------------
 # Ticket #1: worktree_remove must delete the branch it created
 # ---------------------------------------------------------------------------
 

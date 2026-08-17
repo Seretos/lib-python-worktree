@@ -22,6 +22,56 @@ class WorktreeError(RuntimeError):
     """Base class for all worktree-engine errors surfaced to MCP clients."""
 
 
+_NETWORK_SUBCOMMANDS = frozenset({"clone", "fetch", "ls-remote", "pull", "push"})
+"""Git subcommands that talk to a remote and are worth retrying on timeout.
+
+Deliberately excludes ``remote`` and ``submodule``: both are local in their
+common invocations (``git remote -v``, ``git submodule status``), and
+flagging them as network would produce a false retry signal.
+"""
+
+
+def _git_subcommand(command: List[str]) -> Optional[str]:
+    """Best-effort extraction of the git subcommand from an argv list.
+
+    Skips a leading ``"git"`` token (if present) and any leading global
+    options -- ``-c key=val``, ``--no-pager``, ``-C <dir>``, ``--git-dir
+    <path>``, or any other ``-``/``--`` prefixed token (consuming its value
+    when one is expected, but only when that value is a SEPARATE token --
+    an ``=``-joined form like ``--git-dir=/path`` is a single token and
+    never consumes the next one) -- then returns the first remaining bare
+    token. Returns ``None`` for an empty or all-options command rather than
+    raising, so a malformed/empty ``command`` never breaks exception
+    construction.
+    """
+    tokens = list(command)
+    if tokens and tokens[0] == "git":
+        tokens = tokens[1:]
+
+    # Global options that take a separate (space-delimited) value argument.
+    # https://git-scm.com/docs/git#_options
+    _takes_value = {
+        "-c",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+    }
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("-"):
+            i += 1
+            if tok in _takes_value and i < len(tokens):
+                i += 1
+            continue
+        return tok
+    return None
+
+
 class GitTimeoutError(WorktreeError):
     """Raised when a ``git`` subprocess exceeds the configured timeout.
 
@@ -30,12 +80,35 @@ class GitTimeoutError(WorktreeError):
     ``_run_git`` now closes stdin, runs via ``Popen.communicate(timeout=...)``,
     and raises this on overrun so the MCP tool can surface a real error rather
     than blocking the client forever.
+
+    Ticket #102: a single E2E sweep observed one ``git fetch`` timeout that
+    didn't reproduce on retry, suggesting transient network contention rather
+    than a genuine hang. There was no way for a caller to tell "this timeout
+    was on a network operation, retrying may help" from "this timeout was on
+    a purely local command, retrying won't help" -- so this now also derives
+    (or accepts an explicit override for) a ``.network`` flag and the
+    ``.subcommand`` it was derived from, purely as a diagnostic signal. No
+    retry/backoff behaviour is implemented here.
     """
 
-    def __init__(self, command: List[str], elapsed: float) -> None:
-        super().__init__(
-            f"git command timed out after {elapsed:.1f}s: {' '.join(command)}"
+    def __init__(
+        self,
+        command: List[str],
+        elapsed: float,
+        *,
+        network: Optional[bool] = None,
+    ) -> None:
+        self.subcommand = _git_subcommand(command)
+        self.network = (
+            network if network is not None else self.subcommand in _NETWORK_SUBCOMMANDS
         )
+        message = f"git command timed out after {elapsed:.1f}s: {' '.join(command)}"
+        if self.network:
+            message += (
+                " (network operation -- this may be transient remote/network "
+                "contention; retrying may succeed)"
+            )
+        super().__init__(message)
         self.command = command
         self.elapsed = elapsed
 
