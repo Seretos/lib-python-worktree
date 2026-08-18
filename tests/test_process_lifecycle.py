@@ -5365,10 +5365,16 @@ class TestStaleTrackedPidCompositeCommand:
             # is guaranteed to raise OSError (leader reaped) by the time
             # stop() runs -- this is what makes the test exercise finding
             # #110-1's dead-leader path rather than the ordinary alive path.
+            # `proc` is this test process's own child, so a wrapper that has
+            # exited but not yet been waited on lingers as a zombie -- for
+            # which `_pid_alive` (os.kill(pid, 0)) keeps reading "alive"
+            # forever. `proc.poll()` performs the reaping wait4/waitpid
+            # itself, so it (unlike raw `_pid_alive`) actually observes and
+            # clears the exit.
             deadline = time.monotonic() + 10.0
-            while _pid_alive(wrapper_pid) and time.monotonic() < deadline:
+            while proc.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert not _pid_alive(wrapper_pid), "wrapper did not exit in time"
+            assert proc.poll() is not None, "wrapper did not exit in time"
 
             record = _make_record(
                 "wt-composite-stale", pids={DEFAULT_ROLE: wrapper_pid},
