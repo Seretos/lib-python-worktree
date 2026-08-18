@@ -40,7 +40,7 @@ from lib_python_worktree.core.state import (
     StopDetail,
     WorktreeRecord,
 )
-from lib_python_worktree.core.yaml_store import YamlStateStore
+from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -1382,6 +1382,146 @@ def _make_wt_record(wt_id: str = "wt-abc12345", **kwargs) -> "WorktreeRecord":
     return WorktreeRecord(**defaults)
 
 
+# ---------------------------------------------------------------------------
+# TestManagerListReconciles -- ticket #110
+# ---------------------------------------------------------------------------
+
+class TestManagerListReconciles:
+    """WorktreeManager.list() must refresh liveness via reconcile() for a
+    YamlStateStore-backed manager (ticket #110), exactly like __init__
+    already does -- otherwise a caller that only ever calls list() (never
+    re-instantiating the manager) keeps seeing a stale dead pid/status
+    indefinitely. Gated on the same reconcile_on_init flag so tests/callers
+    that opt out at construction time keep that opt-out on every list()
+    call too, and InMemoryStateStore-backed managers (reconcile() only
+    accepts a YamlStateStore) are unaffected either way.
+    """
+
+    def test_list_reconciles_dead_pid_for_yaml_state_store(self, tmp_path: Path):
+        """Driving test: a record with a dead pid, written directly to a
+        YamlStateStore (bypassing start()), must have that pid cleared and
+        status normalized to "stopped" by the time list() returns -- proving
+        list() actually ran reconcile(), not just read the store as-is."""
+        state_dir = tmp_path / "state"
+        existing_path = tmp_path / "wt-reconcile-list"
+        existing_path.mkdir()
+        store = YamlStateStore(state_dir=state_dir)
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=store,
+            reconcile_on_init=True,
+        )
+
+        if _pid_alive(99999997):
+            pytest.skip("PID 99999997 is alive on this machine — skipping")
+        dead_record = WorktreeRecord(
+            id="wt-reconcile-list",
+            repo_root="/fake/repo",
+            branch="feature/x",
+            path=str(existing_path),
+            status="running",
+            pids={"main": 99999997},
+        )
+        store.add(dead_record)
+
+        listed = mgr.list()
+
+        assert len(listed) == 1
+        assert listed[0].pids == {}
+        assert listed[0].status == "stopped"
+
+    def test_list_does_not_reconcile_when_reconcile_on_init_false(self, tmp_path: Path):
+        """Edge case: a manager constructed with reconcile_on_init=False
+        must keep that opt-out on list() too -- a dead pid must NOT be
+        cleared."""
+        state_dir = tmp_path / "state"
+        existing_path = tmp_path / "wt-no-reconcile-list"
+        existing_path.mkdir()
+        store = YamlStateStore(state_dir=state_dir)
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=store,
+            reconcile_on_init=False,
+        )
+
+        if _pid_alive(99999996):
+            pytest.skip("PID 99999996 is alive on this machine — skipping")
+        dead_record = WorktreeRecord(
+            id="wt-no-reconcile-list",
+            repo_root="/fake/repo",
+            branch="feature/x",
+            path=str(existing_path),
+            status="running",
+            pids={"main": 99999996},
+        )
+        store.add(dead_record)
+
+        listed = mgr.list()
+
+        assert len(listed) == 1
+        assert listed[0].pids == {"main": 99999996}
+        assert listed[0].status == "running"
+
+    def test_list_with_in_memory_state_store_unaffected(self, tmp_path: Path):
+        """Edge case: an InMemoryStateStore-backed manager's list() must not
+        raise and must not attempt reconcile() (which only accepts a
+        YamlStateStore) -- record contents pass through unchanged."""
+        mgr = _make_mgr_in_memory(tmp_path)  # reconcile_on_init=False
+        record = _make_wt_record(pids={"main": 99999995}, status="running")
+        mgr.state.add(record)
+
+        listed = mgr.list()  # must not raise
+
+        assert len(listed) == 1
+        assert listed[0].pids == {"main": 99999995}
+        assert listed[0].status == "running"
+
+    @pytest.mark.requires_git
+    def test_list_repo_reconciles_dead_pid_for_yaml_state_store(
+        self, tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG002
+    ):
+        """Driving test (review round 2, blocking finding 1): mirrors
+        test_list_reconciles_dead_pid_for_yaml_state_store above, but through
+        list_repo() -- the repo-scoped listing used to call
+        self.state.list() directly, bypassing the same reconcile gate
+        list() uses, so a caller polling only list_repo() kept seeing a
+        stale dead pid / stale "running" status indefinitely. A tracked
+        primary-checkout record with a dead pid, written directly to a
+        YamlStateStore (bypassing start()), must have that pid cleared and
+        status normalized to "stopped" by the time list_repo() returns."""
+        from lib_python_worktree.core.checkout import primary_id_for
+
+        state_dir = tmp_path / "state"
+        store = YamlStateStore(state_dir=state_dir)
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=store,
+            reconcile_on_init=True,
+        )
+
+        if _pid_alive(99999993):
+            pytest.skip("PID 99999993 is alive on this machine — skipping")
+        dead_record = WorktreeRecord(
+            id=primary_id_for(git_repo),
+            repo_root=str(git_repo.resolve().as_posix()),
+            branch=None,
+            path=str(git_repo),
+            backing="primary",
+            status="running",
+            pids={"main": 99999993},
+        )
+        store.add(dead_record)
+
+        listing = mgr.list_repo(str(git_repo))
+
+        primary_entries = [
+            e for e in listing.entries if e.record.id == primary_id_for(git_repo)
+        ]
+        assert len(primary_entries) == 1
+        assert primary_entries[0].record.pids == {}
+        assert primary_entries[0].record.status == "stopped"
+
+
 def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
     """start() builds the cmd from contract.start[0] and passes it to _lifecycle_start."""
     mgr = _make_mgr_in_memory(tmp_path)
@@ -2306,6 +2446,68 @@ def test_manager_stop_without_pid_is_noop(tmp_path: Path):
     mock_lc_stop.assert_not_called()
     assert result.status == "stopped"
     assert mgr.state.get(record.id).status == "stopped"
+
+
+def test_manager_stop_without_pid_sets_stop_attempt_no_process_recorded(
+    tmp_path: Path,
+):
+    """Ticket #110: the no-op branch (no pid recorded for the resolved
+    role) must set stop_attempt=StopAttempt(outcome="no_process_recorded")
+    -- process_lifecycle.stop() (and therefore every other StopAttempt
+    outcome) is never even reached for this role."""
+    from lib_python_worktree.core.state import STOP_ATTEMPT_NO_PROCESS_RECORDED
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(status="ready")  # no pids
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        result = mgr.stop(record.id)
+
+    mock_lc_stop.assert_not_called()
+    assert result.stop_attempt is not None
+    assert result.stop_attempt.outcome == STOP_ATTEMPT_NO_PROCESS_RECORDED
+    assert result.stop_attempt.role == "main"
+    assert result.stop_attempt.tracked_pid is None
+    stored = mgr.state.get(record.id)
+    assert stored.stop_attempt is not None
+    assert stored.stop_attempt.outcome == STOP_ATTEMPT_NO_PROCESS_RECORDED
+
+
+def test_manager_stop_without_pid_clears_stale_killed_pids(tmp_path: Path):
+    """Driving test (review round 2, blocking finding 2): the no-op branch
+    (no pid recorded for the resolved role) must also refresh
+    record.killed_pids to [] -- mirroring process_lifecycle.stop(), which
+    unconditionally recomputes killed_pids on every path, including to an
+    empty list. Before this fix, a record left with stale killed_pids from
+    an earlier real stop()/start() call kept reporting those stale pids
+    even though this call reports "no process recorded; nothing to stop"."""
+    from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    stale_killed = [
+        KilledProcessInfo(pid=4242, name="stale.exe", source="tracked"),
+    ]
+    record = _make_wt_record(status="ready", killed_pids=stale_killed)  # no pids
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        result = mgr.stop(record.id)
+
+    mock_lc_stop.assert_not_called()
+    assert result.killed_pids == []
+    stored = mgr.state.get(record.id)
+    assert stored.killed_pids == []
 
 
 class TestManagerStopStickyStatus:

@@ -60,10 +60,12 @@ from .state import (
     SETUP_STATUS_SKIPPED,
     SHADOW_REASON_DIFFERS,
     SHADOW_REASON_UNREADABLE,
+    STOP_ATTEMPT_NO_PROCESS_RECORDED,
     InMemoryStateStore,
     SetupOutcome,
     ShadowedContract,
     StateStore,
+    StopAttempt,
     WorktreeRecord,
 )
 from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
@@ -823,6 +825,10 @@ class WorktreeManager:
         # shutil.which/subprocess path is used.
         self._plugin_install_which = _plugin_install_which
         self._plugin_install_runner = _plugin_install_runner
+        # Ticket #110: remembered so list() can re-run the same reconcile()
+        # gate on every call, not just at construction time -- see list()'s
+        # own comment for why.
+        self._reconcile_on_init = reconcile_on_init
         if reconcile_on_init and isinstance(resolved_state, YamlStateStore):
             reconcile(resolved_state)
 
@@ -1098,8 +1104,32 @@ class WorktreeManager:
 
         return record
 
-    def list(self) -> List[WorktreeRecord]:
+    def _list_reconciled(self) -> List[WorktreeRecord]:
+        """Return every tracked ``WorktreeRecord``, reconciled first.
+
+        Ticket #110: for a ``YamlStateStore``-backed manager, this first
+        re-runs ``reconcile()`` -- exactly as ``__init__`` already does --
+        so a caller that only ever polls a listing method repeatedly (never
+        re-instantiating the manager) still sees a dead pid cleared /
+        ``status`` normalized promptly rather than only at construction
+        time. Gated on the same ``reconcile_on_init`` flag the constructor
+        was given, so a caller that explicitly opted out of reconcile at
+        construction time keeps that opt-out on every call here too.
+        A no-op for an ``InMemoryStateStore``-backed manager (``reconcile()``
+        only accepts a ``YamlStateStore``). Shared by ``list()`` and
+        ``list_repo()`` so both listing paths get the same staleness fix.
+        """
+        if self._reconcile_on_init and isinstance(self.state, YamlStateStore):
+            reconcile(self.state)
         return self.state.list()
+
+    def list(self) -> List[WorktreeRecord]:
+        """Return every tracked ``WorktreeRecord``.
+
+        See ``_list_reconciled()`` for the reconcile-before-listing
+        behaviour (ticket #110).
+        """
+        return self._list_reconciled()
 
     def remove(
         self,
@@ -1521,6 +1551,29 @@ class WorktreeManager:
                 # stop_detail in lockstep, mirroring
                 # process_lifecycle.stop()'s own clean-"stopped" branch.
                 record.stop_detail = None
+            # Ticket #110: process_lifecycle.stop() (and therefore every
+            # StopAttempt outcome it can set -- "killed"/"already_exited"/
+            # "tracked_pid_missing") is never reached on this no-op path --
+            # there is no pid to check. Record that explicitly rather than
+            # leaving stop_attempt at whatever a previous stop() call left
+            # it as (or None, for a role that was never started).
+            record.stop_attempt = StopAttempt(
+                outcome=STOP_ATTEMPT_NO_PROCESS_RECORDED,
+                message=(
+                    f"stop(worktree_id={record.id}, role={effective_role}): "
+                    f"no process recorded for this role; nothing to stop"
+                ),
+                role=effective_role,
+            )
+            # Ticket #110 (review round 2, blocking finding 2): mirror
+            # process_lifecycle.stop(), which unconditionally recomputes
+            # record.killed_pids on every path -- including to an empty
+            # list. This no-op branch used to skip that refresh, so a
+            # record left with stale killed_pids from an earlier real
+            # stop()/start() call would still report those stale pids here
+            # even though this call reports "nothing to stop". Clear it so
+            # stale data from an older call can't leak forward.
+            record.killed_pids = []
             self.state.update(record)
             return record
 
@@ -1576,8 +1629,13 @@ class WorktreeManager:
         with the current store's records — the actual join/synthesis logic
         lives there (store-free, independently unit-testable) so this method
         stays a two-line, read-only pass-through.
+
+        Ticket #110: the records are fetched via ``_list_reconciled()``, the
+        same reconcile-before-listing gate ``list()`` uses, so this
+        repo-scoped listing doesn't return a stale ``status: running`` for a
+        dead pid either.
         """
-        return _list_repo(path, self.state.list())
+        return _list_repo(path, self._list_reconciled())
 
     def _resolve_target(
         self,
