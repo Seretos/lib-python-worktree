@@ -406,7 +406,7 @@ memoised per removal attempt, so it never issues more than one extra
 
 When a `Step` does not specify `shell:`, `SetupRunner` picks:
 
-- **Windows:** `powershell.exe -NoProfile -Command`
+- **Windows:** `powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64 blob>`
 - **POSIX:** `bash -c`
 
 Per-step overrides (the `shell:` field):
@@ -415,8 +415,19 @@ Per-step overrides (the `shell:` field):
 |-------|-------------|
 | `bash` | `bash -c` |
 | `sh` | `sh -c` |
-| `pwsh` | `pwsh -NoProfile -Command` |
-| `powershell` | `powershell.exe -NoProfile -Command` |
+| `pwsh` | `pwsh -NoProfile -NonInteractive -EncodedCommand <base64 blob>` |
+| `powershell` | `powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64 blob>` |
+
+For `pwsh`/`powershell`, the step's `run:` line is base64-encoded (UTF-16LE)
+and passed via `-EncodedCommand` rather than appended as raw `-Command`
+text — including when the `run:` line is itself a self-wrapped/nested
+PowerShell invocation, e.g. `run: powershell -Command "..."`. A raw
+`-Command <text>` argument round-trips through both `subprocess`'s Windows
+argv re-quoting (`list2cmdline`) and PowerShell's own `-Command` re-parsing,
+which can mangle such a self-wrapped run line's quote structure and cause
+the step to fail silently. `-EncodedCommand` carries no spaces or quotes, so
+neither re-quoting pass can corrupt it, and previously-silent steps like
+this now run correctly. Exit-code semantics are unchanged from `-Command`.
 
 ### Git timeout
 
