@@ -420,6 +420,241 @@ class TestStartOutputCaptureAndEarlyExit:
 
 
 # ---------------------------------------------------------------------------
+# start() log filename casing (ticket #111)
+# ---------------------------------------------------------------------------
+
+class TestStartLogFilenameCasing:
+    """Ticket #111: the log filename's role component must preserve the
+    same casing as the ``pids`` dict key -- ``_slug`` (from
+    ``setup.runner``) lower-cases, which desynced ``start-<role>.log``
+    from ``record.pids[role]``. ``start()`` must sanitize the role for
+    filesystem-safety without lower-casing it.
+    """
+
+    def test_start_log_filename_role_component_matches_pids_key(self):
+        """Requirement 1 (driving test): the token between 'start-' and
+        '.log' in the log filename must be a literal key of result.pids.
+        Pre-fix, _slug(role) lower-cases 'roleA' to 'rolea', which is not a
+        key of pids (only 'roleA' is) -- AssertionError."""
+        record = _make_record("wt-casing-1")
+        store = _make_store(record)
+
+        result = start(
+            "wt-casing-1",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="roleA",
+        )
+
+        name = Path(result.start_log_path).name
+        assert name.startswith("start-") and name.endswith(".log")
+        token = name[len("start-"):-len(".log")]
+        assert token in result.pids
+
+    def test_start_log_filename_exact_for_mixed_case_role(self):
+        """Edge case: exact filename for a simple mixed-case role."""
+        record = _make_record("wt-casing-2")
+        store = _make_store(record)
+
+        result = start(
+            "wt-casing-2",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="roleA",
+        )
+
+        assert Path(result.start_log_path).name == "start-roleA.log"
+
+    def test_start_log_filename_unchanged_for_default_role(self):
+        """Edge case: the default role ('main') is already all-lowercase,
+        so its filename is unaffected by the fix."""
+        record = _make_record("wt-casing-3")
+        store = _make_store(record)
+
+        result = start(
+            "wt-casing-3",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+        )
+
+        assert Path(result.start_log_path).name == "start-main.log"
+
+    def test_start_pids_key_is_raw_role(self):
+        """Edge case: guards against fixing the mismatch in the wrong
+        direction (e.g. by lower-casing the pids key instead of
+        preserving the role's case in the filename)."""
+        record = _make_record("wt-casing-4")
+        store = _make_store(record)
+
+        result = start(
+            "wt-casing-4",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="roleA",
+        )
+
+        assert "roleA" in result.pids
+        assert "rolea" not in result.pids
+
+    def test_start_log_filename_sanitizes_unsafe_chars_preserving_case(self):
+        """Requirement 2 (driving test): filesystem-unsafe characters are
+        still replaced with '-', but case is preserved. Pre-fix this
+        produces 'start-role-a-b.log' (lower-cased)."""
+        from lib_python_worktree.setup.runner import log_dir_for
+
+        record = _make_record("wt-casing-5")
+        store = _make_store(record)
+
+        result = start(
+            "wt-casing-5",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="Role A/B",
+        )
+
+        log_path = Path(result.start_log_path)
+        assert log_path.name == "start-Role-A-B.log"
+        assert log_path.parent == log_dir_for("wt-casing-5")
+        assert log_path.exists()
+
+    def test_start_log_filename_degenerate_role_falls_back(self):
+        """Edge case: a role with zero alphanumeric characters falls back
+        to a non-empty token ('_', distinct from setup.runner._slug's
+        'step' fallback) rather than producing 'start-.log'."""
+        record = _make_record("wt-casing-6")
+        store = _make_store(record)
+
+        result = start(
+            "wt-casing-6",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="!!!",
+        )
+
+        log_path = Path(result.start_log_path)
+        assert log_path.name == "start-_.log"
+        assert log_path.exists()
+
+    def test_start_log_filename_fallback_does_not_collide_with_literal_role(
+        self,
+    ):
+        """Regression (review finding): the fallback token must not collide
+        with a literal role string that happens to equal the old fallback.
+        A literal role='role' and a degenerate role='!!!' must produce
+        different filenames -- 'start-role.log' vs 'start-_.log' -- even
+        though both were tracked as distinct 'pids' keys. Pre-fix (fallback
+        == 'role'), both produced the identical string 'start-role.log'."""
+        record = _make_record("wt-casing-8")
+        store = _make_store(record)
+
+        result_literal = start(
+            "wt-casing-8",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="role",
+        )
+        name_literal = Path(result_literal.start_log_path).name
+
+        stop("wt-casing-8", store=store, role="role")
+
+        result_degenerate = start(
+            "wt-casing-8",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="!!!",
+        )
+        name_degenerate = Path(result_degenerate.start_log_path).name
+
+        assert name_literal == "start-role.log"
+        assert name_degenerate == "start-_.log"
+        assert name_literal != name_degenerate
+
+    def test_start_log_filenames_differ_for_case_only_distinct_roles(self):
+        """Requirement 3 (driving test): two roles that differ only by case
+        must produce distinct filename strings. This is a platform-
+        independent string comparison -- it deliberately does NOT assert
+        both log files exist on disk, since on a case-insensitive
+        filesystem (Windows, default macOS) 'start-roleA.log' and
+        'start-rolea.log' name the same physical file (accepted, documented
+        limitation -- see _role_log_slug's docstring). Pre-fix, both calls
+        produce the identical string 'start-rolea.log' -- AssertionError."""
+        record = _make_record("wt-casing-7")
+        store = _make_store(record)
+
+        result_a = start(
+            "wt-casing-7",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="roleA",
+        )
+        name_a = Path(result_a.start_log_path).name
+
+        stop("wt-casing-7", store=store, role="roleA")
+
+        result_b = start(
+            "wt-casing-7",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="rolea",
+        )
+        name_b = Path(result_b.start_log_path).name
+
+        assert name_a != name_b
+
+
+class TestRoleLogSlug:
+    """Unit tests for the private ``_role_log_slug`` helper directly."""
+
+    def test_preserves_case(self):
+        assert _pl._role_log_slug("AbC") == "AbC"
+
+    def test_strips_leading_and_trailing_unsafe_runs(self):
+        assert _pl._role_log_slug("--Ab--") == "Ab"
+
+    def test_replaces_internal_unsafe_chars_with_single_dash(self):
+        assert _pl._role_log_slug("Role A/B") == "Role-A-B"
+
+    def test_empty_string_falls_back(self):
+        assert _pl._role_log_slug("") == "_"
+
+    def test_all_unsafe_falls_back(self):
+        assert _pl._role_log_slug("!!!") == "_"
+
+    def test_truncates_to_max_len(self):
+        role = "A" * 80
+        assert _pl._role_log_slug(role) == "A" * 40
+
+    def test_digits_and_mixed_alphanumerics_untouched(self):
+        assert _pl._role_log_slug("Worker2b") == "Worker2b"
+
+    def test_fallback_does_not_collide_with_literal_role_named_role(self):
+        """Regression (review finding): a literal role of 'role' must not
+        sanitize to the same token as a degenerate role's fallback. Pre-fix
+        the fallback was 'role' itself, so _role_log_slug('!!!') == 'role'
+        == _role_log_slug('role') -- a collision. Post-fix, a
+        *non-degenerate* role (one with at least one alphanumeric character,
+        like 'role') can never sanitize to '_', so the fallback can never
+        collide with it -- which is exactly why the old 'role' fallback was
+        broken: it collided with the non-degenerate literal role 'role'.
+        Degenerate roles (including the literal role '_') all sanitize to
+        '_' and collide with each other -- that narrower ambiguity is a
+        separately documented, accepted limitation, not fixed here."""
+        assert _pl._role_log_slug("role") == "role"
+        assert _pl._role_log_slug("!!!") == "_"
+        assert _pl._role_log_slug("role") != _pl._role_log_slug("!!!")
+
+    def test_truncation_never_leaves_trailing_dash(self):
+        """Nit fix: strip("-") -> [:max_len] can expose a trailing '-' at
+        the truncation boundary (e.g. 'a'*39 + '-' + 'b'*10 truncates to
+        'a'*39 + '-' before a second strip). The result must be re-stripped
+        so no filename ends in '-.log'."""
+        role = ("a" * 39) + "-" + ("b" * 10)
+        result = _pl._role_log_slug(role, max_len=40)
+        assert result == "a" * 39
+        assert not result.endswith("-")
+
+
+# ---------------------------------------------------------------------------
 # stop() tests
 # ---------------------------------------------------------------------------
 
