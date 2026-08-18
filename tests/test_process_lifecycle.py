@@ -36,6 +36,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _HANDLE_QUERY_GRACE_SEC,
     _HANDLE_QUERY_TIMEOUT_SEC,
     _MAX_WEDGED_HANDLE_WORKERS,
+    _describe_pid,
     _find_blocking_processes,
     _force_kill,
     _kill_blocking_processes,
@@ -54,6 +55,9 @@ from lib_python_worktree.core.process_lifecycle import (
 )
 from lib_python_worktree.core.manager import WorktreeNotFoundError
 from lib_python_worktree.core.state import (
+    STOP_ATTEMPT_ALREADY_EXITED,
+    STOP_ATTEMPT_KILLED,
+    STOP_ATTEMPT_TRACKED_PID_MISSING,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
     STOP_REASON_SURVIVORS,
@@ -4809,6 +4813,598 @@ class TestStopDetail:
 
 
 # ---------------------------------------------------------------------------
+# TestStopAttemptOutcome -- ticket #110
+# ---------------------------------------------------------------------------
+
+class TestStopAttemptOutcome:
+    """Regression tests for ticket #110: stop() must attach a machine-
+    readable ``StopAttempt`` to ``record.stop_attempt`` distinguishing
+    "nothing needed killing" from "the tracked PID had already gone stale
+    while real work it spawned kept running" (the stale-tracked-pid-for-
+    composite-command finding, #110-1) from the ordinary case where the
+    tracked pid was alive at entry."""
+
+    def test_outcome_killed_when_tracked_pid_alive(self):
+        """Driving test: tracked pid alive at entry -> stop_attempt.outcome
+        == "killed"."""
+        fake_pid = 91000
+        record = _make_record("wt-attempt-killed", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-attempt-killed", store=store, timeout=1.0)
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_KILLED
+        assert result.stop_attempt.tracked_pid == fake_pid
+        assert result.stop_attempt.tracked_pid_alive is True
+        assert result.stop_attempt.role == DEFAULT_ROLE
+
+    def test_outcome_already_exited_when_nothing_found(self):
+        """Driving test: tracked pid dead at entry AND nothing from its
+        tree/process-group/job/orphan-scan was found -> stop_attempt.outcome
+        == "already_exited", killed_pids == [] (the genuinely-nothing-to-do
+        case, distinct from tracked_pid_missing below)."""
+        fake_pid = 91100
+        record = _make_record("wt-attempt-exited", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+        ):
+            result = stop("wt-attempt-exited", store=store, timeout=1.0)
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_ALREADY_EXITED
+        assert result.stop_attempt.tracked_pid_alive is False
+        assert result.killed_pids == []
+
+    def test_outcome_tracked_pid_missing_when_tree_survives_dead_tracked_pid(self):
+        """Driving test (finding #110-1): tracked pid already dead at entry,
+        BUT its descendant tree still has a member -> stop_attempt.outcome
+        == "tracked_pid_missing" -- the tracked pid had gone stale for a
+        composite/chained shell command while real work it spawned kept
+        running under a different, untracked pid."""
+        fake_pid = 91200
+        child = KilledProcessInfo(pid=91201, name="child", cmdline=["child"])
+        record = _make_record("wt-attempt-missing", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-attempt-missing", store=store, timeout=1.0)
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+        assert result.stop_attempt.tracked_pid_alive is False
+        assert result.stop_attempt.kill_orphans_may_help is True
+
+    def test_outcome_already_exited_when_only_unrelated_orphan_found(self):
+        """Driving test (reviewer fix cycle, blocking finding #1): tracked
+        pid dead at entry, its OWN tree/process-group/job is genuinely empty,
+        but the unrelated path-heuristic orphan scan (kill_orphans=True)
+        separately found and killed something. This must still be
+        "already_exited", NOT "tracked_pid_missing" -- an orphan-scan hit
+        says nothing about whether the tracked pid's own descendant
+        tree/process-group/job survived it, so it must never be folded into
+        that determination. Before the fix, `_something_else_found =
+        bool(killed_tree) or bool(orphan_found)` conflated the two, so this
+        exact scenario (empty killed_tree, non-empty orphan_found) was
+        mislabeled "tracked_pid_missing" with a message falsely claiming
+        "tree/process-group/job" evidence."""
+        fake_pid = 91300
+        orphan = KilledProcessInfo(
+            pid=91301, name="orphan", cmdline=["orphan"], source="orphan_scan",
+        )
+        record = _make_record("wt-attempt-orphan-only", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                side_effect=lambda p: False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([orphan]),
+            ),
+        ):
+            result = stop(
+                "wt-attempt-orphan-only", store=store, timeout=1.0, kill_orphans=True,
+            )
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_ALREADY_EXITED
+        assert result.stop_attempt.tracked_pid_alive is False
+
+    def test_kill_orphans_may_help_false_for_tracked_pid_missing_when_already_run(self):
+        """Edge case: kill_orphans_may_help must be False for
+        tracked_pid_missing when kill_orphans=True was already passed on
+        this call -- retrying offers nothing new."""
+        fake_pid = 91250
+        child = KilledProcessInfo(pid=91251, name="child", cmdline=["child"])
+        record = _make_record("wt-attempt-missing-help", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([]),
+            ),
+        ):
+            result = stop(
+                "wt-attempt-missing-help", store=store, timeout=1.0, kill_orphans=True,
+            )
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+        assert result.stop_attempt.kill_orphans_may_help is False
+
+    def test_start_clears_leftover_stop_attempt(self):
+        """start() must clear a leftover stop_attempt from a previous
+        stop() call, mirroring how it already clears stop_detail."""
+        from lib_python_worktree.core.state import StopAttempt
+
+        record = _make_record(
+            "wt-attempt-start-clears",
+            stop_attempt=StopAttempt(outcome=STOP_ATTEMPT_KILLED, message="stale"),
+        )
+        store = _make_store(record)
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._spawn_detached"
+        ) as mock_spawn:
+            mock_proc = MagicMock()
+            mock_proc.pid = 91300
+            mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=0.25)
+            mock_spawn.return_value = mock_proc
+
+            result = start("wt-attempt-start-clears", ["echo", "hi"], store=store)
+
+        assert result.stop_attempt is None
+
+
+# ---------------------------------------------------------------------------
+# TestKilledPidsIdentifiability -- ticket #110
+# ---------------------------------------------------------------------------
+
+class TestKilledPidsIdentifiability:
+    """Regression tests for ticket #110, finding #110-3: every
+    ``killed_pids`` entry must carry a ``source`` provenance tag, and
+    duplicate-pid entries from two sources must keep the richer (non-empty
+    name/cmdline) one rather than first-wins."""
+
+    def test_describe_pid_never_raises_on_access_denied(self):
+        """_describe_pid must never raise -- an AccessDenied/NoSuchProcess
+        failure degrades to ("", [])."""
+        import psutil
+
+        with patch.object(
+            psutil, "Process", side_effect=psutil.AccessDenied(pid=12345)
+        ):
+            name, cmdline = _describe_pid(12345)
+
+        assert name == ""
+        assert cmdline == []
+
+    def test_describe_pid_never_raises_on_no_such_process(self):
+        import psutil
+
+        with patch.object(
+            psutil, "Process", side_effect=psutil.NoSuchProcess(pid=12345)
+        ):
+            name, cmdline = _describe_pid(12345)
+
+        assert name == ""
+        assert cmdline == []
+
+    def test_tracked_pid_entry_has_source_tracked(self):
+        """The tracked-pid killed_pids entry carries source="tracked"."""
+        fake_pid = 92000
+        record = _make_record("wt-source-tracked", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-source-tracked", store=store, timeout=1.0)
+
+        tracked_entries = [info for info in result.killed_pids if info.pid == fake_pid]
+        assert len(tracked_entries) == 1
+        assert tracked_entries[0].source == "tracked"
+
+    def test_tree_entry_has_source_tree(self):
+        fake_pid = 92100
+        child = KilledProcessInfo(
+            pid=92101, name="child", cmdline=["child"], source="tree",
+        )
+        record = _make_record("wt-source-tree", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+        ):
+            result = stop("wt-source-tree", store=store, timeout=1.0)
+
+        matching = [info for info in result.killed_pids if info.pid == 92101]
+        assert len(matching) == 1
+        assert matching[0].source == "tree"
+
+    def test_process_group_only_entry_has_source_process_group(self):
+        fake_pid = 92200
+        group_only_pid = 92201
+        record = _make_record("wt-source-group", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[group_only_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-source-group", store=store, timeout=1.0)
+
+        matching = [info for info in result.killed_pids if info.pid == group_only_pid]
+        assert len(matching) == 1
+        assert matching[0].source == "process_group"
+
+    def test_job_only_entry_has_source_job_object(self):
+        """A Job Object member not already covered by the ppid-tree or
+        process-group snapshot must be tagged source="job_object", with its
+        name/cmdline populated from the pre-terminate _describe_pid
+        snapshot (ticket #110, finding #110-3) -- mirroring how
+        process_group/tree/orphan_scan/tracked entries are already
+        covered above."""
+        fake_pid = 92500
+        member_pid = 92501
+        record = _make_record(
+            "wt-source-job",
+            pids={DEFAULT_ROLE: fake_pid},
+            job_names={DEFAULT_ROLE: "Local\\fake-job-source"},
+        )
+        store = _make_store(record)
+
+        def _fake_describe(pid):
+            if pid == member_pid:
+                return ("job-member.exe", ["job-member.exe", "--flag"])
+            return ("", [])
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([member_pid]),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._describe_pid",
+                side_effect=_fake_describe,
+            ),
+        ):
+            result = stop("wt-source-job", store=store, timeout=1.0)
+
+        matching = [info for info in result.killed_pids if info.pid == member_pid]
+        assert len(matching) == 1
+        assert matching[0].source == "job_object"
+        assert matching[0].name == "job-member.exe"
+        assert matching[0].cmdline == ["job-member.exe", "--flag"]
+
+    def test_orphan_entry_has_source_orphan_scan(self):
+        fake_pid = 92300
+        orphan = KilledProcessInfo(
+            pid=92301, name="orphan", cmdline=["orphan"], source="orphan_scan",
+        )
+        record = _make_record("wt-source-orphan", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([orphan]),
+            ),
+        ):
+            result = stop(
+                "wt-source-orphan", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == 92301]
+        assert len(matching) == 1
+        assert matching[0].source == "orphan_scan"
+
+    def test_dedup_prefers_richest_entry(self):
+        """A pid appearing twice -- once bare (empty name/cmdline, e.g. a
+        process-group/job-object artifact) and once with real metadata --
+        must keep the richer entry, not first-wins."""
+        fake_pid = 92400
+        shared_pid = 92401
+        bare = KilledProcessInfo(pid=shared_pid, name="", cmdline=[], source="tree")
+        rich = KilledProcessInfo(
+            pid=shared_pid, name="real-name", cmdline=["real", "cmd"],
+            source="orphan_scan",
+        )
+        record = _make_record("wt-source-dedup", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[bare],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([rich]),
+            ),
+        ):
+            result = stop(
+                "wt-source-dedup", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == shared_pid]
+        assert len(matching) == 1
+        assert matching[0].name == "real-name", (
+            "dedup must prefer the richer (non-empty name/cmdline) entry, "
+            "not first-wins"
+        )
+        assert matching[0].cmdline == ["real", "cmd"]
+
+    def test_dedup_prefers_richer_entry_between_two_partially_populated(self):
+        """Driving test for review round 4's blocking finding: the OLD dedup
+        logic only distinguished has-any-metadata vs has-none, so once the
+        first-seen entry for a pid had ANY metadata (e.g. name set but
+        cmdline empty), a later duplicate with STRICTLY RICHER metadata (both
+        name AND a full cmdline) was wrongly discarded -- has-any-metadata
+        was already True, so `candidate_has_metadata and not
+        existing_has_metadata` never fired. The fix scores richness by how
+        many of {name, cmdline} are populated, so the two-populated-fields
+        entry must win over the one-populated-fields entry regardless of
+        which was appended first."""
+        fake_pid = 92500
+        shared_pid = 92501
+        partial = KilledProcessInfo(
+            pid=shared_pid, name="proc.exe", cmdline=[], source="tree",
+        )
+        fuller = KilledProcessInfo(
+            pid=shared_pid, name="proc.exe", cmdline=["proc.exe", "--flag"],
+            source="orphan_scan",
+        )
+        record = _make_record("wt-source-dedup-partial", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[partial],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([fuller]),
+            ),
+        ):
+            result = stop(
+                "wt-source-dedup-partial", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == shared_pid]
+        assert len(matching) == 1
+        assert matching[0].cmdline == ["proc.exe", "--flag"], (
+            "dedup must prefer the entry with MORE populated fields (name "
+            "AND cmdline) over one with fewer (name only), not just "
+            "any-metadata-vs-none"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestStaleTrackedPidCompositeCommand -- ticket #110, finding #110-1
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group only")
+class TestStaleTrackedPidCompositeCommand:
+    """Regression test for finding #110-1: a composite/chained shell
+    command (e.g. ``sh -c "... & long_running_child"``) can leave the
+    tracked wrapper pid dead while the backgrounded child survives under a
+    different, untracked pid but the SAME process group (start_new_session
+    guarantees pgid == the tracked pid). Before this ticket, stop() bailed
+    out of _process_group_members the instant os.getpgid(tracked_pid) raised
+    OSError (leader already reaped), so the surviving child was never found,
+    never killed, and stop() silently reported killed_pids: [] /
+    status="stopped"."""
+
+    def test_stop_finds_and_kills_survivor_of_dead_leader_composite_command(self):
+        """Driving test: spawn a real `sh -c` wrapper that exits almost
+        immediately while backgrounding a long-running child in the same
+        process group; stop() must find that child via
+        _process_group_members, kill it, report it with
+        source="process_group", and set stop_attempt.outcome ==
+        "tracked_pid_missing"."""
+        marker = Path(_tempdir_for_test()) / f"pgroup-marker-{os.getpid()}"
+        if marker.exists():
+            marker.unlink()
+
+        proc = _spawn_detached(
+            [
+                "sh", "-c",
+                # Ticket #110 fix cycle (blocking finding #2): capture `$!`
+                # immediately after backgrounding the marker-write job, into
+                # pid1, BEFORE backgrounding `sleep 30` -- `$!` always refers
+                # to the most recently backgrounded job, so waiting on a
+                # bare `$!` taken after both jobs are backgrounded would
+                # actually be `sleep 30`'s pid, blocking this wrapper for
+                # the full 30s instead of letting it exit right after the
+                # marker write (which is what makes the wrapper's PID go
+                # stale while `sleep 30` keeps running -- the scenario this
+                # test exists to exercise).
+                f"echo started > {marker} & pid1=$!; sleep 30 & wait $pid1",
+            ],
+            env=dict(os.environ),
+            cwd=None,
+            log_path=Path(_tempdir_for_test()) / f"pgroup-log-{os.getpid()}.log",
+        )
+        wrapper_pid = proc.pid
+
+        try:
+            # Wait for the backgrounded grandchild to actually start, then
+            # let the wrapper shell itself exit -- `wait $pid1` returns once
+            # the marker-write job (not `sleep 30`) has finished, so the
+            # outer `sh -c` process this test tracks exits shortly after,
+            # while `sleep 30` (spawned into the SAME process group --
+            # start_new_session guarantees pgid == wrapper_pid) keeps
+            # running under a different, now-untracked pid.
+            deadline = time.monotonic() + 10.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.exists(), "wrapper never reached the backgrounding point"
+
+            # Poll for the wrapper to actually exit so os.getpgid(wrapper_pid)
+            # is guaranteed to raise OSError (leader reaped) by the time
+            # stop() runs -- this is what makes the test exercise finding
+            # #110-1's dead-leader path rather than the ordinary alive path.
+            deadline = time.monotonic() + 10.0
+            while _pid_alive(wrapper_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not _pid_alive(wrapper_pid), "wrapper did not exit in time"
+
+            record = _make_record(
+                "wt-composite-stale", pids={DEFAULT_ROLE: wrapper_pid},
+            )
+            store = _make_store(record)
+
+            result = stop("wt-composite-stale", store=store, timeout=10.0)
+
+            process_group_entries = [
+                info for info in result.killed_pids
+                if info.source == "process_group"
+            ]
+            assert process_group_entries, (
+                "the surviving `sleep 30` grandchild (same process group as "
+                "the dead wrapper) must be found via _process_group_members "
+                "and reported with source='process_group'"
+            )
+            assert result.stop_attempt is not None
+            assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+            for info in process_group_entries:
+                assert not _pid_alive(info.pid), (
+                    f"survivor pid {info.pid} must actually be killed by stop()"
+                )
+        finally:
+            if marker.exists():
+                marker.unlink()
+            if _pid_alive(wrapper_pid):
+                _force_kill(wrapper_pid)
+
+
+def _tempdir_for_test() -> str:
+    import tempfile
+    return tempfile.gettempdir()
+
+
+# ---------------------------------------------------------------------------
 # TestDiscoveryBudget -- ticket #87
 # ---------------------------------------------------------------------------
 
@@ -5874,17 +6470,79 @@ class TestProcessGroupMembers:
 
         assert result == []
 
-    def test_dead_pid_returns_empty(self):
+    def test_dead_leader_no_members_returns_empty(self):
+        """Ticket #110: a dead leader (os.getpgid(pid) raises OSError -- the
+        leader has already been reaped) with no surviving group members
+        still yields [] -- but this is NO LONGER unconditional for any dead
+        leader (see test_dead_leader_finds_surviving_group_members below for
+        the composite-command regression this behavior change closes). This
+        replaces the old test_dead_pid_returns_empty, which asserted []
+        purely because the pre-#110 implementation bailed out immediately on
+        OSError without ever scanning for survivors."""
+        import psutil
+
+        host_pid = os.getpid()
+
+        def _fake_getpgid(p):
+            if p == 424242:
+                raise OSError("no such process")  # leader already reaped
+            if p in (0, host_pid):
+                return 999  # our own pgid -- distinct from the probed group
+            raise OSError("no such process")  # no member matches either
+
         with (
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-            patch.object(
-                os, "getpgid", create=True, side_effect=OSError("no such process")
-            ),
+            patch.object(os, "getpgid", create=True, side_effect=_fake_getpgid),
+            patch.object(psutil, "process_iter", return_value=[]),
         ):
             mock_sys.platform = "linux"
             result = _process_group_members(424242)
 
         assert result == []
+
+    def test_dead_leader_finds_surviving_group_members(self):
+        """Ticket #110, finding #110-1 (the composite/chained-shell-command
+        case): when the group leader has already been reaped
+        (os.getpgid(pid) raises OSError), a member that is STILL ALIVE and
+        shares pid's pgid must still be found. start_new_session=True (see
+        _spawn_detached) guarantees a group this module created has pgid ==
+        the tracked pid, so pid remains a valid probe for surviving members
+        even after the leader itself exits -- this is exactly what lets
+        stop() recover a backgrounded child of a wrapper shell (e.g. ``sh -c
+        "... & long_running_child"``) that exits while the child keeps
+        running under a different, untracked pid."""
+        import psutil
+
+        host_pid = os.getpid()
+        dead_leader_pid = 55000
+        survivor_pid = 55001
+
+        def _fake_getpgid(p):
+            if p == dead_leader_pid:
+                raise OSError("no such process")  # leader already reaped
+            if p in (0, host_pid):
+                return 999  # our own pgid
+            if p == survivor_pid:
+                return dead_leader_pid  # still shares the now-leaderless group
+            raise OSError("no such process")
+
+        proc_survivor = MagicMock()
+        proc_survivor.info = {"pid": survivor_pid}
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "getpgid", create=True, side_effect=_fake_getpgid),
+            patch.object(psutil, "process_iter", return_value=[proc_survivor]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_sys.platform = "linux"
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _process_group_members(dead_leader_pid)
+
+        assert result == [survivor_pid]
 
     def test_returns_other_members_sharing_pgid_excludes_self_and_host(self):
         """Only OTHER processes sharing the pgid are returned -- *pid*

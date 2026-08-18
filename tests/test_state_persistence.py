@@ -345,6 +345,67 @@ def test_shadowed_contract_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore)
 
 
 # ---------------------------------------------------------------------------
+# Ticket #110: stop_attempt is transient -- never persisted to state.yaml,
+# mirroring the killed_pids/shadowed_contract precedent above.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_attempt_not_serialised_to_dict():
+    """`_record_to_dict` must never write a `stop_attempt` key."""
+    from lib_python_worktree.core.state import STOP_ATTEMPT_KILLED, StopAttempt
+    from lib_python_worktree.core.yaml_store import _record_to_dict
+
+    rec = _make_record(id="rec-stop-attempt")
+    rec.stop_attempt = StopAttempt(
+        outcome=STOP_ATTEMPT_KILLED,
+        message="stop(): killed pid 123",
+        tracked_pid=123,
+        tracked_pid_alive=True,
+    )
+
+    assert "stop_attempt" not in _record_to_dict(rec)
+
+
+def test_record_from_dict_legacy_dict_has_no_stop_attempt_key():
+    """A legacy dict with no `stop_attempt` key at all (any state.yaml
+    written before this field existed) must deserialise with `None`, not
+    raise."""
+    from lib_python_worktree.core.yaml_store import _record_from_dict
+
+    legacy = {
+        "id": "rec-legacy-stop-attempt",
+        "repo_root": "/repos/myrepo",
+        "branch": "main",
+        "path": "/store/myrepo/rec-legacy-stop-attempt",
+    }
+
+    rec = _record_from_dict(legacy)
+
+    assert rec.stop_attempt is None
+
+
+def test_stop_attempt_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
+    """A real YamlStateStore add/get cycle must drop `stop_attempt` rather
+    than persisting a stale copy -- it describes a single stop() call's
+    attempt, not a stored verdict."""
+    from lib_python_worktree.core.state import STOP_ATTEMPT_KILLED, StopAttempt
+
+    rec = _make_record(id="rec-stop-attempt-roundtrip")
+    rec.stop_attempt = StopAttempt(
+        outcome=STOP_ATTEMPT_KILLED,
+        message="stop(): killed pid 456",
+        tracked_pid=456,
+        tracked_pid_alive=True,
+    )
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-stop-attempt-roundtrip")
+
+    assert retrieved is not None
+    assert retrieved.stop_attempt is None
+
+
+# ---------------------------------------------------------------------------
 # reconcile(): orphaned path
 # ---------------------------------------------------------------------------
 

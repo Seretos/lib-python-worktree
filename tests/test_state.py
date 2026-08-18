@@ -7,7 +7,16 @@ from __future__ import annotations
 
 import pytest
 
-from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
+from lib_python_worktree.core.state import (
+    STOP_ATTEMPT_ALREADY_EXITED,
+    STOP_ATTEMPT_KILLED,
+    STOP_ATTEMPT_NO_PROCESS_RECORDED,
+    STOP_ATTEMPT_OUTCOMES,
+    STOP_ATTEMPT_TRACKED_PID_MISSING,
+    InMemoryStateStore,
+    StopAttempt,
+    WorktreeRecord,
+)
 
 
 def _make_record(
@@ -197,6 +206,38 @@ def test_update_missing_raises_key_error():
 def test_worktree_record_default_backing_is_worktree():
     rec = _make_record()
     assert rec.backing == "worktree"
+
+
+# ---------------------------------------------------------------------------
+# StopAttempt / STOP_ATTEMPT_OUTCOMES (ticket #110)
+# ---------------------------------------------------------------------------
+
+def test_worktree_record_default_stop_attempt_is_none():
+    """A freshly constructed WorktreeRecord (never passed through stop())
+    has stop_attempt is None -- transient, like killed_pids."""
+    rec = _make_record()
+    assert rec.stop_attempt is None
+
+
+def test_stop_attempt_outcomes_vocabulary_membership():
+    """STOP_ATTEMPT_OUTCOMES names exactly the four outcome tags used by
+    process_lifecycle.stop() and WorktreeManager.stop()'s no-op branch."""
+    assert set(STOP_ATTEMPT_OUTCOMES) == {
+        STOP_ATTEMPT_KILLED,
+        STOP_ATTEMPT_ALREADY_EXITED,
+        STOP_ATTEMPT_TRACKED_PID_MISSING,
+        STOP_ATTEMPT_NO_PROCESS_RECORDED,
+    }
+
+
+def test_stop_attempt_defaults():
+    """StopAttempt's optional fields default to None/False, mirroring
+    StopDetail's default-field convention."""
+    attempt = StopAttempt(outcome=STOP_ATTEMPT_KILLED, message="killed pid 123")
+    assert attempt.role is None
+    assert attempt.tracked_pid is None
+    assert attempt.tracked_pid_alive is False
+    assert attempt.kill_orphans_may_help is False
 
 
 def test_find_by_branch_skips_primary_records():
