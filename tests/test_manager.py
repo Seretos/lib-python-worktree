@@ -2379,8 +2379,10 @@ def test_manager_start_default_resolves_lone_named_step(tmp_path: Path, step_nam
         isolation="full",
         start=[named_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2469,8 +2471,10 @@ def test_manager_start_default_prefers_lone_unnamed_over_named_sibling(tmp_path:
         isolation="full",
         start=[unnamed_step, gui_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python a.py"]
+    expected_cmd = _build_step_command(expected_shell, "python a.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
