@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -31,6 +32,36 @@ from lib_python_worktree.core.manager import (
 )
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 from lib_python_worktree.core.yaml_store import YamlStateStore
+
+
+@pytest.fixture(autouse=True)
+def _no_blocking_processes_by_default():
+    """Default-patch ``_find_blocking_processes`` to return ``[]`` for every
+    test in this module (ticket #107).
+
+    Mirrors ``tests/test_teardown.py``'s identical fixture and rationale:
+    ``_teardown``'s Windows-only pre-flight check (Step 2b) calls
+    ``_find_blocking_processes(record.path, os.getpid())`` before running
+    ``git worktree remove``. Every test in this module ultimately drives
+    ``mgr.remove(...)``, which reaches that call site -- and these tests run
+    on a real Windows dev machine, so ``sys.platform`` is genuinely
+    ``"win32"`` even where nothing here patches ``manager.sys``. Left
+    unpatched, every ``remove(...)`` call runs the real, system-wide psutil
+    scan against fake/temp paths, which is both slow and (per ticket #107)
+    was able to raise an uncaught ``RuntimeError`` out of psutil's
+    ``open_files()`` under handle-table pressure on a loaded machine,
+    crashing tests in this module that have nothing to do with blocking-
+    process detection. Tests that specifically want to exercise the real
+    pre-flight behaviour override this via their own nested ``patch(...)``
+    for the duration of their ``with`` block (an inner ``patch`` on the same
+    target always wins for its scope and unwinds back to this outer patch on
+    exit).
+    """
+    with patch(
+        "lib_python_worktree.core.manager._find_blocking_processes",
+        return_value=[],
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------

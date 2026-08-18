@@ -40,7 +40,7 @@ from lib_python_worktree.core.state import (
     StopDetail,
     WorktreeRecord,
 )
-from lib_python_worktree.core.yaml_store import YamlStateStore
+from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -1362,6 +1362,12 @@ from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: 
 from lib_python_worktree.contract.loader import ContractError, ContractValidationError  # noqa: E402
 from lib_python_worktree.setup.runner import _resolve_shell  # noqa: E402
 
+# NOTE: `_build_step_command` (ticket #109) is imported locally inside each
+# test function that needs it below, rather than at module level here -- it
+# is a brand-new helper introduced by this fix, and importing it at module
+# level would make the *entire* test_manager.py module fail to collect
+# against pre-fix code (masking every other test's genuine RED/GREEN result).
+
 
 def _make_mgr_in_memory(tmp_path: Path) -> WorktreeManager:
     return WorktreeManager(
@@ -1382,6 +1388,146 @@ def _make_wt_record(wt_id: str = "wt-abc12345", **kwargs) -> "WorktreeRecord":
     return WorktreeRecord(**defaults)
 
 
+# ---------------------------------------------------------------------------
+# TestManagerListReconciles -- ticket #110
+# ---------------------------------------------------------------------------
+
+class TestManagerListReconciles:
+    """WorktreeManager.list() must refresh liveness via reconcile() for a
+    YamlStateStore-backed manager (ticket #110), exactly like __init__
+    already does -- otherwise a caller that only ever calls list() (never
+    re-instantiating the manager) keeps seeing a stale dead pid/status
+    indefinitely. Gated on the same reconcile_on_init flag so tests/callers
+    that opt out at construction time keep that opt-out on every list()
+    call too, and InMemoryStateStore-backed managers (reconcile() only
+    accepts a YamlStateStore) are unaffected either way.
+    """
+
+    def test_list_reconciles_dead_pid_for_yaml_state_store(self, tmp_path: Path):
+        """Driving test: a record with a dead pid, written directly to a
+        YamlStateStore (bypassing start()), must have that pid cleared and
+        status normalized to "stopped" by the time list() returns -- proving
+        list() actually ran reconcile(), not just read the store as-is."""
+        state_dir = tmp_path / "state"
+        existing_path = tmp_path / "wt-reconcile-list"
+        existing_path.mkdir()
+        store = YamlStateStore(state_dir=state_dir)
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=store,
+            reconcile_on_init=True,
+        )
+
+        if _pid_alive(99999997):
+            pytest.skip("PID 99999997 is alive on this machine — skipping")
+        dead_record = WorktreeRecord(
+            id="wt-reconcile-list",
+            repo_root="/fake/repo",
+            branch="feature/x",
+            path=str(existing_path),
+            status="running",
+            pids={"main": 99999997},
+        )
+        store.add(dead_record)
+
+        listed = mgr.list()
+
+        assert len(listed) == 1
+        assert listed[0].pids == {}
+        assert listed[0].status == "stopped"
+
+    def test_list_does_not_reconcile_when_reconcile_on_init_false(self, tmp_path: Path):
+        """Edge case: a manager constructed with reconcile_on_init=False
+        must keep that opt-out on list() too -- a dead pid must NOT be
+        cleared."""
+        state_dir = tmp_path / "state"
+        existing_path = tmp_path / "wt-no-reconcile-list"
+        existing_path.mkdir()
+        store = YamlStateStore(state_dir=state_dir)
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=store,
+            reconcile_on_init=False,
+        )
+
+        if _pid_alive(99999996):
+            pytest.skip("PID 99999996 is alive on this machine — skipping")
+        dead_record = WorktreeRecord(
+            id="wt-no-reconcile-list",
+            repo_root="/fake/repo",
+            branch="feature/x",
+            path=str(existing_path),
+            status="running",
+            pids={"main": 99999996},
+        )
+        store.add(dead_record)
+
+        listed = mgr.list()
+
+        assert len(listed) == 1
+        assert listed[0].pids == {"main": 99999996}
+        assert listed[0].status == "running"
+
+    def test_list_with_in_memory_state_store_unaffected(self, tmp_path: Path):
+        """Edge case: an InMemoryStateStore-backed manager's list() must not
+        raise and must not attempt reconcile() (which only accepts a
+        YamlStateStore) -- record contents pass through unchanged."""
+        mgr = _make_mgr_in_memory(tmp_path)  # reconcile_on_init=False
+        record = _make_wt_record(pids={"main": 99999995}, status="running")
+        mgr.state.add(record)
+
+        listed = mgr.list()  # must not raise
+
+        assert len(listed) == 1
+        assert listed[0].pids == {"main": 99999995}
+        assert listed[0].status == "running"
+
+    @pytest.mark.requires_git
+    def test_list_repo_reconciles_dead_pid_for_yaml_state_store(
+        self, tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG002
+    ):
+        """Driving test (review round 2, blocking finding 1): mirrors
+        test_list_reconciles_dead_pid_for_yaml_state_store above, but through
+        list_repo() -- the repo-scoped listing used to call
+        self.state.list() directly, bypassing the same reconcile gate
+        list() uses, so a caller polling only list_repo() kept seeing a
+        stale dead pid / stale "running" status indefinitely. A tracked
+        primary-checkout record with a dead pid, written directly to a
+        YamlStateStore (bypassing start()), must have that pid cleared and
+        status normalized to "stopped" by the time list_repo() returns."""
+        from lib_python_worktree.core.checkout import primary_id_for
+
+        state_dir = tmp_path / "state"
+        store = YamlStateStore(state_dir=state_dir)
+        mgr = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=store,
+            reconcile_on_init=True,
+        )
+
+        if _pid_alive(99999993):
+            pytest.skip("PID 99999993 is alive on this machine — skipping")
+        dead_record = WorktreeRecord(
+            id=primary_id_for(git_repo),
+            repo_root=str(git_repo.resolve().as_posix()),
+            branch=None,
+            path=str(git_repo),
+            backing="primary",
+            status="running",
+            pids={"main": 99999993},
+        )
+        store.add(dead_record)
+
+        listing = mgr.list_repo(str(git_repo))
+
+        primary_entries = [
+            e for e in listing.entries if e.record.id == primary_id_for(git_repo)
+        ]
+        assert len(primary_entries) == 1
+        assert primary_entries[0].record.pids == {}
+        assert primary_entries[0].record.status == "stopped"
+
+
 def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
     """start() builds the cmd from contract.start[0] and passes it to _lifecycle_start."""
     mgr = _make_mgr_in_memory(tmp_path)
@@ -1393,8 +1539,10 @@ def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
         isolation="full",
         start=[Step(run="python server.py")],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)  # platform-appropriate prefix
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -1960,8 +2108,10 @@ def test_manager_start_named_variant_selected(tmp_path: Path):
         isolation="full",
         start=[headless_step, gui_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py --headless"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py --headless")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2011,8 +2161,10 @@ def test_manager_start_backward_compat_single_unnamed_step(tmp_path: Path):
         isolation="full",
         start=[Step(run="python server.py")],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2038,8 +2190,10 @@ def test_manager_start_named_default_step_selected(tmp_path: Path):
         isolation="full",
         start=[default_step, other_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2071,8 +2225,10 @@ def test_manager_start_named_default_wins_over_unnamed(tmp_path: Path):
         isolation="full",
         start=[unnamed_step, default_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python default.py"]
+    expected_cmd = _build_step_command(expected_shell, "python default.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2085,6 +2241,55 @@ def test_manager_start_named_default_wins_over_unnamed(tmp_path: Path):
     assert call_kwargs.args[1] == expected_cmd, (
         "Expected the explicitly named 'default' step to win over the unnamed step"
     )
+
+
+def test_manager_start_uses_encoded_command_argv(tmp_path: Path, monkeypatch):
+    """Ticket #109: manager.start() funnels its argv assembly through the
+    same _build_step_command helper as SetupRunner._invoke, so a `start:`
+    step gets the identical -EncodedCommand fix as a `setup:` step on
+    Windows -- not a hand-rolled `[*_resolve_shell(...), step.run]`
+    concatenation that would still be vulnerable to the quoting bug.
+    """
+    import lib_python_worktree.setup.runner as _runner_module  # noqa: PLC0415
+
+    monkeypatch.setattr(_runner_module.sys, "platform", "win32")
+    # `sys` is a process-wide singleton, so the patch above also makes
+    # _env_utils._get_user_profile_env() (called by manager._build_worktree_env
+    # while assembling the args to the mocked _lifecycle_start below) believe
+    # it is on Windows and try a real `import winreg`, which does not exist
+    # on non-Windows CI runners. Stub it out -- this test only asserts on the
+    # argv shape, not on environment-variable sourcing.
+    monkeypatch.setattr(
+        "lib_python_worktree.core.manager._get_user_profile_env",
+        lambda: dict(os.environ),
+    )
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+    expected_cmd = _runner_module._build_step_command(_resolve_shell(None), "python server.py")
+    assert expected_cmd[:4] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+    ]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
 
 
 def test_manager_start_unknown_variant_raises_worktree_error(tmp_path: Path):
@@ -2166,6 +2371,199 @@ def test_manager_start_multi_unnamed_steps_unknown_default_raises(tmp_path: Path
         mgr.start(record.id)
 
     assert "default" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("step_name", ["main", "web", "dev server"])
+def test_manager_start_default_resolves_lone_named_step(tmp_path: Path, step_name: str):
+    """Ticket #112: bare start() (and start(variant="default")) must resolve
+    a contract whose sole start: step carries a name, not just a lone
+    unnamed one. Before the fix this raised UnknownVariantError on the very
+    first call."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    named_step = Step(run="python server.py", name=step_name)
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[named_step],
+    )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    expected_shell = _resolve_shell(None)
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+    # Also covers variant="default" passed explicitly on the same contract.
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="default")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_default_lone_named_step_records_step_name(tmp_path: Path):
+    """Ticket #112: when the fallback resolves a lone named step, the
+    variant recorded for the role must be the step's own name ("main"),
+    not the literal "default"."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py", name="main")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["variant"] == "main"
+
+
+def test_manager_start_lone_unnamed_step_still_records_default(tmp_path: Path):
+    """Back-compat: a lone unnamed step still records variant="default"
+    for the role (unchanged by the ticket #112 fallback broadening)."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["variant"] == "default"
+
+
+def test_manager_start_default_prefers_lone_unnamed_over_named_sibling(tmp_path: Path):
+    """Load-bearing: rule 1 (lone unnamed step) must still win over rule 2
+    (lone step total) by ordering. A two-step contract with one unnamed and
+    one named step resolves via the pre-existing unnamed-step rule, not the
+    new single-step-total rule."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    unnamed_step = Step(run="python a.py")
+    gui_step = Step(run="python b.py", name="gui")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[unnamed_step, gui_step],
+    )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    expected_shell = _resolve_shell(None)
+    expected_cmd = _build_step_command(expected_shell, "python a.py")
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+    assert call_kwargs.kwargs["variant"] == "default"
+
+
+def test_manager_start_default_two_named_steps_still_raises(tmp_path: Path):
+    """Multi-step contracts (two named steps) keep raising UnknownVariantError
+    unchanged -- the ticket #112 fallback only applies when there is exactly
+    one start: step total."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id)
+
+    assert exc_info.value.available == ["headless", "gui"]
+
+
+def test_manager_start_default_two_unnamed_steps_still_raises(tmp_path: Path):
+    """Multi-step contracts (two unnamed steps) keep raising
+    UnknownVariantError unchanged -- exactly one step total is required for
+    the new fallback rule to apply."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1"), Step(run="cmd2")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id)
+
+    assert exc_info.value.available == []
+
+
+def test_manager_start_unknown_variant_on_lone_named_step_still_raises(tmp_path: Path):
+    """A lone named step ("main") does NOT make every variant name valid --
+    requesting an unrelated variant still raises UnknownVariantError."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py", name="main")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["main"]
 
 
 def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):
@@ -2306,6 +2704,68 @@ def test_manager_stop_without_pid_is_noop(tmp_path: Path):
     mock_lc_stop.assert_not_called()
     assert result.status == "stopped"
     assert mgr.state.get(record.id).status == "stopped"
+
+
+def test_manager_stop_without_pid_sets_stop_attempt_no_process_recorded(
+    tmp_path: Path,
+):
+    """Ticket #110: the no-op branch (no pid recorded for the resolved
+    role) must set stop_attempt=StopAttempt(outcome="no_process_recorded")
+    -- process_lifecycle.stop() (and therefore every other StopAttempt
+    outcome) is never even reached for this role."""
+    from lib_python_worktree.core.state import STOP_ATTEMPT_NO_PROCESS_RECORDED
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(status="ready")  # no pids
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        result = mgr.stop(record.id)
+
+    mock_lc_stop.assert_not_called()
+    assert result.stop_attempt is not None
+    assert result.stop_attempt.outcome == STOP_ATTEMPT_NO_PROCESS_RECORDED
+    assert result.stop_attempt.role == "main"
+    assert result.stop_attempt.tracked_pid is None
+    stored = mgr.state.get(record.id)
+    assert stored.stop_attempt is not None
+    assert stored.stop_attempt.outcome == STOP_ATTEMPT_NO_PROCESS_RECORDED
+
+
+def test_manager_stop_without_pid_clears_stale_killed_pids(tmp_path: Path):
+    """Driving test (review round 2, blocking finding 2): the no-op branch
+    (no pid recorded for the resolved role) must also refresh
+    record.killed_pids to [] -- mirroring process_lifecycle.stop(), which
+    unconditionally recomputes killed_pids on every path, including to an
+    empty list. Before this fix, a record left with stale killed_pids from
+    an earlier real stop()/start() call kept reporting those stale pids
+    even though this call reports "no process recorded; nothing to stop"."""
+    from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    stale_killed = [
+        KilledProcessInfo(pid=4242, name="stale.exe", source="tracked"),
+    ]
+    record = _make_wt_record(status="ready", killed_pids=stale_killed)  # no pids
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+    ):
+        result = mgr.stop(record.id)
+
+    mock_lc_stop.assert_not_called()
+    assert result.killed_pids == []
+    stored = mgr.state.get(record.id)
+    assert stored.killed_pids == []
 
 
 class TestManagerStopStickyStatus:
@@ -2599,6 +3059,66 @@ class TestManagerStopByVariant:
             timeout=10.0,
             kill_orphans=False,
         )
+
+    def test_manager_stop_by_variant_after_default_resolved_named_step(self, tmp_path: Path):
+        """Ticket #112: a record left the way start() now leaves it after
+        resolving a lone named step via the default fallback (pids and
+        variants keyed by the step's own name) is stoppable by that same
+        name via stop(variant=...) without raising."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111},
+            variants={"main": "main"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, variant="main")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_by_default_variant_fails_after_named_step_fallback(
+        self, tmp_path: Path
+    ):
+        """Ticket #112 (blocking review finding): a record left the way
+        start() leaves it after resolving a lone named step via the default
+        fallback (variants keyed by the step's own name, e.g. "main", not
+        the literal "default") is NOT stoppable via
+        stop(variant="default") -- the exact literal the caller originally
+        passed to start(). This is a deliberate, documented asymmetry (see
+        the start() docstring and README's role-vs-variant section): only
+        stop(variant="main") resolves it."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111},
+            variants={"main": "main"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="default")
+
+        mock_lc_stop.assert_not_called()
+        err = exc_info.value
+        assert err.roles == []
 
 
 # ---------------------------------------------------------------------------

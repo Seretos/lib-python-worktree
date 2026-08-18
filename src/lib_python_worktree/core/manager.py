@@ -60,10 +60,12 @@ from .state import (
     SETUP_STATUS_SKIPPED,
     SHADOW_REASON_DIFFERS,
     SHADOW_REASON_UNREADABLE,
+    STOP_ATTEMPT_NO_PROCESS_RECORDED,
     InMemoryStateStore,
     SetupOutcome,
     ShadowedContract,
     StateStore,
+    StopAttempt,
     WorktreeRecord,
 )
 from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
@@ -823,6 +825,10 @@ class WorktreeManager:
         # shutil.which/subprocess path is used.
         self._plugin_install_which = _plugin_install_which
         self._plugin_install_runner = _plugin_install_runner
+        # Ticket #110: remembered so list() can re-run the same reconcile()
+        # gate on every call, not just at construction time -- see list()'s
+        # own comment for why.
+        self._reconcile_on_init = reconcile_on_init
         if reconcile_on_init and isinstance(resolved_state, YamlStateStore):
             reconcile(resolved_state)
 
@@ -1098,8 +1104,32 @@ class WorktreeManager:
 
         return record
 
-    def list(self) -> List[WorktreeRecord]:
+    def _list_reconciled(self) -> List[WorktreeRecord]:
+        """Return every tracked ``WorktreeRecord``, reconciled first.
+
+        Ticket #110: for a ``YamlStateStore``-backed manager, this first
+        re-runs ``reconcile()`` -- exactly as ``__init__`` already does --
+        so a caller that only ever polls a listing method repeatedly (never
+        re-instantiating the manager) still sees a dead pid cleared /
+        ``status`` normalized promptly rather than only at construction
+        time. Gated on the same ``reconcile_on_init`` flag the constructor
+        was given, so a caller that explicitly opted out of reconcile at
+        construction time keeps that opt-out on every call here too.
+        A no-op for an ``InMemoryStateStore``-backed manager (``reconcile()``
+        only accepts a ``YamlStateStore``). Shared by ``list()`` and
+        ``list_repo()`` so both listing paths get the same staleness fix.
+        """
+        if self._reconcile_on_init and isinstance(self.state, YamlStateStore):
+            reconcile(self.state)
         return self.state.list()
+
+    def list(self) -> List[WorktreeRecord]:
+        """Return every tracked ``WorktreeRecord``.
+
+        See ``_list_reconciled()`` for the reconcile-before-listing
+        behaviour (ticket #110).
+        """
+        return self._list_reconciled()
 
     def remove(
         self,
@@ -1250,13 +1280,20 @@ class WorktreeManager:
 
         *variant* selects which step to run (default ``"default"``):
 
-        - If *variant* is ``"default"`` and exactly one step has no ``name``
-          set, that step is used (backward-compatibility path).
-        - Otherwise the step whose ``name`` equals *variant* is used.
-        - If no matching step is found, ``UnknownVariantError`` is raised
-          listing the available named steps. ``UnknownVariantError`` is both
-          a ``WorktreeError`` and a ``ValueError``, so callers may catch
-          either base.
+        - The step whose ``name`` equals *variant* is used, if any.
+        - Otherwise, when *variant* is ``"default"``, a two-tier fallback
+          applies: (1) if exactly one step has no ``name`` set, that step is
+          used (the original backward-compatibility path -- an unnamed step
+          always wins over a named sibling); (2) else, if the contract has
+          exactly one ``start:`` step total, that step is used regardless of
+          whether it is named (ticket #112 -- so a contract with a single
+          named step, e.g. ``name: "main"``, works out of the box without
+          requiring ``variant="main"``).
+        - If no matching step is found (multiple named and/or unnamed steps
+          with no exact match), ``UnknownVariantError`` is raised listing the
+          available named steps. ``UnknownVariantError`` is both a
+          ``WorktreeError`` and a ``ValueError``, so callers may catch either
+          base.
 
         ``role`` vs ``variant`` (ticket #104)
         --------------------------------------
@@ -1273,7 +1310,16 @@ class WorktreeManager:
         that started ``variant="web"`` under some role can later stop it
         without separately tracking which role it used. The no-op "ready"
         start below (no ``start:`` step configured) spawns nothing and
-        therefore records no variant for *role*.
+        therefore records no variant for *role*. When the ticket #112
+        fallback resolves a named step from a bare ``variant="default"``
+        call, ``record.variants[role]`` records the resolved step's own
+        name (e.g. ``"main"``), not the literal ``"default"`` -- so a
+        subsequent ``stop(variant="main")`` resolves it correctly. This is a
+        deliberate, documented asymmetry: ``stop(variant="default")`` --
+        the same literal the caller passed to ``start()`` -- will **not**
+        resolve in this case, because no role is ever recorded under the
+        variant ``"default"`` once the fallback substitutes the step's own
+        name. Only ``stop(variant=<the step's actual name>)`` finds it.
 
         When no ``start:`` step is configured at all (missing
         ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
@@ -1340,19 +1386,26 @@ class WorktreeManager:
             if len(unnamed_steps) == 1:
                 step = unnamed_steps[0]
 
+        # (3) Ticket #112: variant still defaulted and no exact/unnamed match →
+        # if the contract has exactly one start: step total, use it regardless
+        # of naming. Multi-step contracts (named or unnamed) keep raising
+        # UnknownVariantError below, unchanged.
+        if step is None and variant == "default" and len(contract.start) == 1:
+            step = contract.start[0]
+
         if step is None:
             available = [s.name for s in contract.start if s.name]
             raise UnknownVariantError(variant, available)
 
-        from ..setup.runner import _resolve_shell
-        cmd = [*_resolve_shell(step.shell), step.run]
+        from ..setup.runner import _build_step_command, _resolve_shell
+        cmd = _build_step_command(_resolve_shell(step.shell), step.run)
 
         result = _lifecycle_start(
             record.id,
             cmd,
             store=self.state,
             role=role,
-            variant=variant,
+            variant=step.name or variant,
             env=_build_worktree_env(record, env),
             cwd=cwd if cwd is not None else record.path,
         )
@@ -1521,6 +1574,29 @@ class WorktreeManager:
                 # stop_detail in lockstep, mirroring
                 # process_lifecycle.stop()'s own clean-"stopped" branch.
                 record.stop_detail = None
+            # Ticket #110: process_lifecycle.stop() (and therefore every
+            # StopAttempt outcome it can set -- "killed"/"already_exited"/
+            # "tracked_pid_missing") is never reached on this no-op path --
+            # there is no pid to check. Record that explicitly rather than
+            # leaving stop_attempt at whatever a previous stop() call left
+            # it as (or None, for a role that was never started).
+            record.stop_attempt = StopAttempt(
+                outcome=STOP_ATTEMPT_NO_PROCESS_RECORDED,
+                message=(
+                    f"stop(worktree_id={record.id}, role={effective_role}): "
+                    f"no process recorded for this role; nothing to stop"
+                ),
+                role=effective_role,
+            )
+            # Ticket #110 (review round 2, blocking finding 2): mirror
+            # process_lifecycle.stop(), which unconditionally recomputes
+            # record.killed_pids on every path -- including to an empty
+            # list. This no-op branch used to skip that refresh, so a
+            # record left with stale killed_pids from an earlier real
+            # stop()/start() call would still report those stale pids here
+            # even though this call reports "nothing to stop". Clear it so
+            # stale data from an older call can't leak forward.
+            record.killed_pids = []
             self.state.update(record)
             return record
 
@@ -1576,8 +1652,13 @@ class WorktreeManager:
         with the current store's records — the actual join/synthesis logic
         lives there (store-free, independently unit-testable) so this method
         stays a two-line, read-only pass-through.
+
+        Ticket #110: the records are fetched via ``_list_reconciled()``, the
+        same reconcile-before-listing gate ``list()`` uses, so this
+        repo-scoped listing doesn't return a stale ``status: running`` for a
+        dead pid either.
         """
-        return _list_repo(path, self.state.list())
+        return _list_repo(path, self._list_reconciled())
 
     def _resolve_target(
         self,
@@ -1928,7 +2009,44 @@ class WorktreeManager:
         kill_attempted = False
         if sys.platform == "win32":
             _preflight_blockers = _find_blocking_processes(record.path, os.getpid())
-            if _preflight_blockers:
+            # Ticket #107 fix cycle (review finding 2): an empty result is
+            # falsy regardless of *why* the scan came back empty --
+            # `_find_blocking_processes` returns an empty, *degraded*
+            # `_PartialList` (`.complete=False`, tagged
+            # ``"open_files:degraded"``, D9) rather than raising when Pass
+            # 2's `open_files()` hits the Windows-only "SystemExtendedHandle
+            # Information buffer too big" condition -- a process-independent
+            # failure where the OS refused the query outright, so this pass
+            # never got a real look at *any* process. A truthiness-only
+            # check here cannot distinguish that from "scanned and found
+            # nothing" and would silently fall through to the destructive
+            # `git worktree remove` call below -- reproducing exactly the
+            # locked/partial-directory failure mode this pre-flight exists
+            # to prevent.
+            #
+            # Deliberately narrower than "any incompleteness": ordinary
+            # per-pass timeouts (D3/D5/D7 `*:truncated` -- the scan ran out
+            # of its own clock budget partway through, e.g.
+            # `_HANDLE_SCAN_BUDGET_SEC`) are ALSO pre-existing
+            # `.complete=False` conditions on this exact `_PartialList`, but
+            # they are not "never got a real look" -- they mean the scan
+            # inspected as many processes as its budget allowed and simply
+            # ran out of time, which this pre-flight has always tolerated
+            # (a pre-#107 truthiness-only check already accepted a
+            # truncated-but-empty result). On a busy dev host with a large
+            # ambient process/handle count, a real Pass 1c/Pass 2 scan can
+            # legitimately truncate on every call -- treating that the same
+            # as "found a blocker" would make `remove()` unconditionally
+            # fail under exactly the ambient-load conditions ticket #107 is
+            # about, which is the opposite of this ticket's intent. So only
+            # the degraded tag -- not general `.complete` -- escalates here;
+            # `stop(kill_orphans=True)` still reports `stop_incomplete` for
+            # *any* incompleteness (truncated or degraded) because that is a
+            # status report, not a hard gate on a destructive action.
+            if _preflight_blockers or (
+                "open_files:degraded"
+                in getattr(_preflight_blockers, "skipped_passes", ())
+            ):
                 # Q2 (ticket #103): probe for real dirt BEFORE taking any
                 # irreversible action -- including the kill below. If real
                 # dirt is ALSO present, this removal cannot succeed on this
@@ -1946,6 +2064,23 @@ class WorktreeManager:
                     killed = _kill_blocking_processes(record.path)
                     record.killed_pids = killed
                     kill_attempted = True
+                    # Review finding (fix-loop round 2): _kill_blocking_processes
+                    # re-runs _find_blocking_processes itself and, per its own
+                    # `if not found: return found` early return, does nothing at
+                    # all when that rescan is STILL degraded -- the OS-wide
+                    # "buffer too big" condition is process-independent, so it
+                    # will typically recur immediately on retry. Killing
+                    # whatever *was* found (if anything) does not make the
+                    # remaining, un-inspectable process space any safer to
+                    # assume clear. Do not fall through to the destructive git
+                    # remove call on zero real new information; refuse
+                    # explicitly, the same way the initial gate above does.
+                    if "open_files:degraded" in getattr(
+                        killed, "skipped_passes", ()
+                    ):
+                        raise WorktreeDirLockedError(
+                            record.id, killed=list(killed), kill_attempted=True
+                        )
                     # Fall through to the (now-safe) git remove call below.
                 else:
                     # Caller did not opt into the kill-and-retry remedy: raise

@@ -39,6 +39,23 @@ STOP_REASONS: Tuple[str, ...] = (
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
 )
 
+# Outcome vocabulary for ``StopAttempt.outcome`` (ticket #110) -- distinguishes
+# "nothing needed killing" from "the tracked PID had already gone stale (but
+# other work from its tree/group/job was found and killed)" and from
+# "process_lifecycle.stop() was never even reached" (the WorktreeManager.stop()
+# no-op branch for a role with no recorded pid).
+STOP_ATTEMPT_KILLED = "killed"
+STOP_ATTEMPT_ALREADY_EXITED = "already_exited"
+STOP_ATTEMPT_TRACKED_PID_MISSING = "tracked_pid_missing"
+STOP_ATTEMPT_NO_PROCESS_RECORDED = "no_process_recorded"
+
+STOP_ATTEMPT_OUTCOMES: Tuple[str, ...] = (
+    STOP_ATTEMPT_KILLED,
+    STOP_ATTEMPT_ALREADY_EXITED,
+    STOP_ATTEMPT_TRACKED_PID_MISSING,
+    STOP_ATTEMPT_NO_PROCESS_RECORDED,
+)
+
 # Reason vocabulary for ``ShadowedContract.reason`` (ticket #100) -- one tag
 # per branch in ``manager._detect_shadowed_contract``.
 SHADOW_REASON_DIFFERS = "differs"
@@ -134,6 +151,81 @@ class StopDetail:
     survivor_count: int = 0
     truncated_at: Optional[int] = None
     skipped_passes: Tuple[str, ...] = ()
+    kill_orphans_may_help: bool = False
+
+
+@dataclass(frozen=True)
+class StopAttempt:
+    """Machine-readable verdict of what a ``stop()`` call found at the
+    tracked PID itself (ticket #110), orthogonal to :class:`StopDetail`.
+
+    ``StopDetail`` answers "did anything this call tried to kill survive?".
+    ``StopAttempt`` answers a narrower, earlier question: "was the *tracked*
+    PID actually alive when this call started, or had it already gone
+    stale?" -- and, when it was already stale, "did that matter?" (i.e. did
+    real work from its tree/process-group/Job Object still get found and
+    killed, or was there genuinely nothing left).
+
+    This closes an ambiguity finding #110-2: a composite/chained shell
+    command (e.g. ``cmd /c "echo running>marker & ping -n 120 127.0.0.1
+    >nul"``) can leave the tracked wrapper PID dead while the real
+    backgrounded child keeps running under a different, untracked PID.
+    Before this field existed, that case and the genuinely-nothing-to-do
+    case both surfaced identically as ``killed_pids: []`` -- a caller could
+    not tell them apart.
+
+    ``outcome`` is always one of :data:`STOP_ATTEMPT_OUTCOMES`:
+
+    - ``"killed"``: the tracked pid was alive at entry -- kills were
+      attempted against it (and its tree/group/job).
+    - ``"already_exited"``: the tracked pid was already dead at entry, AND
+      nothing from its own tree/process-group/Job Object was found either --
+      genuinely nothing to do for that pid's lineage. (This can still be
+      true even when the unrelated, path-heuristic orphan scan separately
+      found and killed something -- that scan is not evidence about the
+      tracked pid's own tree/group/job, so it deliberately does not affect
+      this outcome; see finding #110's fix cycle blocking finding #1.)
+    - ``"tracked_pid_missing"``: the tracked pid was already dead at entry,
+      BUT something from its OWN tree/process-group/Job Object was found and
+      killed anyway -- the tracked pid itself had gone stale while real work
+      it spawned kept running. This is the composite-command case above.
+      Deliberately based on ``killed_tree`` only, never on the orphan scan's
+      results.
+    - ``"no_process_recorded"``: emitted only by
+      ``WorktreeManager.stop()``'s no-op branch, for a role that has no
+      entry in ``record.pids`` at all -- ``process_lifecycle.stop()`` (and
+      therefore every other outcome above) was never even reached.
+
+    ``message`` mirrors :class:`StopDetail`'s message-parity convention:
+    the exact human-readable string also passed to a log call for the same
+    branch (``_logger.warning`` for ``"tracked_pid_missing"``, `debug` for
+    ``"already_exited"``), so the log line and this field can never drift.
+
+    ``tracked_pid`` / ``tracked_pid_alive`` record the pid that was checked
+    and whether it was alive at entry -- ``tracked_pid`` is ``None`` for
+    ``"no_process_recorded"`` (there was no pid to check).
+    ``kill_orphans_may_help`` mirrors :class:`StopDetail`'s hint: ``True``
+    when a ``kill_orphans=True`` retry might catch something this call
+    missed (only meaningful for ``"tracked_pid_missing"`` when the orphan
+    scan did not already run).
+
+    Deliberately **transient**, exactly like ``WorktreeRecord.killed_pids``:
+    this describes a single call's attempt, not a durable verdict, so it is
+    never persisted to ``state.yaml`` (``yaml_store._record_to_dict`` never
+    serialises it) and carries the same in-memory-store-by-reference caveat
+    documented on ``killed_pids`` for ``InMemoryStateStore``-backed
+    managers. Deliberately kept as its OWN field rather than overloading
+    ``stop_detail``: the invariant ``stop_detail is not None implies status
+    == "stop_incomplete"`` must stay intact, and ``"tracked_pid_missing"``
+    is a *successful* stop (something else was found and killed) that must
+    never be reported as incomplete.
+    """
+
+    outcome: str
+    message: str
+    role: Optional[str] = None
+    tracked_pid: Optional[int] = None
+    tracked_pid_alive: bool = False
     kill_orphans_may_help: bool = False
 
 
@@ -388,6 +480,16 @@ class WorktreeRecord:
     ``status="skipped"``, which means ``create()`` ran and found no
     ``setup:`` steps to run."""
 
+    stop_attempt: Optional[StopAttempt] = None
+    """Ticket #110: machine-readable verdict of what the most recent
+    ``stop()`` call found at the tracked PID itself, or ``None``. See
+    :class:`StopAttempt`'s own docstring for the full rationale and outcome
+    vocabulary. Deliberately **transient**, exactly like ``killed_pids``:
+    never persisted to ``state.yaml`` (unlike ``stop_detail``), cleared by
+    ``start()`` in lockstep with ``stop_detail``, and subject to the same
+    in-memory-store-by-reference caveat documented on ``killed_pids`` for
+    ``InMemoryStateStore``-backed managers."""
+
 
 class StateStore(Protocol):
     """Interface that W7 will re-implement against a persistent backing store."""
@@ -456,6 +558,8 @@ __all__: Iterable[str] = (
     "ShadowedContract",
     "SHADOW_REASONS",
     "StateStore",
+    "StopAttempt",
+    "STOP_ATTEMPT_OUTCOMES",
     "StopDetail",
     "STOP_REASONS",
     "WorktreeRecord",

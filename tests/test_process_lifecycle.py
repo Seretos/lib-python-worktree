@@ -36,6 +36,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _HANDLE_QUERY_GRACE_SEC,
     _HANDLE_QUERY_TIMEOUT_SEC,
     _MAX_WEDGED_HANDLE_WORKERS,
+    _describe_pid,
     _find_blocking_processes,
     _force_kill,
     _kill_blocking_processes,
@@ -54,6 +55,9 @@ from lib_python_worktree.core.process_lifecycle import (
 )
 from lib_python_worktree.core.manager import WorktreeNotFoundError
 from lib_python_worktree.core.state import (
+    STOP_ATTEMPT_ALREADY_EXITED,
+    STOP_ATTEMPT_KILLED,
+    STOP_ATTEMPT_TRACKED_PID_MISSING,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
     STOP_REASON_SURVIVORS,
@@ -3357,29 +3361,45 @@ class TestWinHandleHoldersReal:
         sys.platform != "win32",
         reason="Windows-only: exercises ntdll/ctypes handle enumeration",
     )
-    def test_budget_sec_bounds_real_scan_wall_clock(self, tmp_path):
-        """Regression for the deadline-threading fix: passing a near-zero
-        ``budget_sec`` must make the per-handle resolution loop bail out
-        almost immediately against the real, full system handle table,
-        rather than spending up to the full 15s _HANDLE_SCAN_BUDGET_SEC
-        ceiling. This is the real (non-mocked) mechanism that
-        _find_blocking_processes relies on to keep Pass 1c bounded by
-        whatever remains of a caller's overall timeout."""
+    def test_zero_budget_skips_per_handle_loop_entirely(self, tmp_path, monkeypatch):
+        """De-flake (ticket #107): the previous version of this test asserted
+        ``elapsed < 8.0`` around a real, unmocked handle-table dump -- on a
+        loaded CI runner the dump itself (unavoidable; see below) could
+        legitimately exceed that threshold even with correct behaviour,
+        making the assertion measure ambient system load rather than the
+        contract under test. This is the same class of fix as D5's
+        ``test_handle_scan_truncated_by_own_deadline`` and the N2/N3 tests
+        above (see their rationale comments): prove the *structural*
+        contract -- "budget_sec <= 0 means the per-PID/per-handle
+        resolution loop never executes a single query" -- by spying on
+        ``_BoundedQueryWorker.submit`` (the function that loop would have to
+        call at least once to resolve even a single handle) and asserting it
+        is never invoked, rather than by racing a stopwatch against
+        unpredictable ambient load.
+
+        The handle-table dump/parse itself (``NtQuerySystemInformation`` +
+        structure walk) runs unconditionally before the per-handle loop's
+        deadline check is ever consulted -- that part is real and unmocked,
+        so this still exercises the genuine early-exit path against the live
+        system, just without timing it."""
         target = str(tmp_path / "definitely-not-a-real-worktree")
+        calls: List[int] = []
 
-        t0 = time.monotonic()
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.CAPPED, None)
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
         result = _win_handle_holders(target, excluded_pids=set(), budget_sec=0.0)
-        elapsed = time.monotonic() - t0
 
-        assert result == []
-        # Well under the 15s ceiling -- the handle-table dump itself is
-        # unavoidable, but the per-handle resolution loop must not run once
-        # the (already-expired) budget is exhausted.
-        assert elapsed < 8.0, (
-            f"_win_handle_holders(budget_sec=0.0) took {elapsed:.2f}s -- expected "
-            "it to bail out of the per-handle loop almost immediately instead of "
-            "spending time comparable to the full _HANDLE_SCAN_BUDGET_SEC ceiling"
+        assert not calls, (
+            "_BoundedQueryWorker.submit was invoked -- the per-handle "
+            "resolution loop ran despite budget_sec=0.0 (already expired at "
+            "entry), which is exactly what this contract forbids"
         )
+        assert result == []
+        assert result.complete is False
 
     @pytest.mark.skipif(
         sys.platform != "win32",
@@ -4793,6 +4813,604 @@ class TestStopDetail:
 
 
 # ---------------------------------------------------------------------------
+# TestStopAttemptOutcome -- ticket #110
+# ---------------------------------------------------------------------------
+
+class TestStopAttemptOutcome:
+    """Regression tests for ticket #110: stop() must attach a machine-
+    readable ``StopAttempt`` to ``record.stop_attempt`` distinguishing
+    "nothing needed killing" from "the tracked PID had already gone stale
+    while real work it spawned kept running" (the stale-tracked-pid-for-
+    composite-command finding, #110-1) from the ordinary case where the
+    tracked pid was alive at entry."""
+
+    def test_outcome_killed_when_tracked_pid_alive(self):
+        """Driving test: tracked pid alive at entry -> stop_attempt.outcome
+        == "killed"."""
+        fake_pid = 91000
+        record = _make_record("wt-attempt-killed", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-attempt-killed", store=store, timeout=1.0)
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_KILLED
+        assert result.stop_attempt.tracked_pid == fake_pid
+        assert result.stop_attempt.tracked_pid_alive is True
+        assert result.stop_attempt.role == DEFAULT_ROLE
+
+    def test_outcome_already_exited_when_nothing_found(self):
+        """Driving test: tracked pid dead at entry AND nothing from its
+        tree/process-group/job/orphan-scan was found -> stop_attempt.outcome
+        == "already_exited", killed_pids == [] (the genuinely-nothing-to-do
+        case, distinct from tracked_pid_missing below)."""
+        fake_pid = 91100
+        record = _make_record("wt-attempt-exited", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+        ):
+            result = stop("wt-attempt-exited", store=store, timeout=1.0)
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_ALREADY_EXITED
+        assert result.stop_attempt.tracked_pid_alive is False
+        assert result.killed_pids == []
+
+    def test_outcome_tracked_pid_missing_when_tree_survives_dead_tracked_pid(self):
+        """Driving test (finding #110-1): tracked pid already dead at entry,
+        BUT its descendant tree still has a member -> stop_attempt.outcome
+        == "tracked_pid_missing" -- the tracked pid had gone stale for a
+        composite/chained shell command while real work it spawned kept
+        running under a different, untracked pid."""
+        fake_pid = 91200
+        child = KilledProcessInfo(pid=91201, name="child", cmdline=["child"])
+        record = _make_record("wt-attempt-missing", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-attempt-missing", store=store, timeout=1.0)
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+        assert result.stop_attempt.tracked_pid_alive is False
+        assert result.stop_attempt.kill_orphans_may_help is True
+
+    def test_outcome_already_exited_when_only_unrelated_orphan_found(self):
+        """Driving test (reviewer fix cycle, blocking finding #1): tracked
+        pid dead at entry, its OWN tree/process-group/job is genuinely empty,
+        but the unrelated path-heuristic orphan scan (kill_orphans=True)
+        separately found and killed something. This must still be
+        "already_exited", NOT "tracked_pid_missing" -- an orphan-scan hit
+        says nothing about whether the tracked pid's own descendant
+        tree/process-group/job survived it, so it must never be folded into
+        that determination. Before the fix, `_something_else_found =
+        bool(killed_tree) or bool(orphan_found)` conflated the two, so this
+        exact scenario (empty killed_tree, non-empty orphan_found) was
+        mislabeled "tracked_pid_missing" with a message falsely claiming
+        "tree/process-group/job" evidence."""
+        fake_pid = 91300
+        orphan = KilledProcessInfo(
+            pid=91301, name="orphan", cmdline=["orphan"], source="orphan_scan",
+        )
+        record = _make_record("wt-attempt-orphan-only", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                side_effect=lambda p: False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([orphan]),
+            ),
+        ):
+            result = stop(
+                "wt-attempt-orphan-only", store=store, timeout=1.0, kill_orphans=True,
+            )
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_ALREADY_EXITED
+        assert result.stop_attempt.tracked_pid_alive is False
+
+    def test_kill_orphans_may_help_false_for_tracked_pid_missing_when_already_run(self):
+        """Edge case: kill_orphans_may_help must be False for
+        tracked_pid_missing when kill_orphans=True was already passed on
+        this call -- retrying offers nothing new."""
+        fake_pid = 91250
+        child = KilledProcessInfo(pid=91251, name="child", cmdline=["child"])
+        record = _make_record("wt-attempt-missing-help", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([]),
+            ),
+        ):
+            result = stop(
+                "wt-attempt-missing-help", store=store, timeout=1.0, kill_orphans=True,
+            )
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+        assert result.stop_attempt.kill_orphans_may_help is False
+
+    def test_start_clears_leftover_stop_attempt(self):
+        """start() must clear a leftover stop_attempt from a previous
+        stop() call, mirroring how it already clears stop_detail."""
+        from lib_python_worktree.core.state import StopAttempt
+
+        record = _make_record(
+            "wt-attempt-start-clears",
+            stop_attempt=StopAttempt(outcome=STOP_ATTEMPT_KILLED, message="stale"),
+        )
+        store = _make_store(record)
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._spawn_detached"
+        ) as mock_spawn:
+            mock_proc = MagicMock()
+            mock_proc.pid = 91300
+            mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=0.25)
+            mock_spawn.return_value = mock_proc
+
+            result = start("wt-attempt-start-clears", ["echo", "hi"], store=store)
+
+        assert result.stop_attempt is None
+
+
+# ---------------------------------------------------------------------------
+# TestKilledPidsIdentifiability -- ticket #110
+# ---------------------------------------------------------------------------
+
+class TestKilledPidsIdentifiability:
+    """Regression tests for ticket #110, finding #110-3: every
+    ``killed_pids`` entry must carry a ``source`` provenance tag, and
+    duplicate-pid entries from two sources must keep the richer (non-empty
+    name/cmdline) one rather than first-wins."""
+
+    def test_describe_pid_never_raises_on_access_denied(self):
+        """_describe_pid must never raise -- an AccessDenied/NoSuchProcess
+        failure degrades to ("", [])."""
+        import psutil
+
+        with patch.object(
+            psutil, "Process", side_effect=psutil.AccessDenied(pid=12345)
+        ):
+            name, cmdline = _describe_pid(12345)
+
+        assert name == ""
+        assert cmdline == []
+
+    def test_describe_pid_never_raises_on_no_such_process(self):
+        import psutil
+
+        with patch.object(
+            psutil, "Process", side_effect=psutil.NoSuchProcess(pid=12345)
+        ):
+            name, cmdline = _describe_pid(12345)
+
+        assert name == ""
+        assert cmdline == []
+
+    def test_tracked_pid_entry_has_source_tracked(self):
+        """The tracked-pid killed_pids entry carries source="tracked"."""
+        fake_pid = 92000
+        record = _make_record("wt-source-tracked", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-source-tracked", store=store, timeout=1.0)
+
+        tracked_entries = [info for info in result.killed_pids if info.pid == fake_pid]
+        assert len(tracked_entries) == 1
+        assert tracked_entries[0].source == "tracked"
+
+    def test_tree_entry_has_source_tree(self):
+        fake_pid = 92100
+        child = KilledProcessInfo(
+            pid=92101, name="child", cmdline=["child"], source="tree",
+        )
+        record = _make_record("wt-source-tree", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[child],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+        ):
+            result = stop("wt-source-tree", store=store, timeout=1.0)
+
+        matching = [info for info in result.killed_pids if info.pid == 92101]
+        assert len(matching) == 1
+        assert matching[0].source == "tree"
+
+    def test_process_group_only_entry_has_source_process_group(self):
+        fake_pid = 92200
+        group_only_pid = 92201
+        record = _make_record("wt-source-group", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[group_only_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-source-group", store=store, timeout=1.0)
+
+        matching = [info for info in result.killed_pids if info.pid == group_only_pid]
+        assert len(matching) == 1
+        assert matching[0].source == "process_group"
+
+    def test_job_only_entry_has_source_job_object(self):
+        """A Job Object member not already covered by the ppid-tree or
+        process-group snapshot must be tagged source="job_object", with its
+        name/cmdline populated from the pre-terminate _describe_pid
+        snapshot (ticket #110, finding #110-3) -- mirroring how
+        process_group/tree/orphan_scan/tracked entries are already
+        covered above."""
+        fake_pid = 92500
+        member_pid = 92501
+        record = _make_record(
+            "wt-source-job",
+            pids={DEFAULT_ROLE: fake_pid},
+            job_names={DEFAULT_ROLE: "Local\\fake-job-source"},
+        )
+        store = _make_store(record)
+
+        def _fake_describe(pid):
+            if pid == member_pid:
+                return ("job-member.exe", ["job-member.exe", "--flag"])
+            return ("", [])
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([member_pid]),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._describe_pid",
+                side_effect=_fake_describe,
+            ),
+        ):
+            result = stop("wt-source-job", store=store, timeout=1.0)
+
+        matching = [info for info in result.killed_pids if info.pid == member_pid]
+        assert len(matching) == 1
+        assert matching[0].source == "job_object"
+        assert matching[0].name == "job-member.exe"
+        assert matching[0].cmdline == ["job-member.exe", "--flag"]
+
+    def test_orphan_entry_has_source_orphan_scan(self):
+        fake_pid = 92300
+        orphan = KilledProcessInfo(
+            pid=92301, name="orphan", cmdline=["orphan"], source="orphan_scan",
+        )
+        record = _make_record("wt-source-orphan", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([orphan]),
+            ),
+        ):
+            result = stop(
+                "wt-source-orphan", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == 92301]
+        assert len(matching) == 1
+        assert matching[0].source == "orphan_scan"
+
+    def test_dedup_prefers_richest_entry(self):
+        """A pid appearing twice -- once bare (empty name/cmdline, e.g. a
+        process-group/job-object artifact) and once with real metadata --
+        must keep the richer entry, not first-wins."""
+        fake_pid = 92400
+        shared_pid = 92401
+        bare = KilledProcessInfo(pid=shared_pid, name="", cmdline=[], source="tree")
+        rich = KilledProcessInfo(
+            pid=shared_pid, name="real-name", cmdline=["real", "cmd"],
+            source="orphan_scan",
+        )
+        record = _make_record("wt-source-dedup", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[bare],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([rich]),
+            ),
+        ):
+            result = stop(
+                "wt-source-dedup", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == shared_pid]
+        assert len(matching) == 1
+        assert matching[0].name == "real-name", (
+            "dedup must prefer the richer (non-empty name/cmdline) entry, "
+            "not first-wins"
+        )
+        assert matching[0].cmdline == ["real", "cmd"]
+
+    def test_dedup_prefers_richer_entry_between_two_partially_populated(self):
+        """Driving test for review round 4's blocking finding: the OLD dedup
+        logic only distinguished has-any-metadata vs has-none, so once the
+        first-seen entry for a pid had ANY metadata (e.g. name set but
+        cmdline empty), a later duplicate with STRICTLY RICHER metadata (both
+        name AND a full cmdline) was wrongly discarded -- has-any-metadata
+        was already True, so `candidate_has_metadata and not
+        existing_has_metadata` never fired. The fix scores richness by how
+        many of {name, cmdline} are populated, so the two-populated-fields
+        entry must win over the one-populated-fields entry regardless of
+        which was appended first."""
+        fake_pid = 92500
+        shared_pid = 92501
+        partial = KilledProcessInfo(
+            pid=shared_pid, name="proc.exe", cmdline=[], source="tree",
+        )
+        fuller = KilledProcessInfo(
+            pid=shared_pid, name="proc.exe", cmdline=["proc.exe", "--flag"],
+            source="orphan_scan",
+        )
+        record = _make_record("wt-source-dedup-partial", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[partial],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([fuller]),
+            ),
+        ):
+            result = stop(
+                "wt-source-dedup-partial", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        matching = [info for info in result.killed_pids if info.pid == shared_pid]
+        assert len(matching) == 1
+        assert matching[0].cmdline == ["proc.exe", "--flag"], (
+            "dedup must prefer the entry with MORE populated fields (name "
+            "AND cmdline) over one with fewer (name only), not just "
+            "any-metadata-vs-none"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestStaleTrackedPidCompositeCommand -- ticket #110, finding #110-1
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group only")
+class TestStaleTrackedPidCompositeCommand:
+    """Regression test for finding #110-1: a composite/chained shell
+    command (e.g. ``sh -c "... & long_running_child"``) can leave the
+    tracked wrapper pid dead while the backgrounded child survives under a
+    different, untracked pid but the SAME process group (start_new_session
+    guarantees pgid == the tracked pid). Before this ticket, stop() bailed
+    out of _process_group_members the instant os.getpgid(tracked_pid) raised
+    OSError (leader already reaped), so the surviving child was never found,
+    never killed, and stop() silently reported killed_pids: [] /
+    status="stopped"."""
+
+    def test_stop_finds_and_kills_survivor_of_dead_leader_composite_command(self):
+        """Driving test: spawn a real `sh -c` wrapper that exits almost
+        immediately while backgrounding a long-running child in the same
+        process group; stop() must find that child via
+        _process_group_members, kill it, report it with
+        source="process_group", and set stop_attempt.outcome ==
+        "tracked_pid_missing"."""
+        marker = Path(_tempdir_for_test()) / f"pgroup-marker-{os.getpid()}"
+        if marker.exists():
+            marker.unlink()
+
+        proc = _spawn_detached(
+            [
+                "sh", "-c",
+                # Ticket #110 fix cycle (blocking finding #2): capture `$!`
+                # immediately after backgrounding the marker-write job, into
+                # pid1, BEFORE backgrounding `sleep 30` -- `$!` always refers
+                # to the most recently backgrounded job, so waiting on a
+                # bare `$!` taken after both jobs are backgrounded would
+                # actually be `sleep 30`'s pid, blocking this wrapper for
+                # the full 30s instead of letting it exit right after the
+                # marker write (which is what makes the wrapper's PID go
+                # stale while `sleep 30` keeps running -- the scenario this
+                # test exists to exercise).
+                f"echo started > {marker} & pid1=$!; sleep 30 & wait $pid1",
+            ],
+            env=dict(os.environ),
+            cwd=None,
+            log_path=Path(_tempdir_for_test()) / f"pgroup-log-{os.getpid()}.log",
+        )
+        wrapper_pid = proc.pid
+
+        try:
+            # Wait for the backgrounded grandchild to actually start, then
+            # let the wrapper shell itself exit -- `wait $pid1` returns once
+            # the marker-write job (not `sleep 30`) has finished, so the
+            # outer `sh -c` process this test tracks exits shortly after,
+            # while `sleep 30` (spawned into the SAME process group --
+            # start_new_session guarantees pgid == wrapper_pid) keeps
+            # running under a different, now-untracked pid.
+            deadline = time.monotonic() + 10.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.exists(), "wrapper never reached the backgrounding point"
+
+            # Poll for the wrapper to actually exit so os.getpgid(wrapper_pid)
+            # is guaranteed to raise OSError (leader reaped) by the time
+            # stop() runs -- this is what makes the test exercise finding
+            # #110-1's dead-leader path rather than the ordinary alive path.
+            # `proc` is this test process's own child, so a wrapper that has
+            # exited but not yet been waited on lingers as a zombie -- for
+            # which `_pid_alive` (os.kill(pid, 0)) keeps reading "alive"
+            # forever. `proc.poll()` performs the reaping wait4/waitpid
+            # itself, so it (unlike raw `_pid_alive`) actually observes and
+            # clears the exit.
+            deadline = time.monotonic() + 10.0
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert proc.poll() is not None, "wrapper did not exit in time"
+
+            record = _make_record(
+                "wt-composite-stale", pids={DEFAULT_ROLE: wrapper_pid},
+            )
+            store = _make_store(record)
+
+            result = stop("wt-composite-stale", store=store, timeout=10.0)
+
+            process_group_entries = [
+                info for info in result.killed_pids
+                if info.source == "process_group"
+            ]
+            assert process_group_entries, (
+                "the surviving `sleep 30` grandchild (same process group as "
+                "the dead wrapper) must be found via _process_group_members "
+                "and reported with source='process_group'"
+            )
+            assert result.stop_attempt is not None
+            assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+            for info in process_group_entries:
+                assert not _pid_alive(info.pid), (
+                    f"survivor pid {info.pid} must actually be killed by stop()"
+                )
+        finally:
+            if marker.exists():
+                marker.unlink()
+            if _pid_alive(wrapper_pid):
+                _force_kill(wrapper_pid)
+
+
+def _tempdir_for_test() -> str:
+    import tempfile
+    return tempfile.gettempdir()
+
+
+# ---------------------------------------------------------------------------
 # TestDiscoveryBudget -- ticket #87
 # ---------------------------------------------------------------------------
 
@@ -5277,6 +5895,249 @@ class TestDiscoveryCompleteness:
         assert result.complete is False
         assert "open_files:truncated" in result.skipped_passes
 
+    # -- D9 (ticket #107): Pass 2 (open_files) OS-wide RuntimeError ---------
+
+    def test_open_files_runtime_error_degrades_instead_of_raising(self):
+        """D9: psutil's Windows open_files() can raise a bare RuntimeError
+        (e.g. "SystemExtendedHandleInformation buffer too big") when the
+        OS-wide handle table is large. Pass 2 must catch it, stop scanning
+        (the condition is process-independent -- every remaining PID would
+        raise identically), and report "open_files:degraded" instead of
+        letting the exception propagate out of _find_blocking_processes and
+        crash every caller (stop()/remove())."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = RuntimeError(
+                "SystemExtendedHandleInformation buffer too big"
+            )
+            return proc
+
+        procs = [_make_raising_proc(66000 + i) for i in range(3)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            # D9's RuntimeError catch is Windows-only (see the platform-gate
+            # regression test below) -- this is the platform on which the
+            # real condition occurs, so exercise it here.
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is False
+        assert "open_files:degraded" in result.skipped_passes
+        assert result == []
+
+    def test_open_files_runtime_error_stops_pass_after_first_pid(self):
+        """Additional coverage: the OS-wide condition means every remaining
+        PID would raise identically, so Pass 2 must break (not continue) --
+        open_files() must be invoked exactly once, not once per raising
+        proc, and the tag must be emitted exactly once."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)
+            proc.open_files.side_effect = RuntimeError("buffer too big")
+            return proc
+
+        procs = [_make_raising_proc(67000 + i) for i in range(50)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            # D9's RuntimeError catch is Windows-only -- see the
+            # platform-gate regression test below.
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        called = sum(1 for p in procs if p.open_files.called)
+        assert called == 1, (
+            f"expected exactly 1 open_files() call before the pass breaks "
+            f"out entirely, got {called}"
+        )
+        assert result.skipped_passes.count("open_files:degraded") == 1
+        assert result == []
+
+    def test_open_files_access_denied_still_continues_no_regression(self):
+        """No-regression guard: AccessDenied/NoSuchProcess from open_files()
+        must still `continue` per-PID (not degrade the whole pass) -- this
+        pre-existing behaviour must survive the new RuntimeError handling."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_denied_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)
+            proc.open_files.side_effect = psutil.AccessDenied(pid)
+            return proc
+
+        procs = [_make_denied_proc(68000 + i) for i in range(5)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is True
+        assert result.skipped_passes == ()
+        assert all(p.open_files.called for p in procs)
+
+    def test_open_files_truncation_wins_over_degradation_if_deadline_fires_first(self):
+        """If Pass 2's per-loop deadline check fires before a
+        RuntimeError-raising proc is reached, "open_files:truncated" wins --
+        the pass never got a chance to observe the RuntimeError, so it must
+        not be tagged "open_files:degraded". Distinguishes D7 (truncated:
+        ran out of clock) from D9 (degraded: OS refused the query
+        outright)."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_proc(pid, open_files_effect):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = open_files_effect
+            return proc
+
+        def _fast():
+            return []
+
+        def _slow():
+            time.sleep(0.3)
+            return []
+
+        def _would_raise():
+            raise RuntimeError("buffer too big")
+
+        proc0 = _make_proc(70000, _fast)
+        proc1 = _make_proc(70001, _slow)
+        proc2 = _make_proc(70002, _would_raise)
+
+        def _process_iter_side_effect(*args, **kwargs):
+            return iter([proc0, proc1, proc2])
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            deadline = time.monotonic() + 0.1
+            result = _find_blocking_processes(target, host_pid, deadline=deadline)
+
+        assert result.complete is False
+        assert "open_files:truncated" in result.skipped_passes
+        assert "open_files:degraded" not in result.skipped_passes
+        assert not proc2.open_files.called
+
+    def test_open_files_runtime_error_reraises_on_non_windows(self):
+        """Regression test for the review finding on D9: the
+        "SystemExtendedHandleInformation buffer too big" condition is
+        Windows/psutil-C-extension-specific. On POSIX, a bare RuntimeError
+        from open_files() is NOT this known failure mode and must propagate
+        rather than being silently caught and mis-tagged as
+        "open_files:degraded" -- doing so would swallow and mis-attribute an
+        unrelated, genuinely unexpected bug on that platform."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = RuntimeError("some unrelated posix bug")
+            return proc
+
+        procs = [_make_raising_proc(71000)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            with pytest.raises(RuntimeError, match="some unrelated posix bug"):
+                _find_blocking_processes(target, host_pid)
+
+    def test_open_files_runtime_error_reraises_on_windows_if_unrelated_message(self):
+        """Full re-review finding (fix-loop round 2): D9's RuntimeError
+        catch must be scoped to the documented psutil failure signature
+        ("...buffer too big"), not to "any bare RuntimeError on Windows".
+        An unrelated Windows-side bug that happens to raise a plain
+        RuntimeError from open_files() must still propagate rather than
+        being silently downgraded to "open_files:degraded"."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = RuntimeError("some unrelated windows bug")
+            return proc
+
+        procs = [_make_raising_proc(72000)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            with pytest.raises(RuntimeError, match="some unrelated windows bug"):
+                _find_blocking_processes(target, host_pid)
+
     # -- N5: Windows-only passes simply not applicable on POSIX ------------
 
     def test_windows_only_passes_not_applicable_on_posix_leaves_complete_true(self):
@@ -5489,6 +6350,85 @@ class TestDiscoveryCompleteness:
         assert result.complete is False
         assert "lineage:truncated" in result.skipped_passes
 
+    # -- D9 (ticket #107): stop(kill_orphans=True) survives an open_files() --
+    # -- RuntimeError instead of crashing -------------------------------------
+
+    def test_stop_kill_orphans_reports_incomplete_on_open_files_degraded(self):
+        """R2 (ticket #107): when Pass 2's OS-wide open_files() RuntimeError
+        degrades discovery to an empty, incomplete _PartialList tagged
+        "open_files:degraded" (see D9 above), stop(kill_orphans=True) must
+        report "stop_incomplete" via STOP_REASON_ORPHAN_SCAN_INCOMPLETE --
+        exactly like any other incomplete-discovery tag -- rather than the
+        pre-fix behaviour of the RuntimeError propagating out of
+        _kill_blocking_processes and crashing stop() entirely. This pins the
+        integration surface between _find_blocking_processes' D9 catch (via
+        _kill_blocking_processes' `if not found: return found` early return)
+        and stop()'s existing reporting branch; _find_blocking_processes' own
+        RuntimeError handling is covered directly by
+        TestDiscoveryCompleteness::
+        test_open_files_runtime_error_degrades_instead_of_raising above."""
+        fake_pid = 61003
+        record = _make_record(
+            "wt-discovery-degraded-open-files", pids={DEFAULT_ROLE: fake_pid}
+        )
+        store = _make_store(record)
+
+        degraded = _pl._PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=degraded,
+            ),
+        ):
+            result = stop(
+                "wt-discovery-degraded-open-files",
+                store=store,
+                kill_orphans=True,
+                timeout=5.0,
+            )
+
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        assert "open_files:degraded" in result.stop_detail.skipped_passes
+        assert result.stop_detail.kill_orphans_may_help is False
+
+    def test_stop_kill_orphans_false_unaffected_by_open_files_degradation(self):
+        """Negative pair: with kill_orphans=False, the orphan scan (and
+        therefore _find_blocking_processes) never runs at all -- a would-be
+        open_files() degradation is simply never observed, and stop() must
+        report "stopped" normally."""
+        fake_pid = 61004
+        record = _make_record(
+            "wt-discovery-degraded-no-orphans", pids={DEFAULT_ROLE: fake_pid}
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+            ) as mock_find,
+        ):
+            result = stop(
+                "wt-discovery-degraded-no-orphans",
+                store=store,
+                kill_orphans=False,
+                timeout=5.0,
+            )
+
+        assert result.status == "stopped"
+        mock_find.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestProcessGroupMembers -- ticket #87 follow-up, finding B3
@@ -5536,17 +6476,79 @@ class TestProcessGroupMembers:
 
         assert result == []
 
-    def test_dead_pid_returns_empty(self):
+    def test_dead_leader_no_members_returns_empty(self):
+        """Ticket #110: a dead leader (os.getpgid(pid) raises OSError -- the
+        leader has already been reaped) with no surviving group members
+        still yields [] -- but this is NO LONGER unconditional for any dead
+        leader (see test_dead_leader_finds_surviving_group_members below for
+        the composite-command regression this behavior change closes). This
+        replaces the old test_dead_pid_returns_empty, which asserted []
+        purely because the pre-#110 implementation bailed out immediately on
+        OSError without ever scanning for survivors."""
+        import psutil
+
+        host_pid = os.getpid()
+
+        def _fake_getpgid(p):
+            if p == 424242:
+                raise OSError("no such process")  # leader already reaped
+            if p in (0, host_pid):
+                return 999  # our own pgid -- distinct from the probed group
+            raise OSError("no such process")  # no member matches either
+
         with (
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-            patch.object(
-                os, "getpgid", create=True, side_effect=OSError("no such process")
-            ),
+            patch.object(os, "getpgid", create=True, side_effect=_fake_getpgid),
+            patch.object(psutil, "process_iter", return_value=[]),
         ):
             mock_sys.platform = "linux"
             result = _process_group_members(424242)
 
         assert result == []
+
+    def test_dead_leader_finds_surviving_group_members(self):
+        """Ticket #110, finding #110-1 (the composite/chained-shell-command
+        case): when the group leader has already been reaped
+        (os.getpgid(pid) raises OSError), a member that is STILL ALIVE and
+        shares pid's pgid must still be found. start_new_session=True (see
+        _spawn_detached) guarantees a group this module created has pgid ==
+        the tracked pid, so pid remains a valid probe for surviving members
+        even after the leader itself exits -- this is exactly what lets
+        stop() recover a backgrounded child of a wrapper shell (e.g. ``sh -c
+        "... & long_running_child"``) that exits while the child keeps
+        running under a different, untracked pid."""
+        import psutil
+
+        host_pid = os.getpid()
+        dead_leader_pid = 55000
+        survivor_pid = 55001
+
+        def _fake_getpgid(p):
+            if p == dead_leader_pid:
+                raise OSError("no such process")  # leader already reaped
+            if p in (0, host_pid):
+                return 999  # our own pgid
+            if p == survivor_pid:
+                return dead_leader_pid  # still shares the now-leaderless group
+            raise OSError("no such process")
+
+        proc_survivor = MagicMock()
+        proc_survivor.info = {"pid": survivor_pid}
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "getpgid", create=True, side_effect=_fake_getpgid),
+            patch.object(psutil, "process_iter", return_value=[proc_survivor]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_sys.platform = "linux"
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _process_group_members(dead_leader_pid)
+
+        assert result == [survivor_pid]
 
     def test_returns_other_members_sharing_pgid_excludes_self_and_host(self):
         """Only OTHER processes sharing the pgid are returned -- *pid*

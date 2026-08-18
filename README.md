@@ -191,7 +191,7 @@ at construction to clean up stale records.
 | `remove` | `(worktree_id: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False, *, checkout_path: Optional[str] = None)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. Target by `worktree_id` **or** `checkout_path`; a `checkout_path` pointing at an untracked/orphaned linked worktree is removed without needing `adopt()` first (see "Orphan worktree recovery" below — `checkout_path` for an untracked orphan, `worktree_id` for a tracked-but-deregistered one). `force=True` removes despite uncommitted changes; never bypasses the primary-checkout refusal. |
 | `adopt` | `(repo_root: str)` | `AdoptReport` | Import untracked on-disk worktrees into the state store. Requires `YamlStateStore`. |
 | `prune` | `(repo_root: str)` | `None` | Run `git worktree prune --expire=now` to clear stale git metadata. |
-| `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID under `role`, and records the variant under `record.variants[role]`, which is what `stop(variant=...)` resolves against. |
+| `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID under `role`, and records the variant under `record.variants[role]`, which is what `stop(variant=...)` resolves against. With `variant="default"` and no exact `name` match, a two-tier fallback applies: a lone unnamed step wins if present (back-compat), else a contract with exactly one `start:` step total resolves to that step regardless of its name (ticket #112) — multi-step contracts still raise `UnknownVariantError`. |
 | `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: Optional[str] = None, variant: Optional[str] = None, timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role` (or the role `variant` resolves to); force-kills if it does not exit within `timeout` seconds. `role=None` (the default) means `"main"`, same as `start()`. `variant=` resolves to the role that was started with it via `record.variants`; if `role` is also given, both must agree or `VariantResolutionError` is raised. An unknown or ambiguous `variant` also raises `VariantResolutionError` — see "`role` vs `variant`" below. On `status="stop_incomplete"`, see `stop_detail` below. |
 
 ### Orphan worktree recovery
@@ -406,7 +406,7 @@ memoised per removal attempt, so it never issues more than one extra
 
 When a `Step` does not specify `shell:`, `SetupRunner` picks:
 
-- **Windows:** `powershell.exe -NoProfile -Command`
+- **Windows:** `powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64 blob>`
 - **POSIX:** `bash -c`
 
 Per-step overrides (the `shell:` field):
@@ -415,8 +415,19 @@ Per-step overrides (the `shell:` field):
 |-------|-------------|
 | `bash` | `bash -c` |
 | `sh` | `sh -c` |
-| `pwsh` | `pwsh -NoProfile -Command` |
-| `powershell` | `powershell.exe -NoProfile -Command` |
+| `pwsh` | `pwsh -NoProfile -NonInteractive -EncodedCommand <base64 blob>` |
+| `powershell` | `powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64 blob>` |
+
+For `pwsh`/`powershell`, the step's `run:` line is base64-encoded (UTF-16LE)
+and passed via `-EncodedCommand` rather than appended as raw `-Command`
+text — including when the `run:` line is itself a self-wrapped/nested
+PowerShell invocation, e.g. `run: powershell -Command "..."`. A raw
+`-Command <text>` argument round-trips through both `subprocess`'s Windows
+argv re-quoting (`list2cmdline`) and PowerShell's own `-Command` re-parsing,
+which can mangle such a self-wrapped run line's quote structure and cause
+the step to fail silently. `-EncodedCommand` carries no spaces or quotes, so
+neither re-quoting pass can corrupt it, and previously-silent steps like
+this now run correctly. Exit-code semantics are unchanged from `-Command`.
 
 ### Git timeout
 
@@ -471,7 +482,17 @@ raises `ProcessAlreadyRunningError`.
 Whichever `variant` actually started a given `role` is recorded under
 `record.variants[role]` (persisted through `state.yaml`, mirroring
 `record.pids`/`record.job_names`: one entry per currently-tracked role, no
-entry at all for a role with no known variant). `stop(variant=...)` resolves
+entry at all for a role with no known variant). When `start()`'s
+`variant="default"` fallback resolves a *named* step (ticket #112 — a
+contract with exactly one `start:` step total, named or not),
+`record.variants[role]` records that step's own name (e.g. `"main"`), not
+the literal `"default"` — so `stop(variant="main")` resolves it correctly
+afterward. Note: after this fallback resolves a named step,
+`stop(variant="default")` will **not** find it — no role is ever recorded
+under the literal `"default"` in this case, so you must stop it with the
+step's actual name (`stop(variant="main")` in this example).
+
+`stop(variant=...)` resolves
 against this mapping so a caller that started `variant="web"` under some
 role does not have to separately track which role it used. Resolution can
 fail three ways, and each raises `VariantResolutionError` (carries

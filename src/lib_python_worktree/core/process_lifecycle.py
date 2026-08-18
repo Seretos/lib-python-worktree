@@ -64,11 +64,15 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .state import (
+    STOP_ATTEMPT_ALREADY_EXITED,
+    STOP_ATTEMPT_KILLED,
+    STOP_ATTEMPT_TRACKED_PID_MISSING,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
     STOP_REASON_SURVIVORS,
     STOP_REASON_TREE_TRUNCATED,
     StateStore,
+    StopAttempt,
     StopDetail,
     WorktreeRecord,
     _STOP_DETAIL_MAX_PIDS,
@@ -189,6 +193,13 @@ _HANDLE_SCAN_BUDGET_SEC = 15.0
 # collect for a single root pid. Defense in depth against a pathological or
 # cyclic process tree turning a single stop() call into an unbounded scan.
 _MAX_TREE_NODES = 256
+
+# Ticket #110: cap on how many PIDs a single _describe_pid() enrichment pass
+# (job-object / process-group member snapshotting) will look up name/cmdline
+# for before a stop() call. Bounds the extra psutil.Process(...) calls the
+# snapshot-time enrichment adds -- beyond the cap, entries keep empty
+# name/cmdline but still carry an accurate `source`.
+_DESCRIBE_MAX_PIDS = 256
 
 # Ticket #87: hard ceiling (seconds) on _find_blocking_processes' own
 # discovery cost -- Pass 1 (cwd), Pass 1b (cmdline tokens), Pass 1c (Windows
@@ -802,11 +813,27 @@ def _wait_or_kill(pid: int, timeout: float) -> None:
 
 @dataclass
 class KilledProcessInfo:
-    """Information about a process that was killed to unblock worktree removal."""
+    """Information about a process that was killed to unblock worktree removal.
+
+    ``source`` (ticket #110) is provenance: which discovery mechanism found
+    this pid -- one of ``"tree"`` (ppid-descendant walk, :func:`_process_tree`),
+    ``"process_group"`` (POSIX process-group snapshot,
+    :func:`_process_group_members`), ``"job_object"`` (Windows Job Object
+    member enumeration), ``"tracked"`` (the pid ``stop()`` was originally
+    given), or ``"orphan_scan"`` (the path-heuristic scan,
+    :func:`_find_blocking_processes` / :func:`_kill_blocking_processes`).
+    Defaults to ``"unknown"`` only for callers/tests constructed before this
+    field existed. A ``"job_object"``-sourced entry may legitimately be an
+    OS-created artifact of the job (e.g. a stray ``conhost.exe``) rather than
+    anything this module spawned directly -- ``source`` is what a caller
+    should filter/group on, never an empty ``name`` alone (an empty name can
+    also mean "psutil could not be queried in time", not "nothing there").
+    """
 
     pid: int
     name: str
     cmdline: List[str] = field(default_factory=list)
+    source: str = "unknown"
 
 
 class _PartialList(list):
@@ -824,7 +851,7 @@ class _PartialList(list):
     (whether a killed process is actually dead is the survivor re-probe's
     job, not this flag's) and never platform applicability (a pass simply
     not running on this OS, e.g. Pass 1b/1c on POSIX, is not incompleteness
-    -- see the D1-D8 / N1-N8 rules documented on ``_find_blocking_processes``
+    -- see the D1-D9 / N1-N8 rules documented on ``_find_blocking_processes``
     and ``_kill_blocking_processes``).
 
     ``skipped_passes`` names which pass(es) contributed to ``complete=False``,
@@ -851,6 +878,36 @@ class _PartialList(list):
         super().__init__(iterable)
         self.complete = complete
         self.skipped_passes = tuple(skipped_passes)
+
+
+def _describe_pid(pid: int) -> Tuple[str, List[str]]:
+    """Best-effort ``(name, cmdline)`` lookup for *pid* (ticket #110).
+
+    Never raises: any psutil failure (``NoSuchProcess``, ``AccessDenied``, or
+    anything else) degrades to ``("", [])`` -- mirrors the per-field
+    try/except style already used in :func:`_process_tree` and the Pass 1c
+    handle-scan enrichment in :func:`_find_blocking_processes`. Callers are
+    expected to invoke this BEFORE any signal is sent, while there is still a
+    chance the OS can answer -- once a process has been killed, both
+    ``name()`` and ``cmdline()`` reliably fail.
+    """
+    import psutil
+
+    name = ""
+    cmdline: List[str] = []
+    try:
+        proc = psutil.Process(pid)
+    except Exception:  # noqa: BLE001 -- e.g. NoSuchProcess/AccessDenied
+        return name, cmdline
+    try:
+        name = proc.name() or ""
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        cmdline = proc.cmdline() or []
+    except Exception:  # noqa: BLE001
+        pass
+    return name, cmdline
 
 
 def _process_tree(pid: int) -> List[KilledProcessInfo]:
@@ -1024,7 +1081,9 @@ def _process_tree(pid: int) -> List[KilledProcessInfo]:
             cmdline = proc.cmdline() or []
         except Exception:  # noqa: BLE001
             pass
-        result.append(KilledProcessInfo(pid=proc_pid, name=name, cmdline=cmdline))
+        result.append(
+            KilledProcessInfo(pid=proc_pid, name=name, cmdline=cmdline, source="tree")
+        )
 
     if truncated:
         # Ticket #87 follow-up, finding F2: make the cap's effect observable
@@ -1100,13 +1159,38 @@ def _process_group_members(pid: int) -> List[int]:
     the result into both the force-kill path and the candidate PIDs
     checked by the survivor re-probe.
 
-    Mirrors :func:`_signal_process_group`'s own guards exactly, so this only
-    ever returns members in the same situations that function would actually
-    signal the group: ``[]`` on Windows; ``[]`` when *pid* is not the leader
-    of its own group (``os.getpgid(pid) != pid``); ``[]`` when that group is
-    our own process group. The host process, its ancestors, and *pid* itself
-    are always excluded from the result -- callers already handle *pid*
-    separately.
+    Mirrors :func:`_signal_process_group`'s own guards, with one deliberate
+    divergence (ticket #110, finding #110-1): when ``os.getpgid(pid)`` raises
+    ``OSError`` -- the group LEADER has already been reaped -- this function
+    does NOT bail out to ``[]`` the way :func:`_signal_process_group` still
+    does. ``start_new_session=True`` (used by ``_spawn_detached`` for every
+    process this module spawns) guarantees the group *pid* originally
+    created has ``pgid == pid``, so *pid* remains a valid probe for
+    surviving members even after the leader itself has exited -- POSIX does
+    not recycle a pgid number while members of that group still exist. This
+    is exactly the composite/chained-shell-command case: a wrapper such as
+    ``sh -c "... & long_running_child"`` can exit (reaping the leader)
+    while the backgrounded child it started keeps running under a
+    different, untracked pid but the SAME process group. Before this
+    change, that survivor was invisible to this scan, so ``stop()`` would
+    silently report ``killed_pids: []`` / ``status="stopped"`` while the
+    child kept running.
+
+    Otherwise mirrors :func:`_signal_process_group`'s guards exactly: ``[]``
+    on Windows; ``[]`` when *pid* is alive but not the leader of its own
+    group (``os.getpgid(pid)`` succeeds and is ``!= pid`` -- signalling/
+    scanning a group we did not create could hit unrelated processes);
+    ``[]`` when that group is our own process group. The host process, its
+    ancestors, and *pid* itself are always excluded from the result --
+    callers already handle *pid* separately.
+
+    Known limitation -- PID reuse (accepted trade-off, same class already
+    documented on ``stop()``'s own module-level docstring): if the OS has
+    recycled *pid*'s integer for an unrelated process by the time this scan
+    runs, ``os.getpgid(pid)`` (dead-leader branch) or the per-member
+    ``os.getpgid(member_pid) == pgid`` comparisons below could match that
+    unrelated process's group instead. Not newly introduced by this change --
+    the identity of *pid* is trusted as-is throughout this module.
 
     Never raises: any psutil/OS failure degrades to a best-effort partial (or
     empty) list rather than propagating out of ``stop()``.
@@ -1116,9 +1200,14 @@ def _process_group_members(pid: int) -> List[int]:
     try:
         pgid = os.getpgid(pid)
     except OSError:
-        return []
-    if pgid != pid:
-        return []
+        # Ticket #110: the leader has already been reaped -- do not bail out
+        # here. start_new_session=True guarantees pgid == pid for any group
+        # this module created, so pid itself remains a valid pgid probe for
+        # the process_iter scan below (see the docstring above).
+        pgid = pid
+    else:
+        if pgid != pid:
+            return []
     try:
         own_pgid = os.getpgid(0)
     except OSError:
@@ -1987,7 +2076,10 @@ def _find_blocking_processes(
         ``_HANDLE_SCAN_BUDGET_SEC`` and skipped entirely once no budget
         remains.
     2. Open-file match — processes holding an open file handle inside *path*
-       (via ``psutil.open_files()``).
+       (via ``psutil.open_files()``). On Windows, a single call can raise a
+       bare ``RuntimeError`` when the OS-wide handle table is too large for
+       psutil's query to succeed (D9) -- this is process-independent, not a
+       per-PID failure; see the Returns section below.
 
     All passes exclude the host process and all its OS-level ancestors.
     Results are de-duplicated by PID.
@@ -2024,11 +2116,24 @@ def _find_blocking_processes(
     Pass 1b (``"cmdline:..."``), Pass 1c (``"handle_scan:..."``, including
     ``"handle_scan:failed"`` when :func:`_win_handle_holders` raised and was
     swallowed -- zero coverage from that pass, not a mere degradation), and
-    Pass 2 (``"open_files:..."``). A pass simply not applicable on this OS
-    (Pass 1b/1c off Windows) never contributes a tag. An individual PID
-    raising ``AccessDenied``/``NoSuchProcess`` within a pass is caught and
-    skipped (``continue``) without affecting that pass's completeness -- only
-    a whole pass being skipped/truncated/failed does.
+    Pass 2 (``"open_files:..."``, including ``"open_files:degraded"`` (D9)
+    when ``proc.open_files()`` raised a bare ``RuntimeError`` -- see below).
+    A pass simply not applicable on this OS (Pass 1b/1c off Windows) never
+    contributes a tag. An individual PID raising
+    ``AccessDenied``/``NoSuchProcess`` within a pass is caught and skipped
+    (``continue``) without affecting that pass's completeness -- only a
+    whole pass being skipped/truncated/failed/degraded does. A
+    ``RuntimeError`` from ``proc.open_files()`` on Windows (D9) is different
+    from those: it is *not* per-PID -- it reflects an OS-wide condition (the
+    handle table is too large for a single query) that will recur
+    identically for every remaining process, so Pass 2 stops early
+    (``break``, not ``continue``) and reports ``"open_files:degraded"``
+    rather than either silently continuing to burn the scan budget on
+    guaranteed failures or letting the exception escape and crash the
+    caller (ticket #107). This is distinct from ``"open_files:truncated"``
+    (D7): truncated means the loop ran out of clock (``scan_stop`` was
+    reached); degraded means the OS refused the query outright, independent
+    of remaining budget.
     """
     import psutil
 
@@ -2074,9 +2179,10 @@ def _find_blocking_processes(
     seen_pids: set[int] = set()
     result: List[KilledProcessInfo] = []
     # Ticket #95, finding 3: names of passes that were skipped entirely
-    # (entry guard false) or truncated (inner loop broke on scan_stop),
-    # failed (raised and was swallowed), in the order encountered. See the
-    # D1-D8 / N1-N8 rules documented above.
+    # (entry guard false), truncated (inner loop broke on scan_stop), failed
+    # (raised and was swallowed), or degraded (OS-wide condition made
+    # continuing pointless -- Pass 2 only, ticket #107), in the order
+    # encountered. See the D1-D9 / N1-N8 rules documented above.
     skipped_passes: List[str] = []
 
     # Pass 1: CWD match.
@@ -2103,6 +2209,7 @@ def _find_blocking_processes(
                             pid=pid,
                             name=proc.info["name"] or "",
                             cmdline=proc.info["cmdline"] or [],
+                            source="orphan_scan",
                         )
                     )
             except (psutil.AccessDenied, psutil.NoSuchProcess):
@@ -2139,6 +2246,7 @@ def _find_blocking_processes(
                                 pid=pid,
                                 name=proc.info["name"] or "",
                                 cmdline=cmdline,
+                                source="orphan_scan",
                             ))
                             break
                 except (psutil.AccessDenied, psutil.NoSuchProcess):
@@ -2199,7 +2307,10 @@ def _find_blocking_processes(
                     pass
                 seen_pids.add(pid)
                 result.append(
-                    KilledProcessInfo(pid=pid, name=proc_name or "", cmdline=cmdline)
+                    KilledProcessInfo(
+                        pid=pid, name=proc_name or "", cmdline=cmdline,
+                        source="orphan_scan",
+                    )
                 )
         else:
             skipped_passes.append("handle_scan:skipped")  # D4
@@ -2208,6 +2319,7 @@ def _find_blocking_processes(
     # away from the worktree but still hold file locks inside it.
     if time.monotonic() <= scan_stop:
         pass_truncated = False
+        pass_degraded = False
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             if time.monotonic() > scan_stop:
                 pass_truncated = True
@@ -2220,6 +2332,35 @@ def _find_blocking_processes(
                     open_files = proc.open_files()
                 except (psutil.AccessDenied, psutil.NoSuchProcess):
                     continue
+                except RuntimeError as exc:
+                    # D9 (ticket #107): psutil's Windows open_files() can
+                    # raise a bare RuntimeError (e.g.
+                    # "SystemExtendedHandleInformation buffer too big")
+                    # when the OS-wide handle table is large. This is
+                    # process-independent -- it will fail identically for
+                    # every remaining PID -- so continuing the loop would
+                    # just burn the discovery budget on guaranteed
+                    # failures. Stop this pass now and report the
+                    # degradation instead of letting the error escape and
+                    # crash the caller.
+                    #
+                    # Narrowly scoped to this documented psutil failure
+                    # signature (checked case-insensitively, matching this
+                    # module's existing convention for classifying error
+                    # text -- see the lock-signal detection elsewhere in
+                    # this package) -- a bare RuntimeError from
+                    # open_files() with any other message is an unexpected,
+                    # unrelated failure and must not be silently swallowed
+                    # and mis-attributed to "open_files:degraded"; re-raise
+                    # so it surfaces like any other unexpected error. Same
+                    # for POSIX, where this specific Windows C-extension
+                    # condition cannot occur at all.
+                    if sys.platform != "win32" or "buffer too big" not in str(
+                        exc
+                    ).lower():
+                        raise
+                    pass_degraded = True
+                    break
                 for finfo in open_files:
                     norm_fpath = os.path.normcase(os.path.normpath(finfo.path))
                     if norm_fpath.startswith(normalized + os.sep) or norm_fpath == normalized:
@@ -2229,6 +2370,7 @@ def _find_blocking_processes(
                                 pid=pid,
                                 name=proc.info["name"] or "",
                                 cmdline=proc.info["cmdline"] or [],
+                                source="orphan_scan",
                             )
                         )
                         break
@@ -2236,6 +2378,8 @@ def _find_blocking_processes(
                 continue
         if pass_truncated:  # D7
             skipped_passes.append("open_files:truncated")
+        elif pass_degraded:  # D9
+            skipped_passes.append("open_files:degraded")
     else:
         skipped_passes.append("open_files:skipped")  # D7
 
@@ -2446,6 +2590,10 @@ def start(
     # stop_incomplete outcome is now stale by the same invariant: stop_detail
     # is not None implies status == "stop_incomplete". Clear it in lockstep.
     record.stop_detail = None
+    # Ticket #110: mirror the stop_detail clear immediately above -- a
+    # leftover stop_attempt from a previous stop() call on this role is
+    # equally stale once a new process has been spawned for it.
+    record.stop_attempt = None
     record.returncode = returncode
     record.start_log_path = str(log_path)
     # Ticket #95, R5 (fix cycle: per-role, not a record-wide scalar --
@@ -2551,7 +2699,30 @@ def stop(
     itself (only when it was alive at entry), and the orphan scan (when
     ``kill_orphans=True``) -- de-duplicated, deepest-first. This is a
     transient, in-memory-only field: it is never persisted to ``state.yaml``
-    (see ``WorktreeRecord.killed_pids``'s own docstring).
+    (see ``WorktreeRecord.killed_pids``'s own docstring). Ticket #110,
+    finding #110-3: every entry carries a ``source`` -- ``"tree"``,
+    ``"process_group"``, ``"job_object"``, ``"tracked"``, or
+    ``"orphan_scan"`` -- naming which discovery mechanism found it, and
+    name/cmdline are captured at snapshot time (before any signal is sent)
+    wherever the OS can still answer, so a ``"process_group"``/
+    ``"job_object"`` entry is no longer an anonymous bare PID. A
+    ``"job_object"``-sourced entry may legitimately be an OS-created
+    artifact of the job (e.g. a stray ``conhost.exe``), not something this
+    module spawned directly -- ``source`` is what a caller should
+    filter/group on, never an empty ``name`` alone. A pid discovered by more
+    than one mechanism keeps whichever entry carries non-empty name/cmdline
+    (dedup prefers the richest entry, not first-wins).
+
+    ``record.stop_attempt`` (ticket #110, finding #110-2) is a
+    ``state.StopAttempt`` distinguishing "the tracked pid was alive at
+    entry" (``"killed"``) from "the tracked pid was already dead AND
+    genuinely nothing else was found" (``"already_exited"``) from "the
+    tracked pid was already dead BUT other process(es) from its tree/
+    process-group/job were found and killed anyway" (``"tracked_pid_missing"``
+    -- e.g. a composite/chained shell command whose wrapper exited while a
+    backgrounded child it spawned kept running under a different, untracked
+    pid). Orthogonal to ``stop_detail``/``status`` above and equally
+    transient -- see :class:`state.StopAttempt`'s own docstring.
 
     Status honesty (ticket #87)
     -----------------------------
@@ -2660,6 +2831,14 @@ def stop(
     # anything that only looks at the tracked PID.
     tree = _process_tree(pid)
 
+    # Ticket #110, finding #110-3: describe the tracked pid itself BEFORE any
+    # signal is sent -- once it is killed, psutil can no longer answer
+    # name()/cmdline() for it. Used below to enrich the tracked-pid
+    # KilledProcessInfo entry instead of constructing it with an empty
+    # name/cmdline (the root cause of "killed_pids" entries that look like
+    # anonymous bare PIDs).
+    tracked_pid_name, tracked_pid_cmdline = _describe_pid(pid)
+
     # Ticket #87 follow-up, finding F2: _process_tree's _MAX_TREE_NODES cap
     # truncates silently -- a tree with more descendants than the cap allows
     # leaves the excess neither collected, killed, nor checked below. This
@@ -2690,12 +2869,22 @@ def stop(
     job_handle: Optional[int] = None
     job_member_pids: List[int] = []
     job_list_truncated = False
+    job_pid_descriptions: Dict[int, Tuple[str, List[str]]] = {}
     if job_name:
         job_handle = _open_job_object(job_name)
         if job_handle is not None:
             job_members = _job_object_member_pids(job_handle)
             job_list_truncated = not getattr(job_members, "complete", True)
             job_member_pids = list(job_members)
+            # Ticket #110, finding #110-3: describe each member BEFORE
+            # _terminate_job_object runs below -- same snapshot-time
+            # rationale as tracked_pid_name/tracked_pid_cmdline above.
+            # Bounded by _DESCRIBE_MAX_PIDS: beyond the cap, an entry keeps
+            # empty metadata but still carries source="job_object".
+            for _jidx, _jpid in enumerate(job_member_pids):
+                if _jidx >= _DESCRIBE_MAX_PIDS:
+                    break
+                job_pid_descriptions[_jpid] = _describe_pid(_jpid)
         # else: no live handle available (POSIX, or OpenJobObjectW failed --
         # e.g. a restarted host whose predecessor's keeper handle already
         # closed the object). This is rule N7 -- a fallback degrading to the
@@ -2711,6 +2900,16 @@ def stop(
     # lineage) still get force-killed and checked by the survivor re-probe,
     # instead of silently surviving while stop() still reports "stopped".
     group_member_pids = _process_group_members(pid)
+    # Ticket #110, finding #110-3: describe each member BEFORE the graceful
+    # signal below -- same snapshot-time rationale as tracked_pid_name/
+    # tracked_pid_cmdline and job_pid_descriptions above. Bounded by
+    # _DESCRIBE_MAX_PIDS: beyond the cap, an entry keeps empty metadata but
+    # still carries source="process_group".
+    group_pid_descriptions: Dict[int, Tuple[str, List[str]]] = {}
+    for _gidx, _gpid in enumerate(group_member_pids):
+        if _gidx >= _DESCRIBE_MAX_PIDS:
+            break
+        group_pid_descriptions[_gpid] = _describe_pid(_gpid)
 
     # POSIX only: if *pid* is itself the leader of its own process group (as
     # start_new_session=True guarantees for processes we spawned), signal
@@ -2731,7 +2930,12 @@ def stop(
     # not orphan-hunting.
     tree_pids = {info.pid for info in tree}
     group_only_infos = [
-        KilledProcessInfo(pid=gpid, name="", cmdline=[])
+        KilledProcessInfo(
+            pid=gpid,
+            name=group_pid_descriptions.get(gpid, ("", []))[0],
+            cmdline=group_pid_descriptions.get(gpid, ("", []))[1],
+            source="process_group",
+        )
         for gpid in group_member_pids
         if gpid not in tree_pids and gpid != pid
     ]
@@ -2742,7 +2946,12 @@ def stop(
     # (both already handled elsewhere).
     already_covered = tree_pids | {info.pid for info in group_only_infos}
     job_only_infos = [
-        KilledProcessInfo(pid=jpid, name="", cmdline=[])
+        KilledProcessInfo(
+            pid=jpid,
+            name=job_pid_descriptions.get(jpid, ("", []))[0],
+            cmdline=job_pid_descriptions.get(jpid, ("", []))[1],
+            source="job_object",
+        )
         for jpid in job_member_pids
         if jpid not in already_covered and jpid != pid and jpid != os.getpid()
     ]
@@ -2823,15 +3032,40 @@ def stop(
     # it, so this never round-trips through state.yaml.
     _attempted_infos = list(killed_tree)
     if pid_was_alive:
-        _attempted_infos.append(KilledProcessInfo(pid=pid, name="", cmdline=[]))
+        _attempted_infos.append(
+            KilledProcessInfo(
+                pid=pid,
+                name=tracked_pid_name,
+                cmdline=tracked_pid_cmdline,
+                source="tracked",
+            )
+        )
     _attempted_infos.extend(orphan_found)
-    _seen_killed_pids: "set[int]" = set()
-    killed_pids: List[KilledProcessInfo] = []
+    # Ticket #110, finding #110-3: prefer the RICHEST entry per pid rather
+    # than first-wins -- a pid can legitimately appear from more than one
+    # discovery mechanism (e.g. a process-group member that the orphan scan
+    # also matched by cwd), and before this fix whichever source happened to
+    # be appended first silently won even when it carried no name/cmdline
+    # while a later duplicate had real metadata. Richness is scored by how
+    # many of {name, cmdline} are populated (0, 1, or 2) so a candidate with
+    # BOTH beats one with only one populated, which beats one with neither --
+    # not just an any-vs-none check, which would (wrongly) keep a
+    # partially-populated first entry over a strictly richer later one.
+    # Insertion order (and therefore killed_pids' existing deepest-first
+    # ordering) is preserved -- only the winning entry's CONTENT at that
+    # position can change, never its position.
+    def _richness(info: "KilledProcessInfo") -> int:
+        return (1 if info.name else 0) + (1 if info.cmdline else 0)
+
+    _seen_killed_pids: "Dict[int, KilledProcessInfo]" = {}
     for info in _attempted_infos:
-        if info.pid in _seen_killed_pids:
+        existing = _seen_killed_pids.get(info.pid)
+        if existing is None:
+            _seen_killed_pids[info.pid] = info
             continue
-        _seen_killed_pids.add(info.pid)
-        killed_pids.append(info)
+        if _richness(info) > _richness(existing):
+            _seen_killed_pids[info.pid] = info
+    killed_pids: List[KilledProcessInfo] = list(_seen_killed_pids.values())
     record.killed_pids = killed_pids
 
     # Clear the role regardless of whether the process was alive — the
@@ -2918,7 +3152,7 @@ def stop(
         # Ticket #95, finding 3: every candidate we DID collect came back
         # dead, but the orphan scan itself did not have full discovery
         # coverage (a pass was skipped/truncated/failed against the
-        # deadline -- see _PartialList/_find_blocking_processes' D1-D8
+        # deadline -- see _PartialList/_find_blocking_processes' D1-D9
         # rules). "Found nothing" and "never looked" used to be
         # indistinguishable ([] either way); reporting "stopped" here would
         # reintroduce exactly that silent false positive.
@@ -2966,6 +3200,65 @@ def stop(
         # fail the `record.status not in (...)` guard and fall through
         # untouched.
         record.stop_detail = None
+
+    # Ticket #110: StopAttempt -- orthogonal to stop_detail/status above,
+    # this answers "was the TRACKED pid itself alive at entry, or had it
+    # already gone stale?" and, when stale, "did that matter?". Closes
+    # finding #110-2: before this field existed, "genuinely nothing to kill"
+    # and "the tracked pid had gone stale but real work it spawned (e.g. a
+    # composite/chained shell command's backgrounded child) was still found
+    # and killed" both surfaced identically as killed_pids: []. See
+    # StopAttempt's own docstring for the full outcome vocabulary and why
+    # this is a separate field rather than overloading stop_detail --
+    # "tracked_pid_missing" is a SUCCESSFUL stop (something else was found
+    # and killed) and must never be reported as incomplete.
+    # Ticket #110 fix cycle (blocking finding #1): base this solely on
+    # killed_tree (the descendant tree/process-group/job recovery this
+    # message describes), NOT on orphan_found. orphan_found comes from the
+    # unrelated path-heuristic orphan scan (_kill_blocking_processes,
+    # cwd/cmdline matching against record.path) -- a hit there says nothing
+    # about whether the TRACKED pid's own tree/group/job was still alive.
+    # Folding it in mislabeled "tracked pid missing, but its tree/group/job
+    # was found and killed" for a case where the tree/group/job was in fact
+    # empty and only an unrelated orphan was found -- that is genuinely
+    # "already_exited", just with an orphan-scan hit alongside it.
+    _something_else_found = bool(killed_tree)
+    if pid_was_alive:
+        _stop_attempt_outcome = STOP_ATTEMPT_KILLED
+        _stop_attempt_message = (
+            f"stop(worktree_id={worktree_id}, role={role}): tracked pid "
+            f"{pid} was alive at entry; termination attempted"
+        )
+    elif _something_else_found:
+        _stop_attempt_outcome = STOP_ATTEMPT_TRACKED_PID_MISSING
+        _stop_attempt_message = (
+            f"stop(worktree_id={worktree_id}, role={role}): tracked pid "
+            f"{pid} had already exited at entry, but other process(es) "
+            f"from its descendant tree/process-group/job were found and "
+            f"killed -- the tracked pid may have gone stale (e.g. a "
+            f"composite/chained shell command) while real work it spawned "
+            f"kept running"
+        )
+        _logger.warning(_stop_attempt_message)
+    else:
+        _stop_attempt_outcome = STOP_ATTEMPT_ALREADY_EXITED
+        _stop_attempt_message = (
+            f"stop(worktree_id={worktree_id}, role={role}): tracked pid "
+            f"{pid} had already exited at entry; nothing found to kill"
+        )
+        _logger.debug(_stop_attempt_message)
+    record.stop_attempt = StopAttempt(
+        outcome=_stop_attempt_outcome,
+        message=_stop_attempt_message,
+        role=role,
+        tracked_pid=pid,
+        tracked_pid_alive=pid_was_alive,
+        kill_orphans_may_help=(
+            _stop_attempt_outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+            and not kill_orphans
+        ),
+    )
+
     store.update(record)
 
     return record
