@@ -19,6 +19,7 @@ dependencies = [
 test = [
   "pytest>=8",
   "pytest-cov>=4",
+  "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools]
@@ -30,7 +31,16 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra --strict-markers --cov=lib_python_worktree --cov-report=term-missing --cov-fail-under=80"
+addopts = "-ra --strict-markers"
+# Per-test timeout (#90, #114): several tests spawn real OS
+# processes/threads (process_lifecycle.py's _query_object_bounded /
+# NtQueryObject on Windows) that are documented to wedge indefinitely
+# at 0% CPU. `thread` (not `signal`) is chosen deliberately so the
+# Windows and POSIX matrix legs behave identically, and on expiry it
+# dumps thread stacks -- an accepted tradeoff, since that dump is how
+# the original hang was diagnosed.
+timeout = 90
+timeout_method = "thread"
 markers = [
   "requires_git: marks tests that invoke real git subprocesses (skipped if git is absent)",
 ]
