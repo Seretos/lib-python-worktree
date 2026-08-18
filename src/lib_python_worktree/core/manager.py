@@ -1928,7 +1928,44 @@ class WorktreeManager:
         kill_attempted = False
         if sys.platform == "win32":
             _preflight_blockers = _find_blocking_processes(record.path, os.getpid())
-            if _preflight_blockers:
+            # Ticket #107 fix cycle (review finding 2): an empty result is
+            # falsy regardless of *why* the scan came back empty --
+            # `_find_blocking_processes` returns an empty, *degraded*
+            # `_PartialList` (`.complete=False`, tagged
+            # ``"open_files:degraded"``, D9) rather than raising when Pass
+            # 2's `open_files()` hits the Windows-only "SystemExtendedHandle
+            # Information buffer too big" condition -- a process-independent
+            # failure where the OS refused the query outright, so this pass
+            # never got a real look at *any* process. A truthiness-only
+            # check here cannot distinguish that from "scanned and found
+            # nothing" and would silently fall through to the destructive
+            # `git worktree remove` call below -- reproducing exactly the
+            # locked/partial-directory failure mode this pre-flight exists
+            # to prevent.
+            #
+            # Deliberately narrower than "any incompleteness": ordinary
+            # per-pass timeouts (D3/D5/D7 `*:truncated` -- the scan ran out
+            # of its own clock budget partway through, e.g.
+            # `_HANDLE_SCAN_BUDGET_SEC`) are ALSO pre-existing
+            # `.complete=False` conditions on this exact `_PartialList`, but
+            # they are not "never got a real look" -- they mean the scan
+            # inspected as many processes as its budget allowed and simply
+            # ran out of time, which this pre-flight has always tolerated
+            # (a pre-#107 truthiness-only check already accepted a
+            # truncated-but-empty result). On a busy dev host with a large
+            # ambient process/handle count, a real Pass 1c/Pass 2 scan can
+            # legitimately truncate on every call -- treating that the same
+            # as "found a blocker" would make `remove()` unconditionally
+            # fail under exactly the ambient-load conditions ticket #107 is
+            # about, which is the opposite of this ticket's intent. So only
+            # the degraded tag -- not general `.complete` -- escalates here;
+            # `stop(kill_orphans=True)` still reports `stop_incomplete` for
+            # *any* incompleteness (truncated or degraded) because that is a
+            # status report, not a hard gate on a destructive action.
+            if _preflight_blockers or (
+                "open_files:degraded"
+                in getattr(_preflight_blockers, "skipped_passes", ())
+            ):
                 # Q2 (ticket #103): probe for real dirt BEFORE taking any
                 # irreversible action -- including the kill below. If real
                 # dirt is ALSO present, this removal cannot succeed on this
@@ -1946,6 +1983,23 @@ class WorktreeManager:
                     killed = _kill_blocking_processes(record.path)
                     record.killed_pids = killed
                     kill_attempted = True
+                    # Review finding (fix-loop round 2): _kill_blocking_processes
+                    # re-runs _find_blocking_processes itself and, per its own
+                    # `if not found: return found` early return, does nothing at
+                    # all when that rescan is STILL degraded -- the OS-wide
+                    # "buffer too big" condition is process-independent, so it
+                    # will typically recur immediately on retry. Killing
+                    # whatever *was* found (if anything) does not make the
+                    # remaining, un-inspectable process space any safer to
+                    # assume clear. Do not fall through to the destructive git
+                    # remove call on zero real new information; refuse
+                    # explicitly, the same way the initial gate above does.
+                    if "open_files:degraded" in getattr(
+                        killed, "skipped_passes", ()
+                    ):
+                        raise WorktreeDirLockedError(
+                            record.id, killed=list(killed), kill_attempted=True
+                        )
                     # Fall through to the (now-safe) git remove call below.
                 else:
                     # Caller did not opt into the kill-and-retry remedy: raise

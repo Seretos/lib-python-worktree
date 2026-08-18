@@ -23,6 +23,7 @@ import pytest
 from lib_python_worktree.core.manager import WorktreeManager, ManagerConfig
 from lib_python_worktree.core.process_lifecycle import (
     ProcessNotRunningError,
+    _PartialList,
 )
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 
@@ -2920,6 +2921,243 @@ class TestWindowsPreflightBlockingCheck:
 
         mock_find.assert_not_called()
         mock_kill.assert_not_called()
+        mock_git.assert_called_once()
+
+    def test_preflight_degraded_partial_raises_instead_of_silent_removal(
+        self, tmp_path
+    ):
+        """Ticket #107 fix cycle (review finding 2): when
+        _find_blocking_processes' Pass 2 degrades (e.g. psutil's
+        open_files() raised an OS-wide RuntimeError on Windows -- see
+        TestDiscoveryCompleteness::
+        test_open_files_runtime_error_degrades_instead_of_raising in
+        test_process_lifecycle.py), it returns an empty, degraded
+        _PartialList (complete=False, skipped_passes=("open_files:degraded",)).
+        A truthiness-only check on that empty list cannot distinguish
+        "scanned and found nothing" from "never got a real look", and would
+        silently fall through to the destructive `git worktree remove` call
+        -- reproducing exactly the locked/partial-directory failure mode
+        this pre-flight exists to prevent. _teardown must instead treat an
+        incomplete scan the same as "found a blocker": with
+        kill_blocking_processes=False it must raise WorktreeDirLockedError
+        BEFORE the destructive git call runs, not proceed straight through
+        like the genuinely-clean-scan case in
+        test_preflight_no_blockers_falls_through_to_normal_removal above."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-degraded", path="/fake/store/wt-preflight-degraded"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        degraded = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=degraded,
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.kill_attempted is False
+        mock_find.assert_called_once_with(record.path, os.getpid())
+        # The destructive `git worktree remove` must never run -- only the
+        # dirt-probe `git status` call (if any) is permitted before the
+        # raise.
+        for call_args in mock_git.call_args_list:
+            args = call_args.args[0] if call_args.args else call_args.kwargs.get("args")
+            assert args[:2] != ["worktree", "remove"], (
+                "git worktree remove must not run when the pre-flight scan "
+                "was incomplete and no kill was attempted"
+            )
+
+    def test_preflight_degraded_partial_kill_flag_on_attempts_kill_and_proceeds(
+        self, tmp_path
+    ):
+        """Companion to the above: with kill_blocking_processes=True, an
+        incomplete/degraded pre-flight scan must still attempt a kill (best
+        effort) before falling through to `git worktree remove`, exactly as
+        it already does for a scan that positively found a blocker -- it
+        must not skip the kill attempt just because the degraded scan
+        itself returned an empty list."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-degraded-killon",
+            path="/fake/store/wt-preflight-degraded-killon",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        degraded = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        call_order: List[str] = []
+
+        def _mock_kill(path):
+            call_order.append("kill")
+            return []
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                call_order.append("git_remove")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=degraded,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                side_effect=_mock_kill,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert call_order == ["kill", "git_remove"], (
+            f"expected pre-flight kill before git remove even on a "
+            f"degraded scan, got {call_order}"
+        )
+
+    def test_preflight_degraded_partial_kill_flag_on_rescan_still_degraded_raises(
+        self, tmp_path
+    ):
+        """Full re-review finding (fix-loop round 2): _kill_blocking_processes
+        re-runs _find_blocking_processes itself and, per its own `if not
+        found: return found` early return, does nothing at all when that
+        rescan is STILL degraded -- the OS-wide "buffer too big" condition
+        is process-independent, so it will typically recur immediately on
+        retry. Killing whatever *was* found (if anything) does not make the
+        remaining, un-inspectable process space any safer to assume clear.
+        Unlike the companion test above (where the kill's rescan comes back
+        clean and removal proceeds), a rescan that is STILL degraded must
+        raise WorktreeDirLockedError with kill_attempted=True rather than
+        falling through to the destructive `git worktree remove` call on
+        zero real new information."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-degraded-killon-stillblind",
+            path="/fake/store/wt-preflight-degraded-killon-stillblind",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        degraded = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+        still_degraded = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=degraded,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=still_degraded,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.kill_attempted is True
+        for call_args in mock_git.call_args_list:
+            args = call_args.args[0] if call_args.args else call_args.kwargs.get("args")
+            assert args[:2] != ["worktree", "remove"], (
+                "git worktree remove must not run when the kill's own "
+                "rescan is still degraded/blind"
+            )
+
+    def test_preflight_ordinary_truncation_falls_through_to_normal_removal(
+        self, tmp_path
+    ):
+        """Ticket #107 fix cycle (review finding 2, follow-up): the
+        completeness check added above must be scoped to the new
+        ``"open_files:degraded"`` tag specifically, NOT to
+        ``_PartialList.complete`` in general. Pass 1c/Pass 2 can also come
+        back with ``complete=False`` for the pre-existing, previously
+        tolerated ``"handle_scan:truncated"``/``"open_files:truncated"``
+        reasons (D5/D7) -- the scan simply ran out of its own time budget
+        partway through a real, large process/handle table, which is
+        expected and common on a busy dev host, not "never got a real
+        look". A pre-#107 truthiness-only check already accepted a
+        truncated-but-empty result and fell through to the normal removal
+        path; escalating *that* to WorktreeDirLockedError as well would
+        make `remove()` unconditionally fail under exactly the ambient-load
+        conditions ticket #107 is about, which is the opposite of this
+        ticket's intent. Only the degraded tag should escalate; ordinary
+        truncation must still fall through unchanged."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-truncated", path="/fake/store/wt-preflight-truncated"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        truncated = _PartialList(
+            [], complete=False, skipped_passes=("open_files:truncated",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=truncated,
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must not raise -- ordinary truncation is tolerated, unlike
+            # the degraded case above.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_find.assert_called_once_with(record.path, os.getpid())
         mock_git.assert_called_once()
 
 

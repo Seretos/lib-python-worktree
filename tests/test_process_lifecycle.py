@@ -3357,29 +3357,45 @@ class TestWinHandleHoldersReal:
         sys.platform != "win32",
         reason="Windows-only: exercises ntdll/ctypes handle enumeration",
     )
-    def test_budget_sec_bounds_real_scan_wall_clock(self, tmp_path):
-        """Regression for the deadline-threading fix: passing a near-zero
-        ``budget_sec`` must make the per-handle resolution loop bail out
-        almost immediately against the real, full system handle table,
-        rather than spending up to the full 15s _HANDLE_SCAN_BUDGET_SEC
-        ceiling. This is the real (non-mocked) mechanism that
-        _find_blocking_processes relies on to keep Pass 1c bounded by
-        whatever remains of a caller's overall timeout."""
+    def test_zero_budget_skips_per_handle_loop_entirely(self, tmp_path, monkeypatch):
+        """De-flake (ticket #107): the previous version of this test asserted
+        ``elapsed < 8.0`` around a real, unmocked handle-table dump -- on a
+        loaded CI runner the dump itself (unavoidable; see below) could
+        legitimately exceed that threshold even with correct behaviour,
+        making the assertion measure ambient system load rather than the
+        contract under test. This is the same class of fix as D5's
+        ``test_handle_scan_truncated_by_own_deadline`` and the N2/N3 tests
+        above (see their rationale comments): prove the *structural*
+        contract -- "budget_sec <= 0 means the per-PID/per-handle
+        resolution loop never executes a single query" -- by spying on
+        ``_BoundedQueryWorker.submit`` (the function that loop would have to
+        call at least once to resolve even a single handle) and asserting it
+        is never invoked, rather than by racing a stopwatch against
+        unpredictable ambient load.
+
+        The handle-table dump/parse itself (``NtQuerySystemInformation`` +
+        structure walk) runs unconditionally before the per-handle loop's
+        deadline check is ever consulted -- that part is real and unmocked,
+        so this still exercises the genuine early-exit path against the live
+        system, just without timing it."""
         target = str(tmp_path / "definitely-not-a-real-worktree")
+        calls: List[int] = []
 
-        t0 = time.monotonic()
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.CAPPED, None)
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
         result = _win_handle_holders(target, excluded_pids=set(), budget_sec=0.0)
-        elapsed = time.monotonic() - t0
 
-        assert result == []
-        # Well under the 15s ceiling -- the handle-table dump itself is
-        # unavoidable, but the per-handle resolution loop must not run once
-        # the (already-expired) budget is exhausted.
-        assert elapsed < 8.0, (
-            f"_win_handle_holders(budget_sec=0.0) took {elapsed:.2f}s -- expected "
-            "it to bail out of the per-handle loop almost immediately instead of "
-            "spending time comparable to the full _HANDLE_SCAN_BUDGET_SEC ceiling"
+        assert not calls, (
+            "_BoundedQueryWorker.submit was invoked -- the per-handle "
+            "resolution loop ran despite budget_sec=0.0 (already expired at "
+            "entry), which is exactly what this contract forbids"
         )
+        assert result == []
+        assert result.complete is False
 
     @pytest.mark.skipif(
         sys.platform != "win32",
@@ -5277,6 +5293,249 @@ class TestDiscoveryCompleteness:
         assert result.complete is False
         assert "open_files:truncated" in result.skipped_passes
 
+    # -- D9 (ticket #107): Pass 2 (open_files) OS-wide RuntimeError ---------
+
+    def test_open_files_runtime_error_degrades_instead_of_raising(self):
+        """D9: psutil's Windows open_files() can raise a bare RuntimeError
+        (e.g. "SystemExtendedHandleInformation buffer too big") when the
+        OS-wide handle table is large. Pass 2 must catch it, stop scanning
+        (the condition is process-independent -- every remaining PID would
+        raise identically), and report "open_files:degraded" instead of
+        letting the exception propagate out of _find_blocking_processes and
+        crash every caller (stop()/remove())."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = RuntimeError(
+                "SystemExtendedHandleInformation buffer too big"
+            )
+            return proc
+
+        procs = [_make_raising_proc(66000 + i) for i in range(3)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            # D9's RuntimeError catch is Windows-only (see the platform-gate
+            # regression test below) -- this is the platform on which the
+            # real condition occurs, so exercise it here.
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is False
+        assert "open_files:degraded" in result.skipped_passes
+        assert result == []
+
+    def test_open_files_runtime_error_stops_pass_after_first_pid(self):
+        """Additional coverage: the OS-wide condition means every remaining
+        PID would raise identically, so Pass 2 must break (not continue) --
+        open_files() must be invoked exactly once, not once per raising
+        proc, and the tag must be emitted exactly once."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)
+            proc.open_files.side_effect = RuntimeError("buffer too big")
+            return proc
+
+        procs = [_make_raising_proc(67000 + i) for i in range(50)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            # D9's RuntimeError catch is Windows-only -- see the
+            # platform-gate regression test below.
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        called = sum(1 for p in procs if p.open_files.called)
+        assert called == 1, (
+            f"expected exactly 1 open_files() call before the pass breaks "
+            f"out entirely, got {called}"
+        )
+        assert result.skipped_passes.count("open_files:degraded") == 1
+        assert result == []
+
+    def test_open_files_access_denied_still_continues_no_regression(self):
+        """No-regression guard: AccessDenied/NoSuchProcess from open_files()
+        must still `continue` per-PID (not degrade the whole pass) -- this
+        pre-existing behaviour must survive the new RuntimeError handling."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_denied_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)
+            proc.open_files.side_effect = psutil.AccessDenied(pid)
+            return proc
+
+        procs = [_make_denied_proc(68000 + i) for i in range(5)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert result.complete is True
+        assert result.skipped_passes == ()
+        assert all(p.open_files.called for p in procs)
+
+    def test_open_files_truncation_wins_over_degradation_if_deadline_fires_first(self):
+        """If Pass 2's per-loop deadline check fires before a
+        RuntimeError-raising proc is reached, "open_files:truncated" wins --
+        the pass never got a chance to observe the RuntimeError, so it must
+        not be tagged "open_files:degraded". Distinguishes D7 (truncated:
+        ran out of clock) from D9 (degraded: OS refused the query
+        outright)."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_proc(pid, open_files_effect):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = open_files_effect
+            return proc
+
+        def _fast():
+            return []
+
+        def _slow():
+            time.sleep(0.3)
+            return []
+
+        def _would_raise():
+            raise RuntimeError("buffer too big")
+
+        proc0 = _make_proc(70000, _fast)
+        proc1 = _make_proc(70001, _slow)
+        proc2 = _make_proc(70002, _would_raise)
+
+        def _process_iter_side_effect(*args, **kwargs):
+            return iter([proc0, proc1, proc2])
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            deadline = time.monotonic() + 0.1
+            result = _find_blocking_processes(target, host_pid, deadline=deadline)
+
+        assert result.complete is False
+        assert "open_files:truncated" in result.skipped_passes
+        assert "open_files:degraded" not in result.skipped_passes
+        assert not proc2.open_files.called
+
+    def test_open_files_runtime_error_reraises_on_non_windows(self):
+        """Regression test for the review finding on D9: the
+        "SystemExtendedHandleInformation buffer too big" condition is
+        Windows/psutil-C-extension-specific. On POSIX, a bare RuntimeError
+        from open_files() is NOT this known failure mode and must propagate
+        rather than being silently caught and mis-tagged as
+        "open_files:degraded" -- doing so would swallow and mis-attribute an
+        unrelated, genuinely unexpected bug on that platform."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = RuntimeError("some unrelated posix bug")
+            return proc
+
+        procs = [_make_raising_proc(71000)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "linux"
+
+            with pytest.raises(RuntimeError, match="some unrelated posix bug"):
+                _find_blocking_processes(target, host_pid)
+
+    def test_open_files_runtime_error_reraises_on_windows_if_unrelated_message(self):
+        """Full re-review finding (fix-loop round 2): D9's RuntimeError
+        catch must be scoped to the documented psutil failure signature
+        ("...buffer too big"), not to "any bare RuntimeError on Windows".
+        An unrelated Windows-side bug that happens to raise a plain
+        RuntimeError from open_files() must still propagate rather than
+        being silently downgraded to "open_files:degraded"."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        def _make_raising_proc(pid):
+            proc = MagicMock()
+            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
+            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
+            proc.open_files.side_effect = RuntimeError("some unrelated windows bug")
+            return proc
+
+        procs = [_make_raising_proc(72000)]
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            with pytest.raises(RuntimeError, match="some unrelated windows bug"):
+                _find_blocking_processes(target, host_pid)
+
     # -- N5: Windows-only passes simply not applicable on POSIX ------------
 
     def test_windows_only_passes_not_applicable_on_posix_leaves_complete_true(self):
@@ -5488,6 +5747,85 @@ class TestDiscoveryCompleteness:
 
         assert result.complete is False
         assert "lineage:truncated" in result.skipped_passes
+
+    # -- D9 (ticket #107): stop(kill_orphans=True) survives an open_files() --
+    # -- RuntimeError instead of crashing -------------------------------------
+
+    def test_stop_kill_orphans_reports_incomplete_on_open_files_degraded(self):
+        """R2 (ticket #107): when Pass 2's OS-wide open_files() RuntimeError
+        degrades discovery to an empty, incomplete _PartialList tagged
+        "open_files:degraded" (see D9 above), stop(kill_orphans=True) must
+        report "stop_incomplete" via STOP_REASON_ORPHAN_SCAN_INCOMPLETE --
+        exactly like any other incomplete-discovery tag -- rather than the
+        pre-fix behaviour of the RuntimeError propagating out of
+        _kill_blocking_processes and crashing stop() entirely. This pins the
+        integration surface between _find_blocking_processes' D9 catch (via
+        _kill_blocking_processes' `if not found: return found` early return)
+        and stop()'s existing reporting branch; _find_blocking_processes' own
+        RuntimeError handling is covered directly by
+        TestDiscoveryCompleteness::
+        test_open_files_runtime_error_degrades_instead_of_raising above."""
+        fake_pid = 61003
+        record = _make_record(
+            "wt-discovery-degraded-open-files", pids={DEFAULT_ROLE: fake_pid}
+        )
+        store = _make_store(record)
+
+        degraded = _pl._PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=degraded,
+            ),
+        ):
+            result = stop(
+                "wt-discovery-degraded-open-files",
+                store=store,
+                kill_orphans=True,
+                timeout=5.0,
+            )
+
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        assert "open_files:degraded" in result.stop_detail.skipped_passes
+        assert result.stop_detail.kill_orphans_may_help is False
+
+    def test_stop_kill_orphans_false_unaffected_by_open_files_degradation(self):
+        """Negative pair: with kill_orphans=False, the orphan scan (and
+        therefore _find_blocking_processes) never runs at all -- a would-be
+        open_files() degradation is simply never observed, and stop() must
+        report "stopped" normally."""
+        fake_pid = 61004
+        record = _make_record(
+            "wt-discovery-degraded-no-orphans", pids={DEFAULT_ROLE: fake_pid}
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+            ) as mock_find,
+        ):
+            result = stop(
+                "wt-discovery-degraded-no-orphans",
+                store=store,
+                kill_orphans=False,
+                timeout=5.0,
+            )
+
+        assert result.status == "stopped"
+        mock_find.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
