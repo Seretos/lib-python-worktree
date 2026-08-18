@@ -824,7 +824,7 @@ class _PartialList(list):
     (whether a killed process is actually dead is the survivor re-probe's
     job, not this flag's) and never platform applicability (a pass simply
     not running on this OS, e.g. Pass 1b/1c on POSIX, is not incompleteness
-    -- see the D1-D8 / N1-N8 rules documented on ``_find_blocking_processes``
+    -- see the D1-D9 / N1-N8 rules documented on ``_find_blocking_processes``
     and ``_kill_blocking_processes``).
 
     ``skipped_passes`` names which pass(es) contributed to ``complete=False``,
@@ -1987,7 +1987,10 @@ def _find_blocking_processes(
         ``_HANDLE_SCAN_BUDGET_SEC`` and skipped entirely once no budget
         remains.
     2. Open-file match — processes holding an open file handle inside *path*
-       (via ``psutil.open_files()``).
+       (via ``psutil.open_files()``). On Windows, a single call can raise a
+       bare ``RuntimeError`` when the OS-wide handle table is too large for
+       psutil's query to succeed (D9) -- this is process-independent, not a
+       per-PID failure; see the Returns section below.
 
     All passes exclude the host process and all its OS-level ancestors.
     Results are de-duplicated by PID.
@@ -2024,11 +2027,24 @@ def _find_blocking_processes(
     Pass 1b (``"cmdline:..."``), Pass 1c (``"handle_scan:..."``, including
     ``"handle_scan:failed"`` when :func:`_win_handle_holders` raised and was
     swallowed -- zero coverage from that pass, not a mere degradation), and
-    Pass 2 (``"open_files:..."``). A pass simply not applicable on this OS
-    (Pass 1b/1c off Windows) never contributes a tag. An individual PID
-    raising ``AccessDenied``/``NoSuchProcess`` within a pass is caught and
-    skipped (``continue``) without affecting that pass's completeness -- only
-    a whole pass being skipped/truncated/failed does.
+    Pass 2 (``"open_files:..."``, including ``"open_files:degraded"`` (D9)
+    when ``proc.open_files()`` raised a bare ``RuntimeError`` -- see below).
+    A pass simply not applicable on this OS (Pass 1b/1c off Windows) never
+    contributes a tag. An individual PID raising
+    ``AccessDenied``/``NoSuchProcess`` within a pass is caught and skipped
+    (``continue``) without affecting that pass's completeness -- only a
+    whole pass being skipped/truncated/failed/degraded does. A
+    ``RuntimeError`` from ``proc.open_files()`` on Windows (D9) is different
+    from those: it is *not* per-PID -- it reflects an OS-wide condition (the
+    handle table is too large for a single query) that will recur
+    identically for every remaining process, so Pass 2 stops early
+    (``break``, not ``continue``) and reports ``"open_files:degraded"``
+    rather than either silently continuing to burn the scan budget on
+    guaranteed failures or letting the exception escape and crash the
+    caller (ticket #107). This is distinct from ``"open_files:truncated"``
+    (D7): truncated means the loop ran out of clock (``scan_stop`` was
+    reached); degraded means the OS refused the query outright, independent
+    of remaining budget.
     """
     import psutil
 
@@ -2074,9 +2090,10 @@ def _find_blocking_processes(
     seen_pids: set[int] = set()
     result: List[KilledProcessInfo] = []
     # Ticket #95, finding 3: names of passes that were skipped entirely
-    # (entry guard false) or truncated (inner loop broke on scan_stop),
-    # failed (raised and was swallowed), in the order encountered. See the
-    # D1-D8 / N1-N8 rules documented above.
+    # (entry guard false), truncated (inner loop broke on scan_stop), failed
+    # (raised and was swallowed), or degraded (OS-wide condition made
+    # continuing pointless -- Pass 2 only, ticket #107), in the order
+    # encountered. See the D1-D9 / N1-N8 rules documented above.
     skipped_passes: List[str] = []
 
     # Pass 1: CWD match.
@@ -2208,6 +2225,7 @@ def _find_blocking_processes(
     # away from the worktree but still hold file locks inside it.
     if time.monotonic() <= scan_stop:
         pass_truncated = False
+        pass_degraded = False
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             if time.monotonic() > scan_stop:
                 pass_truncated = True
@@ -2220,6 +2238,35 @@ def _find_blocking_processes(
                     open_files = proc.open_files()
                 except (psutil.AccessDenied, psutil.NoSuchProcess):
                     continue
+                except RuntimeError as exc:
+                    # D9 (ticket #107): psutil's Windows open_files() can
+                    # raise a bare RuntimeError (e.g.
+                    # "SystemExtendedHandleInformation buffer too big")
+                    # when the OS-wide handle table is large. This is
+                    # process-independent -- it will fail identically for
+                    # every remaining PID -- so continuing the loop would
+                    # just burn the discovery budget on guaranteed
+                    # failures. Stop this pass now and report the
+                    # degradation instead of letting the error escape and
+                    # crash the caller.
+                    #
+                    # Narrowly scoped to this documented psutil failure
+                    # signature (checked case-insensitively, matching this
+                    # module's existing convention for classifying error
+                    # text -- see the lock-signal detection elsewhere in
+                    # this package) -- a bare RuntimeError from
+                    # open_files() with any other message is an unexpected,
+                    # unrelated failure and must not be silently swallowed
+                    # and mis-attributed to "open_files:degraded"; re-raise
+                    # so it surfaces like any other unexpected error. Same
+                    # for POSIX, where this specific Windows C-extension
+                    # condition cannot occur at all.
+                    if sys.platform != "win32" or "buffer too big" not in str(
+                        exc
+                    ).lower():
+                        raise
+                    pass_degraded = True
+                    break
                 for finfo in open_files:
                     norm_fpath = os.path.normcase(os.path.normpath(finfo.path))
                     if norm_fpath.startswith(normalized + os.sep) or norm_fpath == normalized:
@@ -2236,6 +2283,8 @@ def _find_blocking_processes(
                 continue
         if pass_truncated:  # D7
             skipped_passes.append("open_files:truncated")
+        elif pass_degraded:  # D9
+            skipped_passes.append("open_files:degraded")
     else:
         skipped_passes.append("open_files:skipped")  # D7
 
@@ -2918,7 +2967,7 @@ def stop(
         # Ticket #95, finding 3: every candidate we DID collect came back
         # dead, but the orphan scan itself did not have full discovery
         # coverage (a pass was skipped/truncated/failed against the
-        # deadline -- see _PartialList/_find_blocking_processes' D1-D8
+        # deadline -- see _PartialList/_find_blocking_processes' D1-D9
         # rules). "Found nothing" and "never looked" used to be
         # indistinguishable ([] either way); reporting "stopped" here would
         # reintroduce exactly that silent false positive.
