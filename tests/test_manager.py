@@ -2253,6 +2253,16 @@ def test_manager_start_uses_encoded_command_argv(tmp_path: Path, monkeypatch):
     import lib_python_worktree.setup.runner as _runner_module  # noqa: PLC0415
 
     monkeypatch.setattr(_runner_module.sys, "platform", "win32")
+    # `sys` is a process-wide singleton, so the patch above also makes
+    # _env_utils._get_user_profile_env() (called by manager._build_worktree_env
+    # while assembling the args to the mocked _lifecycle_start below) believe
+    # it is on Windows and try a real `import winreg`, which does not exist
+    # on non-Windows CI runners. Stub it out -- this test only asserts on the
+    # argv shape, not on environment-variable sourcing.
+    monkeypatch.setattr(
+        "lib_python_worktree.core.manager._get_user_profile_env",
+        lambda: dict(os.environ),
+    )
 
     mgr = _make_mgr_in_memory(tmp_path)
     record = _make_wt_record()

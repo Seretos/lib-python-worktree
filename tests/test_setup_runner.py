@@ -253,6 +253,16 @@ def test_powershell_step_argv_uses_encoded_command(tmp_path: Path, monkeypatch):
     a raw -Command <text> argument -- the raw run line must not appear
     verbatim in any argv element, and the blob must decode back to it."""
     monkeypatch.setattr(sys, "platform", "win32")
+    # `sys` is a process-wide singleton, so the patch above also makes
+    # _env_utils._get_user_profile_env() (called by SetupRunner._build_env
+    # during runner.run() below) believe it is on Windows and try a real
+    # `import winreg`, which does not exist on non-Windows CI runners. Stub
+    # it out -- this test only asserts on the argv shape, not on
+    # environment-variable sourcing.
+    monkeypatch.setattr(
+        "lib_python_worktree.setup.runner._get_user_profile_env",
+        lambda: dict(os.environ),
+    )
     wt = tmp_path / "wt"
     wt.mkdir()
     captured: List[List[str]] = []
