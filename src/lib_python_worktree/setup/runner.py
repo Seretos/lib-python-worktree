@@ -19,6 +19,7 @@ object that exposes ``.run`` / ``.name`` / ``.shell``.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shutil
@@ -186,15 +187,34 @@ def log_dir_for(worktree_id: str, env: Optional[Dict[str, str]] = None) -> Path:
     return root / worktree_id
 
 
+# Interpreter names for which _build_step_command switches from a raw
+# "-Command <text>" argument to "-EncodedCommand <base64 blob>" (ticket #109).
+_POWERSHELL_INTERPRETERS = ("powershell.exe", "pwsh")
+
+
 def _resolve_shell(step_shell: Optional[str]) -> List[str]:
-    """Return the ``[shell, "-c"-equivalent]`` prefix for a step.
+    """Return the ``[shell, "-c"/"-Command"-equivalent]`` prefix for a step.
+
+    This picks the interpreter and its flags only; joining the prefix with
+    the run line is done later by ``_build_step_command`` (the sole seam
+    that appends a run line to a resolved shell prefix).
 
     Override values map as:
     - ``bash`` / ``sh``  → ``["<name>", "-c"]``
-    - ``pwsh``           → ``["pwsh", "-NoProfile", "-Command"]``
-    - ``powershell``     → ``["powershell.exe", "-NoProfile", "-Command"]``
+    - ``pwsh``           → ``["pwsh", "-NoProfile", "-NonInteractive", "-Command"]``
+    - ``powershell``     → ``["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]``
 
     With no override, picks ``powershell.exe`` on Windows and ``bash`` elsewhere.
+    ``-NonInteractive`` is included for both PowerShell variants so a step
+    that would otherwise prompt fails loudly (``_default_popen`` already sets
+    ``stdin=DEVNULL``) instead of hanging or exiting obscurely.
+
+    The trailing ``-Command`` entry on the PowerShell/pwsh prefixes is a
+    placeholder consumed by ``_build_step_command``, which replaces it with
+    ``-EncodedCommand <blob>`` rather than appending the run text after it
+    verbatim (ticket #109: raw ``-Command <text>`` round-trips through both
+    ``subprocess.list2cmdline`` re-quoting and PowerShell's own re-parsing,
+    which mangles a self-wrapped ``run:`` value's quote structure).
     """
 
     if step_shell:
@@ -204,14 +224,42 @@ def _resolve_shell(step_shell: Optional[str]) -> List[str]:
         if name == "sh":
             return ["sh", "-c"]
         if name == "pwsh":
-            return ["pwsh", "-NoProfile", "-Command"]
+            return ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
         if name == "powershell":
-            return ["powershell.exe", "-NoProfile", "-Command"]
+            return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
         raise ValueError(f"unknown step shell: {step_shell!r}")
 
     if sys.platform == "win32":
-        return ["powershell.exe", "-NoProfile", "-Command"]
+        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
     return ["bash", "-c"]
+
+
+def _build_step_command(shell_cmd: List[str], run_line: str) -> List[str]:
+    """Build the final argv for a step from a resolved shell prefix + run line.
+
+    This is the *only* place a shell prefix (from ``_resolve_shell``) and a
+    run line are joined into an executable argv. Both ``SetupRunner._invoke``
+    and ``WorktreeManager.start`` funnel through this function so the fix
+    applies identically to ``setup:`` and ``start:`` steps.
+
+    For the ``powershell.exe`` / ``pwsh`` interpreters, the run line is
+    transported as ``-EncodedCommand <base64(utf-16-le)>`` instead of a raw
+    ``-Command <text>`` argument (ticket #109): the encoded blob contains no
+    spaces or quotes, so neither ``subprocess.list2cmdline`` (Windows argv
+    re-quoting) nor PowerShell's own command-line re-parsing (backslash is
+    not an escape character there) can mangle a self-wrapped ``run:`` value's
+    quote structure, e.g. ``powershell -NoProfile -Command "..."``. Exit-code
+    semantics are identical to ``-Command``.
+
+    Any other shell prefix (``bash -c`` / ``sh -c`` / an unrecognised
+    prefix) is appended to verbatim, unchanged from before this fix.
+    """
+
+    if shell_cmd and shell_cmd[0] in _POWERSHELL_INTERPRETERS:
+        prefix = shell_cmd[:-1] if shell_cmd[-1] == "-Command" else shell_cmd
+        blob = base64.b64encode(run_line.encode("utf-16-le")).decode("ascii")
+        return [*prefix, "-EncodedCommand", blob]
+    return [*shell_cmd, run_line]
 
 
 # ---- runner ------------------------------------------------------------------
@@ -441,8 +489,21 @@ class SetupRunner:
         An effective timeout of ``None`` disables the timeout entirely
         (block-forever opt-out), matching how the git/plugin-install timeout
         subsystems behave when disabled via empty-string env.
+
+        The log header always shows an accurate effective-argv line: for the
+        ``-EncodedCommand`` transport (PowerShell/pwsh), the opaque base64
+        blob is swapped back for the human-readable ``run_line`` so the log
+        stays legible (ticket #109). When a step exits non-zero and produced
+        no stdout/stderr at all (or only whitespace), a synthetic diagnostic
+        note is appended to the stderr section naming the exit code,
+        interpreter, and effective argv -- so a step can never again fail
+        with `returncode: 1` and two empty sections and no clue why.
         """
-        cmd = [*shell_cmd, run_line]
+        interpreter = shell_cmd[0] if shell_cmd else ""
+        cmd = _build_step_command(shell_cmd, run_line)
+        log_argv = list(cmd)
+        if shell_cmd and shell_cmd[0] in _POWERSHELL_INTERPRETERS and log_argv:
+            log_argv[-1] = run_line  # swap the base64 blob for readability
         proc = self._runner(cmd, cwd=str(cwd), env=env)
         effective_timeout = _resolve_setup_timeout(timeout)
 
@@ -458,7 +519,9 @@ class SetupRunner:
                 pass
             header = (
                 f"# setup step {step_index} ({step_name})\n"
-                f"# cmd: {shell_cmd[0]} ... -c {run_line!r}\n"
+                f"# argv: {log_argv!r}\n"
+                f"# run: {run_line!r}\n"
+                f"# interpreter: {interpreter}\n"
                 f"# returncode: -1 (timed out after {effective_timeout}s)\n"
                 f"# ---- stdout ----\n"
             )
@@ -477,15 +540,31 @@ class SetupRunner:
 
         header = (
             f"# setup step {step_index} ({step_name})\n"
-            f"# cmd: {shell_cmd[0]} ... -c {run_line!r}\n"
+            f"# argv: {log_argv!r}\n"
+            f"# run: {run_line!r}\n"
+            f"# interpreter: {interpreter}\n"
             f"# returncode: {proc.returncode}\n"
             f"# ---- stdout ----\n"
         )
+        stdout_text = stdout or ""
+        stderr_text = stderr or ""
+        synthetic_note = ""
+        if (
+            proc.returncode != 0
+            and not stdout_text.strip()
+            and not stderr_text.strip()
+        ):
+            synthetic_note = (
+                f"[worktree] step exited with code {proc.returncode} via "
+                f"{interpreter!r} but produced no stdout or stderr output.\n"
+                f"[worktree] effective argv: {log_argv!r}\n"
+            )
         with log_path.open("w", encoding="utf-8") as fh:
             fh.write(header)
-            fh.write(stdout or "")
+            fh.write(stdout_text)
             fh.write("\n# ---- stderr ----\n")
-            fh.write(stderr or "")
+            fh.write(stderr_text)
+            fh.write(synthetic_note)
         return int(proc.returncode)
 
 

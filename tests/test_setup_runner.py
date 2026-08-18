@@ -13,6 +13,8 @@ from typing import List, Optional
 
 import pytest
 
+import base64
+
 from lib_python_worktree.setup.runner import (
     DEFAULT_LOG_ROOT,
     LOG_ROOT_ENV,
@@ -25,6 +27,15 @@ from lib_python_worktree.setup.runner import (
     _resolve_shell,
     log_dir_for,
 )
+
+# NOTE: `_build_step_command` (ticket #109) is imported locally inside the
+# handful of test functions that call it directly, rather than at module
+# level here. It is a brand-new helper introduced by this fix, so importing
+# it at module level would make the *entire* test module fail to collect
+# against pre-fix code -- masking the genuine behavioural RED signal (wrong
+# argv shape / wrong log content) that the other tests in this file exist to
+# demonstrate. Keeping it function-local preserves collection of the rest of
+# the suite so those tests can RED for the right reason.
 
 
 @dataclass
@@ -176,7 +187,7 @@ def test_env_vars_injected(tmp_path: Path, monkeypatch):
 
 
 def test_shell_override_pwsh(monkeypatch):
-    assert _resolve_shell("pwsh") == ["pwsh", "-NoProfile", "-Command"]
+    assert _resolve_shell("pwsh") == ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
 
 
 def test_shell_override_bash():
@@ -191,6 +202,7 @@ def test_shell_override_powershell():
     assert _resolve_shell("powershell") == [
         "powershell.exe",
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
     ]
 
@@ -227,6 +239,257 @@ def test_shell_override_used_for_step(tmp_path: Path):
     assert captured[0][-1] == "echo hi"
 
 
+# ---------------------------------------------------------------------------
+# Ticket #109: a self-wrapped `powershell -Command "..."` run: value fails
+# silently (returncode 1, empty stdout/stderr) because raw `-Command <text>`
+# round-trips through subprocess.list2cmdline re-quoting AND PowerShell's own
+# re-parsing, mangling the original quote structure. Fix: transport the run
+# line via -EncodedCommand (base64 utf-16-le) instead.
+# ---------------------------------------------------------------------------
+
+
+def test_powershell_step_argv_uses_encoded_command(tmp_path: Path, monkeypatch):
+    """The argv built for a PowerShell-routed step uses -EncodedCommand, not
+    a raw -Command <text> argument -- the raw run line must not appear
+    verbatim in any argv element, and the blob must decode back to it."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    captured: List[List[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _FakeProc(returncode=0)
+
+    run_line = 'powershell -NoProfile -NonInteractive -Command "Write-Output \'hello world\'"'
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    runner.run(
+        setup=[_PlainStep(run=run_line, name="probe")],
+        worktree_id="wt-encoded",
+        worktree_path=wt,
+        branch="main",
+    )
+
+    argv = captured[0]
+    blob = argv[-1]
+    assert argv == ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", blob]
+    assert all(part != run_line for part in argv)
+    assert base64.b64decode(blob).decode("utf-16-le") == run_line
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+def test_self_wrapped_powershell_step_runs_to_completion(tmp_path: Path):
+    """End-to-end regression coverage for the ticket #109 shape: a run: value
+    that self-wraps `powershell -Command "..."` (with a quoted, spaced inner
+    argument), using the real (non-faked) _default_popen runner, must execute
+    the inner command and produce its output.
+
+    Honesty note: on this machine's Windows PowerShell build (5.1.26100),
+    this exact quote shape was verified to already return 0 with correct
+    output *before* the -EncodedCommand fix too -- extensive local probing
+    (varying quote style/nesting and trailing-backslash counts) did not
+    reproduce a case where `subprocess.list2cmdline`'s round-trip through
+    this specific PowerShell host actually corrupted the argv, so this test
+    does not demonstrate a RED->GREEN transition here. It is retained as
+    real end-to-end coverage that the fix does not regress normal execution
+    of this shape, and as a regression guard in case the underlying
+    mangling *does* reproduce on a different PowerShell build/edition.
+    `test_powershell_step_argv_uses_encoded_command` below is the test that
+    demonstrates the actual behavioural change (the argv transport itself)
+    with a genuine RED->GREEN transition."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    sentinel = "WORKTREE-109-SENTINEL"
+    run_line = (
+        "powershell -NoProfile -NonInteractive -Command "
+        f"\"Write-Output '{sentinel} with spaces'\""
+    )
+
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    res = runner.run(
+        setup=[_PlainStep(run=run_line, name="self-wrapped")],
+        worktree_id="wt-self-wrapped",
+        worktree_path=wt,
+        branch="main",
+    )
+
+    assert res.ok
+    assert res.steps[0].returncode == 0
+    text = res.steps[0].log_path.read_text(encoding="utf-8")
+    assert sentinel in text
+
+
+def test_silent_nonzero_step_logs_synthetic_diagnostic(tmp_path: Path):
+    """A step that exits non-zero with completely empty stdout/stderr gets a
+    synthetic diagnostic note appended to the log's stderr section, naming
+    the exit code and effective argv -- so it can never again fail as an
+    opaque `returncode: 1` with two empty sections."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    def fake_run(cmd, **kwargs):
+        return _FakeProc(returncode=1, stdout="", stderr="")
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run="mystery-failure", name="probe", shell="bash")],
+            worktree_id="wt-silent",
+            worktree_path=wt,
+            branch="main",
+        )
+
+    text = exc_info.value.log_path.read_text(encoding="utf-8")
+    assert "mystery-failure" in text
+    assert "['bash', '-c', 'mystery-failure']" in text
+    assert "# returncode: 1" in text
+    stderr_section = text.split("# ---- stderr ----\n", 1)[1]
+    assert stderr_section.strip() != ""
+
+
+def test_whitespace_only_output_also_triggers_synthetic_note(tmp_path: Path):
+    """Whitespace-only stdout/stderr counts as "no output" for the synthetic
+    diagnostic note -- not just a literally empty string."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    def fake_run(cmd, **kwargs):
+        return _FakeProc(returncode=3, stdout="   \n", stderr="\t\n")
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run="whitespace-step", name="probe", shell="bash")],
+            worktree_id="wt-whitespace",
+            worktree_path=wt,
+            branch="main",
+        )
+
+    text = exc_info.value.log_path.read_text(encoding="utf-8")
+    stderr_section = text.split("# ---- stderr ----\n", 1)[1]
+    assert stderr_section.strip() != ""
+
+
+def test_nonzero_step_with_real_stderr_gets_no_synthetic_note(tmp_path: Path):
+    """A non-zero step that DID produce real stderr keeps that stderr
+    verbatim -- no synthetic note is appended on top of it."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    def fake_run(cmd, **kwargs):
+        return _FakeProc(returncode=1, stdout="", stderr="real error text\n")
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run="real-stderr-step", name="probe", shell="bash")],
+            worktree_id="wt-real-stderr",
+            worktree_path=wt,
+            branch="main",
+        )
+
+    text = exc_info.value.log_path.read_text(encoding="utf-8")
+    stderr_section = text.split("# ---- stderr ----\n", 1)[1]
+    assert stderr_section == "real error text\n"
+
+
+def test_zero_exit_with_empty_output_gets_no_synthetic_note(tmp_path: Path):
+    """A successful (zero-exit) step with empty output is normal and quiet
+    -- it must NOT get the synthetic diagnostic note."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    def fake_run(cmd, **kwargs):
+        return _FakeProc(returncode=0, stdout="", stderr="")
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    res = runner.run(
+        setup=[_PlainStep(run="quiet-success", name="probe", shell="bash")],
+        worktree_id="wt-quiet",
+        worktree_path=wt,
+        branch="main",
+    )
+    text = res.steps[0].log_path.read_text(encoding="utf-8")
+    stderr_section = text.split("# ---- stderr ----\n", 1)[1]
+    assert stderr_section == ""
+
+
+def test_build_step_command_bash_unchanged():
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    assert _build_step_command(["bash", "-c"], "echo hi") == ["bash", "-c", "echo hi"]
+
+
+def test_build_step_command_sh_unchanged():
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    assert _build_step_command(["sh", "-c"], "echo hi") == ["sh", "-c", "echo hi"]
+
+
+def test_build_step_command_pwsh_matches_powershell_encoding():
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    run_line = "Get-ChildItem"
+    ps_shell = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    pwsh_shell = ["pwsh", "-NoProfile", "-NonInteractive", "-Command"]
+    ps_cmd = _build_step_command(ps_shell, run_line)
+    pwsh_cmd = _build_step_command(pwsh_shell, run_line)
+    assert ps_cmd == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        ps_cmd[-1],
+    ]
+    assert pwsh_cmd == ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand", pwsh_cmd[-1]]
+    assert base64.b64decode(ps_cmd[-1]).decode("utf-16-le") == run_line
+    assert base64.b64decode(pwsh_cmd[-1]).decode("utf-16-le") == run_line
+
+
+def test_build_step_command_unknown_shell_raises_via_resolve_shell():
+    with pytest.raises(ValueError):
+        _resolve_shell("zsh")
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        'echo "double quoted"',
+        "echo 'single quoted'",
+        "echo back\\slash\\path",
+        "echo `backtick`",
+        "echo $env:VAR and $variable",
+        "line one\nline two",
+        "echo café accented and 中文 characters",
+    ],
+)
+def test_build_step_command_powershell_round_trips_special_characters(run_line):
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    cmd = _build_step_command(shell_cmd, run_line)
+    blob = cmd[-1]
+    assert base64.b64decode(blob).decode("utf-16-le") == run_line
+
+
+def test_build_step_command_posix_argv_shape_pinned():
+    """Regression pin (ticket #109): bash -c / sh -c argv assembly is
+    byte-identical to before this fix -- no -EncodedCommand involved for
+    POSIX shells, ever."""
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    assert _build_step_command(["bash", "-c"], "npm install") == [
+        "bash",
+        "-c",
+        "npm install",
+    ]
+    assert _build_step_command(["sh", "-c"], "npm install") == [
+        "sh",
+        "-c",
+        "npm install",
+    ]
+
+
 def test_log_dir_for_default():
     p = log_dir_for("abc", env={})
     assert p == DEFAULT_LOG_ROOT / "abc"
@@ -243,19 +506,27 @@ def test_failed_step_marks_aborted_at(tmp_path: Path):
 
     def fake_run(cmd, **kwargs):
         # Step 0 succeeds, step 1 fails.
+        #
+        # shell="bash" pins the argv shape to `[..., "-c", run_line]`
+        # regardless of host platform/default shell, so `cmd[-1]` is always
+        # the raw run text here -- otherwise, on win32, the default
+        # PowerShell shell would route the run text through
+        # `_build_step_command`'s `-EncodedCommand` transport (ticket #109)
+        # and `cmd[-1]` would be an opaque base64 blob instead.
         return _FakeProc(returncode=0 if "ok" in cmd[-1] else 7)
 
     runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
     with pytest.raises(SetupFailedError) as exc_info:
         runner.run(
             setup=[
-                _PlainStep(run="ok-1"),
-                _PlainStep(run="bad-step"),
+                _PlainStep(run="ok-1", shell="bash"),
+                _PlainStep(run="bad-step", shell="bash"),
             ],
             worktree_id="wt-7",
             worktree_path=wt,
             branch="main",
         )
+    assert exc_info.value.step_index == 1
     assert exc_info.value.returncode == 7
 
 

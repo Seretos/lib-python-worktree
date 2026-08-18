@@ -1344,8 +1344,8 @@ class WorktreeManager:
             available = [s.name for s in contract.start if s.name]
             raise UnknownVariantError(variant, available)
 
-        from ..setup.runner import _resolve_shell
-        cmd = [*_resolve_shell(step.shell), step.run]
+        from ..setup.runner import _build_step_command, _resolve_shell
+        cmd = _build_step_command(_resolve_shell(step.shell), step.run)
 
         result = _lifecycle_start(
             record.id,

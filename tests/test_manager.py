@@ -1362,6 +1362,12 @@ from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: 
 from lib_python_worktree.contract.loader import ContractError, ContractValidationError  # noqa: E402
 from lib_python_worktree.setup.runner import _resolve_shell  # noqa: E402
 
+# NOTE: `_build_step_command` (ticket #109) is imported locally inside each
+# test function that needs it below, rather than at module level here -- it
+# is a brand-new helper introduced by this fix, and importing it at module
+# level would make the *entire* test_manager.py module fail to collect
+# against pre-fix code (masking every other test's genuine RED/GREEN result).
+
 
 def _make_mgr_in_memory(tmp_path: Path) -> WorktreeManager:
     return WorktreeManager(
@@ -1393,8 +1399,10 @@ def test_manager_start_reads_cmd_from_contract(tmp_path: Path):
         isolation="full",
         start=[Step(run="python server.py")],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)  # platform-appropriate prefix
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -1960,8 +1968,10 @@ def test_manager_start_named_variant_selected(tmp_path: Path):
         isolation="full",
         start=[headless_step, gui_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py --headless"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py --headless")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2011,8 +2021,10 @@ def test_manager_start_backward_compat_single_unnamed_step(tmp_path: Path):
         isolation="full",
         start=[Step(run="python server.py")],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2038,8 +2050,10 @@ def test_manager_start_named_default_step_selected(tmp_path: Path):
         isolation="full",
         start=[default_step, other_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python server.py"]
+    expected_cmd = _build_step_command(expected_shell, "python server.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2071,8 +2085,10 @@ def test_manager_start_named_default_wins_over_unnamed(tmp_path: Path):
         isolation="full",
         start=[unnamed_step, default_step],
     )
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
     expected_shell = _resolve_shell(None)
-    expected_cmd = [*expected_shell, "python default.py"]
+    expected_cmd = _build_step_command(expected_shell, "python default.py")
 
     with (
         patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
@@ -2085,6 +2101,45 @@ def test_manager_start_named_default_wins_over_unnamed(tmp_path: Path):
     assert call_kwargs.args[1] == expected_cmd, (
         "Expected the explicitly named 'default' step to win over the unnamed step"
     )
+
+
+def test_manager_start_uses_encoded_command_argv(tmp_path: Path, monkeypatch):
+    """Ticket #109: manager.start() funnels its argv assembly through the
+    same _build_step_command helper as SetupRunner._invoke, so a `start:`
+    step gets the identical -EncodedCommand fix as a `setup:` step on
+    Windows -- not a hand-rolled `[*_resolve_shell(...), step.run]`
+    concatenation that would still be vulnerable to the quoting bug.
+    """
+    import lib_python_worktree.setup.runner as _runner_module  # noqa: PLC0415
+
+    monkeypatch.setattr(_runner_module.sys, "platform", "win32")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+    expected_cmd = _runner_module._build_step_command(_resolve_shell(None), "python server.py")
+    assert expected_cmd[:4] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+    ]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
 
 
 def test_manager_start_unknown_variant_raises_worktree_error(tmp_path: Path):
