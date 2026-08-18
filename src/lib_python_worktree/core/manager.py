@@ -1250,13 +1250,20 @@ class WorktreeManager:
 
         *variant* selects which step to run (default ``"default"``):
 
-        - If *variant* is ``"default"`` and exactly one step has no ``name``
-          set, that step is used (backward-compatibility path).
-        - Otherwise the step whose ``name`` equals *variant* is used.
-        - If no matching step is found, ``UnknownVariantError`` is raised
-          listing the available named steps. ``UnknownVariantError`` is both
-          a ``WorktreeError`` and a ``ValueError``, so callers may catch
-          either base.
+        - The step whose ``name`` equals *variant* is used, if any.
+        - Otherwise, when *variant* is ``"default"``, a two-tier fallback
+          applies: (1) if exactly one step has no ``name`` set, that step is
+          used (the original backward-compatibility path -- an unnamed step
+          always wins over a named sibling); (2) else, if the contract has
+          exactly one ``start:`` step total, that step is used regardless of
+          whether it is named (ticket #112 -- so a contract with a single
+          named step, e.g. ``name: "main"``, works out of the box without
+          requiring ``variant="main"``).
+        - If no matching step is found (multiple named and/or unnamed steps
+          with no exact match), ``UnknownVariantError`` is raised listing the
+          available named steps. ``UnknownVariantError`` is both a
+          ``WorktreeError`` and a ``ValueError``, so callers may catch either
+          base.
 
         ``role`` vs ``variant`` (ticket #104)
         --------------------------------------
@@ -1273,7 +1280,16 @@ class WorktreeManager:
         that started ``variant="web"`` under some role can later stop it
         without separately tracking which role it used. The no-op "ready"
         start below (no ``start:`` step configured) spawns nothing and
-        therefore records no variant for *role*.
+        therefore records no variant for *role*. When the ticket #112
+        fallback resolves a named step from a bare ``variant="default"``
+        call, ``record.variants[role]`` records the resolved step's own
+        name (e.g. ``"main"``), not the literal ``"default"`` -- so a
+        subsequent ``stop(variant="main")`` resolves it correctly. This is a
+        deliberate, documented asymmetry: ``stop(variant="default")`` --
+        the same literal the caller passed to ``start()`` -- will **not**
+        resolve in this case, because no role is ever recorded under the
+        variant ``"default"`` once the fallback substitutes the step's own
+        name. Only ``stop(variant=<the step's actual name>)`` finds it.
 
         When no ``start:`` step is configured at all (missing
         ``.seretos/worktree-setup.yml`` or an empty ``start:`` list), there is
@@ -1340,6 +1356,13 @@ class WorktreeManager:
             if len(unnamed_steps) == 1:
                 step = unnamed_steps[0]
 
+        # (3) Ticket #112: variant still defaulted and no exact/unnamed match →
+        # if the contract has exactly one start: step total, use it regardless
+        # of naming. Multi-step contracts (named or unnamed) keep raising
+        # UnknownVariantError below, unchanged.
+        if step is None and variant == "default" and len(contract.start) == 1:
+            step = contract.start[0]
+
         if step is None:
             available = [s.name for s in contract.start if s.name]
             raise UnknownVariantError(variant, available)
@@ -1352,7 +1375,7 @@ class WorktreeManager:
             cmd,
             store=self.state,
             role=role,
-            variant=variant,
+            variant=step.name or variant,
             env=_build_worktree_env(record, env),
             cwd=cwd if cwd is not None else record.path,
         )

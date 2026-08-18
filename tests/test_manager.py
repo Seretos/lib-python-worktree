@@ -2168,6 +2168,195 @@ def test_manager_start_multi_unnamed_steps_unknown_default_raises(tmp_path: Path
     assert "default" in str(exc_info.value)
 
 
+@pytest.mark.parametrize("step_name", ["main", "web", "dev server"])
+def test_manager_start_default_resolves_lone_named_step(tmp_path: Path, step_name: str):
+    """Ticket #112: bare start() (and start(variant="default")) must resolve
+    a contract whose sole start: step carries a name, not just a lone
+    unnamed one. Before the fix this raised UnknownVariantError on the very
+    first call."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    named_step = Step(run="python server.py", name=step_name)
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[named_step],
+    )
+    expected_shell = _resolve_shell(None)
+    expected_cmd = [*expected_shell, "python server.py"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+    # Also covers variant="default" passed explicitly on the same contract.
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="default")
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+
+
+def test_manager_start_default_lone_named_step_records_step_name(tmp_path: Path):
+    """Ticket #112: when the fallback resolves a lone named step, the
+    variant recorded for the role must be the step's own name ("main"),
+    not the literal "default"."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py", name="main")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["variant"] == "main"
+
+
+def test_manager_start_lone_unnamed_step_still_records_default(tmp_path: Path):
+    """Back-compat: a lone unnamed step still records variant="default"
+    for the role (unchanged by the ticket #112 fallback broadening)."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.kwargs["variant"] == "default"
+
+
+def test_manager_start_default_prefers_lone_unnamed_over_named_sibling(tmp_path: Path):
+    """Load-bearing: rule 1 (lone unnamed step) must still win over rule 2
+    (lone step total) by ordering. A two-step contract with one unnamed and
+    one named step resolves via the pre-existing unnamed-step rule, not the
+    new single-step-total rule."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    unnamed_step = Step(run="python a.py")
+    gui_step = Step(run="python b.py", name="gui")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[unnamed_step, gui_step],
+    )
+    expected_shell = _resolve_shell(None)
+    expected_cmd = [*expected_shell, "python a.py"]
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id)
+
+    call_kwargs = mock_start.call_args
+    assert call_kwargs.args[1] == expected_cmd
+    assert call_kwargs.kwargs["variant"] == "default"
+
+
+def test_manager_start_default_two_named_steps_still_raises(tmp_path: Path):
+    """Multi-step contracts (two named steps) keep raising UnknownVariantError
+    unchanged -- the ticket #112 fallback only applies when there is exactly
+    one start: step total."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id)
+
+    assert exc_info.value.available == ["headless", "gui"]
+
+
+def test_manager_start_default_two_unnamed_steps_still_raises(tmp_path: Path):
+    """Multi-step contracts (two unnamed steps) keep raising
+    UnknownVariantError unchanged -- exactly one step total is required for
+    the new fallback rule to apply."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1"), Step(run="cmd2")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id)
+
+    assert exc_info.value.available == []
+
+
+def test_manager_start_unknown_variant_on_lone_named_step_still_raises(tmp_path: Path):
+    """A lone named step ("main") does NOT make every variant name valid --
+    requesting an unrelated variant still raises UnknownVariantError."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py", name="main")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["main"]
+
+
 def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):
     """start() raises WorktreeNotFoundError when the worktree id is not in the store."""
     mgr = _make_mgr_in_memory(tmp_path)
@@ -2599,6 +2788,66 @@ class TestManagerStopByVariant:
             timeout=10.0,
             kill_orphans=False,
         )
+
+    def test_manager_stop_by_variant_after_default_resolved_named_step(self, tmp_path: Path):
+        """Ticket #112: a record left the way start() now leaves it after
+        resolving a lone named step via the default fallback (pids and
+        variants keyed by the step's own name) is stoppable by that same
+        name via stop(variant=...) without raising."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111},
+            variants={"main": "main"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            mock_lc_stop.return_value = record
+            mgr.stop(record.id, variant="main")
+
+        mock_lc_stop.assert_called_once_with(
+            record.id,
+            store=mgr.state,
+            role="main",
+            timeout=10.0,
+            kill_orphans=False,
+        )
+
+    def test_manager_stop_by_default_variant_fails_after_named_step_fallback(
+        self, tmp_path: Path
+    ):
+        """Ticket #112 (blocking review finding): a record left the way
+        start() leaves it after resolving a lone named step via the default
+        fallback (variants keyed by the step's own name, e.g. "main", not
+        the literal "default") is NOT stoppable via
+        stop(variant="default") -- the exact literal the caller originally
+        passed to start(). This is a deliberate, documented asymmetry (see
+        the start() docstring and README's role-vs-variant section): only
+        stop(variant="main") resolves it."""
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            pids={"main": 111},
+            variants={"main": "main"},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+            patch("lib_python_worktree.core.manager._lifecycle_stop") as mock_lc_stop,
+        ):
+            with pytest.raises(VariantResolutionError) as exc_info:
+                mgr.stop(record.id, variant="default")
+
+        mock_lc_stop.assert_not_called()
+        err = exc_info.value
+        assert err.roles == []
 
 
 # ---------------------------------------------------------------------------
