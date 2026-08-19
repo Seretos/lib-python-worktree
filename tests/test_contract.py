@@ -115,6 +115,82 @@ def test_port_name_invalid_format_rejected():
         load_text("version: 1\nisolation: full\nports:\n  - name: '1bad'\n")
 
 
+# ---------------------------------------------------------------------------
+# Ticket #120 -- explicit port pinning
+# ---------------------------------------------------------------------------
+
+def test_port_slot_accepts_explicit_port():
+    contract = load_text(
+        "version: 1\nisolation: full\nports:\n  - name: app\n    port: 31000\n"
+    )
+    assert contract.ports[0].port == 31000
+
+
+def test_port_slot_port_defaults_to_none():
+    contract = load_text("version: 1\nisolation: full\nports:\n  - name: app\n")
+    assert contract.ports[0].port is None
+
+
+@pytest.mark.parametrize("bad_port", [0, 65536, -1, "abc"])
+def test_port_slot_invalid_port_rejected(bad_port):
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: full\nports:\n"
+            f"  - name: app\n    port: {bad_port!r}\n"
+        )
+
+
+def test_port_slot_pin_outside_default_range_is_accepted():
+    contract = load_text(
+        "version: 1\nisolation: full\nports:\n  - name: app\n    port: 5432\n"
+    )
+    assert contract.ports[0].port == 5432
+
+
+def test_isolation_none_forbids_pinned_ports():
+    with pytest.raises(ContractValidationError):
+        load_text(
+            "version: 1\nisolation: none\nports:\n  - name: app\n    port: 31000\n"
+        )
+
+
+def test_duplicate_pinned_port_rejected():
+    text = """
+version: 1
+isolation: full
+ports:
+  - name: app
+    port: 31000
+  - name: api
+    port: 31000
+"""
+    with pytest.raises(ContractValidationError) as exc_info:
+        load_text(text)
+    msg = str(exc_info.value).lower()
+    assert "duplicate" in msg
+    assert "31000" in msg
+
+
+def test_distinct_pinned_ports_load_fine():
+    contract = load_text(
+        "version: 1\nisolation: full\nports:\n"
+        "  - name: app\n    port: 31000\n"
+        "  - name: api\n    port: 31001\n"
+    )
+    assert contract.ports[0].port == 31000
+    assert contract.ports[1].port == 31001
+
+
+def test_one_pinned_one_auto_port_loads_fine():
+    contract = load_text(
+        "version: 1\nisolation: full\nports:\n"
+        "  - name: app\n    port: 31000\n"
+        "  - name: api\n"
+    )
+    assert contract.ports[0].port == 31000
+    assert contract.ports[1].port is None
+
+
 def test_isolation_none_forbids_setup():
     with pytest.raises(ContractValidationError) as exc_info:
         load_text(

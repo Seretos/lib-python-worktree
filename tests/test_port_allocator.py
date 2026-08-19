@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lib_python_worktree.core.port_allocator import (
+    PinnedPortUnavailableError,
     PortAllocationError,
     PortAllocator,
     _NoOpPortAllocator,
@@ -125,6 +126,154 @@ def test_port_range_boundary(tmp_path: Path):
     allocator = _make_allocator(tmp_path, port_range=(30000, 30001))
     result = allocator.allocate(["x", "y"], "wt-boundary")
     assert set(result.values()) == {30000, 30001}
+
+
+# ---------------------------------------------------------------------------
+# Ticket #120 -- explicit port pinning (R3, R4)
+# ---------------------------------------------------------------------------
+
+def test_allocate_honours_pinned_port(tmp_path: Path):
+    """A pinned port is claimed exactly, even outside the configured range."""
+    allocator = _make_allocator(tmp_path, port_range=(30000, 30001))
+    result = allocator.allocate(["app"], "wt-pin", pinned={"app": 34567})
+    assert result["app"] == 34567
+    pf = _make_ports_file(tmp_path)
+    assert pf.get_all()["wt-pin:app"] == 34567
+
+
+def test_allocate_pin_declared_after_auto_slot_still_wins(tmp_path: Path, monkeypatch):
+    """Two-pass ordering: a pin declared after an auto slot is still honoured
+    and the auto slot never collides with it, even with shuffle disabled."""
+    monkeypatch.setattr(
+        "lib_python_worktree.core.port_allocator.random.shuffle", lambda seq: None
+    )
+    allocator = _make_allocator(tmp_path, port_range=(30000, 30001))
+    # "auto" is listed first; "app" (pinned to 30000, the first candidate a
+    # no-op shuffle would hand to "auto") is listed second.
+    result = allocator.allocate(["auto", "app"], "wt-order", pinned={"app": 30000})
+    assert result["app"] == 30000
+    assert result["auto"] != 30000
+
+
+def test_allocate_preserves_input_slot_order(tmp_path: Path):
+    allocator = _make_allocator(tmp_path, port_range=(30000, 30010))
+    result = allocator.allocate(["b", "a", "c"], "wt-order2", pinned={"a": 30005})
+    assert list(result.keys()) == ["b", "a", "c"]
+
+
+def test_allocate_empty_slots_with_pinned_returns_empty(tmp_path: Path):
+    allocator = _make_allocator(tmp_path, port_range=(30000, 30010))
+    result = allocator.allocate([], "wt-empty-pin", pinned={"a": 30000})
+    assert result == {}
+
+
+def test_allocate_pinned_none_and_empty_dict_equivalent(tmp_path: Path):
+    (tmp_path / "s1").mkdir()
+    (tmp_path / "s2").mkdir()
+    (tmp_path / "s3").mkdir()
+    a1 = _make_allocator(tmp_path / "s1", port_range=(30000, 30099))
+    a2 = _make_allocator(tmp_path / "s2", port_range=(30000, 30099))
+    r1 = a1.allocate(["web"], "wt-a")
+    r2 = a2.allocate(["web"], "wt-b", pinned=None)
+    r3_allocator = _make_allocator(tmp_path / "s3", port_range=(30000, 30099))
+    r3 = r3_allocator.allocate(["web"], "wt-c", pinned={})
+    assert isinstance(r1["web"], int) and isinstance(r2["web"], int) and isinstance(r3["web"], int)
+
+
+def test_pinned_port_collision_raises(tmp_path: Path):
+    """A pin already claimed by another worktree/slot fails loudly."""
+    pf = _make_ports_file(tmp_path)
+    pf.set_all({"wt-other:web": 31000})
+    allocator = PortAllocator(pf, port_range=(30000, 30099))
+    with pytest.raises(PinnedPortUnavailableError) as exc_info:
+        allocator.allocate(["app"], "wt-new", pinned={"app": 31000})
+    exc = exc_info.value
+    assert exc.port == 31000
+    assert exc.slot == "app"
+    assert exc.reason == "taken"
+    assert exc.owner == "wt-other:web"
+    assert isinstance(exc, PortAllocationError)
+    # ports.yaml must be unchanged -- no partial write.
+    assert pf.get_all() == {"wt-other:web": 31000}
+
+
+def test_pinned_port_collision_os_busy(tmp_path: Path):
+    allocator = _make_allocator(tmp_path, port_range=(30000, 30099))
+    with patch(
+        "lib_python_worktree.core.port_allocator._port_in_use",
+        side_effect=lambda p: p == 31000,
+    ):
+        with pytest.raises(PinnedPortUnavailableError) as exc_info:
+            allocator.allocate(["app"], "wt-busy", pinned={"app": 31000})
+    exc = exc_info.value
+    assert exc.reason == "in_use"
+    assert exc.owner is None
+
+
+def test_pinned_port_idempotent_self_reclaim_skips_probe(tmp_path: Path):
+    """Re-claiming a pin the same worktree/slot already holds is a no-op --
+    no taken check, no _port_in_use probe (a service of ours legitimately
+    listening on it must not be read as a collision)."""
+    pf = _make_ports_file(tmp_path)
+    pf.set_all({"wt-self:app": 31000})
+    allocator = PortAllocator(pf, port_range=(30000, 30099))
+    with patch(
+        "lib_python_worktree.core.port_allocator._port_in_use"
+    ) as mock_busy:
+        result = allocator.allocate(["app"], "wt-self", pinned={"app": 31000})
+    assert result["app"] == 31000
+    mock_busy.assert_not_called()
+
+
+def test_pinned_port_idempotent_self_reclaim_reserves_port_for_pass_two(
+    tmp_path: Path,
+):
+    """The idempotent self-reclaim branch (pin already matches the
+    persisted port) must still add the port to `taken`, so pass two's
+    auto-allocation for a *different* unpinned slot in the same
+    ``allocate()`` call cannot randomly pick that identical port (review
+    fix for ticket #120).
+
+    ``port_range`` is narrowed to exactly two ports and ``random.shuffle``
+    is patched to a no-op so the auto slot's candidate order is
+    deterministic: without the fix it would pick the lower (pinned) port
+    first, colliding; with the fix that port is excluded and it must fall
+    through to the other one.
+    """
+    pf = _make_ports_file(tmp_path)
+    pf.set_all({"wt-x:app": 30000})
+    allocator = PortAllocator(pf, port_range=(30000, 30001))
+    with patch(
+        "lib_python_worktree.core.port_allocator.random.shuffle",
+        lambda seq: None,
+    ):
+        result = allocator.allocate(["app", "api"], "wt-x", pinned={"app": 30000})
+    assert result["app"] == 30000
+    assert result["api"] == 30001
+    assert result["app"] != result["api"]
+
+
+def test_pinned_collision_in_mixed_call_leaves_auto_slot_unpersisted(tmp_path: Path):
+    pf = _make_ports_file(tmp_path)
+    pf.set_all({"wt-other:web": 31000})
+    allocator = PortAllocator(pf, port_range=(30000, 30099))
+    with pytest.raises(PinnedPortUnavailableError):
+        allocator.allocate(["auto", "app"], "wt-mixed", pinned={"app": 31000})
+    # Nothing from this failed call was persisted.
+    assert pf.get_all() == {"wt-other:web": 31000}
+
+
+def test_allocate_own_key_exclusion_rewrites_stale_pin(tmp_path: Path):
+    """Re-pinning a slot this worktree already owns to a new number rewrites
+    the same key with no leftover stale entry."""
+    pf = _make_ports_file(tmp_path)
+    pf.set_all({"wt-x:app": 31000})
+    allocator = PortAllocator(pf, port_range=(30000, 30099))
+    result = allocator.allocate(["app"], "wt-x", pinned={"app": 32000})
+    assert result["app"] == 32000
+    all_ports = pf.get_all()
+    assert all_ports == {"wt-x:app": 32000}
+    assert 31000 not in all_ports.values()
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +414,113 @@ def test_manager_create_populates_record_ports(tmp_path: Path):
                     record = mgr.create(str(tmp_path / "fake_repo"), "feature/x")
 
     assert record.ports == {"web": 31000, "db": 31001}
-    mock_allocator.allocate.assert_called_once_with(["web", "db"], record.id)
+    mock_allocator.allocate.assert_called_once_with(["web", "db"], record.id, pinned={})
+
+
+# ---------------------------------------------------------------------------
+# Ticket #120 -- create() forwards pins from the contract (R5)
+# ---------------------------------------------------------------------------
+
+def test_manager_create_forwards_pinned_ports(tmp_path: Path):
+    """WorktreeManager.create forwards the contract's pin map to allocate()."""
+    from unittest.mock import MagicMock, patch
+
+    from lib_python_worktree.core.manager import ManagerConfig, WorktreeManager
+    from lib_python_worktree.core.state import InMemoryStateStore
+
+    store = InMemoryStateStore()
+    cfg = ManagerConfig(store_root=tmp_path / "store")
+    mgr = WorktreeManager(config=cfg, state=store, reconcile_on_init=False)
+
+    mock_allocator = MagicMock()
+    mock_allocator.allocate.return_value = {"web": 31000, "db": 31005}
+    mock_allocator.release.return_value = None
+    mgr._allocator = mock_allocator
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._run_git",
+            return_value=MagicMock(returncode=0, stdout="/fake/repo\n", stderr=""),
+        ),
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+        ) as mock_load,
+    ):
+        from lib_python_worktree.contract.schema import PortSlot, WorktreeContract
+        mock_contract = MagicMock(spec=WorktreeContract)
+        mock_contract.ports = [PortSlot(name="web", port=31000), PortSlot(name="db")]
+        mock_contract.setup = []
+        mock_load.return_value = mock_contract
+
+        with patch.object(
+            mgr, "_validate_repo", return_value=tmp_path / "fake_repo"
+        ):
+            with patch.object(mgr, "_branch_exists", return_value=True):
+                (tmp_path / "store" / "fake-repo").mkdir(parents=True, exist_ok=True)
+                with patch(
+                    "lib_python_worktree.core.manager.Path.mkdir",
+                ):
+                    record = mgr.create(str(tmp_path / "fake_repo"), "feature/x")
+
+    args, kwargs = mock_allocator.allocate.call_args
+    assert args == (["web", "db"], record.id)
+    assert kwargs["pinned"] == {"web": 31000}
+
+
+def test_manager_create_rolls_back_on_pinned_collision(tmp_path: Path):
+    """A PinnedPortUnavailableError during create() triggers the same
+    worktree-remove + release + branch-delete rollback as any other
+    PortAllocationError."""
+    from unittest.mock import MagicMock, patch
+
+    from lib_python_worktree.core.manager import ManagerConfig, WorktreeManager
+    from lib_python_worktree.core.port_allocator import PinnedPortUnavailableError
+    from lib_python_worktree.core.state import InMemoryStateStore
+
+    store = InMemoryStateStore()
+    cfg = ManagerConfig(store_root=tmp_path / "store")
+    mgr = WorktreeManager(config=cfg, state=store, reconcile_on_init=False)
+
+    mock_allocator = MagicMock()
+    mock_allocator.allocate.side_effect = PinnedPortUnavailableError(
+        "web", 31000, "wt-collide", reason="taken", owner="wt-other:web"
+    )
+    mock_allocator.release.return_value = None
+    mgr._allocator = mock_allocator
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._run_git",
+            return_value=MagicMock(returncode=0, stdout="/fake/repo\n", stderr=""),
+        ) as mock_run_git,
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+        ) as mock_load,
+    ):
+        from lib_python_worktree.contract.schema import PortSlot, WorktreeContract
+        mock_contract = MagicMock(spec=WorktreeContract)
+        mock_contract.ports = [PortSlot(name="web", port=31000)]
+        mock_contract.setup = []
+        mock_load.return_value = mock_contract
+
+        with patch.object(
+            mgr, "_validate_repo", return_value=tmp_path / "fake_repo"
+        ):
+            with patch.object(mgr, "_branch_exists", return_value=True):
+                (tmp_path / "store" / "fake-repo").mkdir(parents=True, exist_ok=True)
+                with patch(
+                    "lib_python_worktree.core.manager.Path.mkdir",
+                ):
+                    with pytest.raises(PinnedPortUnavailableError):
+                        mgr.create(str(tmp_path / "fake_repo"), "feature/x")
+
+    mock_allocator.release.assert_called_once()
+    assert store.list() == []
+    remove_calls = [
+        c for c in mock_run_git.call_args_list
+        if c.args and c.args[0][:2] == ["worktree", "remove"]
+    ]
+    assert remove_calls, "expected a `git worktree remove --force` rollback call"
 
 
 def test_manager_remove_calls_release(tmp_path: Path):
