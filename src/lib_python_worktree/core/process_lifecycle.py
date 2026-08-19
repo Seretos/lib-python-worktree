@@ -4,7 +4,15 @@ Public API
 ----------
 - ``start(worktree_id, cmd, *, store, role="main", env=None, cwd=None)``
   Spawns a detached process, persists ``pids[role]`` and ``status="running"``
-  to the state store, returns the updated ``WorktreeRecord``.
+  to the state store, returns the updated ``WorktreeRecord``. The captured
+  output log is written to
+  ``<log_dir_for(worktree_id)>/start-<sanitized role, case preserved>.log``
+  (ticket #111): the role is sanitized for filesystem-safety (unsafe
+  characters collapsed to ``-``) but never lower-cased, so the filename's
+  role token stays identical to the literal ``pids`` dict key -- a caller
+  holding a role name can always reconstruct the log path without querying
+  the record. Note this is ambiguous on case-insensitive filesystems for
+  roles that differ only by case; see ``_role_log_slug``'s docstring.
 
 - ``stop(worktree_id, *, store, role="main", timeout=10.0, kill_orphans=False)``
   Gracefully terminates the process (SIGTERM/CTRL_BREAK), waits up to
@@ -53,6 +61,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -83,6 +92,85 @@ _logger = logging.getLogger(__name__)
 
 # The role key used when the caller does not supply an explicit role.
 DEFAULT_ROLE = "main"
+
+# Ticket #111: sanitizer for the *log filename's* role component. Unlike
+# setup.runner._slug (lower-cases the value), this preserves case so that
+# start-<role>.log's role token stays identical to the literal record.pids
+# key -- see _role_log_slug's docstring for the full rationale.
+_ROLE_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _role_log_slug(role: str, max_len: int = 40) -> str:
+    """Sanitize *role* for use in the ``start-<role>.log`` filename.
+
+    Case-preserving counterpart to ``setup.runner._slug``: replaces runs of
+    filesystem-unsafe characters with a single ``-`` and strips leading/
+    trailing ``-``, but -- unlike ``_slug`` -- does NOT lower-case the
+    result. This keeps the log filename's role token identical to the raw
+    ``role`` string used as the ``record.pids`` dict key (ticket #111: the
+    two had drifted because ``start()`` previously slugified the filename
+    with ``_slug``, which lower-cases, while ``pids`` is keyed by the raw,
+    original-case role).
+
+    Falls back to ``"_"`` (a single underscore -- not ``_slug``'s
+    ``"step"``) when *role* contains no alphanumeric characters at all.
+    ``"_"`` is deliberate, not arbitrary: ``"_"`` never appears as output of
+    the substitution step alone -- that step's output alphabet is exactly
+    ``[A-Za-z0-9-]``, since every other character, ``_`` included, is
+    collapsed to ``-``. The only way to produce ``"_"`` is the explicit
+    degenerate-role fallback below. A role that is itself entirely
+    non-alphanumeric (including the literal string ``"_"``) is a degenerate
+    role by this function's own definition and is therefore already covered
+    by, not exempt from, the "degenerate roles collide with each other"
+    caveat further down -- it is not a separate collision class. What this
+    does guarantee is narrower but still useful: a *non-degenerate* role
+    (one with at least one alphanumeric character) can never sanitize to
+    ``"_"``, so the fallback can never collide with a non-degenerate role's
+    filename -- an earlier version of this helper fell back to ``"role"``,
+    which DID collide with an actual non-degenerate role literally named
+    ``"role"``: both produced ``start-role.log`` while ``record.pids`` kept
+    them as distinct keys, undermining the very pids-key/filename
+    traceability this ticket exists to restore. This is deliberately not a
+    hashing/suffixing scheme, which every consumer that reconstructs the log
+    path from a role name would have to reimplement.
+
+    Degenerate roles still collide *with each other* (and, as just noted,
+    with the fallback token itself): ``"!!!"``, ``"---"``, and the literal
+    role ``"_"`` all sanitize to ``"_"`` and therefore all name
+    ``start-_.log``. That is the same accepted, documented lossy-
+    sanitization ambiguity already noted below for roles like ``"role a"``
+    vs ``"role-a"`` vs ``"role_a"`` -- not something this helper tries to
+    fix.
+
+    Truncates to *max_len* characters -- mirroring ``_slug``'s 40-char
+    default for parity -- and re-strips any trailing ``-`` a truncation cut
+    exposes (e.g. ``"a" * 39 + "-" + "b" * 10`` truncates to
+    ``"a" * 39 + "-"`` before this second strip, which would otherwise leave
+    a filename ending in ``-.log``). Order is: replace -> strip ->
+    fallback-if-empty -> truncate -> strip again. This intentionally
+    diverges from ``setup.runner._slug``'s ordering (which strips only once,
+    before truncating) -- do not "fix" ``_slug`` to match; that module is
+    out of this ticket's scope. The final strip can never empty the string:
+    after the first strip the leading character is alphanumeric, and the
+    fallback token ``"_"`` contains no ``-``.
+
+    Case-insensitive filesystems (Windows, default macOS): this is a pure
+    string transform, so two roles that differ only by case (e.g. ``"roleA"``
+    and ``"rolea"``) still produce two *distinct filename strings*, but on
+    a case-insensitive filesystem those two strings name the *same physical
+    file* and their log output will interleave. This is an accepted,
+    documented limitation, not a bug: disambiguating case-only-distinct
+    roles would require pushing a suffixing/hashing scheme onto every
+    consumer that reconstructs the log path from a role name, for an
+    ambiguity that already exists today for roles like ``"role a"`` vs
+    ``"role-a"`` vs ``"role_a"``. Callers needing guaranteed per-role log
+    isolation must pick role names that differ by more than case.
+    """
+    s = _ROLE_SLUG_RE.sub("-", role).strip("-")
+    if not s:
+        s = "_"
+    s = s[:max_len]
+    return s.strip("-")
 
 # Bounded wait, right after spawning, for the child to prove it has already
 # exited (ticket #81). Keeps start() from blocking meaningfully while still
@@ -2536,6 +2624,30 @@ def start(
         Working directory for the child.  ``None`` inherits the current
         directory.
 
+    Log filename contract (ticket #111)
+    ------------------------------------
+    Captured output is written to
+    ``<log_dir_for(worktree_id)>/start-<sanitized role, case preserved>.log``.
+    The role is sanitized for filesystem safety (runs of characters other
+    than ``[A-Za-z0-9]`` collapse to a single ``-``, leading/trailing ``-``
+    stripped, empty result falls back to ``"_"`` -- the substitution step
+    alone can never produce ``"_"`` (its output alphabet is exactly
+    ``[A-Za-z0-9-]``), so a non-degenerate role (one with at least one
+    alphanumeric character) can never collide with the fallback; a role
+    that is itself entirely non-alphanumeric is degenerate and already
+    collides with other degenerate roles rather than being a separate case;
+    see ``_role_log_slug``'s docstring) but is never
+    lower-cased, so the filename's role token is always identical to the
+    literal key used in ``record.pids``/``record.job_names``/
+    ``record.variants``. A consumer holding a role name can therefore
+    reconstruct the log path without reading ``record.start_log_path``
+    (which is a record-wide scalar overwritten by every ``start()`` call,
+    regardless of role). Roles that differ only by case (e.g. ``"roleA"``
+    vs ``"rolea"``) produce distinct filename strings but name the same
+    physical file on a case-insensitive filesystem (Windows, default
+    macOS) -- pick role names that differ by more than case if per-role log
+    isolation matters.
+
     Raises
     ------
     WorktreeNotFoundError
@@ -2552,7 +2664,7 @@ def start(
     # manager.start, avoiding a circular import (setup.runner does not import
     # process_lifecycle, but importing at module level here would still tie
     # this module's import order to setup.runner's).
-    from ..setup.runner import _slug, log_dir_for
+    from ..setup.runner import log_dir_for
 
     if not cmd:
         raise ValueError("cmd must be a non-empty list")
@@ -2569,7 +2681,7 @@ def start(
 
     log_dir = log_dir_for(worktree_id, env=env)
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"start-{_slug(role)}.log"
+    log_path = log_dir / f"start-{_role_log_slug(role)}.log"
 
     proc = _spawn_detached(cmd, env=env, cwd=cwd, log_path=log_path)
 

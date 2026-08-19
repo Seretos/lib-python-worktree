@@ -18,8 +18,6 @@ name: lint
 # instead of main. Add this as a required status check in branch protection
 # to make the gate enforcing rather than advisory.
 on:
-  push:
-    branches: ["**"]
   pull_request:
 
 permissions:
