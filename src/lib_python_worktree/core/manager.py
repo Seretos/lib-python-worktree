@@ -88,6 +88,13 @@ _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
 _PORT_RANGE_DEFAULT = (30000, 40000)
 
+# record.status value written by create() when a contract's setup: step(s)
+# fail (ticket #105). Distinct from the setup_outcome.status values
+# (SETUP_STATUS_*, imported above) -- this is the *record*-level status,
+# not the nested setup_outcome verdict. Ticket #118: start() gates on this
+# constant to refuse silently proceeding past a half-provisioned checkout.
+_STATUS_SETUP_FAILED = "setup_failed"
+
 # Retry constants for the post-kill directory-unlock loop (ticket #51).
 _POST_KILL_RETRIES: int = 5      # attempts after kill before giving up
 _POST_KILL_SLEEP: float = 0.5    # seconds to wait between retries
@@ -186,6 +193,36 @@ class DuplicateWorktreeError(WorktreeError):
 
 class WorktreeNotFoundError(WorktreeError):
     pass
+
+
+class SetupIncompleteError(WorktreeError):
+    """Raised by ``start()`` when the target's ``record.status`` is
+    ``"setup_failed"`` (ticket #118).
+
+    ``create()`` sets this status when a contract's ``setup:`` step(s) fail,
+    leaving the checkout half-provisioned. Without this gate, ``start()``
+    would silently overwrite the status to ``"running"`` (a real spawn) or
+    ``"ready"`` (the no-op path), erasing the only top-level evidence that
+    setup never completed -- the nested, easy-to-miss
+    ``record.setup_outcome.status == "failed"`` would be all that remained.
+
+    Deliberately does not read or carry ``record.setup_outcome`` -- callers
+    are pointed at ``list()`` / ``environment_list`` for that detail instead,
+    keeping this error a pointer, not a duplicate of the detail record.
+    """
+
+    def __init__(self, worktree_id: str, status: str) -> None:
+        super().__init__(
+            f"worktree '{worktree_id}' has status '{status}': its last "
+            "setup did not complete. Refusing to start it, to avoid "
+            "masking a half-provisioned checkout as healthy. See "
+            "list()/environment_list for the setup_outcome detail. "
+            "Remedies: re-provision the worktree (recreate it, or re-run "
+            "its setup: steps), or call start(..., allow_setup_failed=True) "
+            "to start it anyway (this is logged as a warning)."
+        )
+        self.worktree_id = worktree_id
+        self.status = status
 
 
 class GitCommandError(WorktreeError):
@@ -1042,7 +1079,7 @@ class WorktreeManager:
                     port_mapping=record.ports,
                 )
             except SetupFailedError as _setup_exc:
-                record.status = "setup_failed"
+                record.status = _STATUS_SETUP_FAILED
                 record.setup_outcome = SetupOutcome(
                     status=SETUP_STATUS_FAILED,
                     message=str(_setup_exc),
@@ -1060,7 +1097,7 @@ class WorktreeManager:
                 # original exception unchanged. Any exception type other
                 # than SetupFailedError carries no step-level detail, so the
                 # step fields stay at their None/0 defaults.
-                record.status = "setup_failed"
+                record.status = _STATUS_SETUP_FAILED
                 record.setup_outcome = SetupOutcome(
                     status=SETUP_STATUS_FAILED,
                     message=f"{type(_setup_exc).__name__}: {_setup_exc}",
@@ -1270,6 +1307,7 @@ class WorktreeManager:
         env: Optional[dict] = None,
         cwd: Optional[str] = None,
         variant: str = "default",
+        allow_setup_failed: bool = False,
     ) -> WorktreeRecord:
         """Spawn a detached process for the target environment, using the
         contract's ``start:`` step, and record its PID.
@@ -1357,8 +1395,37 @@ class WorktreeManager:
         only when a concrete ``start:`` step is selected. ``cwd=None``
         (the default) defaults to ``record.path`` (ticket #81), not the
         caller's own working directory.
+
+        Ticket #118 -- refusing a half-provisioned checkout
+        -----------------------------------------------------
+        If the resolved record's ``status`` is ``"setup_failed"`` (set by
+        ``create()`` when a contract's ``setup:`` step(s) failed), ``start()``
+        raises ``SetupIncompleteError`` instead of proceeding -- by default,
+        silently overwriting ``record.status`` to ``"running"`` or ``"ready"``
+        would erase the only top-level evidence that setup never completed,
+        leaving just the easy-to-miss nested
+        ``record.setup_outcome.status == "failed"``. The check runs before
+        any mutation (port allocation, the no-op ``"ready"`` write, or a real
+        spawn), so a refused call is completely side-effect free. Pass
+        ``allow_setup_failed=True`` to start it anyway -- this is a one-shot
+        override: it is logged as a ``_logger.warning`` each time it is used,
+        and once a forced start succeeds, ``process_lifecycle.start`` rewrites
+        ``status`` to ``"running"`` (or the no-op path sets ``"ready"``), so a
+        *subsequent* ``start()`` call is no longer refused. The override
+        acknowledges the failure once per call, not permanently.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=True)
+
+        if record.status == _STATUS_SETUP_FAILED:
+            if not allow_setup_failed:
+                raise SetupIncompleteError(record.id, record.status)
+            _logger.warning(
+                "start(): worktree '%s' has status 'setup_failed' but "
+                "allow_setup_failed=True was passed -- starting it anyway. "
+                "Its last setup did not complete; see "
+                "list()/environment_list for the setup_outcome detail.",
+                record.id,
+            )
 
         contract = _load_contract(Path(record.repo_root) / CONTRACT_FILENAME)
 
@@ -2584,6 +2651,7 @@ __all__ = (
     "ManagerConfig",
     "PrimaryCheckoutError",
     "RepoListing",
+    "SetupIncompleteError",
     "UnknownVariantError",
     "VariantResolutionError",
     "WorktreeDirLockedError",
