@@ -3042,14 +3042,14 @@ def start(
     see ``_role_log_slug``'s docstring) but is never
     lower-cased, so the filename's role token is always identical to the
     literal key used in ``record.pids``/``record.job_names``/
-    ``record.variants``. A consumer holding a role name can therefore
-    reconstruct the log path without reading ``record.start_log_path``
-    (which is a record-wide scalar overwritten by every ``start()`` call,
-    regardless of role). Roles that differ only by case (e.g. ``"roleA"``
-    vs ``"rolea"``) produce distinct filename strings but name the same
-    physical file on a case-insensitive filesystem (Windows, default
-    macOS) -- pick role names that differ by more than case if per-role log
-    isolation matters.
+    ``record.variants``/``record.start_log_paths``, and is the key under
+    which that path is recorded in ``record.start_log_paths``. A consumer
+    holding a role name can therefore reconstruct the log path itself, or
+    read it directly off ``record.start_log_paths[role]``. Roles that
+    differ only by case (e.g. ``"roleA"`` vs ``"rolea"``) produce distinct
+    filename strings but name the same physical file on a case-insensitive
+    filesystem (Windows, default macOS) -- pick role names that differ by
+    more than case if per-role log isolation matters.
 
     Raises
     ------
@@ -3110,7 +3110,12 @@ def start(
     # equally stale once a new process has been spawned for it.
     record.stop_attempt = None
     record.returncode = returncode
-    record.start_log_path = str(log_path)
+    # Ticket #119: unconditional per-role assignment -- unlike job_names/
+    # variants below, there is no "not available this time" branch here:
+    # start() always creates a log file for this role, so there is nothing
+    # to pop when absent. Restarting the same role overwrites that role's
+    # single entry rather than accumulating.
+    record.start_log_paths[role] = str(log_path)
     # Ticket #95, R5 (fix cycle: per-role, not a record-wide scalar --
     # mirrors how `pids` is keyed by role): persist the Job Object name (if
     # one was successfully created and the child assigned to it) under this
@@ -3154,6 +3159,11 @@ def stop(
     nothing this call tried to kill is still alive.
 
     If the PID is already dead, clears the record gracefully without raising.
+
+    Ticket #119: unlike ``job_names[role]``/``variants[role]``, the stopping
+    role's ``start_log_paths[role]`` entry is deliberately *retained* rather
+    than cleared, so the caller of this very call can still read the log
+    path of the process it just stopped off the returned record.
 
     Process-tree kill (ticket #87)
     -------------------------------
@@ -3605,6 +3615,11 @@ def stop(
     # longer meaningful and would otherwise leave the
     # set(variants) <= set(pids) invariant violated.
     record.variants.pop(role, None)
+    # Ticket #119 -- start_log_paths[role] is intentionally NOT popped here
+    # (contrast job_names/variants immediately above): the log file outlives
+    # its process and callers read it off this very stop() response, so this
+    # field deliberately does not honour the set(x) <= set(pids) invariant
+    # that job_names/variants do.
 
     if survivor_pids:
         message = (

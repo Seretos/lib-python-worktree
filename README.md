@@ -512,6 +512,30 @@ contract `stop:` steps run, no process is signalled):
 `role=None` (`stop()`'s actual default) means `"main"`, exactly like
 `start()`'s `role="main"` default — it is not a no-op.
 
+### Per-role start logs
+
+`record.start_log_paths[role]` gives that role's own start-log path — the
+absolute path of the `start-<role>.log` file `start()` wrote when it started
+that role. It mirrors `pids`/`job_names`/`variants`: one entry per role
+that has ever been started, no key at all for a role with no recorded start
+log. The filename's role token is sanitized (filesystem-unsafe characters
+collapsed to `-`), but the dict *key* is always the raw, unslugged role
+string.
+
+Unlike `pids`/`job_names`/`variants`, entries here are **retained** by
+`stop()` and by `reconcile`'s dead-role sweep — `set(record.start_log_paths)
+<= set(record.pids)` does not hold and is not meant to. The log file
+outlives the process it describes, and the main use case is reading a
+role's log path off the response of the `stop()` call that just stopped it.
+Restarting the same role overwrites that role's single entry rather than
+accumulating.
+
+This replaces the older `start_log_path: Optional[str]` scalar, which was
+overwritten by every `start()` call regardless of role and so, in a
+multi-role worktree, named whichever role started last. The scalar is
+removed entirely — no alias, no deprecation shim — so a `state.yaml`
+written by an older engine deserializes to an empty `start_log_paths: {}`.
+
 ### Stop status and `stop_detail`
 
 When `stop()` cannot confirm that everything it tried to kill actually died,

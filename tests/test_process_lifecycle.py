@@ -355,8 +355,8 @@ class TestStartOutputCaptureAndEarlyExit:
 
         assert result.status == "exited"
         assert result.returncode == 3
-        assert result.start_log_path is not None
-        log_path = Path(result.start_log_path)
+        assert DEFAULT_ROLE in result.start_log_paths
+        log_path = Path(result.start_log_paths[DEFAULT_ROLE])
         assert log_path.exists()
         assert "boom" in log_path.read_text(encoding="utf-8", errors="replace")
 
@@ -383,7 +383,7 @@ class TestStartOutputCaptureAndEarlyExit:
             pass
 
     def test_start_log_file_created_and_written(self):
-        """A chatty short-lived command yields a non-empty start_log_path file."""
+        """A chatty short-lived command yields a non-empty start_log_paths[role] file."""
         record = _make_record("wt-chatty")
         store = _make_store(record)
 
@@ -393,7 +393,7 @@ class TestStartOutputCaptureAndEarlyExit:
             store=store,
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths[DEFAULT_ROLE])
         assert log_path.exists()
         assert log_path.stat().st_size > 0
         assert "hello from child" in log_path.read_text(
@@ -401,7 +401,7 @@ class TestStartOutputCaptureAndEarlyExit:
         )
 
     def test_start_missing_log_root_falls_back_to_default(self, monkeypatch, tmp_path):
-        """With WORKTREE_LOG_ROOT unset, start_log_path resolves under
+        """With WORKTREE_LOG_ROOT unset, start_log_paths[role] resolves under
         DEFAULT_LOG_ROOT."""
         monkeypatch.delenv("WORKTREE_LOG_ROOT", raising=False)
         import lib_python_worktree.setup.runner as _runner_module
@@ -417,13 +417,13 @@ class TestStartOutputCaptureAndEarlyExit:
             store=store,
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths[DEFAULT_ROLE])
         assert log_path.exists()
         assert str(fake_default) in str(log_path)
 
     def test_start_exited_status_persisted(self):
         """After an immediate-exit start, store.get(id) round-trips status,
-        returncode, and start_log_path -- proving these survive
+        returncode, and start_log_paths -- proving these survive
         store.update()/serialization (see YamlStateStore round-trip test for
         the on-disk serialization path)."""
         record = _make_record("wt-exit-persist")
@@ -439,7 +439,7 @@ class TestStartOutputCaptureAndEarlyExit:
         assert stored is not None
         assert stored.status == "exited"
         assert stored.returncode == 7
-        assert stored.start_log_path is not None
+        assert DEFAULT_ROLE in stored.start_log_paths
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +469,7 @@ class TestStartLogFilenameCasing:
             role="roleA",
         )
 
-        name = Path(result.start_log_path).name
+        name = Path(result.start_log_paths["roleA"]).name
         assert name.startswith("start-") and name.endswith(".log")
         token = name[len("start-"):-len(".log")]
         assert token in result.pids
@@ -486,7 +486,7 @@ class TestStartLogFilenameCasing:
             role="roleA",
         )
 
-        assert Path(result.start_log_path).name == "start-roleA.log"
+        assert Path(result.start_log_paths["roleA"]).name == "start-roleA.log"
 
     def test_start_log_filename_unchanged_for_default_role(self):
         """Edge case: the default role ('main') is already all-lowercase,
@@ -500,7 +500,7 @@ class TestStartLogFilenameCasing:
             store=store,
         )
 
-        assert Path(result.start_log_path).name == "start-main.log"
+        assert Path(result.start_log_paths[DEFAULT_ROLE]).name == "start-main.log"
 
     def test_start_pids_key_is_raw_role(self):
         """Edge case: guards against fixing the mismatch in the wrong
@@ -535,7 +535,7 @@ class TestStartLogFilenameCasing:
             role="Role A/B",
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths["Role A/B"])
         assert log_path.name == "start-Role-A-B.log"
         assert log_path.parent == log_dir_for("wt-casing-5")
         assert log_path.exists()
@@ -554,7 +554,7 @@ class TestStartLogFilenameCasing:
             role="!!!",
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths["!!!"])
         assert log_path.name == "start-_.log"
         assert log_path.exists()
 
@@ -576,7 +576,7 @@ class TestStartLogFilenameCasing:
             store=store,
             role="role",
         )
-        name_literal = Path(result_literal.start_log_path).name
+        name_literal = Path(result_literal.start_log_paths["role"]).name
 
         stop("wt-casing-8", store=store, role="role")
 
@@ -586,7 +586,7 @@ class TestStartLogFilenameCasing:
             store=store,
             role="!!!",
         )
-        name_degenerate = Path(result_degenerate.start_log_path).name
+        name_degenerate = Path(result_degenerate.start_log_paths["!!!"]).name
 
         assert name_literal == "start-role.log"
         assert name_degenerate == "start-_.log"
@@ -610,7 +610,7 @@ class TestStartLogFilenameCasing:
             store=store,
             role="roleA",
         )
-        name_a = Path(result_a.start_log_path).name
+        name_a = Path(result_a.start_log_paths["roleA"]).name
 
         stop("wt-casing-7", store=store, role="roleA")
 
@@ -620,9 +620,235 @@ class TestStartLogFilenameCasing:
             store=store,
             role="rolea",
         )
-        name_b = Path(result_b.start_log_path).name
+        name_b = Path(result_b.start_log_paths["rolea"]).name
 
         assert name_a != name_b
+
+
+# ---------------------------------------------------------------------------
+# start_log_paths: per-role log path tracking (ticket #119)
+# ---------------------------------------------------------------------------
+
+class TestStartLogPathsPerRole:
+    """Ticket #119: ``record.start_log_paths`` is a per-role mapping, not a
+    record-wide scalar overwritten by every ``start()`` call regardless of
+    role. Closes the same cross-role bleed pattern already fixed for
+    ``job_names`` (#95) and ``variants`` (#104)."""
+
+    def test_start_log_paths_keyed_per_role_not_last_write_wins(self):
+        """Requirement 1 (driving test): starting 'main' then 'ui' on the
+        same record must leave BOTH roles' log paths present and distinct.
+        Pre-fix (scalar start_log_path), the 'ui' start would silently
+        overwrite -- there would be no way to recover 'main'\'s log path at
+        all, let alone one still naming 'start-main.log'."""
+        record = _make_record("wt-per-role-1")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-1",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+        result = start(
+            "wt-per-role-1",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="ui",
+        )
+
+        assert Path(result.start_log_paths["main"]).name == "start-main.log"
+        assert Path(result.start_log_paths["ui"]).name == "start-ui.log"
+
+    def test_start_log_paths_key_is_raw_role_value_is_slugged_filename(self):
+        """Edge case: the dict key is the raw role string; the value's
+        filename is the sanitized/slugged form. A degenerate role ('!!!')
+        still keys on '!!!' but the file is 'start-_.log'."""
+        record = _make_record("wt-per-role-2")
+        store = _make_store(record)
+
+        result = start(
+            "wt-per-role-2",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="!!!",
+        )
+
+        assert "!!!" in result.start_log_paths
+        assert Path(result.start_log_paths["!!!"]).name == "start-_.log"
+
+    def test_start_log_paths_key_is_raw_role_for_multi_char_role(self):
+        """Edge case: a role with filesystem-unsafe characters keys on the
+        literal raw role string, while the value's filename is slugged."""
+        record = _make_record("wt-per-role-3")
+        store = _make_store(record)
+
+        result = start(
+            "wt-per-role-3",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="Role A/B",
+        )
+
+        assert "Role A/B" in result.start_log_paths
+        assert Path(result.start_log_paths["Role A/B"]).name == "start-Role-A-B.log"
+
+    def test_start_log_paths_case_only_distinct_roles_get_distinct_keys(self):
+        """Edge case: two roles differing only by case produce two distinct
+        keys with two distinct path strings (string comparison only -- no
+        on-disk existence assertion, mirroring the case-insensitive-
+        filesystem caveat already documented on
+        test_start_log_filenames_differ_for_case_only_distinct_roles)."""
+        record = _make_record("wt-per-role-4")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-4",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="roleA",
+        )
+        stop("wt-per-role-4", store=store, role="roleA")
+        result = start(
+            "wt-per-role-4",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="rolea",
+        )
+
+        assert "roleA" in result.start_log_paths
+        assert "rolea" in result.start_log_paths
+        assert result.start_log_paths["roleA"] != result.start_log_paths["rolea"]
+
+    def test_start_log_paths_restarting_same_role_overwrites_not_accumulates(self):
+        """Edge case: restarting the same role overwrites that role's single
+        entry rather than accumulating extra keys."""
+        record = _make_record("wt-per-role-5")
+        store = _make_store(record)
+
+        first = start(
+            "wt-per-role-5",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+        first_path = first.start_log_paths["main"]
+
+        stop("wt-per-role-5", store=store, role="main")
+        second = start(
+            "wt-per-role-5",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+
+        assert list(second.start_log_paths.keys()) == ["main"]
+        # Same role -> same filename contract -> same path string again.
+        assert second.start_log_paths["main"] == first_path
+
+    def test_stop_returns_stopping_roles_own_log_path(self):
+        """Requirement 2 (driving test): the ticket's reported symptom --
+        stop(role='main') must return 'main'\'s own log path, never 'ui'\'s.
+        Pre-fix (scalar start_log_path last-write-wins), the record's single
+        scalar would name whichever role started last ('ui'), so this
+        assertion would fail with a path ending in 'start-ui.log'."""
+        record = _make_record("wt-per-role-6")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-6",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="main",
+        )
+        start(
+            "wt-per-role-6",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="ui",
+        )
+
+        try:
+            result = stop("wt-per-role-6", store=store, role="main")
+
+            assert "main" in result.start_log_paths
+            main_log_name = Path(result.start_log_paths["main"]).name
+            assert main_log_name == "start-main.log"
+            assert main_log_name != "start-ui.log"
+        finally:
+            try:
+                stop("wt-per-role-6", store=store, role="ui")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_stop_does_not_affect_other_roles_log_path_entry(self):
+        """Edge case: stopping 'main' leaves 'ui'\'s start_log_paths entry
+        untouched."""
+        record = _make_record("wt-per-role-7")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-7",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="main",
+        )
+        started_ui = start(
+            "wt-per-role-7",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="ui",
+        )
+        ui_path_before = started_ui.start_log_paths["ui"]
+
+        try:
+            result = stop("wt-per-role-7", store=store, role="main")
+            assert result.start_log_paths["ui"] == ui_path_before
+        finally:
+            try:
+                stop("wt-per-role-7", store=store, role="ui")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_stop_of_never_started_role_leaves_map_untouched(self):
+        """Edge case: stop() of a role with no tracked pid raises
+        ProcessNotRunningError (pre-existing, documented behaviour) without
+        ever touching start_log_paths for any other role."""
+        record = _make_record(
+            "wt-per-role-8", pids={}, start_log_paths={"main": "/some/start-main.log"}
+        )
+        store = _make_store(record)
+
+        # 'ui' was never started -- stop() refuses rather than silently
+        # no-opping.
+        with pytest.raises(ProcessNotRunningError):
+            stop("wt-per-role-8", store=store, role="ui")
+
+        stored = store.get("wt-per-role-8")
+        assert stored is not None
+        assert stored.start_log_paths == {"main": "/some/start-main.log"}
+
+    def test_stop_does_not_pop_the_stopped_roles_start_log_paths_entry(self):
+        """Requirement 2 edge case: a dedicated assertion locking in the
+        deliberate divergence from job_names/variants -- stop() must NOT
+        remove the stopping role's start_log_paths entry (contrast
+        result.job_names / result.variants, which ARE cleared for this
+        role by the same call)."""
+        record = _make_record("wt-per-role-9")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-9",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+
+        result = stop("wt-per-role-9", store=store, role="main")
+
+        assert "main" in result.start_log_paths
+        assert "main" not in result.pids
+        assert "main" not in result.variants
 
 
 class TestRoleLogSlug:

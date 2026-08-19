@@ -284,6 +284,32 @@ def _setup_outcome_from_dict(d: Optional[Dict[str, Any]]) -> Optional[SetupOutco
     )
 
 
+def _start_log_paths_from_dict(d: Any) -> Dict[str, str]:
+    """Reconstruct the ``start_log_paths`` per-role mapping (ticket #119)
+    from its serialised form, tolerating anything a legacy or corrupt
+    state.yaml might hand back.
+
+    Deliberately does **not** fall back to the removed scalar
+    ``start_log_path`` key -- a record written by an older engine (which
+    only ever had that scalar) deserialises to ``{}``, matching the "no
+    start log recorded for this role" convention documented on
+    :attr:`~.state.WorktreeRecord.start_log_paths`.
+
+    Never raises: a missing key, ``None``, or any non-``dict`` value (e.g.
+    a leftover string from a hand-edited file) yields ``{}``; within a
+    dict, any entry whose key or value is not a ``str`` is skipped rather
+    than coerced, so a corrupt single entry cannot take down the whole
+    record load.
+    """
+    if not isinstance(d, dict):
+        return {}
+    return {
+        key: value
+        for key, value in d.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+
+
 def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
     return {
         "id": rec.id,
@@ -295,7 +321,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "pids": dict(rec.pids),
         "branch_created_by_us": rec.branch_created_by_us,
         "returncode": rec.returncode,
-        "start_log_path": rec.start_log_path,
+        "start_log_paths": dict(rec.start_log_paths),
         "backing": rec.backing,
         "job_names": dict(rec.job_names),
         "variants": dict(rec.variants),
@@ -323,7 +349,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         pids=dict(d.get("pids") or {}),
         branch_created_by_us=bool(d.get("branch_created_by_us", False)),
         returncode=d.get("returncode"),
-        start_log_path=d.get("start_log_path"),
+        start_log_paths=_start_log_paths_from_dict(d.get("start_log_paths")),
         backing=d.get("backing", "worktree"),
         job_names=dict(d.get("job_names") or {}),
         variants=dict(d.get("variants") or {}),
@@ -643,6 +669,11 @@ def reconcile(
                 # phantom / ambiguous stop(variant=...) match against a role
                 # that no longer has a live pid.
                 rec.variants.pop(role, None)
+                # Ticket #119 -- start_log_paths[role] is intentionally NOT
+                # popped here; the log file outlives its process and callers
+                # read it off the stop/list response, so this field
+                # deliberately does not honour the set(x) <= set(pids)
+                # invariant that job_names/variants do.
                 _log.warning(
                     "reconcile: worktree '%s' PID %d (role '%s') is dead → removed",
                     wt_id, pid, role,
