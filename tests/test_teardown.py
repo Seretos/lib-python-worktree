@@ -75,6 +75,25 @@ def _no_blocking_processes_by_default():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_preflight_settle_sleep():
+    """Default-patch ``time.sleep`` (as seen through ``manager.time``) to a
+    no-op for every test in this module (ticket #117).
+
+    Gate A's confirmed-blocker pre-flight check now sleeps
+    ``_PREFLIGHT_SETTLE_SLEEP`` seconds before re-scanning a foreign
+    (non-owned) blocker. Left unpatched, that would cost ~1s of real wall
+    time across every foreign-blocker pre-flight test in this module. Tests
+    that specifically assert on sleep/retry behaviour override this via
+    their own nested ``patch("lib_python_worktree.core.manager.time")``
+    (patching the whole module reference, not just ``.sleep``) for the
+    duration of their ``with`` block -- an inner patch on the same target
+    always wins for its scope and unwinds back to this outer patch on exit.
+    """
+    with patch("lib_python_worktree.core.manager.time.sleep"):
+        yield
+
+
 def _run_teardown_with_mocked_git(
     manager: WorktreeManager,
     record: WorktreeRecord,
@@ -2923,28 +2942,25 @@ class TestWindowsPreflightBlockingCheck:
         mock_kill.assert_not_called()
         mock_git.assert_called_once()
 
-    def test_preflight_degraded_partial_raises_instead_of_silent_removal(
-        self, tmp_path
-    ):
-        """Ticket #107 fix cycle (review finding 2): when
-        _find_blocking_processes' Pass 2 degrades (e.g. psutil's
-        open_files() raised an OS-wide RuntimeError on Windows -- see
-        TestDiscoveryCompleteness::
+    def test_degraded_scan_alone_does_not_block_removal(self, tmp_path):
+        """Ticket #117 (Q2 Option A -- inverts the pre-#117 escalation
+        pinned by the old test_preflight_degraded_partial_raises_instead_of_
+        silent_removal): when _find_blocking_processes' Pass 2 degrades
+        (e.g. psutil's open_files() raised an OS-wide RuntimeError on
+        Windows -- see TestDiscoveryCompleteness::
         test_open_files_runtime_error_degrades_instead_of_raising in
         test_process_lifecycle.py), it returns an empty, degraded
         _PartialList (complete=False, skipped_passes=("open_files:degraded",)).
-        A truthiness-only check on that empty list cannot distinguish
-        "scanned and found nothing" from "never got a real look", and would
-        silently fall through to the destructive `git worktree remove` call
-        -- reproducing exactly the locked/partial-directory failure mode
-        this pre-flight exists to prevent. _teardown must instead treat an
-        incomplete scan the same as "found a blocker": with
-        kill_blocking_processes=False it must raise WorktreeDirLockedError
-        BEFORE the destructive git call runs, not proceed straight through
-        like the genuinely-clean-scan case in
-        test_preflight_no_blockers_falls_through_to_normal_removal above."""
-        from lib_python_worktree.core.manager import WorktreeDirLockedError
 
+        Under the pre-#117 behaviour this alone escalated to
+        WorktreeDirLockedError -- "no information" was treated the same as
+        "confirmed blocker", making removal impossible for a never-started
+        or cleanly-stopped environment on a host where the OS-wide handle
+        query happens to fail. Ticket #117 makes this a logged, tolerated
+        condition instead: the degraded tag carries no pid to confirm, so it
+        can never contribute to Gate A's owned/foreign confirmation on its
+        own -- removal must proceed, with a warning naming the degraded
+        pass so the condition is observable rather than silent."""
         manager = _make_manager(tmp_path)
         record = _make_record(
             "wt-preflight-degraded", path="/fake/store/wt-preflight-degraded"
@@ -2966,35 +2982,70 @@ class TestWindowsPreflightBlockingCheck:
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
-            with pytest.raises(WorktreeDirLockedError) as excinfo:
-                manager._teardown(
-                    record,
-                    force=False,
-                    kill_blocking_processes=False,
-                    _lifecycle_module=mock_lifecycle,
-                )
-
-        assert excinfo.value.kill_attempted is False
-        mock_find.assert_called_once_with(record.path, os.getpid())
-        # The destructive `git worktree remove` must never run -- only the
-        # dirt-probe `git status` call (if any) is permitted before the
-        # raise.
-        for call_args in mock_git.call_args_list:
-            args = call_args.args[0] if call_args.args else call_args.kwargs.get("args")
-            assert args[:2] != ["worktree", "remove"], (
-                "git worktree remove must not run when the pre-flight scan "
-                "was incomplete and no kill was attempted"
+            # Must NOT raise -- degraded alone is never a hard block.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
             )
 
-    def test_preflight_degraded_partial_kill_flag_on_attempts_kill_and_proceeds(
-        self, tmp_path
-    ):
-        """Companion to the above: with kill_blocking_processes=True, an
-        incomplete/degraded pre-flight scan must still attempt a kill (best
-        effort) before falling through to `git worktree remove`, exactly as
-        it already does for a scan that positively found a blocker -- it
-        must not skip the kill attempt just because the degraded scan
-        itself returned an empty list."""
+        # Only one scan: an empty (owned+foreign both empty) result never
+        # enters the settle-window rescan.
+        mock_find.assert_called_once_with(record.path, os.getpid())
+        # The destructive `git worktree remove` call did run.
+        assert any(
+            (call_args.args[0] if call_args.args else call_args.kwargs.get("args"))[
+                :2
+            ]
+            == ["worktree", "remove"]
+            for call_args in mock_git.call_args_list
+        ), "git worktree remove must run once a degraded-alone scan is tolerated"
+
+    def test_degraded_scan_alone_logs_warning(self, tmp_path, caplog):
+        """Companion assertion (split out for a clean caplog fixture): the
+        degraded tag is still observable via a WARNING log naming
+        'open_files:degraded', even though it no longer blocks removal."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-preflight-degraded-log", path="/fake/store/wt-preflight-degraded-log"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        degraded = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=degraded,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            caplog.at_level("WARNING", logger="lib_python_worktree.core.manager"),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert any(
+            "open_files:degraded" in rec.message for rec in caplog.records
+        ), "expected a warning naming open_files:degraded"
+
+    def test_degraded_scan_with_kill_flag_does_not_attempt_kill(self, tmp_path):
+        """Rewrite of the old test_preflight_degraded_partial_kill_flag_on_
+        attempts_kill_and_proceeds: since a degraded-alone scan no longer
+        enters Gate A's confirmed-blocker branch at all (ticket #117),
+        kill_blocking_processes=True must NOT attempt a kill -- there is
+        nothing confirmed to kill. Removal still proceeds straight through
+        to `git worktree remove`."""
         manager = _make_manager(tmp_path)
         record = _make_record(
             "wt-preflight-degraded-killon",
@@ -3030,7 +3081,7 @@ class TestWindowsPreflightBlockingCheck:
             patch(
                 "lib_python_worktree.core.manager._kill_blocking_processes",
                 side_effect=_mock_kill,
-            ),
+            ) as mock_kill,
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
@@ -3042,71 +3093,54 @@ class TestWindowsPreflightBlockingCheck:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        assert call_order == ["kill", "git_remove"], (
-            f"expected pre-flight kill before git remove even on a "
-            f"degraded scan, got {call_order}"
+        mock_kill.assert_not_called()
+        assert call_order == ["git_remove"], (
+            f"expected git remove with no kill attempt for a degraded-alone "
+            f"scan, got {call_order}"
         )
 
-    def test_preflight_degraded_partial_kill_flag_on_rescan_still_degraded_raises(
-        self, tmp_path
-    ):
-        """Full re-review finding (fix-loop round 2): _kill_blocking_processes
-        re-runs _find_blocking_processes itself and, per its own `if not
-        found: return found` early return, does nothing at all when that
-        rescan is STILL degraded -- the OS-wide "buffer too big" condition
-        is process-independent, so it will typically recur immediately on
-        retry. Killing whatever *was* found (if anything) does not make the
-        remaining, un-inspectable process space any safer to assume clear.
-        Unlike the companion test above (where the kill's rescan comes back
-        clean and removal proceeds), a rescan that is STILL degraded must
-        raise WorktreeDirLockedError with kill_attempted=True rather than
-        falling through to the destructive `git worktree remove` call on
-        zero real new information."""
+    def test_degraded_plus_confirmed_blocker_still_raises(self, tmp_path):
+        """Additional coverage (ticket #117): the degraded tag never
+        *suppresses* a real confirmation -- if the SAME scan also carries a
+        pid that is confirmed on the settle-window rescan, Gate A must still
+        raise, exactly as it would for a non-degraded confirmed blocker."""
         from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
 
         manager = _make_manager(tmp_path)
         record = _make_record(
-            "wt-preflight-degraded-killon-stillblind",
-            path="/fake/store/wt-preflight-degraded-killon-stillblind",
+            "wt-preflight-degraded-plus-blocker",
+            path="/fake/store/wt-preflight-degraded-plus-blocker",
         )
         manager.state.add(record)
 
         mock_lifecycle = MagicMock()
-        degraded = _PartialList(
-            [], complete=False, skipped_passes=("open_files:degraded",)
-        )
-        still_degraded = _PartialList(
-            [], complete=False, skipped_passes=("open_files:degraded",)
+        degraded_with_blocker = _PartialList(
+            [KilledProcessInfo(pid=3131, name="node.exe", cmdline=["node"])],
+            complete=False,
+            skipped_passes=("open_files:degraded",),
         )
 
         with (
             patch("lib_python_worktree.core.manager._run_git") as mock_git,
             patch(
                 "lib_python_worktree.core.manager._find_blocking_processes",
-                return_value=degraded,
-            ),
-            patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
-                return_value=still_degraded,
+                return_value=degraded_with_blocker,
             ),
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
                 manager._teardown(
                     record,
                     force=True,
-                    kill_blocking_processes=True,
+                    kill_blocking_processes=False,
                     _lifecycle_module=mock_lifecycle,
                 )
 
-        assert excinfo.value.kill_attempted is True
-        for call_args in mock_git.call_args_list:
-            args = call_args.args[0] if call_args.args else call_args.kwargs.get("args")
-            assert args[:2] != ["worktree", "remove"], (
-                "git worktree remove must not run when the kill's own "
-                "rescan is still degraded/blind"
-            )
+        assert excinfo.value.kill_attempted is False
+        mock_git.assert_not_called()
 
     def test_preflight_ordinary_truncation_falls_through_to_normal_removal(
         self, tmp_path
@@ -3159,6 +3193,1193 @@ class TestWindowsPreflightBlockingCheck:
 
         mock_find.assert_called_once_with(record.path, os.getpid())
         mock_git.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestTicket117PreflightFalsePositive -- ticket #117, behavioural
+# requirement 1: a transient foreign blocker must not permanently block
+# removal (the reported false-positive bug).
+# ---------------------------------------------------------------------------
+
+class TestTicket117PreflightFalsePositive:
+    def test_transient_foreign_blocker_settles_and_removal_proceeds(
+        self, tmp_path
+    ):
+        """Driving/regression test: a foreign process (not one of ours) is
+        found on the first pre-flight scan but is gone by the confirming
+        re-scan -- Gate A must NOT refuse removal. Before ticket #117, ANY
+        non-empty scan result refused immediately (WorktreeDirLockedError,
+        killed=[], kill_attempted=False) with no settle window at all."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-transient", path="/fake/store/wt-117-transient"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        transient = [KilledProcessInfo(pid=4444, name="claude", cmdline=["claude"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                side_effect=[transient, []],
+            ) as mock_find,
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes"
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must NOT raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert mock_find.call_count == 2
+        mock_kill.assert_not_called()
+        assert any(
+            (call_args.args[0] if call_args.args else call_args.kwargs.get("args"))[
+                :2
+            ]
+            == ["worktree", "remove"]
+            for call_args in mock_git.call_args_list
+        ), "git worktree remove must run once the transient blocker settles"
+
+    def test_persistent_foreign_blocker_still_raises(self, tmp_path):
+        """A foreign process present on BOTH the initial scan and the
+        confirming re-scan is a genuine, confirmed blocker -- ticket #76's
+        protection is fully retained. kill_blocking_processes=False must
+        still refuse before the destructive git call."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-persistent", path="/fake/store/wt-117-persistent"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        persistent = [KilledProcessInfo(pid=4444, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.kill_attempted is False
+        assert excinfo.value.killed == []
+        assert mock_find.call_count == 2
+        mock_git.assert_not_called()
+
+    def test_persistent_foreign_blocker_with_kill_flag_clears_and_proceeds(
+        self, tmp_path
+    ):
+        """Same persistent, confirmed blocker as above, but with
+        kill_blocking_processes=True: the kill remedy is attempted and
+        removal proceeds -- AC #2, a kill is only ever attempted against a
+        confirmed blocker."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-persistent-kill", path="/fake/store/wt-117-persistent-kill"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        persistent = [KilledProcessInfo(pid=5555, name="node.exe", cmdline=["node"])]
+
+        call_order: List[str] = []
+
+        def _mock_kill(path):
+            call_order.append("kill")
+            return persistent
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_order.append("git_remove")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                side_effect=_mock_kill,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert call_order == ["kill", "git_remove"]
+        assert record.killed_pids == persistent
+
+    def test_settle_warning_names_pid_and_process_name(self, tmp_path, caplog):
+        """The confirmation warning names the offending pid and process
+        name, satisfying AC #4's 'surfacing WHO holds the lock'."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-named", path="/fake/store/wt-117-named"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        persistent = [
+            KilledProcessInfo(pid=9191, name="MsMpEng.exe", cmdline=["MsMpEng.exe"])
+        ]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            caplog.at_level("WARNING", logger="lib_python_worktree.core.manager"),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert any(
+            "9191" in rec.message and "MsMpEng.exe" in rec.message
+            for rec in caplog.records
+        ), "expected a warning naming pid=9191 and MsMpEng.exe"
+
+    def test_settle_loop_is_bounded(self, tmp_path):
+        """The settle window is bounded: at most _PREFLIGHT_SETTLE_RETRIES
+        sleep calls and at most 2 total scan calls, even for a persistent
+        blocker."""
+        from lib_python_worktree.core.manager import (
+            WorktreeDirLockedError,
+            _PREFLIGHT_SETTLE_RETRIES,
+        )
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-bounded", path="/fake/store/wt-117-bounded"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        persistent = [KilledProcessInfo(pid=6262, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.time") as mock_time,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert mock_find.call_count <= 2
+        assert mock_time.sleep.call_count <= _PREFLIGHT_SETTLE_RETRIES
+
+    def test_plain_list_without_skipped_passes_attr_works(self, tmp_path):
+        """A plain `list` return (no `.skipped_passes` attribute, e.g. an
+        older/simpler test double) must not raise AttributeError -- the
+        degraded check uses `getattr(..., "skipped_passes", ())`."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-plainlist", path="/fake/store/wt-117-plainlist"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+    def test_posix_never_scans(self, tmp_path):
+        """Retrospective coverage: the Windows-only guard is unaffected by
+        the Gate A rewrite -- POSIX never calls _find_blocking_processes at
+        all (existing coverage, re-asserted here for the new gate)."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-117-posix", path="/fake/store/wt-117-posix")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes"
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "linux"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_find.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestTicket117OwnedBlocker -- ticket #117, behavioural requirement 2: an
+# owned blocker (a pid this environment itself tracked) is confirmed
+# without a settle delay, and still hard-blocks.
+# ---------------------------------------------------------------------------
+
+class TestTicket117OwnedBlocker:
+    def test_owned_blocker_confirmed_even_when_co_occurring_foreign_settles(
+        self, tmp_path
+    ):
+        """Driving test: a single scan returns BOTH an owned blocker (a pid
+        this environment tracked in record.pids) and a foreign one that
+        turns out to be transient (gone by the confirming re-scan). Gate A
+        must still raise -- the owned pid is trusted immediately, with no
+        need for it to also survive a confirming re-scan -- AND the
+        re-scan must still have happened (because the co-occurring foreign
+        hit needs settling), so `_find_blocking_processes` is called
+        exactly twice.
+
+        This is the genuinely RED-worthy assertion for requirement 2: a
+        single *owned-only* blocker (no co-occurring foreign hit) happens
+        to produce the SAME observable outcome under the pre-#117 code
+        (which also raises immediately with exactly one scan and no sleep,
+        since it never distinguished owned from foreign at all) -- see
+        test_single_owned_blocker_needs_no_settle_delay below, which is
+        legitimate additional coverage but does not itself demonstrate a
+        behavioural difference. The owned/foreign PARTITION machinery this
+        ticket adds only becomes observable once a foreign pid is also in
+        play: pre-#117 code would raise after exactly ONE scan call
+        (compound truthiness check, no settle window at all); ticket #117
+        code must still raise, but only after TWO scan calls (the
+        mandatory settle re-scan for the foreign hit)."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-owned-mixed",
+            path="/fake/store/wt-117-owned-mixed",
+            pids={"main": 4444},
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        owned_hit = KilledProcessInfo(pid=4444, name="daemon", cmdline=["daemon"])
+        foreign_hit = KilledProcessInfo(pid=5555, name="claude", cmdline=["claude"])
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                side_effect=[[owned_hit, foreign_hit], [owned_hit]],
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.kill_attempted is False
+        assert mock_find.call_count == 2, (
+            "the co-occurring foreign hit must still trigger a confirming "
+            "settle re-scan even though the owned hit alone already "
+            "guarantees the refusal"
+        )
+        mock_git.assert_not_called()
+
+    def test_single_owned_blocker_needs_no_settle_delay(self, tmp_path):
+        """Additional coverage: a scan containing ONLY an owned blocker (no
+        co-occurring foreign hit) is confirmed with a single scan call and
+        no sleep. Disclosed honestly: this exact assertion set ALSO holds
+        under the pre-#117 code (which never had a settle window for
+        anything, owned or foreign, so a lone non-empty scan result always
+        raised immediately after one call) -- it does not by itself
+        demonstrate the new owned/foreign partition; the mixed-blocker test
+        above does. Kept here as a pin on the no-unnecessary-delay
+        guarantee for the common single-owned-daemon case."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-owned",
+            path="/fake/store/wt-117-owned",
+            pids={"main": 4444},
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        owned_hit = [KilledProcessInfo(pid=4444, name="daemon", cmdline=["daemon"])]
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=owned_hit,
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.time") as mock_time,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.kill_attempted is False
+        mock_find.assert_called_once_with(record.path, os.getpid())
+        mock_time.sleep.assert_not_called()
+
+    def test_owned_blocker_kill_flag_kills_and_proceeds(self, tmp_path):
+        """Extends the existing owned-blocker coverage: with
+        kill_blocking_processes=True, the owned blocker is killed (no
+        settle delay) and removal proceeds."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-owned-kill",
+            path="/fake/store/wt-117-owned-kill",
+            pids={"main": 7373},
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        owned_hit = [KilledProcessInfo(pid=7373, name="daemon", cmdline=["daemon"])]
+
+        call_order: List[str] = []
+
+        def _mock_kill(path):
+            call_order.append("kill")
+            return owned_hit
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_order.append("git_remove")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=owned_hit,
+            ) as mock_find,
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                side_effect=_mock_kill,
+            ),
+            patch("lib_python_worktree.core.manager.time") as mock_time,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert call_order == ["kill", "git_remove"]
+        assert record.killed_pids == owned_hit
+        mock_find.assert_called_once_with(record.path, os.getpid())
+        mock_time.sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestTicket117FixCycleDegradedConfirmation -- fix-loop round (blocking
+# findings 1 & 2): a DEGRADED rescan must never be read as evidence that a
+# previously observed blocker cleared. The ticket's core de-escalation (a
+# degraded scan with NO prior hit does not block removal -- see
+# TestWindowsPreflightBlockingCheck::test_degraded_scan_alone_does_not_
+# block_removal) must remain intact; these tests cover only the narrower
+# case where a real hit was already observed and the follow-up scan (either
+# Gate A's confirming settle rescan, or _kill_blocking_processes' own
+# internal rescan) comes back blind instead of clean.
+# ---------------------------------------------------------------------------
+
+class TestTicket117FixCycleDegradedConfirmation:
+    def test_degraded_confirming_rescan_does_not_clear_real_blocker(
+        self, tmp_path
+    ):
+        """Driving test for blocking finding 1: the settle-window
+        CONFIRMING re-scan comes back DEGRADED (open_files:degraded, empty
+        contents) instead of clean, after the first scan found a genuine
+        foreign hit. A blind rescan is not evidence the foreign blocker
+        went away -- Gate A must NOT intersect the degraded rescan's empty
+        pid set with the first scan's hit and conclude "settled, proceed".
+        Before this fix, intersecting an empty `_rescan_pids` (the
+        degraded _PartialList's empty contents) with the first-scan
+        foreign pid always produced an empty `_foreign`, silently clearing
+        a real, unconfirmed blocker and falling through to the destructive
+        `git worktree remove` call -- reproducing the exact locked-
+        directory failure ticket #117 exists to prevent."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-degraded-confirm",
+            path="/fake/store/wt-117-degraded-confirm",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        foreign_hit = [
+            KilledProcessInfo(pid=8181, name="node.exe", cmdline=["node"])
+        ]
+        degraded_rescan = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                side_effect=[foreign_hit, degraded_rescan],
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.kill_attempted is False
+        assert mock_find.call_count == 2, (
+            "the degraded confirming rescan must still have been "
+            "attempted once within the bounded settle window"
+        )
+        mock_git.assert_not_called()
+
+    def test_degraded_scan_alone_still_does_not_block_with_new_logic(
+        self, tmp_path
+    ):
+        """Non-regression companion for AC #1: a degraded scan with NO
+        prior hit at all must still proceed without refusal -- the
+        finding-1 fix only concerns a degraded rescan that follows a real
+        first-scan hit; it must not resurrect the pre-#117 blanket
+        degraded-always-blocks behaviour for the no-hit case."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-degraded-nohit-fixcycle",
+            path="/fake/store/wt-117-degraded-nohit-fixcycle",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        degraded = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=degraded,
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must NOT raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        # No prior hit -> `_foreign` is empty -> the settle loop (and thus
+        # any confirming rescan) is never entered at all.
+        mock_find.assert_called_once_with(record.path, os.getpid())
+        mock_git.assert_called_once()
+
+    def test_kill_blocking_processes_degraded_result_does_not_clear_confirmed_blocker(
+        self, tmp_path
+    ):
+        """Driving test for blocking finding 2: `_kill_blocking_processes`
+        returns an empty, DEGRADED `_PartialList` (its own internal rescan
+        hit open_files:degraded and never actually looked for anything to
+        kill) rather than a genuinely empty list. `if not killed:` alone
+        cannot distinguish "killed nothing because the confirmed blocker
+        was already gone" from "the kill's own scan went blind" -- a
+        `_PartialList` is falsy-empty in both cases; only
+        `skipped_passes` on the returned value tells them apart. Before
+        this fix, the pre-#117 guard for exactly this case had been
+        dropped with no replacement, so a still-live, twice-confirmed
+        blocker fell through silently to the destructive `git worktree
+        remove` call."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-kill-degraded", path="/fake/store/wt-117-kill-degraded"
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        persistent = [
+            KilledProcessInfo(pid=9292, name="node.exe", cmdline=["node"])
+        ]
+        degraded_kill_result = _PartialList(
+            [], complete=False, skipped_passes=("open_files:degraded",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                return_value=degraded_kill_result,
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_called_once()
+        assert excinfo.value.kill_attempted is True
+        assert excinfo.value.killed == []
+        mock_git.assert_not_called()
+
+    def test_kill_blocking_processes_empty_non_degraded_still_proceeds(
+        self, tmp_path
+    ):
+        """Non-regression companion: when `_kill_blocking_processes`
+        returns a genuinely empty, NON-degraded result (the confirmed
+        blocker exited in the interval between confirmation and the kill
+        call), the existing 'warn and proceed' behaviour must be
+        unaffected by the finding-2 fix."""
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-kill-empty-clean",
+            path="/fake/store/wt-117-kill-empty-clean",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        persistent = [
+            KilledProcessInfo(pid=9393, name="node.exe", cmdline=["node"])
+        ]
+
+        call_order: List[str] = []
+
+        def _mock_kill(path):
+            call_order.append("kill")
+            return []
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            call_order.append("git_remove")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+                side_effect=_mock_kill,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=True,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert call_order == ["kill", "git_remove"]
+
+
+# ---------------------------------------------------------------------------
+# TestTicket117TeardownRunsAtMostOnce -- ticket #117, behavioural
+# requirement 4 (AC #3): contract teardown: steps run at most once per
+# logical removal, only past both gates.
+# ---------------------------------------------------------------------------
+
+class TestTicket117TeardownRunsAtMostOnce:
+    def test_preflight_block_does_not_run_teardown_steps(self, tmp_path):
+        """Driving test: a twice-confirmed persistent blocker refuses
+        removal (Gate A) BEFORE the contract's teardown: steps ever run --
+        only the stop: steps (Step 1b) may have run. Before ticket #117,
+        teardown: ran unconditionally before the pre-flight gate, so a
+        blocked attempt had already executed it once."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-teardown-once", path="/fake/store/wt-117-teardown-once"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='echo stop', name="stop-svc")],
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        runner_calls: List[dict] = []
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+        persistent = [KilledProcessInfo(pid=8181, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record,
+                    force=True,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        setups_run = [kw["setup"] for kw in runner_calls]
+        assert fake_contract.stop in setups_run, "stop: steps must still run"
+        assert fake_contract.teardown not in setups_run, (
+            "teardown: steps must NOT run when Gate A refuses the removal"
+        )
+
+    def test_dirty_tree_raises_before_teardown_steps(self, tmp_path):
+        """Gate B: real (non-.seretos) uncommitted dirt refuses removal
+        BEFORE the teardown: steps run, when the contract has teardown:
+        steps to protect."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-dirty-gate", path="/fake/store/wt-117-dirty-gate"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? real.txt\0", stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(DirtyWorktreeError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert runner_calls == [], "teardown: steps must not run before Gate B"
+
+    def test_no_teardown_steps_means_no_extra_git_status(self, tmp_path):
+        """When the contract has no teardown: steps, Gate B must not call
+        _dirt_probe() at all -- zero extra `git status` calls, preserving
+        the pre-#117 happy-path call-count guarantee."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-no-teardown-status", path="/fake/store/wt-117-no-teardown-status"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='echo stop', name="stop-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=False, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert not any(_is_status_call(c.args[0]) for c in mock_git.call_args_list), (
+            "no git status call expected when there are no teardown: steps"
+        )
+        mock_git.assert_called_once()
+
+    def test_teardown_step_dirt_is_not_masked_by_stale_pre_teardown_cache(
+        self, tmp_path
+    ):
+        """Ticket #117 fix cycle (blocking finding): pre-teardown dirt is
+        ONLY the benign, exempt `.seretos/` copy (so Gate B correctly does
+        not refuse and lets teardown: run), but the teardown: step itself
+        leaves behind REAL, non-exempt dirt (e.g. a log a teardown script
+        forgot to clean up). The post-teardown `.seretos/`-exemption
+        classifier must re-probe `git status` rather than reuse Gate B's
+        memoised pre-teardown snapshot -- reusing it would make the
+        classifier believe all dirt is still the benign `.seretos/` copy
+        and silently auto-force-discard the real dirt instead of raising
+        DirtyWorktreeError."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-stale-cache", path="/fake/store/wt-117-stale-cache"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        teardown_ran = [False]
+        runner_calls: List[dict] = []
+
+        def _run_teardown(**kw):
+            runner_calls.append(kw)
+            teardown_ran[0] = True
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = _run_teardown
+
+        mock_lifecycle = MagicMock()
+        status_call_count = [0]
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                status_call_count[0] += 1
+                if not teardown_ran[0]:
+                    # Pre-teardown: only the benign, exempt .seretos/ copy.
+                    return MagicMock(
+                        returncode=0, stdout="?? .seretos/notes.txt\0", stderr=""
+                    )
+                # Post-teardown: the teardown step left real, non-exempt
+                # dirt behind (the .seretos/ copy is gone from this
+                # re-probe -- the point is the REAL dirt must be seen, not
+                # masked by whatever the stale snapshot held).
+                return MagicMock(
+                    returncode=0, stdout="?? real_leftover.log\0", stderr=""
+                )
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(DirtyWorktreeError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert len(runner_calls) == 1, "teardown: steps must have run exactly once"
+        assert status_call_count[0] == 2, (
+            "expected exactly two git status calls: Gate B's pre-teardown "
+            "probe (memoised for Gate B's own use), and a fresh "
+            "post-teardown re-probe by the .seretos/-exemption classifier "
+            "-- reusing Gate B's stale snapshot instead of re-probing is "
+            "exactly the bug this test guards against"
+        )
+
+    def test_only_seretos_dirt_still_reaches_git_and_auto_forces(self, tmp_path):
+        """Ticket #100 exemption preserved: when the ONLY dirt is benign
+        untracked content under .seretos/, Gate B must NOT refuse -- the
+        dirt probe used by Gate B (_real_dirt_paths) already filters exempt
+        untracked entries, so removal reaches the git call and the existing
+        auto-force retry logic further down handles the rest."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-seretos-only", path="/fake/store/wt-117-seretos-only"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                return MagicMock(
+                    returncode=0, stdout="?? .seretos/notes.txt\0", stderr=""
+                )
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            # Must not raise.
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1
+        assert runner_calls[0]["setup"] == fake_contract.teardown
+
+    def test_force_true_skips_early_dirt_probe(self, tmp_path):
+        """force=True: Gate B's condition requires `not force`, so it never
+        even calls _dirt_probe() -- real dirt cannot block a forced
+        removal, matching the existing force=True/no-status-call
+        guarantee."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-force-skip", path="/fake/store/wt-117-force-skip"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+        calls: List[list] = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            calls.append(list(args))
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert not any(_is_status_call(c) for c in calls)
+        assert len(runner_calls) == 1
+
+    def test_contract_loaded_once_per_teardown(self, tmp_path):
+        """The consolidated single contract load (ticket #117) means
+        _load_contract is called exactly once per _teardown() invocation,
+        not twice (once for stop:, once for teardown:) as before."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-load-once", path="/fake/store/wt-117-load-once"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='echo stop', name="stop-svc")],
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ) as mock_load,
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=False, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_load.assert_called_once()
+
+    def test_dirt_snapshot_taken_before_teardown_steps(self, tmp_path):
+        """Shared-call-site note (ticket #117): Gate B primes the memoised
+        status cache BEFORE the teardown: steps run, so a teardown step's
+        own generated untracked file cannot retroactively taint the dirt
+        snapshot this same removal attempt already judged. Uses a
+        conclusive (non-empty, exempt-only) status result so the pre-
+        existing memoisation actually short-circuits the second call site
+        further down (an inconclusive/empty result is a documented
+        `_status_entries` special case -- see its docstring -- that is
+        deliberately out of this ticket's scope). The status call must
+        happen exactly once, and before the runner call that executes
+        teardown:."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-117-snapshot-order", path="/fake/store/wt-117-snapshot-order"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        call_order: List[str] = []
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = lambda **kw: call_order.append(
+            "teardown_runner"
+        )
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                call_order.append("git_status")
+                return MagicMock(
+                    returncode=0, stdout="?? .seretos/notes.txt\0", stderr=""
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=False, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert call_order == ["git_status", "teardown_runner"], (
+            f"expected dirt snapshot before teardown: steps, got {call_order}"
+        )
+        assert call_order.count("git_status") == 1
 
 
 # ---------------------------------------------------------------------------
