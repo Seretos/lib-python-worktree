@@ -44,7 +44,12 @@ from .checkout import (
     primary_id_for,
     untracked_id_for,
 )
-from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
+from .port_allocator import (
+    PinnedPortUnavailableError,
+    PortAllocationError,
+    PortAllocator,
+    _NoOpPortAllocator,
+)
 from .process_lifecycle import (
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
@@ -88,9 +93,24 @@ _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _PORT_RANGE_ENV = "WORKTREE_PORT_RANGE"
 _PORT_RANGE_DEFAULT = (30000, 40000)
 
+# record.status value written by create() when a contract's setup: step(s)
+# fail (ticket #105). Distinct from the setup_outcome.status values
+# (SETUP_STATUS_*, imported above) -- this is the *record*-level status,
+# not the nested setup_outcome verdict. Ticket #118: start() gates on this
+# constant to refuse silently proceeding past a half-provisioned checkout.
+_STATUS_SETUP_FAILED = "setup_failed"
+
 # Retry constants for the post-kill directory-unlock loop (ticket #51).
 _POST_KILL_RETRIES: int = 5      # attempts after kill before giving up
 _POST_KILL_SLEEP: float = 0.5    # seconds to wait between retries
+
+# Settle-window constants for Gate A's confirmed-blocker pre-flight check
+# (ticket #117): a foreign (non-owned) process found by the initial scan is
+# re-scanned after a brief wait, and only a pid present in BOTH scans is
+# treated as a genuine blocker -- see _teardown()'s Gate A for the full
+# rationale.
+_PREFLIGHT_SETTLE_SLEEP: float = 1.0     # seconds to wait before the re-scan
+_PREFLIGHT_SETTLE_RETRIES: int = 1       # number of settle re-scans
 
 # Timeout for the Windows long-path robocopy empty-mirror fallback in
 # _teardown (ticket #78). Without a bound, robocopy's own defaults
@@ -178,6 +198,36 @@ class DuplicateWorktreeError(WorktreeError):
 
 class WorktreeNotFoundError(WorktreeError):
     pass
+
+
+class SetupIncompleteError(WorktreeError):
+    """Raised by ``start()`` when the target's ``record.status`` is
+    ``"setup_failed"`` (ticket #118).
+
+    ``create()`` sets this status when a contract's ``setup:`` step(s) fail,
+    leaving the checkout half-provisioned. Without this gate, ``start()``
+    would silently overwrite the status to ``"running"`` (a real spawn) or
+    ``"ready"`` (the no-op path), erasing the only top-level evidence that
+    setup never completed -- the nested, easy-to-miss
+    ``record.setup_outcome.status == "failed"`` would be all that remained.
+
+    Deliberately does not read or carry ``record.setup_outcome`` -- callers
+    are pointed at ``list()`` / ``environment_list`` for that detail instead,
+    keeping this error a pointer, not a duplicate of the detail record.
+    """
+
+    def __init__(self, worktree_id: str, status: str) -> None:
+        super().__init__(
+            f"worktree '{worktree_id}' has status '{status}': its last "
+            "setup did not complete. Refusing to start it, to avoid "
+            "masking a half-provisioned checkout as healthy. See "
+            "list()/environment_list for the setup_outcome detail. "
+            "Remedies: re-provision the worktree (recreate it, or re-run "
+            "its setup: steps), or call start(..., allow_setup_failed=True) "
+            "to start it anyway (this is logged as a warning)."
+        )
+        self.worktree_id = worktree_id
+        self.status = status
 
 
 class GitCommandError(WorktreeError):
@@ -972,7 +1022,14 @@ class WorktreeManager:
 
             if contract.ports:
                 slot_names = [slot.name for slot in contract.ports]
-                port_mapping = self._allocator.allocate(slot_names, worktree_id)
+                pins = {
+                    slot.name: slot.port
+                    for slot in contract.ports
+                    if slot.port is not None
+                }
+                port_mapping = self._allocator.allocate(
+                    slot_names, worktree_id, pinned=pins
+                )
 
             record = WorktreeRecord(
                 id=worktree_id,
@@ -1034,7 +1091,7 @@ class WorktreeManager:
                     port_mapping=record.ports,
                 )
             except SetupFailedError as _setup_exc:
-                record.status = "setup_failed"
+                record.status = _STATUS_SETUP_FAILED
                 record.setup_outcome = SetupOutcome(
                     status=SETUP_STATUS_FAILED,
                     message=str(_setup_exc),
@@ -1052,7 +1109,7 @@ class WorktreeManager:
                 # original exception unchanged. Any exception type other
                 # than SetupFailedError carries no step-level detail, so the
                 # step fields stay at their None/0 defaults.
-                record.status = "setup_failed"
+                record.status = _STATUS_SETUP_FAILED
                 record.setup_outcome = SetupOutcome(
                     status=SETUP_STATUS_FAILED,
                     message=f"{type(_setup_exc).__name__}: {_setup_exc}",
@@ -1172,6 +1229,13 @@ class WorktreeManager:
         names ``checkout_path=`` as the remedy when the id looks like a
         synthesised untracked id) or if *checkout_path* does not resolve to
         any environment at all.
+
+        A blocked attempt (a confirmed Windows pre-flight blocker, or real
+        uncommitted dirt) is guaranteed side-effect-free with respect to the
+        contract's ``teardown:`` steps (ticket #117): those steps run only
+        once removal is confirmed to proceed, so a refused attempt never
+        executes them, and a later successful retry is their first and only
+        execution for this logical removal.
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1255,6 +1319,7 @@ class WorktreeManager:
         env: Optional[dict] = None,
         cwd: Optional[str] = None,
         variant: str = "default",
+        allow_setup_failed: bool = False,
     ) -> WorktreeRecord:
         """Spawn a detached process for the target environment, using the
         contract's ``start:`` step, and record its PID.
@@ -1342,8 +1407,37 @@ class WorktreeManager:
         only when a concrete ``start:`` step is selected. ``cwd=None``
         (the default) defaults to ``record.path`` (ticket #81), not the
         caller's own working directory.
+
+        Ticket #118 -- refusing a half-provisioned checkout
+        -----------------------------------------------------
+        If the resolved record's ``status`` is ``"setup_failed"`` (set by
+        ``create()`` when a contract's ``setup:`` step(s) failed), ``start()``
+        raises ``SetupIncompleteError`` instead of proceeding -- by default,
+        silently overwriting ``record.status`` to ``"running"`` or ``"ready"``
+        would erase the only top-level evidence that setup never completed,
+        leaving just the easy-to-miss nested
+        ``record.setup_outcome.status == "failed"``. The check runs before
+        any mutation (port allocation, the no-op ``"ready"`` write, or a real
+        spawn), so a refused call is completely side-effect free. Pass
+        ``allow_setup_failed=True`` to start it anyway -- this is a one-shot
+        override: it is logged as a ``_logger.warning`` each time it is used,
+        and once a forced start succeeds, ``process_lifecycle.start`` rewrites
+        ``status`` to ``"running"`` (or the no-op path sets ``"ready"``), so a
+        *subsequent* ``start()`` call is no longer refused. The override
+        acknowledges the failure once per call, not permanently.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=True)
+
+        if record.status == _STATUS_SETUP_FAILED:
+            if not allow_setup_failed:
+                raise SetupIncompleteError(record.id, record.status)
+            _logger.warning(
+                "start(): worktree '%s' has status 'setup_failed' but "
+                "allow_setup_failed=True was passed -- starting it anyway. "
+                "Its last setup did not complete; see "
+                "list()/environment_list for the setup_outcome detail.",
+                record.id,
+            )
 
         contract = _load_contract(Path(record.repo_root) / CONTRACT_FILENAME)
 
@@ -1357,9 +1451,25 @@ class WorktreeManager:
             _logger.warning(shadowed_contract.message)
 
         if contract.ports:
-            missing = [s.name for s in contract.ports if s.name not in record.ports]
-            if missing:
-                allocated = self._allocator.allocate(missing, record.id)
+            # A slot is re-allocated when it is entirely missing, OR when it
+            # has a pin (ticket #120) that disagrees with the persisted
+            # value -- the pin is authoritative, so a stale auto-allocated
+            # port (or a stale different pin) is not left behind.
+            needs_alloc = [
+                s.name
+                for s in contract.ports
+                if s.name not in record.ports
+                or (s.port is not None and record.ports[s.name] != s.port)
+            ]
+            if needs_alloc:
+                pins = {
+                    s.name: s.port
+                    for s in contract.ports
+                    if s.port is not None and s.name in needs_alloc
+                }
+                allocated = self._allocator.allocate(
+                    needs_alloc, record.id, pinned=pins
+                )
                 record.ports.update(allocated)
                 self.state.update(record)
 
@@ -1867,14 +1977,22 @@ class WorktreeManager:
     ) -> None:
         """Remove the git worktree checkout directory.
 
-        Sequence (W8):
+        Sequence (ticket #117 reorder -- probe-then-act):
         1. Stop any tracked processes (process lifecycle).
         1b. Run contract ``stop:`` steps via ``SetupRunner`` (best-effort,
             before any FS delete so that daemons with PID files can release
             file handles gracefully).
-        2. Run any contract ``teardown:`` steps via ``SetupRunner``.
-        3. Remove the git worktree checkout.
-        4. Release allocated ports (only after step 3 succeeds).
+        2a. Gate A: Windows-only confirmed-blocker pre-flight (see below).
+        2b. Gate B: early dirty-tree refusal, only when contract ``teardown:``
+            steps exist -- so a removal that cannot possibly succeed never
+            executes a non-idempotent teardown command first.
+        3. Run any contract ``teardown:`` steps via ``SetupRunner``. Reached
+           only once both gates above have passed, so a refused attempt is
+           guaranteed side-effect-free with respect to these steps -- a
+           later retry that clears the blocking condition is the FIRST and
+           ONLY execution of ``teardown:`` for this logical removal.
+        4. Remove the git worktree checkout.
+        5. Release allocated ports (only after step 4 succeeds).
 
         Branch deletion is intentionally *not* done here — it happens in
         ``remove()`` after the state record has been cleaned up, so that a
@@ -1897,76 +2015,51 @@ class WorktreeManager:
         if lifecycle is None:
             from . import process_lifecycle as lifecycle  # type: ignore[assignment]
 
-        # Step 1: stop any tracked processes before removing the worktree dir.
-        if record.pids:
-            for role in list(record.pids.keys()):
-                try:
-                    lifecycle.stop(record.id, store=self.state, role=role)
-                except ProcessNotRunningError:
-                    pass
-                except ProcessLifecycleError:
-                    # Best-effort: log-worthy but don't block the removal.
-                    pass
+        # Ticket #117: capture the set of PIDs THIS environment tracked
+        # before anything below stops them. Gate A uses this to distinguish
+        # "our own daemon, still winding down after stop()" (trusted
+        # immediately) from a genuinely foreign process (settled first --
+        # see Gate A below).
+        owned_pids = {pid for pid in record.pids.values()}
 
-        # Step 1b: run contract stop: steps before FS deletion so that daemons
-        # (e.g. Unity Editor) that write PID files / hold handles have a chance
-        # to release them before git worktree remove is attempted.
-        try:
-            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
-            contract = _load_contract(contract_path)
-            if contract.stop:
-                from ..setup.runner import SetupRunner
-                runner = SetupRunner()
-                try:
-                    runner.run(
-                        setup=contract.stop,
-                        worktree_id=record.id,
-                        worktree_path=Path(record.path),
-                        branch=record.branch,
-                        port_mapping=record.ports,
-                    )
-                except Exception:  # noqa: BLE001
-                    # A stop-step failure must not block the rest of teardown.
-                    pass
-        except Exception:  # noqa: BLE001
-            # Any contract load failure is silently skipped.
-            pass
-
-        # Step 2: run contract teardown: steps.
-        # A missing contract is treated as isolation:none (no teardown steps).
-        try:
-            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
-            contract = _load_contract(contract_path)
-            if contract.teardown:
-                from ..setup.runner import SetupRunner
-                runner = SetupRunner()
-                try:
-                    runner.run(
-                        setup=contract.teardown,
-                        worktree_id=record.id,
-                        worktree_path=Path(record.path),
-                        branch=record.branch,
-                        port_mapping=record.ports,
-                    )
-                except Exception:  # noqa: BLE001
-                    # Teardown step failure must not block git worktree remove.
-                    pass
-        except Exception:  # noqa: BLE001
-            # Any contract load failure is silently skipped — same pattern as
-            # create().
-            pass
-
-        # Dirt probe (ticket #103): a memoised, force-gated closure shared by
-        # every site below that may need to know about real dirt -- the
-        # Step 2b preflight, both `_resolve_lock_or_raise` raise sites, AND
-        # the `.seretos/`-exemption classifier in the dirty-phrase branch
-        # further down -- so that a single removal attempt never issues more
-        # than one `git status` call no matter how many of those sites run
-        # (e.g. preflight probe -> git remove fails with the dirty phrase ->
-        # exemption classifier), and never runs at all when force=True (real
-        # dirt cannot block a forced removal, so there is nothing to report
-        # -- this is what keeps the happy-path and force=True preflight
-        # tests free of any status call).
+        # Dirt probe (ticket #103, hoisted for #117): a memoised, force-gated
+        # closure shared by every site below that may need to know about
+        # real dirt -- Gate A's confirmed-blocker dirt check, Gate B's early
+        # refusal, both `_resolve_lock_or_raise` raise sites, AND the
+        # `.seretos/`-exemption classifier in the dirty-phrase branch further
+        # down -- so that a single removal attempt never issues more than
+        # one `git status` call no matter how many of those sites run, and
+        # never runs at all when force=True (real dirt cannot block a forced
+        # removal, so there is nothing to report -- this is what keeps the
+        # happy-path and force=True preflight tests free of any status
+        # call). Hoisted to just after the guards (ticket #117) so Gate A
+        # and Gate B share the same single probe; Gate B now runs BEFORE the
+        # contract `teardown:` steps, so dirt is judged as of pre-teardown
+        # state -- a deliberate, documented change from the pre-#117
+        # ordering where a teardown step's own generated file could trip a
+        # later attempt's dirty-tree check.
+        #
+        # Two-phase intent (ticket #117 fix cycle, blocking finding): this
+        # memoisation is deliberately scoped to TWO phases, not one shared
+        # snapshot for the whole function. Phase 1 (pre-teardown) is Gate A
+        # and Gate B above -- both run, by construction, before Step 3's
+        # `teardown:` steps below, and MUST see the pre-teardown tree (that
+        # is the whole point of the ordering comment above). Phase 2
+        # (post-teardown) is every consumer that can only run AFTER Step 3
+        # has executed: the `.seretos/`-exemption classifier in the
+        # dirty-phrase branch, and both `_resolve_lock_or_raise` call sites'
+        # `dirt_probe` argument. Those must NOT reuse Gate B's pre-teardown
+        # snapshot -- a `teardown:` step can itself leave real, non-exempt
+        # dirt behind, and a stale snapshot would make the exemption
+        # classifier believe that new dirt is the old, already-cleared
+        # `.seretos/`-only dirt, silently force-discarding it instead of
+        # raising `DirtyWorktreeError`. So Step 3, below, explicitly resets
+        # `_status_cache`/`_status_fetched` right after the teardown steps
+        # run (and only then -- when there were no `teardown:` steps to run,
+        # nothing changed on disk, so the single pre-teardown probe still
+        # correctly serves any Phase-2 consumer too, preserving the
+        # zero-extra-`git status`-calls happy path). Do NOT collapse this
+        # back into one unconditional snapshot for the whole function.
         _status_cache: List[Optional[List[str]]] = [None]
         _status_fetched = [False]
 
@@ -1981,8 +2074,52 @@ class WorktreeManager:
                 return []
             return _real_dirt_paths(record, entries=_cached_status_entries())
 
-        # Step 2b (Windows only, ticket #76): pre-flight blocking-process check
-        # BEFORE the destructive `git worktree remove` call below.
+        # Single contract load (ticket #117): replaces the two duplicate
+        # _load_contract() calls that used to straddle the old Step 1b/
+        # Step 2 boundary. Reused by Step 1b's stop: steps, Gate B's early
+        # dirty check, and Step 3's teardown: steps below. Any load failure
+        # (missing file is NOT a failure -- the loader treats that as
+        # isolation:none with empty step lists) is silently treated as "no
+        # contract", matching create()'s pre-existing swallow-everything
+        # pattern.
+        try:
+            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract = _load_contract(contract_path)
+        except Exception:  # noqa: BLE001
+            contract = None
+
+        # Step 1: stop any tracked processes before removing the worktree dir.
+        if record.pids:
+            for role in list(record.pids.keys()):
+                try:
+                    lifecycle.stop(record.id, store=self.state, role=role)
+                except ProcessNotRunningError:
+                    pass
+                except ProcessLifecycleError:
+                    # Best-effort: log-worthy but don't block the removal.
+                    pass
+
+        # Step 1b: run contract stop: steps before FS deletion so that daemons
+        # (e.g. Unity Editor) that write PID files / hold handles have a chance
+        # to release them before git worktree remove is attempted.
+        if contract is not None and contract.stop:
+            from ..setup.runner import SetupRunner
+            runner = SetupRunner()
+            try:
+                runner.run(
+                    setup=contract.stop,
+                    worktree_id=record.id,
+                    worktree_path=Path(record.path),
+                    branch=record.branch,
+                    port_mapping=record.ports,
+                )
+            except Exception:  # noqa: BLE001
+                # A stop-step failure must not block the rest of teardown.
+                pass
+
+        # Gate A (Windows only, ticket #76, rewritten for #117): pre-flight
+        # blocking-process check BEFORE the destructive `git worktree
+        # remove` call below.
         #
         # Root cause this guards against: on Windows, `git worktree remove
         # --force` can return exit 0 while still leaving a content-less
@@ -2000,53 +2137,130 @@ class WorktreeManager:
         # destructive side effect, and a later kill_blocking_processes=True
         # retry can still find and kill the still-alive blocker.
         #
-        # Placed after the contract stop:/teardown: steps (so daemons that
-        # release handles during those steps are not falsely flagged) but
-        # before the git call. POSIX is intentionally excluded: POSIX unlinks
-        # files even under an open handle, so `git worktree remove` succeeds
+        # Placed after the contract stop: steps (so daemons that release
+        # handles during that step are not falsely flagged) but before the
+        # git call. POSIX is intentionally excluded: POSIX unlinks files
+        # even under an open handle, so `git worktree remove` succeeds
         # there — a naive pre-flight applied to POSIX would incorrectly
         # block/kill on a merely-cwd'd process rather than a genuine locker.
+        #
+        # Ticket #117: the pre-#117 version of this gate refused removal on
+        # ANY heuristic hit (a cmdline-token match under the worktree path
+        # is not proof of an OS-level handle -- it can just as easily be an
+        # editor/shell/the SetupRunner subprocess this very call spawned a
+        # moment ago) or on ANY `"open_files:degraded"` result (meaning the
+        # scan never looked at anything, not that it found something). That
+        # produced a false-positive compound block on nearly every first
+        # removal attempt, even for an environment that was never started or
+        # was already cleanly stopped. This is rewritten as a
+        # confirmed-blocker gate:
+        #   - a hit whose pid is one WE tracked (``owned_pids``, captured
+        #     above before stop() ran) is trusted immediately, no delay --
+        #     that is precisely the "our own daemon is still shutting down"
+        #     case, and killing it is the correct remedy;
+        #   - a hit whose pid is NOT ours (a foreign/transient process --
+        #     AV scanner, indexer, editor) goes through a bounded settle
+        #     window: wait briefly, then re-scan; only a pid present in BOTH
+        #     scans is treated as a genuine, confirmed blocker (AC #4). A
+        #     process that merely happened to touch the path at the instant
+        #     of the first scan and is gone by the second is never reported
+        #     as blocking;
+        #   - ``"open_files:degraded"`` is logged (reduced coverage this
+        #     attempt) but is never, by itself, a refusal condition (Q2
+        #     Option A) -- it can still contribute to a confirmation via the
+        #     owned/foreign logic above, and the pre-existing Final guard
+        #     after the destructive git call remains the backstop for an
+        #     actually-locked directory that this degraded scan could not
+        #     see coming.
         kill_attempted = False
         if sys.platform == "win32":
-            _preflight_blockers = _find_blocking_processes(record.path, os.getpid())
-            # Ticket #107 fix cycle (review finding 2): an empty result is
-            # falsy regardless of *why* the scan came back empty --
-            # `_find_blocking_processes` returns an empty, *degraded*
-            # `_PartialList` (`.complete=False`, tagged
-            # ``"open_files:degraded"``, D9) rather than raising when Pass
-            # 2's `open_files()` hits the Windows-only "SystemExtendedHandle
-            # Information buffer too big" condition -- a process-independent
-            # failure where the OS refused the query outright, so this pass
-            # never got a real look at *any* process. A truthiness-only
-            # check here cannot distinguish that from "scanned and found
-            # nothing" and would silently fall through to the destructive
-            # `git worktree remove` call below -- reproducing exactly the
-            # locked/partial-directory failure mode this pre-flight exists
-            # to prevent.
-            #
-            # Deliberately narrower than "any incompleteness": ordinary
-            # per-pass timeouts (D3/D5/D7 `*:truncated` -- the scan ran out
-            # of its own clock budget partway through, e.g.
-            # `_HANDLE_SCAN_BUDGET_SEC`) are ALSO pre-existing
-            # `.complete=False` conditions on this exact `_PartialList`, but
-            # they are not "never got a real look" -- they mean the scan
-            # inspected as many processes as its budget allowed and simply
-            # ran out of time, which this pre-flight has always tolerated
-            # (a pre-#107 truthiness-only check already accepted a
-            # truncated-but-empty result). On a busy dev host with a large
-            # ambient process/handle count, a real Pass 1c/Pass 2 scan can
-            # legitimately truncate on every call -- treating that the same
-            # as "found a blocker" would make `remove()` unconditionally
-            # fail under exactly the ambient-load conditions ticket #107 is
-            # about, which is the opposite of this ticket's intent. So only
-            # the degraded tag -- not general `.complete` -- escalates here;
-            # `stop(kill_orphans=True)` still reports `stop_incomplete` for
-            # *any* incompleteness (truncated or degraded) because that is a
-            # status report, not a hard gate on a destructive action.
-            if _preflight_blockers or (
-                "open_files:degraded"
-                in getattr(_preflight_blockers, "skipped_passes", ())
+            _preflight_scan = _find_blocking_processes(record.path, os.getpid())
+            if "open_files:degraded" in getattr(
+                _preflight_scan, "skipped_passes", ()
             ):
+                _logger.warning(
+                    "_teardown: worktree '%s' blocking-process scan degraded "
+                    "(open_files:degraded) — reduced coverage for this "
+                    "attempt; not treated as a blocker on its own (ticket "
+                    "#117).",
+                    record.id,
+                )
+
+            _owned = [info for info in _preflight_scan if info.pid in owned_pids]
+            _foreign = [info for info in _preflight_scan if info.pid not in owned_pids]
+            _confirmed = list(_owned)
+
+            if _foreign:
+                # Bounded settle window (ticket #117, AC #4). A transient
+                # foreign process must not permanently hard-block removal --
+                # only a pid still present on the confirming re-scan counts.
+                for _ in range(_PREFLIGHT_SETTLE_RETRIES):
+                    time.sleep(_PREFLIGHT_SETTLE_SLEEP)
+                    _confirm_scan = _find_blocking_processes(record.path, os.getpid())
+                    if "open_files:degraded" in getattr(
+                        _confirm_scan, "skipped_passes", ()
+                    ):
+                        # Ticket #117 fix cycle (blocking finding 1): a
+                        # degraded CONFIRMING rescan returns an
+                        # empty/near-empty result because the scan never
+                        # actually looked at anything -- not because the
+                        # foreign blocker went away. Intersecting that blind
+                        # result with the first scan's hits would silently
+                        # clear a real blocker and fall straight through to
+                        # the destructive `git worktree remove` call below,
+                        # reproducing the exact locked-directory failure
+                        # this ticket exists to prevent. Do NOT let a
+                        # degraded rescan clear a previously observed
+                        # foreign hit: stop settling and conservatively
+                        # treat the still-pending `_foreign` hits from the
+                        # last real (non-degraded) scan as confirmed, rather
+                        # than as disproven. This is deliberately narrower
+                        # than the pre-#117 blanket degraded-refusal: it
+                        # only fires when a real foreign hit is already
+                        # pending confirmation. A degraded scan with NO
+                        # prior hit never enters this `if _foreign:` branch
+                        # at all, so AC #1's de-escalation (a degraded scan
+                        # alone must not block removal) is unaffected.
+                        _logger.warning(
+                            "_teardown: worktree '%s' confirming rescan "
+                            "degraded (open_files:degraded) while %d "
+                            "foreign hit(s) were pending confirmation; "
+                            "treating as still-blocking rather than "
+                            "clearing.",
+                            record.id,
+                            len(_foreign),
+                        )
+                        break
+                    _rescan_pids = {info.pid for info in _confirm_scan}
+                    _foreign = [info for info in _foreign if info.pid in _rescan_pids]
+                    if not _foreign:
+                        break
+                if _foreign:
+                    _confirmed.extend(_foreign)
+                else:
+                    _logger.debug(
+                        "_teardown: worktree '%s' had transient blocking "
+                        "process(es) settle during the pre-flight check; "
+                        "proceeding without refusal.",
+                        record.id,
+                    )
+
+            if _confirmed:
+                _logger.warning(
+                    "_teardown: worktree '%s' blocked by %d confirmed "
+                    "process(es): %s",
+                    record.id,
+                    len(_confirmed),
+                    ", ".join(
+                        "pid=%d name=%r cmd=%r"
+                        % (
+                            info.pid,
+                            info.name,
+                            info.cmdline[0] if info.cmdline else "",
+                        )
+                        for info in _confirmed
+                    ),
+                )
                 # Q2 (ticket #103): probe for real dirt BEFORE taking any
                 # irreversible action -- including the kill below. If real
                 # dirt is ALSO present, this removal cannot succeed on this
@@ -2064,22 +2278,48 @@ class WorktreeManager:
                     killed = _kill_blocking_processes(record.path)
                     record.killed_pids = killed
                     kill_attempted = True
-                    # Review finding (fix-loop round 2): _kill_blocking_processes
-                    # re-runs _find_blocking_processes itself and, per its own
-                    # `if not found: return found` early return, does nothing at
-                    # all when that rescan is STILL degraded -- the OS-wide
-                    # "buffer too big" condition is process-independent, so it
-                    # will typically recur immediately on retry. Killing
-                    # whatever *was* found (if anything) does not make the
-                    # remaining, un-inspectable process space any safer to
-                    # assume clear. Do not fall through to the destructive git
-                    # remove call on zero real new information; refuse
-                    # explicitly, the same way the initial gate above does.
-                    if "open_files:degraded" in getattr(
-                        killed, "skipped_passes", ()
-                    ):
-                        raise WorktreeDirLockedError(
-                            record.id, killed=list(killed), kill_attempted=True
+                    if not killed:
+                        if "open_files:degraded" in getattr(
+                            killed, "skipped_passes", ()
+                        ):
+                            # Ticket #117 fix cycle (blocking finding 2):
+                            # `_kill_blocking_processes` returns a
+                            # `_PartialList` -- a `list` subclass -- so an
+                            # empty `killed` is falsy-equal both when the
+                            # blocker genuinely exited before the kill ran
+                            # AND when the kill's own internal rescan was
+                            # degraded and therefore never actually looked
+                            # for anything to kill. `not killed` alone
+                            # cannot tell those apart. Restore the
+                            # pre-#117 guard for the degraded case: a
+                            # still-live, twice-confirmed blocker (Gate A
+                            # above already confirmed it via two scans)
+                            # must not be silently treated as cleared just
+                            # because the kill's rescan happened to be
+                            # blind. Raise rather than fall through to the
+                            # destructive git remove call.
+                            raise WorktreeDirLockedError(
+                                record.id, killed=list(killed), kill_attempted=True
+                            )
+                        # Ticket #117, AC #2: kill_blocking_processes was
+                        # opted into, the blocker was twice-confirmed live
+                        # above, and the kill's own rescan was NOT
+                        # degraded (handled above) -- so an empty result
+                        # here means it genuinely exited in the interval
+                        # between confirmation and the kill call, not that
+                        # nothing was ever really there. Log and proceed
+                        # rather than raise (the pre-#117 behaviour
+                        # treated this the same as a still-degraded rescan
+                        # and always refused, which is what made
+                        # kill_blocking_processes=True + empty killed_pids
+                        # the normal, misleading outcome this ticket
+                        # fixes).
+                        _logger.warning(
+                            "_teardown: worktree '%s' kill_blocking_processes "
+                            "found nothing left to kill (confirmed "
+                            "blocker(s) exited before the kill ran); "
+                            "proceeding.",
+                            record.id,
                         )
                     # Fall through to the (now-safe) git remove call below.
                 else:
@@ -2090,7 +2330,63 @@ class WorktreeManager:
                         record.id, killed=[], kill_attempted=False
                     )
 
-        # Step 3: remove the git worktree checkout directory.
+        # Gate B (ticket #117, AC #3): early dirty-tree refusal, run BEFORE
+        # the contract teardown: steps below -- but only when there ARE
+        # teardown: steps to protect, so the happy path (no teardown: steps)
+        # pays zero extra `git status` calls, preserving the memoisation
+        # rationale documented on _dirt_probe above. Without this gate, a
+        # removal attempt that is going to fail for being dirty anyway would
+        # still run a non-idempotent teardown: command first (e.g. one that
+        # generates a file), and a later retry would re-run it again.
+        if not force and contract is not None and contract.teardown:
+            _dirt = _dirt_probe()
+            if _dirt:
+                raise DirtyWorktreeError(record.id)
+
+        # Step 3 (ticket #117): run contract teardown: steps. Reached ONLY
+        # when both gates above have passed -- i.e. only when this attempt
+        # is expected to actually proceed to `git worktree remove` below. A
+        # refused attempt (Gate A: a confirmed blocking process with
+        # kill_blocking_processes not opted into, or a still-confirmed
+        # blocker after a failed kill; Gate B: real uncommitted dirt) never
+        # reaches here, so a later retry that clears the blocking condition
+        # is the FIRST and ONLY execution of these steps for this logical
+        # removal (AC #3) -- a non-idempotent teardown command is never
+        # re-run just because an earlier attempt was rejected before any FS
+        # mutation happened.
+        if contract is not None and contract.teardown:
+            from ..setup.runner import SetupRunner
+            runner = SetupRunner()
+            try:
+                runner.run(
+                    setup=contract.teardown,
+                    worktree_id=record.id,
+                    worktree_path=Path(record.path),
+                    branch=record.branch,
+                    port_mapping=record.ports,
+                )
+            except Exception:  # noqa: BLE001
+                # Teardown step failure must not block git worktree remove.
+                pass
+
+            # Ticket #117 fix cycle (blocking finding): invalidate the dirt
+            # probe's memoised snapshot now that teardown: steps have
+            # actually run and may have changed what's on disk. Gate A/Gate
+            # B above already consumed (and correctly relied on) the
+            # pre-teardown snapshot; every consumer reachable from here on
+            # -- the `.seretos/`-exemption classifier and both
+            # `_resolve_lock_or_raise` `dirt_probe` call sites -- must
+            # re-probe actual `git status` instead of silently inheriting
+            # that stale, pre-teardown view (see the two-phase comment on
+            # `_status_cache` above). Only reset when teardown steps
+            # actually ran: when there are none, nothing changed on disk,
+            # so the existing single-probe memoisation still holds and the
+            # no-teardown happy path still pays zero extra `git status`
+            # calls.
+            _status_cache[0] = None
+            _status_fetched[0] = False
+
+        # Step 4: remove the git worktree checkout directory.
         args = ["worktree", "remove"]
         if force:
             args.append("--force")
@@ -2304,7 +2600,7 @@ class WorktreeManager:
                 record.id, killed=record.killed_pids, kill_attempted=kill_attempted
             )
 
-        # Step 4: release allocated ports only after the git worktree remove
+        # Step 5: release allocated ports only after the git worktree remove
         # has succeeded.  Freeing ports before the remove would allow a
         # concurrent allocate() to reissue the same ports while the original
         # service is still bound to them.
@@ -2383,12 +2679,14 @@ __all__ = (
     "ManagerConfig",
     "PrimaryCheckoutError",
     "RepoListing",
+    "SetupIncompleteError",
     "UnknownVariantError",
     "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeError",
     "WorktreeManager",
     "WorktreeNotFoundError",
+    "PinnedPortUnavailableError",
     "PortAllocationError",
     "ProcessAlreadyRunningError",
     "ProcessLifecycleError",

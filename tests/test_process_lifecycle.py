@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import List
 from unittest.mock import MagicMock, call, patch
@@ -87,6 +88,28 @@ def _redirect_start_log_root(tmp_path, monkeypatch):
     the suite.
     """
     monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+
+
+@pytest.fixture(autouse=True)
+def _reset_wedged_object_registry(monkeypatch):
+    """Isolate ``_pl._wedged_object_keys`` (ticket #121) across every test
+    in this module.
+
+    The registry is a module global. Several existing tests
+    (``TestDiscoveryCompleteness``'s N2/N3, and this ticket's own new
+    Windows-only handle-scan tests) run real ``_win_handle_holders`` scans
+    against the live system handle table with ``_BoundedQueryWorker.submit``
+    stubbed to force a non-``RESOLVED`` verdict -- without this reset, those
+    scans would record real process-wide keys that leak into and poison
+    later, unrelated tests (e.g. suppressing a handle a later test expects
+    to be queried). Mirrors how ``_wedged_worker_count`` is already reset
+    per-test in ``TestBoundedQueryWorker`` (``monkeypatch.setattr(_pl,
+    "_wedged_worker_count", 0)``), but applied automatically to every test
+    in the module rather than requiring each test to opt in individually --
+    resetting an empty ``OrderedDict`` is cheap and has no effect on tests
+    that never touch the registry.
+    """
+    monkeypatch.setattr(_pl, "_wedged_object_keys", OrderedDict())
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +355,8 @@ class TestStartOutputCaptureAndEarlyExit:
 
         assert result.status == "exited"
         assert result.returncode == 3
-        assert result.start_log_path is not None
-        log_path = Path(result.start_log_path)
+        assert DEFAULT_ROLE in result.start_log_paths
+        log_path = Path(result.start_log_paths[DEFAULT_ROLE])
         assert log_path.exists()
         assert "boom" in log_path.read_text(encoding="utf-8", errors="replace")
 
@@ -360,7 +383,7 @@ class TestStartOutputCaptureAndEarlyExit:
             pass
 
     def test_start_log_file_created_and_written(self):
-        """A chatty short-lived command yields a non-empty start_log_path file."""
+        """A chatty short-lived command yields a non-empty start_log_paths[role] file."""
         record = _make_record("wt-chatty")
         store = _make_store(record)
 
@@ -370,7 +393,7 @@ class TestStartOutputCaptureAndEarlyExit:
             store=store,
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths[DEFAULT_ROLE])
         assert log_path.exists()
         assert log_path.stat().st_size > 0
         assert "hello from child" in log_path.read_text(
@@ -378,7 +401,7 @@ class TestStartOutputCaptureAndEarlyExit:
         )
 
     def test_start_missing_log_root_falls_back_to_default(self, monkeypatch, tmp_path):
-        """With WORKTREE_LOG_ROOT unset, start_log_path resolves under
+        """With WORKTREE_LOG_ROOT unset, start_log_paths[role] resolves under
         DEFAULT_LOG_ROOT."""
         monkeypatch.delenv("WORKTREE_LOG_ROOT", raising=False)
         import lib_python_worktree.setup.runner as _runner_module
@@ -394,13 +417,13 @@ class TestStartOutputCaptureAndEarlyExit:
             store=store,
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths[DEFAULT_ROLE])
         assert log_path.exists()
         assert str(fake_default) in str(log_path)
 
     def test_start_exited_status_persisted(self):
         """After an immediate-exit start, store.get(id) round-trips status,
-        returncode, and start_log_path -- proving these survive
+        returncode, and start_log_paths -- proving these survive
         store.update()/serialization (see YamlStateStore round-trip test for
         the on-disk serialization path)."""
         record = _make_record("wt-exit-persist")
@@ -416,7 +439,7 @@ class TestStartOutputCaptureAndEarlyExit:
         assert stored is not None
         assert stored.status == "exited"
         assert stored.returncode == 7
-        assert stored.start_log_path is not None
+        assert DEFAULT_ROLE in stored.start_log_paths
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +469,7 @@ class TestStartLogFilenameCasing:
             role="roleA",
         )
 
-        name = Path(result.start_log_path).name
+        name = Path(result.start_log_paths["roleA"]).name
         assert name.startswith("start-") and name.endswith(".log")
         token = name[len("start-"):-len(".log")]
         assert token in result.pids
@@ -463,7 +486,7 @@ class TestStartLogFilenameCasing:
             role="roleA",
         )
 
-        assert Path(result.start_log_path).name == "start-roleA.log"
+        assert Path(result.start_log_paths["roleA"]).name == "start-roleA.log"
 
     def test_start_log_filename_unchanged_for_default_role(self):
         """Edge case: the default role ('main') is already all-lowercase,
@@ -477,7 +500,7 @@ class TestStartLogFilenameCasing:
             store=store,
         )
 
-        assert Path(result.start_log_path).name == "start-main.log"
+        assert Path(result.start_log_paths[DEFAULT_ROLE]).name == "start-main.log"
 
     def test_start_pids_key_is_raw_role(self):
         """Edge case: guards against fixing the mismatch in the wrong
@@ -512,7 +535,7 @@ class TestStartLogFilenameCasing:
             role="Role A/B",
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths["Role A/B"])
         assert log_path.name == "start-Role-A-B.log"
         assert log_path.parent == log_dir_for("wt-casing-5")
         assert log_path.exists()
@@ -531,7 +554,7 @@ class TestStartLogFilenameCasing:
             role="!!!",
         )
 
-        log_path = Path(result.start_log_path)
+        log_path = Path(result.start_log_paths["!!!"])
         assert log_path.name == "start-_.log"
         assert log_path.exists()
 
@@ -553,7 +576,7 @@ class TestStartLogFilenameCasing:
             store=store,
             role="role",
         )
-        name_literal = Path(result_literal.start_log_path).name
+        name_literal = Path(result_literal.start_log_paths["role"]).name
 
         stop("wt-casing-8", store=store, role="role")
 
@@ -563,7 +586,7 @@ class TestStartLogFilenameCasing:
             store=store,
             role="!!!",
         )
-        name_degenerate = Path(result_degenerate.start_log_path).name
+        name_degenerate = Path(result_degenerate.start_log_paths["!!!"]).name
 
         assert name_literal == "start-role.log"
         assert name_degenerate == "start-_.log"
@@ -587,7 +610,7 @@ class TestStartLogFilenameCasing:
             store=store,
             role="roleA",
         )
-        name_a = Path(result_a.start_log_path).name
+        name_a = Path(result_a.start_log_paths["roleA"]).name
 
         stop("wt-casing-7", store=store, role="roleA")
 
@@ -597,9 +620,235 @@ class TestStartLogFilenameCasing:
             store=store,
             role="rolea",
         )
-        name_b = Path(result_b.start_log_path).name
+        name_b = Path(result_b.start_log_paths["rolea"]).name
 
         assert name_a != name_b
+
+
+# ---------------------------------------------------------------------------
+# start_log_paths: per-role log path tracking (ticket #119)
+# ---------------------------------------------------------------------------
+
+class TestStartLogPathsPerRole:
+    """Ticket #119: ``record.start_log_paths`` is a per-role mapping, not a
+    record-wide scalar overwritten by every ``start()`` call regardless of
+    role. Closes the same cross-role bleed pattern already fixed for
+    ``job_names`` (#95) and ``variants`` (#104)."""
+
+    def test_start_log_paths_keyed_per_role_not_last_write_wins(self):
+        """Requirement 1 (driving test): starting 'main' then 'ui' on the
+        same record must leave BOTH roles' log paths present and distinct.
+        Pre-fix (scalar start_log_path), the 'ui' start would silently
+        overwrite -- there would be no way to recover 'main'\'s log path at
+        all, let alone one still naming 'start-main.log'."""
+        record = _make_record("wt-per-role-1")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-1",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+        result = start(
+            "wt-per-role-1",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="ui",
+        )
+
+        assert Path(result.start_log_paths["main"]).name == "start-main.log"
+        assert Path(result.start_log_paths["ui"]).name == "start-ui.log"
+
+    def test_start_log_paths_key_is_raw_role_value_is_slugged_filename(self):
+        """Edge case: the dict key is the raw role string; the value's
+        filename is the sanitized/slugged form. A degenerate role ('!!!')
+        still keys on '!!!' but the file is 'start-_.log'."""
+        record = _make_record("wt-per-role-2")
+        store = _make_store(record)
+
+        result = start(
+            "wt-per-role-2",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="!!!",
+        )
+
+        assert "!!!" in result.start_log_paths
+        assert Path(result.start_log_paths["!!!"]).name == "start-_.log"
+
+    def test_start_log_paths_key_is_raw_role_for_multi_char_role(self):
+        """Edge case: a role with filesystem-unsafe characters keys on the
+        literal raw role string, while the value's filename is slugged."""
+        record = _make_record("wt-per-role-3")
+        store = _make_store(record)
+
+        result = start(
+            "wt-per-role-3",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="Role A/B",
+        )
+
+        assert "Role A/B" in result.start_log_paths
+        assert Path(result.start_log_paths["Role A/B"]).name == "start-Role-A-B.log"
+
+    def test_start_log_paths_case_only_distinct_roles_get_distinct_keys(self):
+        """Edge case: two roles differing only by case produce two distinct
+        keys with two distinct path strings (string comparison only -- no
+        on-disk existence assertion, mirroring the case-insensitive-
+        filesystem caveat already documented on
+        test_start_log_filenames_differ_for_case_only_distinct_roles)."""
+        record = _make_record("wt-per-role-4")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-4",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="roleA",
+        )
+        stop("wt-per-role-4", store=store, role="roleA")
+        result = start(
+            "wt-per-role-4",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="rolea",
+        )
+
+        assert "roleA" in result.start_log_paths
+        assert "rolea" in result.start_log_paths
+        assert result.start_log_paths["roleA"] != result.start_log_paths["rolea"]
+
+    def test_start_log_paths_restarting_same_role_overwrites_not_accumulates(self):
+        """Edge case: restarting the same role overwrites that role's single
+        entry rather than accumulating extra keys."""
+        record = _make_record("wt-per-role-5")
+        store = _make_store(record)
+
+        first = start(
+            "wt-per-role-5",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+        first_path = first.start_log_paths["main"]
+
+        stop("wt-per-role-5", store=store, role="main")
+        second = start(
+            "wt-per-role-5",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+
+        assert list(second.start_log_paths.keys()) == ["main"]
+        # Same role -> same filename contract -> same path string again.
+        assert second.start_log_paths["main"] == first_path
+
+    def test_stop_returns_stopping_roles_own_log_path(self):
+        """Requirement 2 (driving test): the ticket's reported symptom --
+        stop(role='main') must return 'main'\'s own log path, never 'ui'\'s.
+        Pre-fix (scalar start_log_path last-write-wins), the record's single
+        scalar would name whichever role started last ('ui'), so this
+        assertion would fail with a path ending in 'start-ui.log'."""
+        record = _make_record("wt-per-role-6")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-6",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="main",
+        )
+        start(
+            "wt-per-role-6",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="ui",
+        )
+
+        try:
+            result = stop("wt-per-role-6", store=store, role="main")
+
+            assert "main" in result.start_log_paths
+            main_log_name = Path(result.start_log_paths["main"]).name
+            assert main_log_name == "start-main.log"
+            assert main_log_name != "start-ui.log"
+        finally:
+            try:
+                stop("wt-per-role-6", store=store, role="ui")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_stop_does_not_affect_other_roles_log_path_entry(self):
+        """Edge case: stopping 'main' leaves 'ui'\'s start_log_paths entry
+        untouched."""
+        record = _make_record("wt-per-role-7")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-7",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="main",
+        )
+        started_ui = start(
+            "wt-per-role-7",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            store=store,
+            role="ui",
+        )
+        ui_path_before = started_ui.start_log_paths["ui"]
+
+        try:
+            result = stop("wt-per-role-7", store=store, role="main")
+            assert result.start_log_paths["ui"] == ui_path_before
+        finally:
+            try:
+                stop("wt-per-role-7", store=store, role="ui")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_stop_of_never_started_role_leaves_map_untouched(self):
+        """Edge case: stop() of a role with no tracked pid raises
+        ProcessNotRunningError (pre-existing, documented behaviour) without
+        ever touching start_log_paths for any other role."""
+        record = _make_record(
+            "wt-per-role-8", pids={}, start_log_paths={"main": "/some/start-main.log"}
+        )
+        store = _make_store(record)
+
+        # 'ui' was never started -- stop() refuses rather than silently
+        # no-opping.
+        with pytest.raises(ProcessNotRunningError):
+            stop("wt-per-role-8", store=store, role="ui")
+
+        stored = store.get("wt-per-role-8")
+        assert stored is not None
+        assert stored.start_log_paths == {"main": "/some/start-main.log"}
+
+    def test_stop_does_not_pop_the_stopped_roles_start_log_paths_entry(self):
+        """Requirement 2 edge case: a dedicated assertion locking in the
+        deliberate divergence from job_names/variants -- stop() must NOT
+        remove the stopping role's start_log_paths entry (contrast
+        result.job_names / result.variants, which ARE cleared for this
+        role by the same call)."""
+        record = _make_record("wt-per-role-9")
+        store = _make_store(record)
+
+        start(
+            "wt-per-role-9",
+            [sys.executable, "-c", "print('x')"],
+            store=store,
+            role="main",
+        )
+
+        result = stop("wt-per-role-9", store=store, role="main")
+
+        assert "main" in result.start_log_paths
+        assert "main" not in result.pids
+        assert "main" not in result.variants
 
 
 class TestRoleLogSlug:
@@ -3079,6 +3328,154 @@ class TestBoundedQueryWorker:
 
 
 # ---------------------------------------------------------------------------
+# TestWedgedHandleRegistry -- ticket #121 (cross-platform: pure Python, no
+# ctypes involved, so this is exercised by CI on every platform)
+# ---------------------------------------------------------------------------
+
+class TestWedgedHandleRegistry:
+    """Unit tests for the module-level wedged-handle registry (ticket #121):
+    ``_wedging_handle_key``, ``_remember_wedging_handle`` and
+    ``_is_known_wedging_handle``.
+
+    This is the residual half of #90: #90's ``_wedged_worker_count`` /
+    ``_MAX_WEDGED_HANDLE_WORKERS`` bounded only *replacement*-worker churn
+    within a single scan; nothing stopped a *later* ``_win_handle_holders``
+    call from wedging on the exact same handle all over again. This
+    registry closes that gap by remembering, process-wide and permanently
+    (bounded FIFO), which kernel objects have already proven themselves
+    wedging, so later scans can skip them outright.
+    """
+
+    def test_unknown_key_returns_false(self):
+        key = _pl._wedging_handle_key(
+            pid=1234, handle_value=99, object_ptr=0, type_index=1
+        )
+        assert _pl._is_known_wedging_handle(key) is False
+
+    def test_recorded_key_is_then_known(self):
+        key = _pl._wedging_handle_key(
+            pid=1234, handle_value=99, object_ptr=0, type_index=1
+        )
+        _pl._remember_wedging_handle(key)
+        assert _pl._is_known_wedging_handle(key) is True
+
+    def test_zero_object_ptr_falls_back_to_pid_handle_type_key(self):
+        """A zero ``Object`` pointer (the common case for a non-elevated
+        caller -- see ``_wedging_handle_key``'s docstring) must fall back
+        to a ``(pid, handle_value, type_index)``-keyed identity, not
+        silently collapse every zero-pointer handle onto one shared key."""
+        key = _pl._wedging_handle_key(
+            pid=100, handle_value=200, object_ptr=0, type_index=7
+        )
+        assert key == ("pid", 100, 200, 7)
+
+        _pl._remember_wedging_handle(key)
+
+        # A different handle_value for the same pid is a different object
+        # and must NOT be suppressed.
+        other_handle = _pl._wedging_handle_key(
+            pid=100, handle_value=201, object_ptr=0, type_index=7
+        )
+        assert _pl._is_known_wedging_handle(other_handle) is False
+
+        # A different pid holding the same numeric handle_value is also a
+        # different object and must NOT be suppressed.
+        other_pid = _pl._wedging_handle_key(
+            pid=101, handle_value=200, object_ptr=0, type_index=7
+        )
+        assert _pl._is_known_wedging_handle(other_pid) is False
+
+    def test_zero_object_ptr_same_pid_handle_different_type_index_not_suppressed(
+        self,
+    ):
+        """Recycled handle values are the common case on Windows: once a
+        handle value is closed, the OS hands it back out almost
+        immediately, often for an unrelated object. Two handles that share
+        the same ``(pid, handle_value)`` but differ in ``type_index`` must
+        be treated as distinct objects and must NOT suppress each other --
+        this is the narrowing the fallback key gained specifically to
+        avoid permanently aliasing a future, unrelated object that lands on
+        a recycled handle value (ticket #121 review finding)."""
+        key_a = _pl._wedging_handle_key(
+            pid=100, handle_value=200, object_ptr=0, type_index=7
+        )
+        key_b = _pl._wedging_handle_key(
+            pid=100, handle_value=200, object_ptr=0, type_index=9
+        )
+        assert key_a != key_b
+
+        _pl._remember_wedging_handle(key_a)
+
+        assert _pl._is_known_wedging_handle(key_a) is True
+        assert _pl._is_known_wedging_handle(key_b) is False
+
+    def test_nonzero_object_ptr_uses_obj_key(self):
+        """A non-zero ``Object`` pointer identifies the underlying kernel
+        object itself, independent of pid/handle_value -- two different
+        (pid, handle_value) pairs sharing the same object pointer must
+        collapse onto the same key."""
+        key_a = _pl._wedging_handle_key(
+            pid=1, handle_value=10, object_ptr=0xDEAD, type_index=1
+        )
+        key_b = _pl._wedging_handle_key(
+            pid=2, handle_value=20, object_ptr=0xDEAD, type_index=2
+        )
+        assert key_a == key_b == ("obj", 0xDEAD)
+
+        _pl._remember_wedging_handle(key_a)
+        assert _pl._is_known_wedging_handle(key_b) is True
+
+    def test_registry_bounded_fifo_eviction(self):
+        """Recording more than ``_MAX_REMEMBERED_WEDGED_OBJECTS`` distinct
+        keys keeps the container at exactly the bound and evicts the
+        oldest-recorded key first."""
+        cap = _pl._MAX_REMEMBERED_WEDGED_OBJECTS
+        total = cap + 50
+
+        for i in range(total):
+            _pl._remember_wedging_handle(("obj", i))
+
+        assert len(_pl._wedged_object_keys) == cap
+        first_key = ("obj", 0)
+        last_key = ("obj", total - 1)
+        assert _pl._is_known_wedging_handle(first_key) is False, (
+            "the oldest-inserted key must have been evicted once the "
+            "registry exceeded its bound"
+        )
+        assert _pl._is_known_wedging_handle(last_key) is True, (
+            "the most-recently-inserted key must still be present"
+        )
+
+    def test_concurrent_recording_is_thread_safe(self):
+        """8 threads recording distinct keys concurrently must raise
+        nothing and leave the registry at a consistent, bounded final
+        size."""
+        errors: List[BaseException] = []
+
+        def _record(thread_id: int) -> None:
+            try:
+                for i in range(200):
+                    _pl._remember_wedging_handle(("obj", thread_id, i))
+            except BaseException as exc:  # noqa: BLE001 -- surfaced via errors
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_record, args=(t,)) for t in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"concurrent recording raised: {errors}"
+        assert all(not t.is_alive() for t in threads)
+        # 8 threads * 200 distinct keys each = 1600, comfortably under the
+        # cap, so every key should have been recorded with none evicted.
+        assert len(_pl._wedged_object_keys) == 1600
+        assert len(_pl._wedged_object_keys) <= _pl._MAX_REMEMBERED_WEDGED_OBJECTS
+
+
+# ---------------------------------------------------------------------------
 # TestWinHandleHoldersIntegration -- ticket #71 (Pass 1c wiring)
 # ---------------------------------------------------------------------------
 
@@ -3807,7 +4204,10 @@ class TestWinHandleHoldersThreadHygiene:
             assert delta <= 0, (
                 f"10 repeated _win_handle_holders scans against a real, healthy "
                 f"(non-wedged) handle table left a thread-count delta of {delta} "
-                f"-- expected it to settle back to 0, not grow with each scan"
+                f"-- expected it to settle back to 0, not grow with each scan "
+                f"(tickets #90/#121: a healthy scan must never leak a thread at "
+                f"all; #121's wedged-handle registry is only exercised by a "
+                f"handle that actually wedges, see the sibling tests below)"
             )
         finally:
             proc.kill()
@@ -3815,6 +4215,235 @@ class TestWinHandleHoldersThreadHygiene:
                 proc.communicate(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_repeated_scans_with_a_persistently_wedging_handle_plateau_thread_count(
+        self, tmp_path, monkeypatch
+    ):
+        """B1 (ticket #121): a handle whose ``NtQueryObject`` call wedges on
+        *every* scan must leak at most a small, constant number of threads
+        across many repeated ``_win_handle_holders`` calls -- not one
+        thread per call.
+
+        Before this fix, each call's initial worker independently wedged on
+        the same handle (a scan always creates its own initial worker,
+        unconditionally -- see the rejected scan-start-gate comment above
+        ``_win_handle_holders``), accumulating one permanently-blocked
+        daemon thread per call, unbounded over a long-lived host process's
+        lifetime. This is the residual half of #90, which bounded only
+        *replacement*-worker churn within a single scan.
+
+        ``_enumerate_handle_table`` and ``_query_object_raw`` -- both
+        hoisted to module scope by this same ticket specifically to make
+        this possible -- are patched so the scan sees one fixed, real OS
+        handle (so ``DuplicateHandle``/``OpenProcess`` genuinely succeed)
+        whose query always blocks on a ``threading.Event`` until released,
+        deterministically simulating a permanently-wedging handle without
+        depending on an actual named-pipe hang.
+        """
+        import msvcrt
+
+        held = tmp_path / "held.txt"
+        held.write_text("hold me open")
+        f = open(held, "r")
+        try:
+            handle_value = msvcrt.get_osfhandle(f.fileno())
+
+            release = threading.Event()
+
+            def _blocking_query_object_raw(ntdll, dup_handle, info_class):
+                release.wait()
+                return None
+
+            fake_table = {os.getpid(): [(handle_value, 424242, 0)]}
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+            monkeypatch.setattr(_pl, "_query_object_raw", _blocking_query_object_raw)
+
+            baseline = threading.active_count()
+            try:
+                for _ in range(20):
+                    _win_handle_holders(
+                        str(tmp_path),
+                        excluded_pids=set(),
+                        budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+                    )
+
+                delta = threading.active_count() - baseline
+                assert delta <= 2, (
+                    f"ticket #121: 20 repeated scans over a single, persistently "
+                    f"wedging handle left a thread-count delta of {delta} -- "
+                    f"expected it to plateau near a small constant (at most one "
+                    f"leaked thread for the one distinct wedging object), not "
+                    f"grow with each scan"
+                )
+            finally:
+                release.set()
+        finally:
+            f.close()
+            # Settle poll: the released, formerly-wedged worker thread
+            # (and any still-closing replacement worker) get a bounded
+            # moment to actually exit before the test process moves on.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_known_wedging_handle_is_not_requeried_by_a_later_scan(
+        self, tmp_path, monkeypatch
+    ):
+        """B2 (ticket #121): once a handle has wedged one scan's query, a
+        *later* scan must never query it again -- proven directly by
+        counting ``_query_object_raw`` invocations across two scans, rather
+        than only inferring it from the thread-count plateau (B1)."""
+        import msvcrt
+
+        held = tmp_path / "held2.txt"
+        held.write_text("hold me open")
+        f = open(held, "r")
+        try:
+            handle_value = msvcrt.get_osfhandle(f.fileno())
+
+            release = threading.Event()
+            calls: List[int] = []
+
+            def _counting_blocking_query_object_raw(ntdll, dup_handle, info_class):
+                calls.append(1)
+                release.wait()
+                return None
+
+            fake_table = {os.getpid(): [(handle_value, 555555, 0)]}
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+            monkeypatch.setattr(
+                _pl, "_query_object_raw", _counting_blocking_query_object_raw
+            )
+
+            try:
+                _win_handle_holders(
+                    str(tmp_path),
+                    excluded_pids=set(),
+                    budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+                )
+                assert len(calls) == 1, (
+                    f"expected exactly 1 query on the first scan, got {len(calls)}"
+                )
+
+                result2 = _win_handle_holders(
+                    str(tmp_path),
+                    excluded_pids=set(),
+                    budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+                )
+                assert len(calls) == 1, (
+                    f"a handle known to have wedged a previous scan must not be "
+                    f"re-queried by a later scan; got {len(calls)} total query "
+                    f"calls after a second scan"
+                )
+                assert result2.complete is True
+            finally:
+                release.set()
+        finally:
+            f.close()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_capped_verdict_also_records_the_wedging_handle(self, tmp_path, monkeypatch):
+        """B3 (ticket #121): a ``CAPPED`` verdict -- not just ``ABANDONED``
+        -- must also record its handle's key. Both leave a thread
+        genuinely, permanently blocked (mirroring how ``submit()`` already
+        counts both against ``_wedged_worker_count`` -- see ticket #90's
+        fix-pass finding), so both must feed the wedged-handle registry.
+
+        Uses the same ``_BoundedQueryWorker.submit`` stubbing pattern as
+        ``TestDiscoveryCompleteness``'s N2 test.
+        """
+        import msvcrt
+
+        held = tmp_path / "held3.txt"
+        held.write_text("hold me open")
+        f = open(held, "r")
+        try:
+            handle_value = msvcrt.get_osfhandle(f.fileno())
+            object_ptr = 0xABCDEF
+
+            fake_table = {os.getpid(): [(handle_value, 777777, object_ptr)]}
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+
+            def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+                return _pl._QueryOutcome(_pl._QueryStatus.CAPPED, None)
+
+            monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
+            _win_handle_holders(
+                str(tmp_path), excluded_pids=set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
+            )
+
+            expected_key = _pl._wedging_handle_key(
+                os.getpid(), handle_value, object_ptr, 777777
+            )
+            assert dict(_pl._wedged_object_keys) == {expected_key: None}, (
+                f"expected the registry to contain exactly the injected entry's "
+                f"key {expected_key!r}, got {dict(_pl._wedged_object_keys)!r}"
+            )
+        finally:
+            f.close()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_scan_with_all_handles_already_suppressed_issues_zero_submit_calls(
+        self, tmp_path, monkeypatch
+    ):
+        """Additional coverage (ticket #121): when every handle in the
+        table is already a known wedging object, the scan must not submit
+        a single query -- ``_process_handle`` suppresses before
+        ``DuplicateHandle`` is ever attempted -- yet must still return a
+        *complete* (not truncated) empty result."""
+        handle_value = 4242  # never dereferenced: suppression short-circuits
+        # before DuplicateHandle would be attempted on it.
+        object_ptr = 0x123456
+        fake_table = {os.getpid(): [(handle_value, 999999, object_ptr)]}
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+        )
+
+        key = _pl._wedging_handle_key(os.getpid(), handle_value, object_ptr, 999999)
+        monkeypatch.setattr(_pl, "_wedged_object_keys", OrderedDict({key: None}))
+
+        calls: List[int] = []
+
+        def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
+            calls.append(1)
+            return _pl._QueryOutcome(_pl._QueryStatus.RESOLVED, "File")
+
+        monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
+        result = _win_handle_holders(
+            str(tmp_path), excluded_pids=set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
+        )
+
+        assert not calls, (
+            f"submit() was invoked {len(calls)} time(s) despite every handle in "
+            f"the table being a pre-known wedging object"
+        )
+        assert result == []
+        assert result.complete is True
 
 
 # ---------------------------------------------------------------------------

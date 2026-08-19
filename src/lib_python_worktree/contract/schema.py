@@ -38,9 +38,26 @@ class Step(_StrictModel):
 
 
 class PortSlot(_StrictModel):
-    """A named port slot. Allocation happens in W4."""
+    """A named port slot. Allocation happens in W4.
+
+    ``port`` (ticket #120) is an optional explicit pin: when set, the
+    allocator (``core/port_allocator.py``) claims exactly that TCP port for
+    this slot instead of picking one at random from ``WORKTREE_PORT_RANGE``.
+    A pin is explicitly permitted outside the configured range -- that is
+    the point of pinning: honouring a service's hardcoded downstream port
+    expectation, or constructing a deterministic port-collision scenario for
+    CI/E2E. A bare ``name:``-only slot leaves ``port`` as ``None`` and keeps
+    today's random-allocation behaviour byte-for-byte. Two slots in the same
+    contract pinning the same number is rejected at load time by
+    ``WorktreeContract._pinned_ports_must_be_unique`` below. A pin that is
+    already claimed by another worktree/slot, or that the OS reports busy,
+    fails loudly at allocation time (``PinnedPortUnavailableError`` in
+    ``core/port_allocator.py``) rather than silently falling back to a
+    random port.
+    """
 
     name: str
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
 
     @field_validator("name")
     @classmethod
@@ -105,6 +122,21 @@ class WorktreeContract(_StrictModel):
             raise ValueError(
                 f"duplicate port slot names: {', '.join(sorted(set(duplicates)))}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _pinned_ports_must_be_unique(self) -> "WorktreeContract":
+        seen: set[int] = set()
+        duplicates: list[int] = []
+        for slot in self.ports:
+            if slot.port is None:
+                continue
+            if slot.port in seen:
+                duplicates.append(slot.port)
+            seen.add(slot.port)
+        if duplicates:
+            dupes = ", ".join(str(p) for p in sorted(set(duplicates)))
+            raise ValueError(f"duplicate pinned ports: {dupes}")
         return self
 
     @model_validator(mode="after")

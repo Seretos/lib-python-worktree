@@ -68,6 +68,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -248,6 +249,37 @@ _HANDLE_QUERY_GRACE_BUDGET_SEC = 1.0
 # later call to _win_handle_holders would then silently return `[]` forever
 # for the rest of the process's life. That was tried and rejected; do not
 # reintroduce it.
+#
+# Ticket #121 -- this cap alone was only ever half of the fix. It bounds
+# how many *replacement* workers a single scan may spin up once its own
+# worker has already wedged; it never bounded how many *initial* workers a
+# scan creates (every scan creates exactly one, unconditionally, for the
+# scan-start-gate reason above). So before #121, a handle that wedged a
+# scan's initial worker just wedged the *next* scan's initial worker the
+# same way -- one leaked thread per affected _win_handle_holders call,
+# unbounded, with this cap doing nothing to stop it (a fresh scan's initial
+# worker is created regardless of this cap's state). #121 does NOT change
+# this cap, add a pool of reusable workers (a wedged worker never returns
+# to a pool, so under repeated wedging the pool would be empty at every
+# scan start and a fresh thread would be created anyway -- pooling would be
+# a churn optimisation only, not a bound), or add any hard ceiling on
+# initial-worker creation (any such ceiling degenerates into the very
+# scan-start gate rejected above, since a fresh scan's per-call type/name
+# caches start empty every time). Instead, #121 adds a *separate*,
+# complementary bound one level up in _win_handle_holders: a process-wide
+# registry of individual kernel objects that have wedged at least once
+# (see _wedging_handle_key / _remember_wedging_handle /
+# _is_known_wedging_handle below), so a scan's initial worker can still
+# wedge -- exactly as this comment already accepts -- but only ever once
+# per distinct pathological object *for as long as that object's key
+# remains in the registry*, not once per call to this function. The
+# registry is bounded FIFO (see _MAX_REMEMBERED_WEDGED_OBJECTS below), so
+# this is not an unconditional one-ever guarantee: churn through more than
+# _MAX_REMEMBERED_WEDGED_OBJECTS distinct wedging objects evicts the
+# oldest key and can re-admit one further wedge for that evicted object if
+# it is encountered again later. This cap (_MAX_WEDGED_HANDLE_WORKERS)
+# keeps doing its original, narrower job unchanged: bounding
+# replacement-worker churn within and across concurrently-running scans.
 _MAX_WEDGED_HANDLE_WORKERS = 8
 
 # Ticket #90 -- bounded join _BoundedQueryWorker.close() waits for a
@@ -1457,6 +1489,163 @@ def _wedged_slot_available() -> bool:
         return _wedged_worker_count < _MAX_WEDGED_HANDLE_WORKERS
 
 
+# Ticket #121 -- process-wide registry of kernel objects whose NtQueryObject
+# call has already wedged at least once, so a *later* scan never re-queries
+# the same object and never risks leaking another permanently-blocked
+# thread for it. This is the residual half of #90: #90 bounded only
+# *replacement*-worker creation once a scan's own worker had already
+# wedged (see _wedged_worker_count/_wedged_slot_available above); it did
+# nothing to stop a *fresh* scan's *initial* worker from wedging on the
+# exact same pathological handle every time _win_handle_holders is called
+# again (one leaked thread per affected call, unbounded over a long-lived
+# host process's lifetime).
+#
+# Memory policy (deliberate, not a placeholder): a key is remembered
+# permanently -- never expired by time or by scan -- and the only eviction
+# is FIFO once the container exceeds _MAX_REMEMBERED_WEDGED_OBJECTS. This
+# gives the strongest available plateau guarantee: a given pathological
+# kernel object can cost at most one leaked thread per concurrently-running
+# scan that races the first wedge against it -- converging to a true
+# process-wide one-leaked-thread plateau the moment any one of those racing
+# scans records the key -- no matter how many later, non-overlapping
+# _win_handle_holders calls are made -- *for as long as its key remains in
+# the registry* (see the FIFO caveat below). This is the same class of
+# bounded overshoot already accepted for _wedged_worker_count above (each
+# concurrently-running scan may hold one worker beyond the cap, bounded by
+# the small number of concurrent scans): _process_handle's
+# _is_known_wedging_handle check and the matching _remember_wedging_handle
+# call inside _bounded_query are seconds apart -- spanning the query's
+# timeout+grace window, not atomic together -- so two scans already in
+# flight against the same object when it first wedges can both observe
+# "not yet known", both submit, and each leak its own worker before either
+# records. The accepted cost: a handle that was merely very slow once
+# (rather than genuinely, permanently wedged) is skipped by every later scan
+# for the remaining life of the process (or until its key is evicted), so
+# that handle's holder may be missed by _find_blocking_processes from then
+# on. This is deliberately preferred over unbounded thread growth, and it is
+# strictly narrower than the scan-start gate rejected in
+# _win_handle_holders' docstring (which would silently return `[]` for
+# *every* handle, forever, the moment the unrelated
+# _MAX_WEDGED_HANDLE_WORKERS cap filled) -- this registry only ever
+# suppresses the *specific* objects that have individually proven themselves
+# wedging, nothing else. The FIFO bound also means the registry itself
+# cannot grow without limit even if a long-lived process churns through many
+# thousands of distinct wedging objects over its life -- but that same FIFO
+# eviction is a residual gap, not just a memory safeguard: once a process
+# has churned through more than _MAX_REMEMBERED_WEDGED_OBJECTS *distinct*
+# wedging objects, the oldest-recorded key is evicted and, if that same
+# object wedges again later, it can re-admit exactly one further leaked
+# thread for it. So the true guarantee is "at most one leaked thread per
+# distinct wedging object, per admission window between two evictions of its
+# key" -- not an unconditional one-ever bound. This is accepted for the same
+# reason as the slow-handle cost above: it only degrades a best-effort,
+# last-resort diagnostic pass (_find_blocking_processes may miss one
+# holder), whereas the unbounded thread leak this ticket fixes degrades the
+# whole host process.
+#
+# Key-collision caveats (both accepted, for the same best-effort-diagnostic
+# reason as above -- neither is worth the cost of making the fallback
+# non-permanent, which would reinstate the unbounded leak for exactly the
+# non-elevated callers this ticket targets): the ``("pid", pid,
+# handle_value, type_index)`` fallback key (see _wedging_handle_key) can
+# still alias a different, unrelated object if a handle value is recycled
+# by the OS onto a new object of the *same* type within the *same* pid,
+# permanently suppressing that unrelated, healthy handle. The preferred
+# ``("obj", object_ptr)`` key is likewise theoretically susceptible to the
+# kernel reusing a freed object's pointer for a new, unrelated object, far
+# rarer in practice than handle-value reuse. The fallback key is equally
+# susceptible to PID reuse: Windows recycles PIDs just as it recycles handle
+# values, so a short-lived process that wedges a handle once, exits, and is
+# later replaced by an unrelated process that the OS happens to assign the
+# same PID -- which then opens a handle with the same (handle_value,
+# type_index) -- will be suppressed too, even though it is a different
+# process holding a different, unrelated kernel object. As with the
+# handle-value-reuse case above, this fails in the safe direction: it only
+# ever causes extra suppression of this best-effort diagnostic pass (a
+# healthy handle silently skipped), never extra thread leaking.
+_MAX_REMEMBERED_WEDGED_OBJECTS = 4096
+
+# Insertion-ordered bounded set (values are unused, always None) of keys
+# identifying kernel objects that have wedged NtQueryObject at least once.
+# See _wedging_handle_key for how a key is derived from one handle-table
+# entry, and _remember_wedging_handle/_is_known_wedging_handle for the only
+# two operations performed against it. Guarded by _wedged_object_lock.
+# Deliberately pure Python (no ctypes) so it -- and the suppression/
+# recording logic around it -- is exercised by CI on every platform, not
+# just Windows.
+_wedged_object_keys: "OrderedDict[tuple, None]" = OrderedDict()
+_wedged_object_lock = threading.Lock()
+
+
+def _wedging_handle_key(
+    pid: int, handle_value: int, object_ptr: int, type_index: int
+) -> tuple:
+    """Derive the dedup key used by the wedged-handle registry (ticket #121).
+
+    Prefers ``("obj", object_ptr)`` -- identifying the underlying kernel
+    object itself, independent of which process/handle-value currently
+    references it -- whenever the handle table entry's raw ``Object``
+    pointer is non-zero. Falls back to ``("pid", pid, handle_value,
+    type_index)`` when it is zero, which is the common case for a
+    non-elevated caller on modern Windows: the kernel zeroes ``Object`` in
+    ``SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX`` for callers without the
+    ``SeDebugPrivilege``-equivalent elevation, as a kernel-pointer-leak
+    mitigation. This fallback is required, not merely defensive -- without
+    it, the registry would silently never suppress anything on an ordinary
+    unprivileged host process, which is the normal case this ticket exists
+    to fix.
+
+    ``type_index`` is included in the fallback key -- not just ``(pid,
+    handle_value)`` -- because Windows recycles small handle values almost
+    immediately after ``CloseHandle``: without it, a future, completely
+    unrelated object landing on the same now-reused handle value in the
+    same pid would be silently and permanently suppressed too, which is a
+    wider and more common failure mode than the single-object cost this
+    registry already accepts (see the comment above
+    ``_MAX_REMEMBERED_WEDGED_OBJECTS``). Including the type index narrows
+    that aliasing to a recycled handle value that also happens to land on
+    an object of the *same* type -- it does not eliminate it; see that same
+    comment block for the accepted residual risk.
+
+    The ``pid`` component of the fallback key is subject to the same kind
+    of reuse: Windows recycles PIDs, not just handle values, so this key
+    can also alias across two entirely unrelated *processes* if the OS
+    later reassigns a wedged, now-exited process's PID to a new process
+    that happens to open a handle with the same ``(handle_value,
+    type_index)`` -- see the same comment block above
+    ``_MAX_REMEMBERED_WEDGED_OBJECTS``, which names this PID-reuse vector
+    explicitly alongside handle-value reuse. Like that vector, it fails in
+    the safe direction: extra suppression of a diagnostic pass, never extra
+    leaking.
+    """
+    if object_ptr:
+        return ("obj", object_ptr)
+    return ("pid", pid, handle_value, type_index)
+
+
+def _remember_wedging_handle(key: tuple) -> None:
+    """Record *key* as belonging to a kernel object that has wedged
+    NtQueryObject at least once (ticket #121), so no later scan -- in this
+    or any future call to _win_handle_holders -- re-queries it.
+
+    Bounded FIFO: once the registry exceeds _MAX_REMEMBERED_WEDGED_OBJECTS,
+    the oldest-recorded key is evicted first. See the constant's own
+    comment for the accepted-cost rationale.
+    """
+    with _wedged_object_lock:
+        if key not in _wedged_object_keys:
+            _wedged_object_keys[key] = None
+        while len(_wedged_object_keys) > _MAX_REMEMBERED_WEDGED_OBJECTS:
+            _wedged_object_keys.popitem(last=False)
+
+
+def _is_known_wedging_handle(key: tuple) -> bool:
+    """``True`` iff *key* was previously recorded by
+    :func:`_remember_wedging_handle` and has not since been evicted."""
+    with _wedged_object_lock:
+        return key in _wedged_object_keys
+
+
 class _BoundedQueryWorker:
     """One daemon thread that runs submitted zero-arg callables, bounded.
 
@@ -1477,9 +1666,29 @@ class _BoundedQueryWorker:
     worker's queue at that point, so posting the sentinel right behind it is
     safe -- once the wedged callable finally returns, the worker's loop
     drains straight to that sentinel and exits, instead of parking on
-    ``queue.get()`` forever). This is what makes a long-lived caller that
-    creates many of these over its lifetime never accumulate threads
-    without bound (ticket #90).
+    ``queue.get()`` forever).
+
+    That "eventually" is doing real work, though: a genuinely wedged
+    callable (e.g. ``NtQueryObject`` against a named pipe with no
+    listener) may never return, in which case this worker's thread stays
+    alive -- blocked inside the callable, sentinel or not -- for as long as
+    the process runs. Ticket #90 alone therefore does *not* guarantee that
+    a long-lived caller creating many of these over its lifetime never
+    accumulates threads without bound: nothing here stops the *same*
+    callable from wedging again on the next worker created for it. What
+    actually bounds that (ticket #121) lives one level up, in the caller --
+    see ``_win_handle_holders``' module-level wedged-handle registry, which
+    remembers a wedging target so no later caller submits the same callable
+    to a fresh worker again *for as long as that target's key remains
+    recorded* -- the registry is bounded FIFO (see
+    ``_MAX_REMEMBERED_WEDGED_OBJECTS``), so eviction after enough distinct
+    wedging targets have been recorded can re-admit one further wedge for a
+    target evicted earlier; it is not an unconditional guarantee across the
+    process's entire lifetime. This class's own guarantee is narrower, and
+    still accurate: every worker it creates eventually receives its
+    shutdown sentinel exactly once, and exits on its own the moment its
+    callable returns -- it is the caller's responsibility not to keep
+    resubmitting to the same wedging target.
     """
 
     def __init__(self) -> None:
@@ -1644,6 +1853,189 @@ class _BoundedQueryWorker:
         self._thread.join(_WORKER_CLOSE_JOIN_SEC)
 
 
+# NTSTATUS values used by both _enumerate_handle_table and _query_object_raw
+# below. Plain ints -- no ctypes needed to define these -- so, unlike the
+# structures below, they are simple module constants rather than living
+# behind the lazy-ctypes-import memoised builder.
+_STATUS_SUCCESS = 0x00000000
+_STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+
+# SystemInformationClass value for NtQuerySystemInformation's
+# SystemExtendedHandleInformation dump, used by _enumerate_handle_table.
+_SYSTEM_EXTENDED_HANDLE_INFORMATION = 64
+
+# Memoised (ticket #121) module-global cache for the two ctypes.Structure
+# subclasses _enumerate_handle_table and _query_object_raw both need.
+# Populated lazily by _win_handle_structs() below.
+_win_handle_structs_cache: "Optional[Tuple[type, type]]" = None
+
+
+def _win_handle_structs() -> "Tuple[type, type]":
+    """Return ``(SystemHandleTableEntryInfoEx, UnicodeString)`` ctypes
+    structures, building and caching them on first call (ticket #121).
+
+    Both structures used to be defined fresh, as local classes, on every
+    single call to ``_win_handle_holders`` -- harmless when they were only
+    ever constructed once per scan, but ``_query_object_raw`` is now called
+    once per handle after being hoisted to module scope, so redefining
+    ``ctypes.Structure`` subclasses on every call would be wasteful. This
+    builder imports ``ctypes`` itself, on first use only, preserving this
+    module's "no ctypes import at module load time" invariant (the module
+    is imported and exercised by the test suite on non-Windows CI too,
+    where ``ctypes.wintypes``/``ctypes.WinDLL`` are unavailable). The cache
+    assignment is idempotent -- two threads racing this on first use may
+    each build an equivalent pair of classes and one simply overwrites the
+    other's assignment, which is harmless since neither pair carries any
+    shared mutable state -- so no lock is used here.
+    """
+    global _win_handle_structs_cache
+    if _win_handle_structs_cache is not None:
+        return _win_handle_structs_cache
+
+    import ctypes
+
+    class _SystemHandleTableEntryInfoEx(ctypes.Structure):
+        _fields_ = [
+            ("Object", ctypes.c_void_p),
+            ("UniqueProcessId", ctypes.c_size_t),
+            ("HandleValue", ctypes.c_size_t),
+            ("GrantedAccess", ctypes.c_ulong),
+            ("CreatorBackTraceIndex", ctypes.c_ushort),
+            ("ObjectTypeIndex", ctypes.c_ushort),
+            ("HandleAttributes", ctypes.c_ulong),
+            ("Reserved", ctypes.c_ulong),
+        ]
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", ctypes.c_ushort),
+            ("MaximumLength", ctypes.c_ushort),
+            ("Buffer", ctypes.c_wchar_p),
+        ]
+
+    _win_handle_structs_cache = (_SystemHandleTableEntryInfoEx, _UnicodeString)
+    return _win_handle_structs_cache
+
+
+def _enumerate_handle_table(
+    ntdll, excluded_pids: "set[int]"
+) -> "Optional[Dict[int, List[Tuple[int, int, int]]]]":
+    """Dump the system-wide handle table, grouped by owning PID.
+
+    Hoisted to module scope (ticket #121) from ``_win_handle_holders``' old
+    inline Step 1 so it is directly mockable in tests (e.g. to inject a
+    fixed, single-entry table without touching the real system handle
+    table). Behaviour is unchanged: grows the ``NtQuerySystemInformation``
+    buffer on ``STATUS_INFO_LENGTH_MISMATCH`` with bounded retries, and
+    returns ``None`` -- never an empty dict -- when the one-shot dump
+    itself never succeeds, so the caller can tell "found nothing" apart
+    from "never looked" (mapped by the caller to
+    ``_PartialList([], complete=False)``).
+
+    Each grouped tuple is ``(handle_value, type_index, object_ptr)`` --
+    widened (ticket #121) from the original ``(handle_value, type_index)``
+    pair to also carry the handle table entry's raw ``Object`` pointer,
+    which the wedged-handle registry uses as its primary dedup key (see
+    ``_wedging_handle_key``), falling back to ``(pid, handle_value,
+    type_index)`` only when ``Object`` is zero.
+    """
+    import ctypes
+
+    _SystemHandleTableEntryInfoEx, _ = _win_handle_structs()
+
+    buf_size = 1 << 20  # 1 MiB initial guess
+    buf = None
+    for _attempt in range(8):
+        buf = ctypes.create_string_buffer(buf_size)
+        return_length = ctypes.c_ulong(0)
+        status = ntdll.NtQuerySystemInformation(
+            _SYSTEM_EXTENDED_HANDLE_INFORMATION,
+            buf,
+            buf_size,
+            ctypes.byref(return_length),
+        ) & 0xFFFFFFFF
+        if status == _STATUS_INFO_LENGTH_MISMATCH:
+            buf_size = max(buf_size * 2, return_length.value + (1 << 16))
+            continue
+        if status != _STATUS_SUCCESS:
+            # The one-shot dump itself failed -- the caller never looked at
+            # any handle at all, not merely "found nothing".
+            return None
+        break
+    else:
+        return None
+
+    size_t_size = ctypes.sizeof(ctypes.c_size_t)
+    entry_size = ctypes.sizeof(_SystemHandleTableEntryInfoEx)
+    handles_offset = 2 * size_t_size
+    num_handles = ctypes.c_size_t.from_buffer_copy(buf, 0).value
+    # Defend against a corrupt/short buffer reporting more handles than it
+    # actually holds -- clamp rather than read out of bounds.
+    max_fit = max(0, (buf_size - handles_offset) // entry_size)
+    num_handles = min(num_handles, max_fit)
+
+    # Group (handle value, object type index, object pointer) triples by
+    # owning PID so each foreign process is opened (OpenProcess) at most
+    # once regardless of how many of its handles end up inspected.
+    by_pid: Dict[int, List[Tuple[int, int, int]]] = {}
+    for i in range(num_handles):
+        offset = handles_offset + i * entry_size
+        entry = _SystemHandleTableEntryInfoEx.from_buffer_copy(buf, offset)
+        pid = int(entry.UniqueProcessId)
+        if pid <= 0 or pid in excluded_pids:
+            continue
+        by_pid.setdefault(pid, []).append(
+            (
+                int(entry.HandleValue),
+                int(entry.ObjectTypeIndex),
+                int(entry.Object or 0),
+            )
+        )
+    return by_pid
+
+
+def _query_object_raw(ntdll, dup_handle, info_class: int) -> Optional[str]:
+    """Run one raw ``NtQueryObject`` call and parse its ``UNICODE_STRING``
+    result.
+
+    Hoisted to module scope (ticket #121) from a closure defined fresh
+    inside every ``_win_handle_holders`` scan, so it is directly mockable/
+    countable in tests without a live ``ctypes``/``ntdll`` call. Behaviour
+    is unchanged -- only ``ntdll`` became an explicit parameter (previously
+    captured from the enclosing scope), and the ``UNICODE_STRING`` ctypes
+    structure it parses now comes from the memoised
+    :func:`_win_handle_structs` instead of being redefined on every call.
+    """
+    import ctypes
+
+    _, _UnicodeString = _win_handle_structs()
+
+    size = 1024
+    for _attempt in range(4):
+        name_buf = ctypes.create_string_buffer(size)
+        returned = ctypes.c_ulong(0)
+        status = ntdll.NtQueryObject(
+            dup_handle,
+            info_class,
+            name_buf,
+            size,
+            ctypes.byref(returned),
+        ) & 0xFFFFFFFF
+        if status == _STATUS_SUCCESS:
+            # Both ObjectNameInformation and ObjectTypeInformation begin
+            # with a UNICODE_STRING as their first field, so the same
+            # parsing applies to either info_class.
+            uni = _UnicodeString.from_buffer_copy(name_buf, 0)
+            if not uni.Buffer or uni.Length == 0:
+                return None
+            return ctypes.wstring_at(uni.Buffer, uni.Length // 2)
+        if status == _STATUS_INFO_LENGTH_MISMATCH:
+            size = max(size * 2, returned.value + 256)
+            continue
+        return None
+    return None
+
+
 def _win_handle_holders(
     path: str,
     excluded_pids: "set[int]",
@@ -1731,15 +2123,51 @@ def _win_handle_holders(
     can recycle that same handle *value* onto a different, unrelated object
     in the meantime (a real use-after-close/false-match bug fixed by this
     same change). Every worker created during a scan -- healthy or retired
-    -- is guaranteed to eventually receive a shutdown sentinel and exit, so
-    a long-lived host process invoking this function many times over its
-    lifetime does not accumulate threads without bound (the operational
-    limitation this module used to accept — see the ticket for the
-    real-world blowup that made it no longer acceptable). An overall
-    wall-clock budget (``_HANDLE_SCAN_BUDGET_SEC``) additionally bounds the
-    whole function as defense in depth: once exceeded, the scan stops early
-    and returns whatever it has found so far rather than continuing
-    indefinitely.
+    -- is guaranteed to eventually receive a shutdown sentinel; a *healthy*
+    worker then exits essentially immediately. A *retired* one does not: its
+    thread is genuinely, permanently blocked inside the still-running
+    wedged ``NtQueryObject`` call for as long as that real call takes --
+    which, for a handle type documented to hang indefinitely (named pipes
+    with no listener, in particular), may be the remaining life of the
+    process. Ticket #90 alone did not make that safe to repeat: a retired
+    worker's thread is real and outstanding regardless of how quickly this
+    *scan* itself returns, and a long-lived host process that called this
+    function again against the *same* pathological handle would spin up a
+    fresh initial worker that wedged on it all over again -- one leaked
+    thread per affected call, unbounded (the residual gap ticket #121
+    closes). What actually bounds this now is the module-level wedged-
+    handle registry (see ``_wedging_handle_key`` /
+    ``_remember_wedging_handle`` / ``_is_known_wedging_handle`` above
+    ``_BoundedQueryWorker``): the moment a query against a given kernel
+    object fails to resolve, that object's key is recorded, and every
+    *later*, non-overlapping call to this function skips it outright in
+    ``_process_handle``, before ever duplicating or querying it again, for
+    as long as that key remains in the registry. So a single pathological
+    kernel object can leak at most one permanently-blocked thread per
+    distinct object *per concurrently-running scan that races the first
+    wedge against it* -- converging to one leaked thread process-wide the
+    moment any one of those racing scans records the key -- *for as long as
+    its key remains in the registry*, not one per call. This is the same
+    class of bounded overshoot already accepted for
+    ``_wedged_worker_count`` above (each concurrently-running scan may hold
+    one worker beyond the cap, bounded by the small number of concurrent
+    scans): the check in ``_process_handle`` and the record in
+    ``_bounded_query`` are seconds apart, spanning the query's
+    timeout+grace window rather than being atomic together, so two scans
+    already in flight against the same object when it first wedges can
+    both observe "not yet known" and both submit, each leaking its own
+    worker before either records -- the residual bound is one leaked
+    thread per concurrently-running scan racing that wedge, bounded by the
+    (small) number of concurrent scans. On top of that, the registry is
+    bounded FIFO (see ``_MAX_REMEMBERED_WEDGED_OBJECTS``), so this is not
+    an unconditional one-ever-across-the-process's-whole-lifetime
+    guarantee either: eviction after more than
+    ``_MAX_REMEMBERED_WEDGED_OBJECTS`` distinct wedging objects have been
+    recorded can re-admit one further wedge for an object evicted earlier.
+    An overall wall-clock budget (``_HANDLE_SCAN_BUDGET_SEC``) additionally
+    bounds the whole function as defense in depth: once exceeded, the scan
+    stops early and returns whatever it has found so far rather than
+    continuing indefinitely.
 
     Never raises: any unexpected ctypes/structure failure (missing API,
     unexpected buffer layout, etc.) is expected to be caught by the caller
@@ -1808,83 +2236,21 @@ def _win_handle_holders(
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
-    SYSTEM_EXTENDED_HANDLE_INFORMATION = 64
-    STATUS_SUCCESS = 0x00000000
-    STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
     OBJECT_NAME_INFORMATION = 1
     OBJECT_TYPE_INFORMATION = 2
     PROCESS_DUP_HANDLE = 0x0040
     DUPLICATE_SAME_ACCESS = 0x00000002
 
-    class _SystemHandleTableEntryInfoEx(ctypes.Structure):
-        _fields_ = [
-            ("Object", ctypes.c_void_p),
-            ("UniqueProcessId", ctypes.c_size_t),
-            ("HandleValue", ctypes.c_size_t),
-            ("GrantedAccess", ctypes.c_ulong),
-            ("CreatorBackTraceIndex", ctypes.c_ushort),
-            ("ObjectTypeIndex", ctypes.c_ushort),
-            ("HandleAttributes", ctypes.c_ulong),
-            ("Reserved", ctypes.c_ulong),
-        ]
-
-    class _UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("Length", ctypes.c_ushort),
-            ("MaximumLength", ctypes.c_ushort),
-            ("Buffer", ctypes.c_wchar_p),
-        ]
-
-    # --- Step 1: dump the system-wide handle table, growing the buffer on
-    # STATUS_INFO_LENGTH_MISMATCH. Bounded retries so a hostile/changing
-    # buffer size can never loop forever.
-    buf_size = 1 << 20  # 1 MiB initial guess
-    buf = None
-    for _attempt in range(8):
-        buf = ctypes.create_string_buffer(buf_size)
-        return_length = ctypes.c_ulong(0)
-        status = ntdll.NtQuerySystemInformation(
-            SYSTEM_EXTENDED_HANDLE_INFORMATION,
-            buf,
-            buf_size,
-            ctypes.byref(return_length),
-        ) & 0xFFFFFFFF
-        if status == STATUS_INFO_LENGTH_MISMATCH:
-            buf_size = max(buf_size * 2, return_length.value + (1 << 16))
-            continue
-        if status != STATUS_SUCCESS:
-            # The one-shot dump itself failed -- this scan never looked at
-            # any handle at all, not merely "found nothing".
-            return _PartialList([], complete=False)
-        break
-    else:
+    # --- Step 1: dump the system-wide handle table, grouped by owning PID.
+    # Hoisted to module scope as _enumerate_handle_table (ticket #121) so it
+    # is directly mockable in tests; see that function's docstring for the
+    # (handle_value, type_index, object_ptr) tuple shape and the None-means-
+    # "dump itself failed" contract.
+    by_pid = _enumerate_handle_table(ntdll, excluded_pids)
+    if by_pid is None:
+        # The one-shot dump itself failed -- this scan never looked at any
+        # handle at all, not merely "found nothing".
         return _PartialList([], complete=False)
-
-    size_t_size = ctypes.sizeof(ctypes.c_size_t)
-    entry_size = ctypes.sizeof(_SystemHandleTableEntryInfoEx)
-    handles_offset = 2 * size_t_size
-    num_handles = ctypes.c_size_t.from_buffer_copy(buf, 0).value
-    # Defend against a corrupt/short buffer reporting more handles than it
-    # actually holds -- clamp rather than read out of bounds.
-    max_fit = max(0, (buf_size - handles_offset) // entry_size)
-    num_handles = min(num_handles, max_fit)
-
-    # Group (handle value, object type index) pairs by owning PID so each
-    # foreign process is opened (OpenProcess) at most once regardless of how
-    # many of its handles we end up inspecting. ObjectTypeIndex is read
-    # directly from the system handle table -- no syscall needed -- and
-    # drives the type-index cache below that skips non-File handles without
-    # ever duplicating them.
-    by_pid: Dict[int, List[Tuple[int, int]]] = {}
-    for i in range(num_handles):
-        offset = handles_offset + i * entry_size
-        entry = _SystemHandleTableEntryInfoEx.from_buffer_copy(buf, offset)
-        pid = int(entry.UniqueProcessId)
-        if pid <= 0 or pid in excluded_pids:
-            continue
-        by_pid.setdefault(pid, []).append(
-            (int(entry.HandleValue), int(entry.ObjectTypeIndex))
-        )
 
     # --- Step 2: build the NT-device -> drive-letter map used to translate
     # resolved object names (e.g. "\Device\HarddiskVolume3\...") into
@@ -1905,32 +2271,6 @@ def _win_handle_holders(
                 return drive + nt_path[len(device):]
         return None
 
-    def _query_object_raw(dup_handle, info_class: int) -> Optional[str]:
-        size = 1024
-        for _attempt in range(4):
-            name_buf = ctypes.create_string_buffer(size)
-            returned = ctypes.c_ulong(0)
-            status = ntdll.NtQueryObject(
-                dup_handle,
-                info_class,
-                name_buf,
-                size,
-                ctypes.byref(returned),
-            ) & 0xFFFFFFFF
-            if status == STATUS_SUCCESS:
-                # Both ObjectNameInformation and ObjectTypeInformation begin
-                # with a UNICODE_STRING as their first field, so the same
-                # parsing applies to either info_class.
-                uni = _UnicodeString.from_buffer_copy(name_buf, 0)
-                if not uni.Buffer or uni.Length == 0:
-                    return None
-                return ctypes.wstring_at(uni.Buffer, uni.Length // 2)
-            if status == STATUS_INFO_LENGTH_MISMATCH:
-                size = max(size * 2, returned.value + 256)
-                continue
-            return None
-        return None
-
     # Ticket #90: exactly one _BoundedQueryWorker services this whole scan.
     # A scan always creates and uses its initial worker, even when the
     # process-wide wedged-worker cap (_MAX_WEDGED_HANDLE_WORKERS) is
@@ -1948,13 +2288,53 @@ def _win_handle_holders(
     # overshoot: each concurrently-running scan may hold one worker
     # beyond the cap, bounded by the (small) number of concurrent scans.
     # Do not reintroduce a scan-start gate here.
+    #
+    # Ticket #121: that overshoot used to repeat, unboundedly, across
+    # separate calls to this function -- if this scan's initial worker
+    # itself wedges (query gets no replacement because it never even
+    # reaches _bounded_query's ABANDONED/CAPPED branch below until the
+    # wedged call eventually returns, which for a pathological handle may
+    # be never), the *next* call to _win_handle_holders would create a
+    # fresh initial worker that wedges on the *same* handle all over
+    # again -- one leaked thread per affected call, forever, for a
+    # long-lived host process. The module-level wedged-handle registry
+    # (_wedged_object_keys, see _wedging_handle_key/_remember_wedging_handle/
+    # _is_known_wedging_handle above) closes that gap: _process_handle
+    # below now checks the registry before ever duplicating/querying a
+    # handle, and _bounded_query records a handle's key the moment its
+    # query fails to resolve. So while a scan's initial worker can still
+    # wedge -- exactly as accepted above -- a *given* pathological kernel
+    # object can only ever do this once *per concurrently-running scan that
+    # races the first wedge against it*, converging to once, process-wide,
+    # the moment any one of those racing scans records the key -- *for as
+    # long as its key remains in the bounded-FIFO registry* (see
+    # _MAX_REMEMBERED_WEDGED_OBJECTS). This is the same class of bounded
+    # overshoot already accepted for _wedged_worker_count above (each
+    # concurrently-running scan may hold one worker beyond the cap, bounded
+    # by the small number of concurrent scans): the check here in
+    # _process_handle and the record in _bounded_query are seconds apart --
+    # spanning the query's timeout+grace window, not atomic together -- so
+    # two scans already in flight against the same object when it first
+    # wedges can both observe "not yet known" and both leak a worker before
+    # either records. Every later scan -- once any of those racing scans has
+    # recorded the key -- skips it outright, at no thread cost,
+    # until/unless that key is evicted by churn through enough other
+    # distinct wedging objects.
+    #
     # It is always shut down via the try/finally below -- a healthy worker
     # drains and exits promptly; a worker retired because a query wedged
     # (see _BoundedQueryWorker.submit) has already been sent its own
     # shutdown sentinel at retirement time, so close() on it is a fast
     # no-op and the retired thread still self-terminates on its own once
-    # the wedged call finally returns. Either way this scan leaks no
-    # thread. See _BoundedQueryWorker's docstring for the full mechanism.
+    # the wedged call finally returns. See _BoundedQueryWorker's docstring
+    # for the full mechanism, and the wedged-handle registry above for why
+    # a *scan* leaking no thread of its own is no longer the whole story --
+    # a wedged query's thread genuinely is blocked, potentially forever,
+    # until the kernel call returns; what the registry guarantees is that
+    # this happens at most once per distinct pathological object per
+    # concurrently-running scan racing its first wedge, per admission
+    # window between two evictions of its key -- not once per call to this
+    # function, and not an unconditional single leak process-wide.
     worker = _BoundedQueryWorker()
     stop_scan = False
     cap_already_logged = False
@@ -1971,7 +2351,7 @@ def _win_handle_holders(
             kernel32.CloseHandle(dup_handle)
         return _closer
 
-    def _bounded_query(dup_handle, info_class: int):
+    def _bounded_query(dup_handle, info_class: int, key: tuple):
         """Run one NtQueryObject call through the per-scan worker.
 
         Returns ``(_RESOLVED, value)`` on success, or ``(_STOP, None)``
@@ -1983,16 +2363,25 @@ def _win_handle_holders(
         case; the caller must NOT close *dup_handle* itself when this
         does not return ``_RESOLVED`` (ticket #90's handle-reuse /
         false-match fix).
+
+        Ticket #121: *key* (see ``_wedging_handle_key``) identifies the
+        kernel object this query targets. On every non-``RESOLVED``
+        outcome -- ``ABANDONED`` and ``CAPPED`` alike, mirroring how
+        ``submit()`` already counts both against ``_wedged_worker_count``,
+        since both leave a thread genuinely blocked -- *key* is recorded
+        via ``_remember_wedging_handle`` so no *later* scan (in this
+        process's lifetime) ever queries this same object again.
         """
         nonlocal worker, cap_already_logged
         outcome = worker.submit(
-            lambda: _query_object_raw(dup_handle, info_class),
+            lambda: _query_object_raw(ntdll, dup_handle, info_class),
             grace=grace_budget,
             scan_deadline=scan_deadline,
             on_abandoned_done=_make_handle_closer(dup_handle),
         )
         if outcome.status == _QueryStatus.RESOLVED:
             return _RESOLVED, outcome.value
+        _remember_wedging_handle(key)
         if outcome.status == _QueryStatus.ABANDONED and _wedged_slot_available():
             # This worker is now permanently tied up in the still-running
             # wedged call (and has already been sent its own shutdown
@@ -2023,14 +2412,26 @@ def _win_handle_holders(
     _UNSET = object()
     type_name_cache: Dict[int, Optional[str]] = {}
 
-    def _process_handle(proc_handle, pid: int, handle_value: int, type_index: int) -> str:
-        """Resolve one (handle_value, type_index) for *pid*.
+    def _process_handle(
+        proc_handle, pid: int, handle_value: int, type_index: int, object_ptr: int
+    ) -> str:
+        """Resolve one (handle_value, type_index, object_ptr) for *pid*.
 
         Returns ``_MATCHED`` (pid appended to *found*), ``_CONTINUE``
         (nothing to report, keep scanning this pid's other handles), or
         ``_STOP`` (this scan has no usable worker left -- callers must stop
         issuing further queries entirely, not just for this pid).
+
+        Ticket #121: before touching this handle at all -- no
+        ``DuplicateHandle``, no worker traffic -- checks whether it is
+        already known to belong to a kernel object that wedged a previous
+        scan's query (``_is_known_wedging_handle``); if so, skips it
+        outright via ``_CONTINUE``.
         """
+        key = _wedging_handle_key(pid, handle_value, object_ptr, type_index)
+        if _is_known_wedging_handle(key):
+            return _CONTINUE  # known-wedging object -- skip without duplicating
+
         cached_type = type_name_cache.get(type_index, _UNSET)
         if cached_type is not _UNSET and cached_type != "File":
             return _CONTINUE  # known non-file type -- skip without duplicating
@@ -2052,7 +2453,7 @@ def _win_handle_holders(
         nt_name: Optional[str] = None
         try:
             if cached_type is _UNSET:
-                status, type_name = _bounded_query(dup_handle, OBJECT_TYPE_INFORMATION)
+                status, type_name = _bounded_query(dup_handle, OBJECT_TYPE_INFORMATION, key)
                 if status != _RESOLVED:
                     owns_handle = False
                     return _STOP if status == _STOP else _CONTINUE
@@ -2060,7 +2461,7 @@ def _win_handle_holders(
                 if type_name != "File":
                     return _CONTINUE
 
-            status, nt_name = _bounded_query(dup_handle, OBJECT_NAME_INFORMATION)
+            status, nt_name = _bounded_query(dup_handle, OBJECT_NAME_INFORMATION, key)
             if status != _RESOLVED:
                 owns_handle = False
                 return _STOP if status == _STOP else _CONTINUE
@@ -2116,13 +2517,15 @@ def _win_handle_holders(
                 # we cannot cross without running elevated ourselves.
                 continue
             try:
-                for handle_value, type_index in handle_entries:
+                for handle_value, type_index, object_ptr in handle_entries:
                     if stop_scan:
                         break
                     if time.monotonic() > scan_deadline:
                         deadline_truncated = True
                         break
-                    verdict = _process_handle(proc_handle, pid, handle_value, type_index)
+                    verdict = _process_handle(
+                        proc_handle, pid, handle_value, type_index, object_ptr
+                    )
                     if verdict == _STOP:
                         stop_scan = True
                         break
@@ -2639,14 +3042,14 @@ def start(
     see ``_role_log_slug``'s docstring) but is never
     lower-cased, so the filename's role token is always identical to the
     literal key used in ``record.pids``/``record.job_names``/
-    ``record.variants``. A consumer holding a role name can therefore
-    reconstruct the log path without reading ``record.start_log_path``
-    (which is a record-wide scalar overwritten by every ``start()`` call,
-    regardless of role). Roles that differ only by case (e.g. ``"roleA"``
-    vs ``"rolea"``) produce distinct filename strings but name the same
-    physical file on a case-insensitive filesystem (Windows, default
-    macOS) -- pick role names that differ by more than case if per-role log
-    isolation matters.
+    ``record.variants``/``record.start_log_paths``, and is the key under
+    which that path is recorded in ``record.start_log_paths``. A consumer
+    holding a role name can therefore reconstruct the log path itself, or
+    read it directly off ``record.start_log_paths[role]``. Roles that
+    differ only by case (e.g. ``"roleA"`` vs ``"rolea"``) produce distinct
+    filename strings but name the same physical file on a case-insensitive
+    filesystem (Windows, default macOS) -- pick role names that differ by
+    more than case if per-role log isolation matters.
 
     Raises
     ------
@@ -2707,7 +3110,12 @@ def start(
     # equally stale once a new process has been spawned for it.
     record.stop_attempt = None
     record.returncode = returncode
-    record.start_log_path = str(log_path)
+    # Ticket #119: unconditional per-role assignment -- unlike job_names/
+    # variants below, there is no "not available this time" branch here:
+    # start() always creates a log file for this role, so there is nothing
+    # to pop when absent. Restarting the same role overwrites that role's
+    # single entry rather than accumulating.
+    record.start_log_paths[role] = str(log_path)
     # Ticket #95, R5 (fix cycle: per-role, not a record-wide scalar --
     # mirrors how `pids` is keyed by role): persist the Job Object name (if
     # one was successfully created and the child assigned to it) under this
@@ -2752,6 +3160,11 @@ def stop(
 
     If the PID is already dead, clears the record gracefully without raising.
 
+    Ticket #119: unlike ``job_names[role]``/``variants[role]``, the stopping
+    role's ``start_log_paths[role]`` entry is deliberately *retained* rather
+    than cleared, so the caller of this very call can still read the log
+    path of the process it just stopped off the returned record.
+
     Process-tree kill (ticket #87)
     -------------------------------
     Before any signal is sent, the tracked PID's descendant process tree is
@@ -2775,11 +3188,87 @@ def stop(
     tree/group of the process we ourselves spawned is the meaning of "stop",
     not orphan-hunting.
 
-    When *kill_orphans* is ``True``, a further pass using
-    :func:`_kill_blocking_processes` is run against ``record.path`` after the
-    tree kill.  This is the path-heuristic (cwd/cmdline/open-file) orphan
-    scan for processes that detached far enough (e.g. into their own
-    session/process group) to evade even the tree snapshot.
+    What the unconditional kill actually covers, per platform:
+
+    - **Windows, job assigned and a live handle available** (``job_name`` is
+      truthy and :func:`_open_job_object` returned a handle): every
+      descendant of the tracked process is a job member at any depth,
+      regardless of ppid lineage -- this is what reaches a
+      ``Start-Process``/ShellExecuteEx-delegated launch, which lands outside
+      the ppid tree entirely and so cannot be found by :func:`_process_tree`
+      at any recursion depth. :func:`_terminate_job_object`'s single
+      ``TerminateJobObject`` call kills every one of them together.
+      ``CREATE_BREAKAWAY_FROM_JOB`` cannot be used to escape this
+      particular job: :func:`_create_job_object` sets no limit flags and
+      never calls ``SetInformationJobObject``, so without
+      ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` the OS refuses any breakaway
+      ``CreateProcess`` outright. A job member list that hit the
+      ``_JOB_MEMBER_LIST_MAX_SLOTS`` cap (reported as the
+      ``"job_member_list_truncated"`` ``stop_detail`` reason -- see "Status
+      honesty" below) is an enumeration/reporting gap only:
+      :func:`_terminate_job_object` still terminates the job as a whole, so
+      members past the cap are killed regardless of whether they were ever
+      enumerated.
+    - **Windows, no job or no live handle** (rule N7 -- job creation or
+      assignment failed at :func:`_spawn_detached` time, or
+      :func:`_open_job_object` returns ``None`` here): containment degrades
+      to the ppid tree snapshot alone. :func:`_process_group_members` and
+      :func:`_signal_process_group` are both unconditional no-ops on
+      Windows (``sys.platform == "win32"`` makes them return ``[]``/
+      ``False`` immediately), so there is no group-based fallback the way
+      POSIX has below.
+    - **POSIX**: there is no Job Object mechanism at all
+      (:func:`_create_job_object`/:func:`_open_job_object` both return
+      ``None`` off ``win32``). Containment is the ppid tree snapshot plus,
+      when the tracked pid is the leader of its own process group
+      (``start_new_session=True`` guarantees this for everything this
+      module spawns), that group's other members via
+      :func:`_signal_process_group`/:func:`_process_group_members`. A
+      descendant that calls ``setsid()`` itself leaves that group before
+      this snapshot is taken, and is invisible to both mechanisms if its
+      intermediate parent has already exited (classic double-fork
+      daemonization).
+
+    ``kill_orphans`` is **path-scoped, not lineage-scoped**: when *True*, a
+    further pass using :func:`_kill_blocking_processes` is run against
+    ``record.path`` after the tree kill and the Job Object terminate step --
+    the path-heuristic (cwd/cmdline-token/open-file/Windows handle-table)
+    orphan scan implemented by :func:`_find_blocking_processes`. It kills
+    anything it finds under ``record.path``, regardless of who started it,
+    and never consults ``record.pids`` -- a fundamentally different scope
+    from the ppid/group/job containment above, not a deeper version of it.
+    Concretely, on Windows with a successfully-assigned job and a live
+    handle, there is no process this ``stop()`` call is responsible for that
+    escapes the unconditional kill above -- ``kill_orphans`` there widens
+    *scope* (anything under the path), not containment depth. The genuine
+    gaps it closes are: a POSIX descendant that detached via ``setsid()``
+    out of both the ppid tree and the process group (the canonical case,
+    ticket #87); a Windows role whose job was never created or never
+    successfully assigned (:func:`_assign_process_to_job` returned
+    ``False``); a Windows role whose job handle is not available at
+    ``stop()`` time (:func:`_open_job_object` returned ``None``); a process
+    spawned by a ``setup:`` step via ``SetupRunner``'s default runner, which
+    never creates or joins a Job Object and whose pid never enters
+    ``record.pids`` -- entirely outside every mechanism above, reachable
+    only because it still runs with the worktree as its cwd; and the
+    sub-millisecond window documented on :func:`_assign_process_to_job`
+    between a child's ``Popen`` returning and its job assignment landing.
+    It does **not** help with a ``"job_member_list_truncated"`` outcome:
+    those members were already killed by the unconditional
+    ``TerminateJobObject`` call above, regardless of enumeration -- there is
+    nothing left for the orphan scan to find.
+
+    Do not pass ``kill_orphans=True`` defensively on every call: on Windows
+    its cost is dominated by Pass 1c, a **system-wide** OS handle-table scan
+    (:func:`_win_handle_holders` -- a full system handle table routinely
+    holds 100k+ entries), budgeted at ``_HANDLE_SCAN_BUDGET_SEC`` (15.0s)
+    within an overall ``_DISCOVERY_MAX_SEC`` (20.0s) discovery ceiling. This
+    pass exists because ``proc.cwd()`` raises ``AccessDenied`` for most
+    foreign processes on Windows, so it is often the scan's only real
+    coverage there. It also carries a real cost against *timeout* itself:
+    whenever ``kill_orphans=True``, ``_ORPHAN_SCAN_FLOOR_SEC`` (3.0s) of the
+    caller's *timeout* budget is reserved for this pass alone -- see the
+    budget paragraph below.
 
     The *timeout* budget is shared across the primary signal/wait step, the
     tree kill, and the optional orphan scan: each later step receives only
@@ -2898,8 +3387,10 @@ def stop(
         kill + orphan scan combined).  Graceful exit is attempted first;
         force-kill is used if a process has not exited by the deadline.
     kill_orphans:
-        When ``True``, additionally scan for and kill any orphaned processes
-        under ``record.path`` (path heuristics) after the tree kill.
+        When ``True``, additionally run the path-scoped orphan scan (path
+        heuristics against ``record.path``, not process lineage) after the
+        tree kill -- see "Process-tree kill (ticket #87)" above for exactly
+        what this does and does not add over the unconditional kill.
         Defaults to ``False`` to preserve backward-compatible behaviour.
 
     Raises
@@ -3202,6 +3693,11 @@ def stop(
     # longer meaningful and would otherwise leave the
     # set(variants) <= set(pids) invariant violated.
     record.variants.pop(role, None)
+    # Ticket #119 -- start_log_paths[role] is intentionally NOT popped here
+    # (contrast job_names/variants immediately above): the log file outlives
+    # its process and callers read it off this very stop() response, so this
+    # field deliberately does not honour the set(x) <= set(pids) invariant
+    # that job_names/variants do.
 
     if survivor_pids:
         message = (

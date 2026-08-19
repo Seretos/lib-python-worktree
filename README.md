@@ -192,7 +192,7 @@ at construction to clean up stale records.
 | `adopt` | `(repo_root: str)` | `AdoptReport` | Import untracked on-disk worktrees into the state store. Requires `YamlStateStore`. |
 | `prune` | `(repo_root: str)` | `None` | Run `git worktree prune --expire=now` to clear stale git metadata. |
 | `start` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: str = "main", env: Optional[dict] = None, cwd: Optional[str] = None, variant: str = "default")` | `WorktreeRecord` | Resolve the target environment by `worktree_id` or `checkout_path`, then spawn a detached process (per the contract's `start:` step for `variant`) and record its PID under `role`, and records the variant under `record.variants[role]`, which is what `stop(variant=...)` resolves against. With `variant="default"` and no exact `name` match, a two-tier fallback applies: a lone unnamed step wins if present (back-compat), else a contract with exactly one `start:` step total resolves to that step regardless of its name (ticket #112) — multi-step contracts still raise `UnknownVariantError`. |
-| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: Optional[str] = None, variant: Optional[str] = None, timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role` (or the role `variant` resolves to); force-kills if it does not exit within `timeout` seconds. `role=None` (the default) means `"main"`, same as `start()`. `variant=` resolves to the role that was started with it via `record.variants`; if `role` is also given, both must agree or `VariantResolutionError` is raised. An unknown or ambiguous `variant` also raises `VariantResolutionError` — see "`role` vs `variant`" below. On `status="stop_incomplete"`, see `stop_detail` below. |
+| `stop` | `(worktree_id: Optional[str] = None, *, checkout_path: Optional[str] = None, role: Optional[str] = None, variant: Optional[str] = None, timeout: float = 10.0, kill_orphans: bool = False)` | `WorktreeRecord` | Gracefully stop the process for `role` (or the role `variant` resolves to); force-kills if it does not exit within `timeout` seconds. `role=None` (the default) means `"main"`, same as `start()`. `variant=` resolves to the role that was started with it via `record.variants`; if `role` is also given, both must agree or `VariantResolutionError` is raised. An unknown or ambiguous `variant` also raises `VariantResolutionError` — see "`role` vs `variant`" below. On `status="stop_incomplete"`, see `stop_detail` below. See "Orphan scan and `kill_orphans`" above for exactly what `kill_orphans=True` adds over the unconditional kill, per platform. |
 
 ### Orphan worktree recovery
 
@@ -470,6 +470,54 @@ Process detachment on Windows uses `CREATE_NEW_PROCESS_GROUP` so that
 `start_new_session=True` is used and `SIGTERM` / `SIGKILL` are used for
 graceful and force stops respectively.
 
+### Orphan scan and `kill_orphans`
+
+`stop()`'s unconditional kill (ppid-tree snapshot, POSIX process-group
+signal, and — on Windows — the per-role Job Object's `TerminateJobObject`)
+already covers a different set of processes on each platform:
+
+| Platform | Unconditional coverage |
+|---|---|
+| Windows, job assigned + live handle | Every descendant of the tracked process at any depth, including a `Start-Process`/ShellExecuteEx-delegated launch outside the ppid tree — one `TerminateJobObject` call kills the whole job. `CREATE_BREAKAWAY_FROM_JOB` cannot escape it: the job is created with no limit flags, so without `JOB_OBJECT_LIMIT_BREAKAWAY_OK` the OS refuses the breakaway outright. |
+| Windows, no job / no live handle | Degrades to the ppid tree snapshot alone — the process-group path is an unconditional no-op on Windows. |
+| POSIX | The ppid tree snapshot plus, when the tracked pid is its own process-group leader, that group's other members. |
+
+`kill_orphans=True` runs a further, **path-scoped, not lineage-scoped** pass
+against `record.path` (the cwd/cmdline-token/open-file/Windows
+handle-table orphan scan) after the unconditional kill — it kills anything
+it finds under the worktree path regardless of who started it, and never
+consults `record.pids`. On Windows, when the job was assigned successfully
+and a live handle is available, this makes `kill_orphans` a *different
+scope* rather than deeper containment — no process that `stop()` call is
+responsible for escapes the unconditional kill there. Its genuine value is
+closing these gaps:
+
+- **POSIX daemonized descendant** — a child that called `setsid()` itself,
+  leaving both the ppid tree and the process group (the canonical case,
+  ticket #87).
+- **Windows job never assigned** — job creation or `AssignProcessToJobObject`
+  failed when the process was started.
+- **Windows job handle unavailable at `stop()` time** — `OpenJobObjectW`
+  returned no handle to enumerate or terminate.
+- **Windows `setup:`-step process** — spawned by `SetupRunner`'s default
+  runner, which never creates or joins a Job Object and whose pid never
+  enters `record.pids`; entirely outside every other mechanism, reachable
+  only because it still runs with the worktree as its cwd.
+- **The sub-millisecond job-assignment race** — a descendant spawned in the
+  brief window between `Popen` returning and `AssignProcessToJobObject`
+  landing; narrow, and only relevant when that descendant is also outside
+  the ppid tree.
+
+It does **not** help with a `job_member_list_truncated` outcome (see below):
+`TerminateJobObject` already killed every member of that job regardless of
+how many were enumerated, so there is nothing left for the orphan scan to
+find.
+
+Do not pass `kill_orphans=True` on every call defensively — on Windows its
+cost is dominated by a **system-wide** OS handle-table scan, budgeted at 15s
+within a 20s overall discovery ceiling, and it reserves 3s of the caller's
+`timeout` budget whenever requested even if nothing is found.
+
 ### `role` vs `variant`
 
 `role` is the tracking/addressing key a spawned process's pid is recorded
@@ -512,6 +560,30 @@ contract `stop:` steps run, no process is signalled):
 `role=None` (`stop()`'s actual default) means `"main"`, exactly like
 `start()`'s `role="main"` default — it is not a no-op.
 
+### Per-role start logs
+
+`record.start_log_paths[role]` gives that role's own start-log path — the
+absolute path of the `start-<role>.log` file `start()` wrote when it started
+that role. It mirrors `pids`/`job_names`/`variants`: one entry per role
+that has ever been started, no key at all for a role with no recorded start
+log. The filename's role token is sanitized (filesystem-unsafe characters
+collapsed to `-`), but the dict *key* is always the raw, unslugged role
+string.
+
+Unlike `pids`/`job_names`/`variants`, entries here are **retained** by
+`stop()` and by `reconcile`'s dead-role sweep — `set(record.start_log_paths)
+<= set(record.pids)` does not hold and is not meant to. The log file
+outlives the process it describes, and the main use case is reading a
+role's log path off the response of the `stop()` call that just stopped it.
+Restarting the same role overwrites that role's single entry rather than
+accumulating.
+
+This replaces the older `start_log_path: Optional[str]` scalar, which was
+overwritten by every `start()` call regardless of role and so, in a
+multi-role worktree, named whichever role started last. The scalar is
+removed entirely — no alias, no deprecation shim — so a `state.yaml`
+written by an older engine deserializes to an empty `start_log_paths: {}`.
+
 ### Stop status and `stop_detail`
 
 When `stop()` cannot confirm that everything it tried to kill actually died,
@@ -522,7 +594,7 @@ it reports `status="stop_incomplete"` instead of `"stopped"` and attaches a
 |---|---|
 | `survivors` | One or more tracked PIDs were still alive after every kill attempt (`survivor_pids`, capped at 32, plus the true `survivor_count`). |
 | `tree_truncated` | The descendant-process-tree snapshot hit its node cap, so some descendants were never even examined. |
-| `job_member_list_truncated` | Windows-only: the Job Object's member list hit its slot cap. |
+| `job_member_list_truncated` | Windows-only: the Job Object's member list hit its slot cap. `kill_orphans` does not help here — `TerminateJobObject` already killed every member of that job regardless of enumeration. |
 | `orphan_scan_incomplete` | `kill_orphans=True` was passed but the orphan scan's own discovery pass was starved before finishing. |
 
 `stop_detail.kill_orphans_may_help` hints whether retrying with
