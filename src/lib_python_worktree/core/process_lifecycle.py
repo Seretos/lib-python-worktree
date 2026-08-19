@@ -3188,11 +3188,87 @@ def stop(
     tree/group of the process we ourselves spawned is the meaning of "stop",
     not orphan-hunting.
 
-    When *kill_orphans* is ``True``, a further pass using
-    :func:`_kill_blocking_processes` is run against ``record.path`` after the
-    tree kill.  This is the path-heuristic (cwd/cmdline/open-file) orphan
-    scan for processes that detached far enough (e.g. into their own
-    session/process group) to evade even the tree snapshot.
+    What the unconditional kill actually covers, per platform:
+
+    - **Windows, job assigned and a live handle available** (``job_name`` is
+      truthy and :func:`_open_job_object` returned a handle): every
+      descendant of the tracked process is a job member at any depth,
+      regardless of ppid lineage -- this is what reaches a
+      ``Start-Process``/ShellExecuteEx-delegated launch, which lands outside
+      the ppid tree entirely and so cannot be found by :func:`_process_tree`
+      at any recursion depth. :func:`_terminate_job_object`'s single
+      ``TerminateJobObject`` call kills every one of them together.
+      ``CREATE_BREAKAWAY_FROM_JOB`` cannot be used to escape this
+      particular job: :func:`_create_job_object` sets no limit flags and
+      never calls ``SetInformationJobObject``, so without
+      ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` the OS refuses any breakaway
+      ``CreateProcess`` outright. A job member list that hit the
+      ``_JOB_MEMBER_LIST_MAX_SLOTS`` cap (reported as the
+      ``"job_member_list_truncated"`` ``stop_detail`` reason -- see "Status
+      honesty" below) is an enumeration/reporting gap only:
+      :func:`_terminate_job_object` still terminates the job as a whole, so
+      members past the cap are killed regardless of whether they were ever
+      enumerated.
+    - **Windows, no job or no live handle** (rule N7 -- job creation or
+      assignment failed at :func:`_spawn_detached` time, or
+      :func:`_open_job_object` returns ``None`` here): containment degrades
+      to the ppid tree snapshot alone. :func:`_process_group_members` and
+      :func:`_signal_process_group` are both unconditional no-ops on
+      Windows (``sys.platform == "win32"`` makes them return ``[]``/
+      ``False`` immediately), so there is no group-based fallback the way
+      POSIX has below.
+    - **POSIX**: there is no Job Object mechanism at all
+      (:func:`_create_job_object`/:func:`_open_job_object` both return
+      ``None`` off ``win32``). Containment is the ppid tree snapshot plus,
+      when the tracked pid is the leader of its own process group
+      (``start_new_session=True`` guarantees this for everything this
+      module spawns), that group's other members via
+      :func:`_signal_process_group`/:func:`_process_group_members`. A
+      descendant that calls ``setsid()`` itself leaves that group before
+      this snapshot is taken, and is invisible to both mechanisms if its
+      intermediate parent has already exited (classic double-fork
+      daemonization).
+
+    ``kill_orphans`` is **path-scoped, not lineage-scoped**: when *True*, a
+    further pass using :func:`_kill_blocking_processes` is run against
+    ``record.path`` after the tree kill and the Job Object terminate step --
+    the path-heuristic (cwd/cmdline-token/open-file/Windows handle-table)
+    orphan scan implemented by :func:`_find_blocking_processes`. It kills
+    anything it finds under ``record.path``, regardless of who started it,
+    and never consults ``record.pids`` -- a fundamentally different scope
+    from the ppid/group/job containment above, not a deeper version of it.
+    Concretely, on Windows with a successfully-assigned job and a live
+    handle, there is no process this ``stop()`` call is responsible for that
+    escapes the unconditional kill above -- ``kill_orphans`` there widens
+    *scope* (anything under the path), not containment depth. The genuine
+    gaps it closes are: a POSIX descendant that detached via ``setsid()``
+    out of both the ppid tree and the process group (the canonical case,
+    ticket #87); a Windows role whose job was never created or never
+    successfully assigned (:func:`_assign_process_to_job` returned
+    ``False``); a Windows role whose job handle is not available at
+    ``stop()`` time (:func:`_open_job_object` returned ``None``); a process
+    spawned by a ``setup:`` step via ``SetupRunner``'s default runner, which
+    never creates or joins a Job Object and whose pid never enters
+    ``record.pids`` -- entirely outside every mechanism above, reachable
+    only because it still runs with the worktree as its cwd; and the
+    sub-millisecond window documented on :func:`_assign_process_to_job`
+    between a child's ``Popen`` returning and its job assignment landing.
+    It does **not** help with a ``"job_member_list_truncated"`` outcome:
+    those members were already killed by the unconditional
+    ``TerminateJobObject`` call above, regardless of enumeration -- there is
+    nothing left for the orphan scan to find.
+
+    Do not pass ``kill_orphans=True`` defensively on every call: on Windows
+    its cost is dominated by Pass 1c, a **system-wide** OS handle-table scan
+    (:func:`_win_handle_holders` -- a full system handle table routinely
+    holds 100k+ entries), budgeted at ``_HANDLE_SCAN_BUDGET_SEC`` (15.0s)
+    within an overall ``_DISCOVERY_MAX_SEC`` (20.0s) discovery ceiling. This
+    pass exists because ``proc.cwd()`` raises ``AccessDenied`` for most
+    foreign processes on Windows, so it is often the scan's only real
+    coverage there. It also carries a real cost against *timeout* itself:
+    whenever ``kill_orphans=True``, ``_ORPHAN_SCAN_FLOOR_SEC`` (3.0s) of the
+    caller's *timeout* budget is reserved for this pass alone -- see the
+    budget paragraph below.
 
     The *timeout* budget is shared across the primary signal/wait step, the
     tree kill, and the optional orphan scan: each later step receives only
@@ -3311,8 +3387,10 @@ def stop(
         kill + orphan scan combined).  Graceful exit is attempted first;
         force-kill is used if a process has not exited by the deadline.
     kill_orphans:
-        When ``True``, additionally scan for and kill any orphaned processes
-        under ``record.path`` (path heuristics) after the tree kill.
+        When ``True``, additionally run the path-scoped orphan scan (path
+        heuristics against ``record.path``, not process lineage) after the
+        tree kill -- see "Process-tree kill (ticket #87)" above for exactly
+        what this does and does not add over the unconditional kill.
         Defaults to ``False`` to preserve backward-compatible behaviour.
 
     Raises
