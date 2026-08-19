@@ -1,6 +1,13 @@
 name: tests
 
-# Runs pytest on every push to any branch and on every PR. Distinct
+# Runs pytest on every PR only (no `push` trigger). `pull_request` builds
+# and tests `refs/pull/N/merge`, a preview of the PR head merged into its
+# base as of the last sync -- not the head commit alone, and not the SHA
+# that ultimately lands (a squash-merge produces a different SHA); it can
+# also go stale if the base moves after the last sync. Commits landing
+# directly on `main` are consequently not built either. Accepted trade-off
+# of ticket #116, chosen so a failing run always appears where someone
+# will act on it -- the PR -- rather than duplicated per SHA. Distinct
 # from release.yml which is workflow_dispatch-driven and produces the
 # release-branch + tag.
 #
@@ -8,8 +15,6 @@ name: tests
 # ubuntu-latest) matches the WSL2 / plugin-binary glibc target, so a
 # regression here would be visible to the same downstream consumers.
 on:
-  push:
-    branches: ["**"]
   pull_request:
 
 permissions:
@@ -19,7 +24,7 @@ jobs:
   pytest:
     name: pytest (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
