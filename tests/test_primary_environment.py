@@ -100,9 +100,14 @@ def _wait_for_file_content(
     expected vs. what is actually on disk (or that the file never appeared)
     instead of letting a bare ``read_text()`` raise ``FileNotFoundError`` --
     that bare exception is uninformative about *why* the step never wrote
-    the file. When *record* is given and carries a ``start_log_path``, the
-    step's own log is read and appended to the failure message, since that
-    log is what would actually explain a genuine (non-timing) failure.
+    the file. When *record* is given and carries a ``start_log_paths``
+    entry, the step's own log is read and appended to the failure message,
+    since that log is what would actually explain a genuine (non-timing)
+    failure. Ticket #119: ``start_log_paths`` is now role-keyed, so this
+    prefers the log for whichever role *record* actually has a tracked pid
+    for, falling back to any single entry in the map (e.g. a role that has
+    already been stopped, whose pid is gone but whose log entry is
+    deliberately retained).
     """
     import time as _time
 
@@ -123,7 +128,18 @@ def _wait_for_file_content(
         detail = f"file {path} contained {last_seen!r}"
 
     log_excerpt = ""
-    log_path = getattr(record, "start_log_path", None) if record is not None else None
+    log_path = None
+    if record is not None:
+        paths = getattr(record, "start_log_paths", None) or {}
+        # Prefer the log for a role record still has a tracked pid for...
+        for role in getattr(record, "pids", None) or {}:
+            if role in paths:
+                log_path = paths[role]
+                break
+        # ...falling back to any single entry (e.g. a role already stopped,
+        # whose start_log_paths entry ticket #119 deliberately retains).
+        if log_path is None and paths:
+            log_path = next(iter(paths.values()))
     if log_path:
         log_file = Path(log_path)
         if log_file.exists():
@@ -134,7 +150,7 @@ def _wait_for_file_content(
         else:
             log_excerpt = f"\n--- start step log ({log_path}) does not exist ---"
     elif record is not None:
-        log_excerpt = "\n--- record has no start_log_path ---"
+        log_excerpt = "\n--- record has no start_log_paths ---"
 
     raise AssertionError(
         f"timed out after {timeout}s waiting for {path} to contain "
@@ -258,7 +274,7 @@ def test_first_start_materialises_primary_record_and_tracks_pid(
         assert record.branch is None
         assert "main" in record.pids
         assert _pid_alive(record.pids["main"])
-        assert record.start_log_path
+        assert record.start_log_paths.get("main")
 
         all_records = mgr.state.list()
         assert len(all_records) == 1

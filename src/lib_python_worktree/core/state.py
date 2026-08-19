@@ -381,7 +381,33 @@ class WorktreeRecord:
     so a value set by one call can keep appearing on later ``get()``/
     ``list()`` calls until the next call that assigns it overwrites it."""
     returncode: Optional[int] = None
-    start_log_path: Optional[str] = None
+    start_log_paths: Dict[str, str] = field(default_factory=dict)
+    """Ticket #119: per-role mapping of ``role`` -> the absolute path of the
+    ``start-<role>.log`` file ``start()`` wrote for that role. Mirrors
+    ``pids``/``job_names``/``variants``: one entry per role that has ever
+    been started, and a role with no recorded start log has no key in this
+    dict at all, never a ``None`` value. Persisted through ``state.yaml`` --
+    a legacy record written by an older engine (carrying only the removed
+    scalar ``start_log_path:`` key) deserialises to ``{}``.
+
+    Ticket #119 fix-cycle note: this was originally a single scalar
+    ``start_log_path: Optional[str]`` field, unconditionally overwritten by
+    every ``start()`` call regardless of role -- in a multi-role worktree,
+    starting a second role silently overwrote it, so the field ended up
+    naming only the most-recently-started role's log, and e.g.
+    ``stop(role="main")`` could hand the caller ``ui``'s log path. Changed
+    to a per-role dict, consistent with ``pids``, to close that cross-role
+    bleed. The old scalar field is removed entirely (no alias, no
+    deprecation shim).
+
+    Deliberate invariant divergence from ``job_names``/``variants``: entries
+    here are **retained** by ``stop()`` and by ``reconcile``'s dead-role
+    sweep, so ``set(record.start_log_paths) <= set(record.pids)`` does
+    *not* hold and is not meant to. The log file outlives the process it
+    describes, and the ticket's primary use case is reading a role's log
+    path off the response of the ``stop()`` call that just stopped it.
+    Restarting the same role overwrites that role's single entry rather
+    than accumulating."""
     backing: str = "worktree"
     job_names: Dict[str, str] = field(default_factory=dict)
     """Windows-only (ticket #95): per-role mapping of ``role`` -> the name of

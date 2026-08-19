@@ -259,27 +259,153 @@ def test_worktree_record_with_pids_roundtrip(yaml_store: YamlStateStore):
     assert retrieved.pids == {"server": 1234, "worker": 5678}
 
 
-def test_worktree_record_with_returncode_and_start_log_path_roundtrip(
+def test_worktree_record_with_returncode_roundtrip(
     yaml_store: YamlStateStore, tmp_path: Path
 ):
     """Ticket #81 (reviewer finding): a real YamlStateStore add/get cycle must
-    round-trip non-default ``returncode``/``start_log_path`` values.
+    round-trip a non-default ``returncode`` value.
 
     Unlike ``InMemoryStateStore`` (whose ``.update()``/``.add()`` just
     re-store the same object reference and therefore give zero protection
     against a serialization bug), this goes through the real
     ``_record_to_dict``/``_record_from_dict`` YAML (de)serialization path.
     """
-    log_path = str(tmp_path / "start-main.log")
     rec = _make_record(id="rec-returncode")
     rec.returncode = 3
-    rec.start_log_path = log_path
     yaml_store.add(rec)
 
     retrieved = yaml_store.get("rec-returncode")
     assert retrieved is not None
     assert retrieved.returncode == 3
-    assert retrieved.start_log_path == log_path
+
+
+def test_worktree_record_start_log_paths_roundtrip(
+    yaml_store: YamlStateStore, state_dir: Path, tmp_path: Path
+):
+    """Ticket #119: a real YamlStateStore add/get cycle must round-trip a
+    two-role ``start_log_paths`` map byte-for-byte, and the serialised
+    state.yaml must carry the new ``start_log_paths`` key -- never the
+    removed scalar ``start_log_path`` key.
+    """
+    main_log = str(tmp_path / "start-main.log")
+    ui_log = str(tmp_path / "start-ui.log")
+    rec = _make_record(id="rec-start-logs")
+    rec.start_log_paths = {"main": main_log, "ui": ui_log}
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-start-logs")
+    assert retrieved is not None
+    assert retrieved.start_log_paths == {"main": main_log, "ui": ui_log}
+
+    state_path = state_dir / "state.yaml"
+    with open(state_path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    on_disk = data["worktrees"]["rec-start-logs"]
+    assert on_disk["start_log_paths"] == {"main": main_log, "ui": ui_log}
+    assert "start_log_path" not in on_disk
+
+
+# ---------------------------------------------------------------------------
+# start_log_paths: legacy scalar load + corrupt-value tolerance (ticket #119)
+# ---------------------------------------------------------------------------
+
+def _write_raw_state(state_dir: Path, worktree_dict: dict) -> None:
+    """Hand-write a minimal state.yaml with one record, bypassing
+    _record_to_dict entirely, so these tests exercise _record_from_dict's
+    tolerance of a legacy/corrupt on-disk shape rather than round-tripping
+    through the engine's own (well-behaved) writer."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "state.yaml"
+    with open(state_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(
+            {"version": 1, "worktrees": {"rec-legacy": worktree_dict}}, fh
+        )
+
+
+def _base_worktree_dict(**overrides) -> dict:
+    base = {
+        "id": "rec-legacy",
+        "repo_root": "/repos/myrepo",
+        "branch": "main",
+        "path": "/store/myrepo/rec-legacy",
+        "status": "created",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_start_log_paths_legacy_scalar_only_loads_to_empty_dict(state_dir: Path):
+    """A hand-written state.yaml carrying only the removed scalar
+    ``start_log_path`` key (no ``start_log_paths`` key at all) must load
+    cleanly with an empty map -- the legacy scalar is deliberately not
+    migrated."""
+    _write_raw_state(
+        state_dir,
+        _base_worktree_dict(start_log_path="/logs/start-main.log"),
+    )
+    store = YamlStateStore(state_dir=state_dir)
+    rec = store.get("rec-legacy")
+    assert rec is not None
+    assert rec.start_log_paths == {}
+
+
+def test_start_log_paths_missing_key_loads_to_empty_dict(state_dir: Path):
+    """Neither ``start_log_paths`` nor the legacy scalar present -> {}."""
+    _write_raw_state(state_dir, _base_worktree_dict())
+    store = YamlStateStore(state_dir=state_dir)
+    rec = store.get("rec-legacy")
+    assert rec is not None
+    assert rec.start_log_paths == {}
+
+
+def test_start_log_paths_null_loads_to_empty_dict(state_dir: Path):
+    _write_raw_state(state_dir, _base_worktree_dict(start_log_paths=None))
+    store = YamlStateStore(state_dir=state_dir)
+    rec = store.get("rec-legacy")
+    assert rec is not None
+    assert rec.start_log_paths == {}
+
+
+def test_start_log_paths_non_dict_string_loads_to_empty_dict(state_dir: Path):
+    """A corrupt (hand-edited) value that is a bare string, not a mapping,
+    must not raise -- it degrades to {}."""
+    _write_raw_state(
+        state_dir, _base_worktree_dict(start_log_paths="a string")
+    )
+    store = YamlStateStore(state_dir=state_dir)
+    rec = store.get("rec-legacy")
+    assert rec is not None
+    assert rec.start_log_paths == {}
+
+
+def test_start_log_paths_drops_non_string_entries_keeps_valid(state_dir: Path):
+    """A dict containing a non-string value drops just that entry while
+    keeping the other, valid entries."""
+    _write_raw_state(
+        state_dir,
+        _base_worktree_dict(
+            start_log_paths={"main": "/logs/start-main.log", "ui": 42}
+        ),
+    )
+    store = YamlStateStore(state_dir=state_dir)
+    rec = store.get("rec-legacy")
+    assert rec is not None
+    assert rec.start_log_paths == {"main": "/logs/start-main.log"}
+
+
+def test_start_log_paths_drops_non_string_key_keeps_valid(state_dir: Path):
+    """A dict containing a non-string key (e.g. a bare YAML integer) drops
+    just that entry while keeping the other, valid entries."""
+    _write_raw_state(
+        state_dir,
+        _base_worktree_dict(
+            start_log_paths={"main": "/logs/start-main.log", 123: "/logs/x.log"}
+        ),
+    )
+    store = YamlStateStore(state_dir=state_dir)
+    rec = store.get("rec-legacy")
+    assert rec is not None
+    assert rec.start_log_paths == {"main": "/logs/start-main.log"}
 
 
 # ---------------------------------------------------------------------------
