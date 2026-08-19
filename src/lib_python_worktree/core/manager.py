@@ -44,7 +44,12 @@ from .checkout import (
     primary_id_for,
     untracked_id_for,
 )
-from .port_allocator import PortAllocationError, PortAllocator, _NoOpPortAllocator
+from .port_allocator import (
+    PinnedPortUnavailableError,
+    PortAllocationError,
+    PortAllocator,
+    _NoOpPortAllocator,
+)
 from .process_lifecycle import (
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
@@ -1017,7 +1022,14 @@ class WorktreeManager:
 
             if contract.ports:
                 slot_names = [slot.name for slot in contract.ports]
-                port_mapping = self._allocator.allocate(slot_names, worktree_id)
+                pins = {
+                    slot.name: slot.port
+                    for slot in contract.ports
+                    if slot.port is not None
+                }
+                port_mapping = self._allocator.allocate(
+                    slot_names, worktree_id, pinned=pins
+                )
 
             record = WorktreeRecord(
                 id=worktree_id,
@@ -1439,9 +1451,25 @@ class WorktreeManager:
             _logger.warning(shadowed_contract.message)
 
         if contract.ports:
-            missing = [s.name for s in contract.ports if s.name not in record.ports]
-            if missing:
-                allocated = self._allocator.allocate(missing, record.id)
+            # A slot is re-allocated when it is entirely missing, OR when it
+            # has a pin (ticket #120) that disagrees with the persisted
+            # value -- the pin is authoritative, so a stale auto-allocated
+            # port (or a stale different pin) is not left behind.
+            needs_alloc = [
+                s.name
+                for s in contract.ports
+                if s.name not in record.ports
+                or (s.port is not None and record.ports[s.name] != s.port)
+            ]
+            if needs_alloc:
+                pins = {
+                    s.name: s.port
+                    for s in contract.ports
+                    if s.port is not None and s.name in needs_alloc
+                }
+                allocated = self._allocator.allocate(
+                    needs_alloc, record.id, pinned=pins
+                )
                 record.ports.update(allocated)
                 self.state.update(record)
 
@@ -2658,6 +2686,7 @@ __all__ = (
     "WorktreeError",
     "WorktreeManager",
     "WorktreeNotFoundError",
+    "PinnedPortUnavailableError",
     "PortAllocationError",
     "ProcessAlreadyRunningError",
     "ProcessLifecycleError",

@@ -657,9 +657,9 @@ def test_start_no_ports_allocates_nothing_and_takes_no_lock(
     calls = {"n": 0}
     real_allocate = mgr._allocator.allocate
 
-    def _counting_allocate(slots, worktree_id):
+    def _counting_allocate(slots, worktree_id, **kwargs):
         calls["n"] += 1
-        return real_allocate(slots, worktree_id)
+        return real_allocate(slots, worktree_id, **kwargs)
 
     monkeypatch.setattr(mgr._allocator, "allocate", _counting_allocate)
 
