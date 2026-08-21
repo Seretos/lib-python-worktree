@@ -3109,6 +3109,11 @@ def start(
     # leftover stop_attempt from a previous stop() call on this role is
     # equally stale once a new process has been spawned for it.
     record.stop_attempt = None
+    # Ticket #126: a restarted environment is a new logical lifecycle and
+    # must earn a fresh teardown -- a `teardown_ran=True` marker left over
+    # from a prior remove() attempt (or synthesised test state) must not
+    # suppress teardown: steps for THIS lifecycle's eventual removal.
+    record.teardown_ran = False
     record.returncode = returncode
     # Ticket #119: unconditional per-role assignment -- unlike job_names/
     # variants below, there is no "not available this time" branch here:

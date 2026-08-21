@@ -516,6 +516,21 @@ class WorktreeRecord:
     in-memory-store-by-reference caveat documented on ``killed_pids`` for
     ``InMemoryStateStore``-backed managers."""
 
+    teardown_ran: bool = False
+    """Ticket #126: at-most-once-teardown marker. Set ``True`` immediately
+    after ``WorktreeManager._teardown()`` actually runs the contract's
+    ``teardown:`` steps, and persisted *before* the subsequent
+    ``git worktree remove`` is attempted -- so if that removal then fails
+    with a post-teardown dirty-tree error, a caller's ``force=True`` retry
+    (which bypasses Gate B) still sees the marker and skips re-running
+    ``teardown:``. Unconditional scalar (mirrors ``branch_created_by_us``,
+    not the ``Optional``/nullable style of ``stop_detail``): persisted
+    through ``state.yaml``, and a legacy record with no ``teardown_ran`` key
+    deserialises to ``False``. Cleared back to ``False`` by ``start()``
+    (both the normal lifecycle-start path and the no-op ``"ready"`` path) --
+    a restarted environment is a new logical lifecycle and must earn a fresh
+    teardown."""
+
 
 class StateStore(Protocol):
     """Interface that W7 will re-implement against a persistent backing store."""

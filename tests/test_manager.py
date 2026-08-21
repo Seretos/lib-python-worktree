@@ -1775,6 +1775,30 @@ def test_manager_start_empty_contract_is_noop_ready(tmp_path: Path):
     assert result.variants == {}
 
 
+def test_manager_start_empty_contract_clears_leftover_teardown_ran(tmp_path: Path):
+    """Ticket #126: the no-op "ready" start path never reaches
+    _lifecycle_start, so it needs its own reset of a leftover
+    teardown_ran=True marker (e.g. left by a prior remove() attempt) --
+    a restarted environment is a new logical lifecycle and must earn a
+    fresh teardown."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(teardown_ran=True)
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", start=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        result = mgr.start(record.id)
+
+    mock_start.assert_not_called()
+    assert result.status == "ready"
+    assert result.teardown_ran is False
+    assert mgr.state.get(record.id).teardown_ran is False
+
+
 def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
     """start() with a missing contract (implicit isolation:none) is a no-op ready start.
 

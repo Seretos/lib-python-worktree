@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
+import portalocker
+
 # `subprocess` is kept for CompletedProcess / DEVNULL references inside this
 # module even though _run_git now lives in _git_utils.
 
@@ -1231,11 +1233,26 @@ class WorktreeManager:
         any environment at all.
 
         A blocked attempt (a confirmed Windows pre-flight blocker, or real
-        uncommitted dirt) is guaranteed side-effect-free with respect to the
-        contract's ``teardown:`` steps (ticket #117): those steps run only
-        once removal is confirmed to proceed, so a refused attempt never
-        executes them, and a later successful retry is their first and only
-        execution for this logical removal.
+        uncommitted dirt detected *before* teardown runs) is guaranteed
+        side-effect-free with respect to the contract's ``teardown:`` steps
+        (ticket #117): those steps run only once removal is confirmed to
+        proceed, so such a refused attempt never executes them.
+
+        The contract's ``teardown:`` steps run **at most once per logical
+        removal** (ticket #126), enforced by Gates A/B plus a persisted
+        ``WorktreeRecord.teardown_ran`` marker that is written *before* the
+        actual ``git worktree remove`` is attempted. This closes a second
+        failure path distinct from the pre-teardown guard above: if
+        ``teardown:`` runs, then a *post*-teardown dirty-tree check raises
+        ``DirtyWorktreeError`` (e.g. because a teardown step itself wrote a
+        file), a caller's ``force=True`` retry -- the error's own suggested
+        remedy -- bypasses Gate B but still observes ``teardown_ran=True``
+        and skips re-running the steps. Limitation: for an *untracked*
+        (ticket #88) removal target, the marker cannot survive the call
+        (that path never writes to the state store), so two successive
+        untracked ``remove()`` calls on the same checkout may still re-run
+        ``teardown:`` -- this is a deliberate, documented limitation, not a
+        bug.
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1479,6 +1496,12 @@ class WorktreeManager:
             # mark the worktree usable and return without spawning a process.
             record.status = "ready"
             record.shadowed_contract = shadowed_contract
+            # Ticket #126: this no-op path never reaches _lifecycle_start
+            # (where the equivalent reset lives for a real start), so it
+            # needs its own reset -- a restarted environment is a new
+            # logical lifecycle and must earn a fresh teardown, regardless
+            # of whether the restart spawned a process or not.
+            record.teardown_ran = False
             self.state.update(record)
             return record
 
@@ -1987,10 +2010,23 @@ class WorktreeManager:
             steps exist -- so a removal that cannot possibly succeed never
             executes a non-idempotent teardown command first.
         3. Run any contract ``teardown:`` steps via ``SetupRunner``. Reached
-           only once both gates above have passed, so a refused attempt is
-           guaranteed side-effect-free with respect to these steps -- a
-           later retry that clears the blocking condition is the FIRST and
-           ONLY execution of ``teardown:`` for this logical removal.
+           only once both gates above have passed AND
+           ``record.teardown_ran`` is not already ``True``, so a refused
+           attempt is guaranteed side-effect-free with respect to these
+           steps -- a later retry that clears the blocking condition is the
+           FIRST and ONLY execution of ``teardown:`` for this logical
+           removal. ``record.teardown_ran`` is set and persisted (best-
+           effort; see ticket #88 caveat below) immediately after the steps
+           run, *before* step 4 is attempted -- this is what additionally
+           guarantees the steps run **at most once per logical removal**
+           (ticket #126) even when step 4 below fails with a *post*-teardown
+           ``DirtyWorktreeError`` and the caller retries with
+           ``force=True`` (which bypasses Gate B). Persisting the marker is
+           a no-op (swallowed ``KeyError``) for the synthesised, never-
+           stored record used by ticket #88's untracked-target removal
+           path -- for that path only, two successive ``remove()`` calls on
+           the same checkout may still re-run ``teardown:``, a documented
+           limitation rather than a bug.
         4. Remove the git worktree checkout.
         5. Release allocated ports (only after step 4 succeeds).
 
@@ -2343,9 +2379,11 @@ class WorktreeManager:
             if _dirt:
                 raise DirtyWorktreeError(record.id)
 
-        # Step 3 (ticket #117): run contract teardown: steps. Reached ONLY
-        # when both gates above have passed -- i.e. only when this attempt
-        # is expected to actually proceed to `git worktree remove` below. A
+        # Step 3 (ticket #117, guarded further by #126): run contract
+        # teardown: steps. Reached ONLY when both gates above have passed
+        # -- i.e. only when this attempt is expected to actually proceed to
+        # `git worktree remove` below -- AND only when they have not
+        # already run for this record (`not record.teardown_ran`). A
         # refused attempt (Gate A: a confirmed blocking process with
         # kill_blocking_processes not opted into, or a still-confirmed
         # blocker after a failed kill; Gate B: real uncommitted dirt) never
@@ -2353,8 +2391,16 @@ class WorktreeManager:
         # is the FIRST and ONLY execution of these steps for this logical
         # removal (AC #3) -- a non-idempotent teardown command is never
         # re-run just because an earlier attempt was rejected before any FS
-        # mutation happened.
-        if contract is not None and contract.teardown:
+        # mutation happened. Ticket #126 closes a SECOND path to the same
+        # symptom: teardown: steps run, then Step 4 below fails with a
+        # POST-teardown DirtyWorktreeError (e.g. because a teardown step
+        # itself wrote a file), and the caller retries with force=True --
+        # which bypasses Gate B entirely. Without the `teardown_ran` guard,
+        # that retry would re-enter this block and re-run teardown: a
+        # second time. The marker is set and persisted immediately below,
+        # BEFORE Step 4 is attempted, so it survives exactly the failure
+        # this ticket is about.
+        if contract is not None and contract.teardown and not record.teardown_ran:
             from ..setup.runner import SetupRunner
             runner = SetupRunner()
             try:
@@ -2366,8 +2412,64 @@ class WorktreeManager:
                     port_mapping=record.ports,
                 )
             except Exception:  # noqa: BLE001
-                # Teardown step failure must not block git worktree remove.
+                # Teardown step failure must not block git worktree remove
+                # (#117's policy). Ticket #126 fix cycle (blocking finding):
+                # do NOT set teardown_ran here. A raised exception means the
+                # `teardown:` sequence completed only partially -- e.g. it
+                # failed on step 2 of a 3-step contract -- so whatever
+                # cleanup step 2/3 were supposed to do (release a lock, stop
+                # a service, ...) never ran. Leaving the marker at its prior
+                # value (False, on a first attempt) means a later retry
+                # still re-enters this block and gets a genuine chance to
+                # run -- and this time complete -- those steps, instead of
+                # having them silently and permanently skipped.
                 pass
+            else:
+                # Ticket #126: persist the at-most-once marker now, before
+                # Step 4's `git worktree remove` is attempted -- so it
+                # survives even if that call raises DirtyWorktreeError and
+                # the caller retries with force=True. Only reached when
+                # `runner.run()` above returned without raising, i.e. the
+                # full `teardown:` sequence actually completed --
+                # matching the "at most once, and only once it truly ran"
+                # semantics this ticket requires. `self.state.update()`
+                # raises KeyError for the synthesised, never-stored record
+                # used by ticket #88's untracked-target removal path; that
+                # record has nothing to persist to (see remove()'s
+                # docstring for the documented limitation this implies for
+                # that path), so the KeyError is swallowed rather than
+                # propagated.
+                #
+                # Review round 2 (blocking finding): the teardown steps
+                # above have ALREADY completed successfully at this point --
+                # the only thing that can still fail here is the bookkeeping
+                # write itself. `YamlStateStore.update()` can genuinely
+                # raise `OSError` for I/O reasons (`_atomic_write_yaml()`'s
+                # mkstemp/write/`os.replace` -- disk full, permission
+                # hiccup, ...) and `portalocker.exceptions.LockException`
+                # when it cannot acquire `state.yaml.lock` within
+                # `_LOCK_TIMEOUT` (transient contention from a concurrent
+                # writer). Neither is the same class of error as the
+                # documented ticket #88 `KeyError` case, but both are
+                # equally "the marker didn't persist" rather than "teardown
+                # didn't happen" -- so, mirroring ticket #117's policy that a
+                # teardown-step failure must never block `git worktree
+                # remove`, a persistence failure here must not either. Step
+                # 4 below is the actual thing the caller asked for; this
+                # write is best-effort bookkeeping in service of ticket
+                # #126's at-most-once guarantee, not a precondition for it.
+                # Tradeoff: if this write fails, `record.teardown_ran` stays
+                # False in the caller's copy AND in the store, so a
+                # subsequent retry on this same record could re-run
+                # `teardown:` once more -- a narrower, best-effort
+                # regression of this ticket's own guarantee, but strictly
+                # better than blocking the actual removal over a bookkeeping
+                # write failure.
+                record.teardown_ran = True
+                try:
+                    self.state.update(record)
+                except (KeyError, OSError, portalocker.exceptions.LockException):
+                    pass
 
             # Ticket #117 fix cycle (blocking finding): invalidate the dirt
             # probe's memoised snapshot now that teardown: steps have
