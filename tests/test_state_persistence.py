@@ -532,6 +532,53 @@ def test_stop_attempt_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #128: stop_hook_outcome is transient -- never persisted to
+# state.yaml, mirroring the stop_attempt precedent directly above.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_hook_outcome_not_serialised_to_dict():
+    """`_record_to_dict` must never write a `stop_hook_outcome` key."""
+    from lib_python_worktree.core.state import StopHookOutcome
+    from lib_python_worktree.core.yaml_store import _record_to_dict
+
+    rec = _make_record(id="rec-stop-hook-outcome")
+    rec.stop_hook_outcome = StopHookOutcome(
+        status="completed",
+        message="stop: completed 1 step(s)",
+        steps_run=1,
+        contract_found=True,
+        contract_path="/repo/.seretos/worktree-setup.yml",
+        contract_isolation="full",
+    )
+
+    assert "stop_hook_outcome" not in _record_to_dict(rec)
+
+
+def test_stop_hook_outcome_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
+    """A real YamlStateStore add/get cycle must drop `stop_hook_outcome`
+    rather than persisting a stale copy -- it describes a single stop()
+    call's contract/isolation diagnostics, not a stored verdict."""
+    from lib_python_worktree.core.state import StopHookOutcome
+
+    rec = _make_record(id="rec-stop-hook-outcome-roundtrip")
+    rec.stop_hook_outcome = StopHookOutcome(
+        status="skipped",
+        message="no stop: steps in contract",
+        contract_found=True,
+        contract_path="/repo/.seretos/worktree-setup.yml",
+        contract_isolation="none",
+        no_op_reason="isolation_none",
+    )
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-stop-hook-outcome-roundtrip")
+
+    assert retrieved is not None
+    assert retrieved.stop_hook_outcome is None
+
+
+# ---------------------------------------------------------------------------
 # reconcile(): orphaned path
 # ---------------------------------------------------------------------------
 

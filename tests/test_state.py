@@ -8,13 +8,19 @@ from __future__ import annotations
 import pytest
 
 from lib_python_worktree.core.state import (
+    SETUP_STATUS_COMPLETED,
+    SETUP_STATUSES,
     STOP_ATTEMPT_ALREADY_EXITED,
     STOP_ATTEMPT_KILLED,
     STOP_ATTEMPT_NO_PROCESS_RECORDED,
     STOP_ATTEMPT_OUTCOMES,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
+    STOP_NO_OP_ISOLATION_NONE,
+    STOP_NO_OP_NO_PROCESS_RECORDED,
+    STOP_NO_OP_REASONS,
     InMemoryStateStore,
     StopAttempt,
+    StopHookOutcome,
     WorktreeRecord,
 )
 
@@ -238,6 +244,45 @@ def test_stop_attempt_defaults():
     assert attempt.tracked_pid is None
     assert attempt.tracked_pid_alive is False
     assert attempt.kill_orphans_may_help is False
+
+
+# ---------------------------------------------------------------------------
+# StopHookOutcome / STOP_NO_OP_REASONS (ticket #128)
+# ---------------------------------------------------------------------------
+
+def test_worktree_record_default_stop_hook_outcome_is_none():
+    """A freshly constructed WorktreeRecord (never passed through stop())
+    has stop_hook_outcome is None -- transient, like stop_attempt."""
+    rec = _make_record()
+    assert rec.stop_hook_outcome is None
+
+
+def test_stop_no_op_reasons_vocabulary_membership():
+    """STOP_NO_OP_REASONS names exactly the two no_op_reason tags used by
+    WorktreeManager.stop()'s no-op branch."""
+    assert set(STOP_NO_OP_REASONS) == {
+        STOP_NO_OP_ISOLATION_NONE,
+        STOP_NO_OP_NO_PROCESS_RECORDED,
+    }
+
+
+def test_setup_statuses_vocabulary_still_membership_complete():
+    """StopHookOutcome.status reuses SETUP_STATUSES rather than minting a
+    new vocabulary -- this just re-confirms membership from the StopHookOutcome
+    side of that reuse."""
+    assert SETUP_STATUS_COMPLETED in SETUP_STATUSES
+
+
+def test_stop_hook_outcome_defaults():
+    """StopHookOutcome's optional fields default to falsy/None, mirroring
+    SetupOutcome's default-field convention."""
+    outcome = StopHookOutcome(status=SETUP_STATUS_COMPLETED)
+    assert outcome.message == ""
+    assert outcome.steps_run == 0
+    assert outcome.contract_found is False
+    assert outcome.contract_path is None
+    assert outcome.contract_isolation is None
+    assert outcome.no_op_reason is None
 
 
 def test_find_by_branch_skips_primary_records():
