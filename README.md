@@ -213,7 +213,7 @@ and `record.status` fields, and recovered differently:
 | Flavour | `tracked` | `record.status` | Recover with |
 |---------|-----------|------------------|---------------|
 | A — untracked but on disk | `False` | `"created"` | `remove(checkout_path=...)` or `adopt()` |
-| B — tracked but deregistered outside this tool | `True` | `"orphaned"` | `remove(worktree_id=...)` |
+| B — tracked but deregistered outside this tool | `True` | `"orphaned"` | `remove(worktree_id=...)` — no `force` needed |
 
 #### Flavour A — untracked but on disk
 
@@ -261,8 +261,19 @@ orphan = next(
     e for e in listing.entries
     if e.tracked and e.record.status == "orphaned"
 )
-manager.remove(orphan.record.id, force=True)
+manager.remove(orphan.record.id)
 ```
+
+`force=True` is **not** required here (ticket #127): when the checkout
+directory is already gone, `remove()` treats the leftover git registration
+as already torn down, releases the reserved ports, and deletes the state
+record without it. If the record's branch was created by this tool
+(`branch_created_by_us=True`) and turns out to be unmerged, that no longer
+blocks the removal either — the branch is left in place and a warning is
+logged naming it and the manual `git branch -D <branch>` remedy, while
+`remove()` still returns `status="removed"`. `force=True` still works as
+before and still removes despite uncommitted changes on a checkout that
+does exist.
 
 The discriminator is `record.status` — there is no dedicated boolean field
 on `EnvironmentEntry` for this. `record.path` for such an entry may not
