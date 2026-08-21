@@ -4383,6 +4383,521 @@ class TestTicket117TeardownRunsAtMostOnce:
 
 
 # ---------------------------------------------------------------------------
+# TestTicket126TeardownNotReRunOnRetry -- ticket #126
+# ---------------------------------------------------------------------------
+
+class TestTicket126TeardownNotReRunOnRetry:
+    """Ticket #126: a SECOND reachable path to the #117 symptom -- Gate B
+    passes (pre-teardown dirt is clean/exempt), teardown: steps run, but
+    the subsequent `git worktree remove` fails with a POST-teardown
+    DirtyWorktreeError (e.g. because the teardown step itself wrote a
+    file). Following that error's own suggested remedy, the caller retries
+    with force=True, which bypasses Gate B entirely -- without the
+    persisted `teardown_ran` marker, that retry would re-run teardown: a
+    second time."""
+
+    def test_forced_retry_after_post_teardown_dirty_failure_does_not_rerun_teardown(
+        self, tmp_path
+    ):
+        """Driving test: force=False raises DirtyWorktreeError after
+        teardown: has already run once; a subsequent force=True retry on
+        the SAME record must not run teardown: again."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-forced-retry", path="/fake/store/wt-126-forced-retry"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        teardown_ran = [False]
+        runner_calls: List[dict] = []
+
+        def _run_teardown(**kw):
+            runner_calls.append(kw)
+            teardown_ran[0] = True
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = _run_teardown
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                if not teardown_ran[0]:
+                    # Pre-teardown: clean.
+                    return MagicMock(returncode=0, stdout="", stderr="")
+                # Post-teardown: the teardown step left real, non-exempt
+                # dirt behind.
+                return MagicMock(
+                    returncode=0, stdout="?? real_leftover.log\0", stderr=""
+                )
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            if _is_force_remove_call(args):
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(DirtyWorktreeError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+            # Caller follows the error's own suggested remedy.
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        setups_run = [kw["setup"] for kw in runner_calls]
+        assert setups_run.count(fake_contract.teardown) == 1, (
+            f"teardown: steps must run exactly once across both calls, "
+            f"got {setups_run}"
+        )
+        assert record.teardown_ran is True
+
+    def test_retry_after_gate_a_lock_runs_teardown_on_first_successful_attempt(
+        self, tmp_path
+    ):
+        """A retry after a Gate A WorktreeDirLockedError (teardown: never
+        ran on the blocked attempt) must still run teardown: exactly once
+        -- on the first attempt that actually clears the block. Proves the
+        `teardown_ran` marker does not over-suppress steps that never ran
+        in the first place."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-lock-retry", path="/fake/store/wt-126-lock-retry"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        runner_calls: List[dict] = []
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+        persistent = [KilledProcessInfo(pid=9191, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert runner_calls == [], "teardown: must not run while Gate A is blocked"
+
+        # Blocker clears; this retry is the FIRST successful attempt.
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        setups_run = [kw["setup"] for kw in runner_calls]
+        assert setups_run.count(fake_contract.teardown) == 1, (
+            f"teardown: must run exactly once, on the first successful "
+            f"attempt, got {setups_run}"
+        )
+
+    def test_force_true_first_call_still_runs_teardown_once(self, tmp_path):
+        """Additional coverage: a force=True call with no prior attempt
+        (teardown_ran defaults to False) still runs teardown: exactly
+        once -- the new guard must not suppress the very first run."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-force-first", path="/fake/store/wt-126-force-first"
+        )
+        manager.state.add(record)
+        assert record.teardown_ran is False
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1
+        assert record.teardown_ran is True
+
+    def test_no_teardown_steps_never_sets_marker_and_no_extra_status_call(
+        self, tmp_path
+    ):
+        """Additional coverage: protects the existing zero-extra-`git
+        status`-calls invariant (see
+        test_no_teardown_steps_means_no_extra_git_status above) AND
+        confirms the new marker is only ever set when teardown: steps
+        actually exist and run."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-no-teardown", path="/fake/store/wt-126-no-teardown"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='echo stop', name="stop-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=False, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert not any(_is_status_call(c.args[0]) for c in mock_git.call_args_list)
+        assert record.teardown_ran is False
+
+    def test_untracked_target_persist_swallows_keyerror(self, tmp_path):
+        """Ticket #88 style: a synthesised record never added to the state
+        store (mirrors the untracked-removal-target path). The guarded
+        ``self.state.update(record)`` persist added by this ticket must
+        swallow InMemoryStateStore's KeyError rather than let it
+        propagate, and must not create a spurious store entry."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-untracked", path="/fake/store/wt-126-untracked"
+        )
+        # Deliberately NOT added to manager.state.
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1
+        assert record.teardown_ran is True, "marker still set on the in-memory object"
+        assert manager.state.list() == [], "untracked path must never write to the store"
+
+    def test_partial_teardown_failure_leaves_marker_false_and_retries_run_again(
+        self, tmp_path
+    ):
+        """Driving test (fix-cycle blocking finding): `SetupRunner.run()`
+        raises partway through a multi-step `teardown:` sequence -- e.g. it
+        fails on step 2 of 3. `_teardown()` must (a) swallow the exception
+        per ticket #117's "teardown failure must not block remove" policy,
+        (b) leave `record.teardown_ran` at False rather than force it True
+        (the steps never actually completed), and (c) let a *subsequent*
+        `_teardown()` call on the SAME record attempt the teardown steps
+        again -- the retry must get a genuine chance to finish the cleanup
+        work (e.g. releasing a lock, stopping a service) that the first
+        attempt never got to."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-partial-failure", path="/fake/store/wt-126-partial-failure"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[
+                Step(run='echo one', name="step-1"),
+                Step(run='echo two', name="step-2"),
+                Step(run='echo three', name="step-3"),
+            ],
+        )
+
+        runner_calls: List[dict] = []
+
+        def _raise_partway(**kw):
+            # Simulates the real SetupRunner having executed step 1
+            # successfully, then raising while attempting step 2 -- step 3
+            # never runs either. The mock only models the *outcome*
+            # (`run()` raises) since `run()` is what `_teardown()` calls
+            # and swallows.
+            runner_calls.append(kw)
+            raise RuntimeError("step-2 failed")
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = _raise_partway
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+
+            # First attempt: teardown: raises partway through. Per #117's
+            # policy this must not propagate out of _teardown() and must
+            # not block the (mocked) git worktree remove.
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1, "first attempt must have tried to run teardown:"
+        assert record.teardown_ran is False, (
+            "a partially-failed teardown: run must NOT set the at-most-once "
+            "marker -- steps 2/3 never completed, so a retry must still be "
+            "allowed to run the full sequence again"
+        )
+
+        # Second attempt (retry): this time teardown: completes without
+        # raising.
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 2, (
+            "the retry must attempt teardown: again -- it must not be "
+            "skipped just because a prior attempt failed partway through"
+        )
+        assert record.teardown_ran is True, (
+            "once teardown: actually completes without raising, the "
+            "at-most-once marker must be set"
+        )
+
+    def test_marker_persist_oserror_does_not_block_git_worktree_remove(
+        self, tmp_path
+    ):
+        """Driving test (review round 2, blocking finding): teardown: steps
+        complete successfully, but persisting the `teardown_ran` marker via
+        `self.state.update(record)` raises `OSError` (e.g. disk full,
+        transient state.yaml lock contention, permission hiccup). This must
+        NOT propagate out of `_teardown()` and must NOT prevent Step 4
+        (`git worktree remove`) from running -- the teardown steps already
+        completed; the only failure is a bookkeeping write, and ticket
+        #117's policy (a failure that isn't the removal itself must never
+        block the removal) applies here too."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-persist-oserror", path="/fake/store/wt-126-persist-oserror"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch.object(
+                manager.state, "update", side_effect=OSError("disk full")
+            ),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must not raise: the OSError from the marker-persist write must
+            # be swallowed, exactly like the existing KeyError swallow.
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1, "teardown: steps must have run"
+        assert record.teardown_ran is True, (
+            "the in-memory record must still reflect completion even though "
+            "persisting it failed"
+        )
+        assert any(
+            _is_force_remove_call(c.args[0]) or _is_plain_remove_call(c.args[0])
+            for c in mock_git.call_args_list
+        ), (
+            "Step 4 (git worktree remove) must still run despite the "
+            "marker-persist OSError -- the persistence failure must not "
+            "block the actual removal"
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestRobocopyTimeoutBounding -- ticket #78
 # ---------------------------------------------------------------------------
 

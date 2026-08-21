@@ -1986,6 +1986,89 @@ class TestSetupOutcomePersistence:
 
 
 # ---------------------------------------------------------------------------
+# TestTeardownRanPersistence -- ticket #126
+# ---------------------------------------------------------------------------
+
+class TestTeardownRanPersistence:
+    """``teardown_ran`` persists through ``state.yaml`` as an unconditional
+    scalar (mirrors ``branch_created_by_us``, not the ``Optional`` style of
+    ``stop_detail``/``setup_outcome``): always present in the serialised
+    dict, and a legacy record with no ``teardown_ran`` key deserialises to
+    ``False``."""
+
+    def test_teardown_ran_round_trips_true(self, state_dir: Path):
+        """Driving test: a record with teardown_ran=True round-trips
+        through a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-teardown-ran")
+        record.teardown_ran = True
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-teardown-ran")
+        assert reloaded is not None
+        assert reloaded.teardown_ran is True
+
+    def test_teardown_ran_round_trips_false(self, state_dir: Path):
+        """The default False value also round-trips (not merely omitted)."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-teardown-not-ran")
+        assert record.teardown_ran is False
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-teardown-not-ran")
+        assert reloaded is not None
+        assert reloaded.teardown_ran is False
+
+    def test_legacy_record_without_teardown_ran_key_defaults_to_false(
+        self, state_dir: Path
+    ):
+        """A pre-#126 state.yaml entry with no `teardown_ran` key at all
+        must still deserialise, defaulting teardown_ran to False."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-teardown": {
+                    "id": "legacy-wt-teardown",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-teardown",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    # no "teardown_ran" key at all -- simulates a pre-#126
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-teardown")
+        assert legacy is not None
+        assert legacy.teardown_ran is False
+
+    def test_serialised_dict_always_includes_teardown_ran_key(self, state_dir: Path):
+        """Unconditional-scalar convention check: the key is present in the
+        serialised dict even for the (unconditional) False default -- unlike
+        the Optional ``stop_detail``/``setup_outcome`` fields, there is no
+        "field never reached" state to represent."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-teardown-key-present")
+        store.add(record)
+
+        raw = yaml.safe_load((state_dir / "state.yaml").read_text(encoding="utf-8"))
+        stored = raw["worktrees"]["wt-teardown-key-present"]
+        assert "teardown_ran" in stored
+        assert stored["teardown_ran"] is False
+
+
+# ---------------------------------------------------------------------------
 # TestSetupOutcomeSurvivesLifecycle -- ticket #105
 # ---------------------------------------------------------------------------
 

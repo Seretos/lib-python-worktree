@@ -5877,6 +5877,31 @@ class TestStopAttemptOutcome:
 
         assert result.stop_attempt is None
 
+    def test_start_clears_leftover_teardown_ran(self):
+        """Ticket #126: start() must clear a leftover teardown_ran marker
+        from a previous remove() attempt (or synthesised test state) --
+        mirroring how it already clears stop_detail/stop_attempt. A
+        restarted environment is a new logical lifecycle and must earn a
+        fresh teardown."""
+        record = _make_record(
+            "wt-teardown-ran-start-clears",
+            teardown_ran=True,
+        )
+        store = _make_store(record)
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._spawn_detached"
+        ) as mock_spawn:
+            mock_proc = MagicMock()
+            mock_proc.pid = 91301
+            mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=0.25)
+            mock_spawn.return_value = mock_proc
+
+            result = start("wt-teardown-ran-start-clears", ["echo", "hi"], store=store)
+
+        assert result.teardown_ran is False
+        assert store.get("wt-teardown-ran-start-clears").teardown_ran is False
+
 
 # ---------------------------------------------------------------------------
 # TestKilledPidsIdentifiability -- ticket #110
