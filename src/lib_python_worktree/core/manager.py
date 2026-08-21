@@ -1256,6 +1256,20 @@ class WorktreeManager:
         untracked ``remove()`` calls on the same checkout may still re-run
         ``teardown:`` -- this is a deliberate, documented limitation, not a
         bug.
+
+        Orphaned records (ticket #127): when the checkout directory was
+        already deleted externally before this call (``status="orphaned"``
+        per ``reconcile()``), ``force=True`` is **not** required. The
+        missing directory is treated as already torn down -- the leftover
+        git worktree registration is pruned, the state record is deleted,
+        and reserved ports are released, all without ``force``. In that
+        same situation, an owned branch that turns out to be unmerged
+        (``git branch -d`` refusing it) does **not** raise: the removal
+        still completes and returns ``status="removed"``, with a warning
+        logged naming the branch and the manual ``git branch -D`` remedy.
+        This non-fatal handling applies only when the checkout was actually
+        absent; when the checkout is present, an unmerged owned branch still
+        raises ``GitCommandError`` exactly as before.
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1269,6 +1283,11 @@ class WorktreeManager:
             record.repo_root
         ).resolve():
             raise PrimaryCheckoutError(record.id)
+        # Ticket #127: captured before Phase 1 tears down (and thus changes
+        # the on-disk existence of) record.path -- this must reflect whether
+        # the checkout was ALREADY gone (the orphaned-record case) walking
+        # in, not whatever _teardown() leaves behind afterwards.
+        target_absent = not os.path.exists(record.path)
         # Phase 1: remove the git worktree checkout.  If this raises the
         # directory still exists, so we keep the state record and propagate.
         self._teardown(record, force=force, kill_blocking_processes=kill_blocking_processes)
@@ -1294,7 +1313,40 @@ class WorktreeManager:
         # (e.g. unmerged + force=False); the record is already gone from state.
         # A synthesised (untracked) record always has branch_created_by_us=False,
         # so an orphan's branch is never deleted here.
-        self._delete_owned_branch(record, force=force)
+        #
+        # Ticket #127: on the orphaned-record path (target_absent=True), an
+        # unmerged owned branch (the common case for every create(base=...)
+        # environment) must not turn an otherwise-successful cleanup into a
+        # raised exception after the state record has already been deleted
+        # above -- that would leave the caller with neither a usable record
+        # nor a clean error to retry against. Log a warning naming the
+        # remedy and continue; the checkout is genuinely gone either way.
+        #
+        # This tolerance is deliberately narrow: it only covers git's actual
+        # refusal to delete an unmerged branch ("error: The branch 'X' is
+        # not fully merged...", from `git branch -d` without --force), which
+        # is the one failure mode #127's plan (Q2) authorizes as non-fatal.
+        # Any OTHER GitCommandError from _delete_owned_branch -- lockfile
+        # contention ("Unable to create '.git/refs/heads/X.lock'"), the
+        # branch being checked out elsewhere ("Cannot delete branch 'X'
+        # checked out at ..."), or anything else -- is a real failure and
+        # must still propagate even when target_absent is True; swallowing
+        # it would silently report status="removed" for a removal that did
+        # not actually succeed as claimed.
+        # When the checkout was actually present (target_absent=False), this
+        # is unchanged from today: re-raise exactly as before.
+        try:
+            self._delete_owned_branch(record, force=force)
+        except GitCommandError as exc:
+            if not target_absent or "not fully merged" not in exc.stderr:
+                raise
+            _logger.warning(
+                "remove(): worktree '%s' checkout was already absent "
+                "(orphaned record); leaving unmerged branch '%s' in place "
+                "rather than failing the removal. Delete it manually if "
+                "desired: git branch -D %s",
+                record.id, record.branch, record.branch,
+            )
         return removed
 
     def adopt(self, repo_root: str) -> "AdoptReport":
@@ -2119,6 +2171,18 @@ class WorktreeManager:
         ).resolve():
             raise PrimaryCheckoutError(record.id)
 
+        # Ticket #127: an orphaned record's checkout directory was deleted
+        # externally (e.g. by hand, or by a tool that doesn't know about the
+        # git worktree registration). When the target is already absent,
+        # there is nothing on disk that could block removal or hold a
+        # Windows file handle -- Gate A's blocking-process pre-flight below
+        # is skipped entirely for this case, and Step 4's exit-128 fallback
+        # (which normally requires force=True) is widened to also fire here,
+        # so a plain `remove(worktree_id=...)` with no `force` can clean up
+        # the leftover registration, release ports, and delete the state
+        # record instead of raising GitCommandError and leaking the ports.
+        target_absent = not os.path.exists(record.path)
+
         lifecycle = _lifecycle_module
         if lifecycle is None:
             from . import process_lifecycle as lifecycle  # type: ignore[assignment]
@@ -2281,7 +2345,7 @@ class WorktreeManager:
         #     actually-locked directory that this degraded scan could not
         #     see coming.
         kill_attempted = False
-        if sys.platform == "win32":
+        if sys.platform == "win32" and not target_absent:
             _preflight_scan = _find_blocking_processes(record.path, os.getpid())
             if "open_files:degraded" in getattr(
                 _preflight_scan, "skipped_passes", ()
@@ -2586,12 +2650,46 @@ class WorktreeManager:
                 # to port release.
                 _phantom_state_cleanup()
                 # Fall through to step 4.
-            elif proc.returncode == 128 and force:
+            elif proc.returncode == 128 and (
+                force
+                or (
+                    target_absent
+                    and "contains modified or untracked files" not in proc.stderr
+                )
+            ):
                 # The .git link is already gone (worktree dir was wiped
                 # externally).  Fall back: delete the directory ourselves,
                 # then prune the stale git metadata.  Both steps are
                 # best-effort so that port release and state removal still
                 # occur even in a degraded state.
+                #
+                # Ticket #127: this fallback used to require force=True, but
+                # an orphaned record (target_absent=True) hits this exact
+                # exit-128 shape through no fault of the caller -- the
+                # directory is gone, git still has a `prunable` admin dir
+                # under `.git/worktrees/<id>`, and the stderr matches neither
+                # the phantom-state branch above nor a dirty-tree phrase (an
+                # absent directory cannot be dirty). Widening the guard to
+                # also fire when target_absent is True lets a plain
+                # remove(worktree_id=...) recover this case without forcing
+                # the caller to pass force=True. When the directory is
+                # genuinely present (target_absent is False), this branch
+                # stays gated on force exactly as before, and the `else`
+                # below still raises GitCommandError.
+                #
+                # The explicit dirty-tree-phrase exclusion on the
+                # target_absent arm (but NOT on the force arm, which must
+                # keep bypassing everything exactly as it did before this
+                # ticket) guards against a nonsensical co-occurrence: a
+                # directory that does not exist cannot genuinely be dirty, so
+                # this can only happen when a caller's own `_run_git` fake
+                # asserts both conditions at once (as one pre-existing
+                # regression test does, pinning the DirtyWorktreeError
+                # message format). Without this exclusion, target_absent
+                # (evaluated on a real, non-existent test path) would steal
+                # that case away from the nested dirty-tree-phrase check
+                # below and silently swallow a refusal the caller needs to
+                # see and act on.
                 shutil.rmtree(record.path, ignore_errors=True)
                 _run_git(
                     ["worktree", "prune"],

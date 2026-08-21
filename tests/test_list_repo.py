@@ -696,6 +696,206 @@ def test_orphan_recovery_flow_end_to_end(
 
 
 @pytest.mark.requires_git
+def test_orphan_recovery_absent_directory_no_force_end_to_end(
+    tmp_path: Path, git_repo: Path, skip_if_no_git, caplog  # noqa: ARG001
+):
+    """Ticket #127 driving test (real-git e2e): a tracked, status="orphaned"
+    record whose checkout directory was deleted externally -- leaving the
+    `.git/worktrees/<id>` administrative directory intact (a `prunable`
+    porcelain block, distinct from the existing
+    test_orphan_recovery_flow_end_to_end's `git worktree remove --force`,
+    which also removes the admin dir) -- is removable via
+    remove(worktree_id=...) with NO force, releases its reserved ports, and
+    leaves its unmerged owned branch in place with a logged warning.
+
+    Note: on the git version exercised by this suite, `git worktree remove`
+    (no `--force`) on a `prunable` block with the directory already gone
+    exits 0 on its own -- so this particular real-git run does not exercise
+    _teardown()'s widened exit-128 fallback branch (that branch is
+    unit-tested directly, with a mocked `_run_git`, in
+    tests/test_teardown.py::TestTeardownAbsentTarget, for git versions/
+    states that DO exit 128 here). What this end-to-end test authoritatively
+    proves is the other half of the ticket: the real black-box outcome of
+    "remove an orphaned record with no force" -- including that an unmerged
+    owned branch no longer blocks it."""
+    import logging as _logging
+
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+    )
+
+    # A contract with a port slot so create() actually reserves a port --
+    # otherwise there is nothing to verify "released".
+    contract_path = git_repo / ".seretos" / "worktree-setup.yml"
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(
+        "version: 1\nisolation: full\nports:\n  - name: web\n",
+        encoding="utf-8",
+    )
+
+    rec = mgr.create(str(git_repo), "feature/e2e-127", base="main", fetch=False)
+    wt_path = Path(rec.path)
+    assert rec.branch_created_by_us is True
+    assert rec.ports, "expected create() to have reserved at least one port"
+
+    # Make the branch genuinely unmerged (a fresh branch off `main` with no
+    # new commits would otherwise let `git branch -d` succeed trivially).
+    (wt_path / "extra.txt").write_text("wip\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=wt_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "wip"],
+        cwd=wt_path, check=True, capture_output=True,
+    )
+
+    # Simulate an orphaned record: delete the checkout directory directly
+    # (not via `git worktree remove`), leaving the admin dir intact.
+    shutil.rmtree(wt_path, ignore_errors=True)
+    assert not wt_path.exists()
+
+    # Fresh manager so reconcile() (default reconcile_on_init=True) stamps
+    # status="orphaned" on construction.
+    fresh_mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=YamlStateStore(state_dir=state_dir),
+    )
+
+    listing = fresh_mgr.list_repo(str(git_repo))
+    orphan = next(
+        e for e in listing.entries
+        if e.tracked and e.record.status == "orphaned"
+    )
+    assert orphan.record.id == rec.id
+
+    caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+    # No force= -- this is the behaviour ticket #127 adds.
+    removed = fresh_mgr.remove(orphan.record.id)
+    assert removed.status == "removed"
+
+    assert fresh_mgr.state.get(rec.id) is None
+    after_listing = fresh_mgr.list_repo(str(git_repo))
+    assert all(e.record.id != rec.id for e in after_listing.entries)
+
+    # Reserved ports released.
+    remaining_ports = store._ports.get_all()
+    assert not any(k.startswith(f"{rec.id}:") for k in remaining_ports), (
+        f"expected {rec.id}'s ports to be released, got {remaining_ports}"
+    )
+
+    # The unmerged owned branch survives, with a logged warning.
+    branch_list = subprocess.run(
+        ["git", "branch", "--list", "feature/e2e-127"],
+        cwd=git_repo, check=True, capture_output=True, text=True,
+    )
+    assert "feature/e2e-127" in branch_list.stdout
+
+    warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("feature/e2e-127" in r.message for r in warnings), (
+        f"expected a warning naming the surviving branch, got: "
+        f"{[r.message for r in warnings]}"
+    )
+
+
+@pytest.mark.requires_git
+def test_orphan_recovery_fully_deregistered_no_force_end_to_end(
+    tmp_path: Path, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #127 shared sub-case (a): the already-existing
+    test_orphan_recovery_flow_end_to_end scenario -- deregistered via a
+    manual `git worktree remove --force` (both the checkout directory AND
+    the `.git/worktrees/<id>` admin dir are gone) -- also completes with NO
+    force. This path routes through `_phantom_state_cleanup()`, which was
+    never force-gated, so it worked before ticket #127 too; this pins that
+    the widened exit-128 fallback does not disturb it."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+    )
+    rec = mgr.create(str(git_repo), "feature/e2e-127a", base="main", fetch=False)
+    wt_path = Path(rec.path)
+
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    fresh_mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=YamlStateStore(state_dir=state_dir),
+    )
+
+    listing = fresh_mgr.list_repo(str(git_repo))
+    orphan = next(
+        e for e in listing.entries
+        if e.tracked and e.record.status == "orphaned"
+    )
+    assert orphan.record.id == rec.id
+
+    removed = fresh_mgr.remove(orphan.record.id)
+    assert removed.status == "removed"
+
+    after_listing = fresh_mgr.list_repo(str(git_repo))
+    assert all(e.record.id != rec.id for e in after_listing.entries)
+    assert fresh_mgr.state.get(rec.id) is None
+
+
+@pytest.mark.requires_git
+def test_orphan_recovery_directory_present_admin_dir_gone_no_force_end_to_end(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """Ticket #127 shared sub-case (b): the checkout directory is still
+    present on disk but the `.git/worktrees/<id>` admin dir was deleted
+    directly (mirrors
+    test_list_repo_deregistered_worktree_with_directory_still_present_is_orphaned),
+    also completes with NO force. `git worktree remove` fails with "is not
+    a working tree" here (exit 128) regardless of target_absent, which was
+    never force-gated -- this pins that the widened fallback does not
+    disturb it."""
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    rec = WorktreeRecord(
+        id="tracked-linked-127-dir-present",
+        repo_root=git_repo.resolve().as_posix(),
+        branch="feature/alpha",
+        path=linked_worktree.resolve().as_posix(),
+        backing="worktree",
+        status="created",
+    )
+    store.add(rec)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    admin_dir = git_repo / ".git" / "worktrees" / linked_worktree.name
+    assert admin_dir.is_dir()
+    shutil.rmtree(admin_dir)
+    subprocess.run(
+        ["git", "worktree", "prune", "-v"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    assert linked_worktree.exists()
+
+    listing = mgr.list_repo(str(git_repo))
+    orphan = next(
+        e for e in listing.entries if e.record.id == "tracked-linked-127-dir-present"
+    )
+    assert orphan.tracked is True
+    assert orphan.record.status == "orphaned"
+
+    removed = mgr.remove(orphan.record.id)
+    assert removed.status == "removed"
+    assert not linked_worktree.exists()
+    assert mgr.state.get("tracked-linked-127-dir-present") is None
+
+
+@pytest.mark.requires_git
 def test_list_repo_orphan_entries_do_not_mutate_store_or_caller_record(
     tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
 ):
