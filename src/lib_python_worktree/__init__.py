@@ -77,6 +77,9 @@ from .core.state import (
     SETUP_STATUS_SKIPPED,
     SHADOW_REASONS,
     STOP_ATTEMPT_OUTCOMES,
+    STOP_NO_OP_ISOLATION_NONE,
+    STOP_NO_OP_NO_PROCESS_RECORDED,
+    STOP_NO_OP_REASONS,
     STOP_REASONS,
     InMemoryStateStore,
     SetupOutcome,
@@ -84,6 +87,7 @@ from .core.state import (
     StateStore,
     StopAttempt,
     StopDetail,
+    StopHookOutcome,
     WorktreeRecord,
 )
 from .core.yaml_store import AdoptReport, ReconcileReport, YamlStateStore, adopt, reconcile
@@ -145,6 +149,10 @@ __all__ = [
     "STOP_ATTEMPT_OUTCOMES",
     "StopDetail",
     "STOP_REASONS",
+    "StopHookOutcome",
+    "STOP_NO_OP_REASONS",
+    "STOP_NO_OP_ISOLATION_NONE",
+    "STOP_NO_OP_NO_PROCESS_RECORDED",
     "SetupOutcome",
     "SETUP_STATUSES",
     "SETUP_STATUS_COMPLETED",

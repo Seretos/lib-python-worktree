@@ -82,6 +82,25 @@ SETUP_STATUSES: Tuple[str, ...] = (
 )
 
 
+# no_op_reason vocabulary for ``StopHookOutcome.no_op_reason`` (ticket #128) --
+# distinguishes an ``isolation: none`` contract's "nothing to stop, by
+# design" no-op from an ordinary "this role was never started" no-op. Both
+# previously surfaced identically via
+# ``StopAttempt(outcome=STOP_ATTEMPT_NO_PROCESS_RECORDED)`` -- this
+# vocabulary lives on the new, orthogonal ``StopHookOutcome`` field instead
+# of extending ``STOP_ATTEMPT_OUTCOMES`` (which keeps its original, narrower
+# meaning unchanged).
+STOP_NO_OP_ISOLATION_NONE = "isolation_none"
+STOP_NO_OP_NO_PROCESS_RECORDED = "no_process_recorded"
+
+STOP_NO_OP_REASONS = frozenset(
+    {
+        STOP_NO_OP_ISOLATION_NONE,
+        STOP_NO_OP_NO_PROCESS_RECORDED,
+    }
+)
+
+
 @dataclass(frozen=True)
 class StopDetail:
     """Machine-readable reason a ``stop()`` call reported
@@ -345,6 +364,84 @@ class SetupOutcome:
     timed_out: bool = False
 
 
+@dataclass(frozen=True)
+class StopHookOutcome:
+    """Machine-readable verdict of the contract ``stop:`` hook run by
+    ``WorktreeManager.stop()``, plus the contract diagnostics that verdict
+    depends on (ticket #128).
+
+    Before this field existed, ``stop()`` read ``contract.isolation``
+    nowhere and discarded ``SetupRunner.run()``'s return value outright, so
+    two very different situations surfaced identically as
+    ``stop_attempt.outcome == "no_process_recorded"``: an ``isolation: none``
+    contract's "there is nothing to stop, by design" no-op, and an ordinary
+    "this role was simply never started" no-op. ``stop_hook_outcome``
+    answers "did the ``stop:`` hook itself run, how did it end, and what did
+    the contract actually say about isolation?" -- orthogonal to
+    :class:`StopAttempt` (which answers a narrower question about the
+    tracked PID itself) and to :class:`StopDetail` (which answers "did
+    anything survive the kill attempt?").
+
+    ``status`` is always one of :data:`SETUP_STATUSES` (the same vocabulary
+    :class:`SetupOutcome` uses -- deliberately not a new one):
+
+    - ``"completed"``: the contract had ``stop:`` steps and
+      ``SetupRunner.run()`` returned without raising.
+    - ``"failed"``: the contract's ``stop:`` steps could not be determined at
+      all (the contract itself failed to load/parse), or the contract had
+      ``stop:`` steps and running them raised -- either way, ``message`` is
+      ``str()`` of the exception, mirroring :class:`SetupOutcome`'s
+      message-parity convention. Never propagates past ``stop()``: exactly
+      as before this field existed, a ``stop:`` hook failure is swallowed so
+      it can never block the SIGTERM that follows.
+    - ``"skipped"``: the contract loaded fine and simply had no ``stop:``
+      steps to run (missing contract, empty contract, explicit
+      ``stop: []``, or -- structurally, since the schema forbids ``stop:``
+      entries under ``isolation: none`` -- any ``isolation: none`` contract).
+
+    ``steps_run`` is the number of ``stop:`` steps that actually ran -- the
+    length of the underlying ``SetupResult.steps`` on a ``"completed"`` run;
+    always ``0`` for ``"skipped"``/``"failed"``.
+
+    ``contract_found`` is the independent, filesystem-only
+    ``contract_path.exists()`` check -- computed separately from the
+    parse/validate attempt below so a filesystem error on the ``.exists()``
+    check can never mask a successfully parsed contract (or vice versa).
+    ``contract_path`` is the forward-slash ``<repo_root>/.seretos/
+    worktree-setup.yml`` path that was probed, regardless of whether it was
+    found or parsed. ``contract_isolation`` is the loaded contract's
+    ``isolation`` value (``"full"``/``"partial"``/``"none"``), or ``None``
+    when the contract could not be loaded/parsed at all.
+
+    ``no_op_reason``, one of :data:`STOP_NO_OP_REASONS` or ``None``, is the
+    actual point of this ticket: set only on ``WorktreeManager.stop()``'s
+    no-op branch (the resolved role has no entry in ``record.pids``) --
+
+    - :data:`STOP_NO_OP_ISOLATION_NONE`: ``contract_isolation == "none"`` --
+      there was never anything to start or stop for this role, by design.
+    - :data:`STOP_NO_OP_NO_PROCESS_RECORDED`: any other contract isolation --
+      an ordinary "this role was never started" no-op.
+
+    ``None`` on the delegated path (the resolved role *does* have a recorded
+    pid, so ``stop()`` was not a no-op at all) and on every other code path.
+
+    Deliberately **transient**, exactly like :class:`StopAttempt`: recomputed
+    on every ``stop()`` call and never persisted to ``state.yaml``
+    (``yaml_store._record_to_dict`` never serialises it) -- unlike
+    :class:`SetupOutcome`, which is written once by ``create()`` and
+    persisted. Subject to the same in-memory-store-by-reference caveat
+    documented on ``killed_pids`` for ``InMemoryStateStore``-backed managers.
+    """
+
+    status: str
+    message: str = ""
+    steps_run: int = 0
+    contract_found: bool = False
+    contract_path: Optional[str] = None
+    contract_isolation: Optional[str] = None
+    no_op_reason: Optional[str] = None
+
+
 @dataclass
 class WorktreeRecord:
     """A single tracked worktree (or, since ticket #84, a primary checkout).
@@ -531,6 +628,20 @@ class WorktreeRecord:
     a restarted environment is a new logical lifecycle and must earn a fresh
     teardown."""
 
+    stop_hook_outcome: Optional[StopHookOutcome] = None
+    """Ticket #128: machine-readable verdict of the most recent ``stop()``
+    call's contract ``stop:`` hook, plus contract diagnostics (whether a
+    contract file was found, its path, and its ``isolation``), or ``None``.
+    See :class:`StopHookOutcome`'s own docstring for the full rationale --
+    in short, this is orthogonal to ``stop_attempt``: ``stop_attempt``
+    answers what happened to the tracked PID itself, this field answers
+    whether/how the contract's ``stop:`` hook ran and what the contract's
+    isolation was, which is what lets a caller tell an ``isolation: none``
+    "nothing to stop, by design" no-op apart from an ordinary "role never
+    started" no-op. Deliberately **transient**, exactly like
+    ``stop_attempt``: recomputed on every ``stop()`` call and NOT persisted
+    to ``state.yaml``."""
+
 
 class StateStore(Protocol):
     """Interface that W7 will re-implement against a persistent backing store."""
@@ -603,5 +714,9 @@ __all__: Iterable[str] = (
     "STOP_ATTEMPT_OUTCOMES",
     "StopDetail",
     "STOP_REASONS",
+    "StopHookOutcome",
+    "STOP_NO_OP_REASONS",
+    "STOP_NO_OP_ISOLATION_NONE",
+    "STOP_NO_OP_NO_PROCESS_RECORDED",
     "WorktreeRecord",
 )

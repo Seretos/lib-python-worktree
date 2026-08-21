@@ -68,11 +68,14 @@ from .state import (
     SHADOW_REASON_DIFFERS,
     SHADOW_REASON_UNREADABLE,
     STOP_ATTEMPT_NO_PROCESS_RECORDED,
+    STOP_NO_OP_ISOLATION_NONE,
+    STOP_NO_OP_NO_PROCESS_RECORDED,
     InMemoryStateStore,
     SetupOutcome,
     ShadowedContract,
     StateStore,
     StopAttempt,
+    StopHookOutcome,
     WorktreeRecord,
 )
 from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
@@ -1639,6 +1642,21 @@ class WorktreeManager:
         reports ``status="stop_incomplete"``, the returned record's
         ``stop_detail`` (a ``state.StopDetail``) carries a machine-readable
         ``reason`` and evidence for why — see that function's own docstring.
+
+        Ticket #128: every returned record also carries ``stop_hook_outcome``
+        (a ``state.StopHookOutcome``) describing whether/how the contract's
+        ``stop:`` hook ran (``status`` one of ``"completed"``/``"failed"``/
+        ``"skipped"``) and the contract diagnostics behind that verdict
+        (``contract_found``, ``contract_path``, ``contract_isolation``). On
+        the no-op path (no process recorded for the resolved role),
+        ``stop_hook_outcome.no_op_reason`` additionally distinguishes an
+        ``isolation: none`` contract's "nothing to stop, by design" no-op
+        (``"isolation_none"``) from an ordinary "role never started" no-op
+        (``"no_process_recorded"``) — both of which otherwise surface
+        identically via ``stop_attempt.outcome ==
+        "no_process_recorded"``. ``no_op_reason`` is ``None`` whenever this
+        call was not a no-op. Deliberately transient, like ``stop_attempt``:
+        never persisted to ``state.yaml``.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=False)
 
@@ -1664,24 +1682,60 @@ class WorktreeManager:
 
         # Run contract stop: steps (best-effort — a failure must not prevent
         # the SIGTERM from being sent).
+        #
+        # Ticket #128: also compute a StopHookOutcome describing whether/how
+        # the stop: hook ran and what the contract's isolation actually was.
+        # contract_found is deliberately computed via its OWN try/except,
+        # independent of the contract-parse try/except immediately below --
+        # a filesystem error on the .exists() check must never masquerade as
+        # (or mask) a contract parse outcome, or vice versa.
+        contract_path = Path(record.repo_root) / CONTRACT_FILENAME
         try:
-            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract_found = contract_path.exists()
+        except OSError:
+            contract_found = False
+
+        contract_isolation: Optional[str] = None
+        stop_hook_status = SETUP_STATUS_SKIPPED
+        stop_hook_message = "no stop: steps in contract"
+        stop_hook_steps_run = 0
+        try:
             contract = _load_contract(contract_path)
+            contract_isolation = contract.isolation
             if contract.stop:
                 from ..setup.runner import SetupRunner
                 runner = SetupRunner()
                 try:
-                    runner.run(
+                    _stop_result = runner.run(
                         setup=contract.stop,
                         worktree_id=record.id,
                         worktree_path=Path(record.path),
                         branch=_effective_branch(record),
                         port_mapping=record.ports,
                     )
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception:  # noqa: BLE001
-            pass
+                    stop_hook_status = SETUP_STATUS_COMPLETED
+                    stop_hook_steps_run = len(_stop_result.steps)
+                    stop_hook_message = (
+                        f"stop: completed {stop_hook_steps_run} step(s)"
+                    )
+                except Exception as _stop_exc:  # noqa: BLE001
+                    stop_hook_status = SETUP_STATUS_FAILED
+                    stop_hook_message = str(_stop_exc)
+        except Exception as _contract_exc:  # noqa: BLE001
+            stop_hook_status = SETUP_STATUS_FAILED
+            stop_hook_message = str(_contract_exc)
+            contract_isolation = None
+
+        def _stop_hook_outcome(no_op_reason: Optional[str]) -> StopHookOutcome:
+            return StopHookOutcome(
+                status=stop_hook_status,
+                message=stop_hook_message,
+                steps_run=stop_hook_steps_run,
+                contract_found=contract_found,
+                contract_path=contract_path.as_posix(),
+                contract_isolation=contract_isolation,
+                no_op_reason=no_op_reason,
+            )
 
         # No process recorded for this role → graceful no-op (symmetric with
         # the no-op "ready" start).  Avoid delegating to _lifecycle_stop, which
@@ -1721,6 +1775,16 @@ class WorktreeManager:
                 ),
                 role=effective_role,
             )
+            # Ticket #128: distinguish an isolation: none contract's "nothing
+            # to stop, by design" no-op from an ordinary "role never
+            # started" no-op -- both set the same STOP_ATTEMPT_NO_PROCESS_
+            # RECORDED above, so this is the only place that tells them
+            # apart.
+            record.stop_hook_outcome = _stop_hook_outcome(
+                STOP_NO_OP_ISOLATION_NONE
+                if contract_isolation == "none"
+                else STOP_NO_OP_NO_PROCESS_RECORDED
+            )
             # Ticket #110 (review round 2, blocking finding 2): mirror
             # process_lifecycle.stop(), which unconditionally recomputes
             # record.killed_pids on every path -- including to an empty
@@ -1733,13 +1797,21 @@ class WorktreeManager:
             self.state.update(record)
             return record
 
-        return _lifecycle_stop(
+        result = _lifecycle_stop(
             record.id,
             store=self.state,
             role=effective_role,
             timeout=timeout,
             kill_orphans=kill_orphans,
         )
+        # Ticket #128: _lifecycle_stop() hands back a store-loaded record (a
+        # fresh deserialisation for YamlStateStore), which never carries this
+        # transient field -- assign it onto the returned object, not the
+        # pre-call `record` variable, mirroring how shadowed_contract is
+        # propagated explicitly in start() for the same reason. This was not
+        # a no-op, so no_op_reason stays None.
+        result.stop_hook_outcome = _stop_hook_outcome(None)
+        return result
 
     def run_seed_postprocess(self, worktree_id: str) -> "SetupResult":
         """Run the contract's ``seed_postprocess:`` steps in isolation.
