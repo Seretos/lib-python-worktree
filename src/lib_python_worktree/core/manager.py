@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
+import portalocker
+
 # `subprocess` is kept for CompletedProcess / DEVNULL references inside this
 # module even though _run_git now lives in _git_utils.
 
@@ -66,11 +68,14 @@ from .state import (
     SHADOW_REASON_DIFFERS,
     SHADOW_REASON_UNREADABLE,
     STOP_ATTEMPT_NO_PROCESS_RECORDED,
+    STOP_NO_OP_ISOLATION_NONE,
+    STOP_NO_OP_NO_PROCESS_RECORDED,
     InMemoryStateStore,
     SetupOutcome,
     ShadowedContract,
     StateStore,
     StopAttempt,
+    StopHookOutcome,
     WorktreeRecord,
 )
 from .yaml_store import AdoptReport, YamlStateStore, adopt as _yaml_adopt, reconcile
@@ -1231,11 +1236,40 @@ class WorktreeManager:
         any environment at all.
 
         A blocked attempt (a confirmed Windows pre-flight blocker, or real
-        uncommitted dirt) is guaranteed side-effect-free with respect to the
-        contract's ``teardown:`` steps (ticket #117): those steps run only
-        once removal is confirmed to proceed, so a refused attempt never
-        executes them, and a later successful retry is their first and only
-        execution for this logical removal.
+        uncommitted dirt detected *before* teardown runs) is guaranteed
+        side-effect-free with respect to the contract's ``teardown:`` steps
+        (ticket #117): those steps run only once removal is confirmed to
+        proceed, so such a refused attempt never executes them.
+
+        The contract's ``teardown:`` steps run **at most once per logical
+        removal** (ticket #126), enforced by Gates A/B plus a persisted
+        ``WorktreeRecord.teardown_ran`` marker that is written *before* the
+        actual ``git worktree remove`` is attempted. This closes a second
+        failure path distinct from the pre-teardown guard above: if
+        ``teardown:`` runs, then a *post*-teardown dirty-tree check raises
+        ``DirtyWorktreeError`` (e.g. because a teardown step itself wrote a
+        file), a caller's ``force=True`` retry -- the error's own suggested
+        remedy -- bypasses Gate B but still observes ``teardown_ran=True``
+        and skips re-running the steps. Limitation: for an *untracked*
+        (ticket #88) removal target, the marker cannot survive the call
+        (that path never writes to the state store), so two successive
+        untracked ``remove()`` calls on the same checkout may still re-run
+        ``teardown:`` -- this is a deliberate, documented limitation, not a
+        bug.
+
+        Orphaned records (ticket #127): when the checkout directory was
+        already deleted externally before this call (``status="orphaned"``
+        per ``reconcile()``), ``force=True`` is **not** required. The
+        missing directory is treated as already torn down -- the leftover
+        git worktree registration is pruned, the state record is deleted,
+        and reserved ports are released, all without ``force``. In that
+        same situation, an owned branch that turns out to be unmerged
+        (``git branch -d`` refusing it) does **not** raise: the removal
+        still completes and returns ``status="removed"``, with a warning
+        logged naming the branch and the manual ``git branch -D`` remedy.
+        This non-fatal handling applies only when the checkout was actually
+        absent; when the checkout is present, an unmerged owned branch still
+        raises ``GitCommandError`` exactly as before.
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1249,6 +1283,11 @@ class WorktreeManager:
             record.repo_root
         ).resolve():
             raise PrimaryCheckoutError(record.id)
+        # Ticket #127: captured before Phase 1 tears down (and thus changes
+        # the on-disk existence of) record.path -- this must reflect whether
+        # the checkout was ALREADY gone (the orphaned-record case) walking
+        # in, not whatever _teardown() leaves behind afterwards.
+        target_absent = not os.path.exists(record.path)
         # Phase 1: remove the git worktree checkout.  If this raises the
         # directory still exists, so we keep the state record and propagate.
         self._teardown(record, force=force, kill_blocking_processes=kill_blocking_processes)
@@ -1274,7 +1313,40 @@ class WorktreeManager:
         # (e.g. unmerged + force=False); the record is already gone from state.
         # A synthesised (untracked) record always has branch_created_by_us=False,
         # so an orphan's branch is never deleted here.
-        self._delete_owned_branch(record, force=force)
+        #
+        # Ticket #127: on the orphaned-record path (target_absent=True), an
+        # unmerged owned branch (the common case for every create(base=...)
+        # environment) must not turn an otherwise-successful cleanup into a
+        # raised exception after the state record has already been deleted
+        # above -- that would leave the caller with neither a usable record
+        # nor a clean error to retry against. Log a warning naming the
+        # remedy and continue; the checkout is genuinely gone either way.
+        #
+        # This tolerance is deliberately narrow: it only covers git's actual
+        # refusal to delete an unmerged branch ("error: The branch 'X' is
+        # not fully merged...", from `git branch -d` without --force), which
+        # is the one failure mode #127's plan (Q2) authorizes as non-fatal.
+        # Any OTHER GitCommandError from _delete_owned_branch -- lockfile
+        # contention ("Unable to create '.git/refs/heads/X.lock'"), the
+        # branch being checked out elsewhere ("Cannot delete branch 'X'
+        # checked out at ..."), or anything else -- is a real failure and
+        # must still propagate even when target_absent is True; swallowing
+        # it would silently report status="removed" for a removal that did
+        # not actually succeed as claimed.
+        # When the checkout was actually present (target_absent=False), this
+        # is unchanged from today: re-raise exactly as before.
+        try:
+            self._delete_owned_branch(record, force=force)
+        except GitCommandError as exc:
+            if not target_absent or "not fully merged" not in exc.stderr:
+                raise
+            _logger.warning(
+                "remove(): worktree '%s' checkout was already absent "
+                "(orphaned record); leaving unmerged branch '%s' in place "
+                "rather than failing the removal. Delete it manually if "
+                "desired: git branch -D %s",
+                record.id, record.branch, record.branch,
+            )
         return removed
 
     def adopt(self, repo_root: str) -> "AdoptReport":
@@ -1479,6 +1551,12 @@ class WorktreeManager:
             # mark the worktree usable and return without spawning a process.
             record.status = "ready"
             record.shadowed_contract = shadowed_contract
+            # Ticket #126: this no-op path never reaches _lifecycle_start
+            # (where the equivalent reset lives for a real start), so it
+            # needs its own reset -- a restarted environment is a new
+            # logical lifecycle and must earn a fresh teardown, regardless
+            # of whether the restart spawned a process or not.
+            record.teardown_ran = False
             self.state.update(record)
             return record
 
@@ -1616,6 +1694,21 @@ class WorktreeManager:
         reports ``status="stop_incomplete"``, the returned record's
         ``stop_detail`` (a ``state.StopDetail``) carries a machine-readable
         ``reason`` and evidence for why — see that function's own docstring.
+
+        Ticket #128: every returned record also carries ``stop_hook_outcome``
+        (a ``state.StopHookOutcome``) describing whether/how the contract's
+        ``stop:`` hook ran (``status`` one of ``"completed"``/``"failed"``/
+        ``"skipped"``) and the contract diagnostics behind that verdict
+        (``contract_found``, ``contract_path``, ``contract_isolation``). On
+        the no-op path (no process recorded for the resolved role),
+        ``stop_hook_outcome.no_op_reason`` additionally distinguishes an
+        ``isolation: none`` contract's "nothing to stop, by design" no-op
+        (``"isolation_none"``) from an ordinary "role never started" no-op
+        (``"no_process_recorded"``) — both of which otherwise surface
+        identically via ``stop_attempt.outcome ==
+        "no_process_recorded"``. ``no_op_reason`` is ``None`` whenever this
+        call was not a no-op. Deliberately transient, like ``stop_attempt``:
+        never persisted to ``state.yaml``.
         """
         record = self._resolve_target(worktree_id, checkout_path, materialise=False)
 
@@ -1641,24 +1734,60 @@ class WorktreeManager:
 
         # Run contract stop: steps (best-effort — a failure must not prevent
         # the SIGTERM from being sent).
+        #
+        # Ticket #128: also compute a StopHookOutcome describing whether/how
+        # the stop: hook ran and what the contract's isolation actually was.
+        # contract_found is deliberately computed via its OWN try/except,
+        # independent of the contract-parse try/except immediately below --
+        # a filesystem error on the .exists() check must never masquerade as
+        # (or mask) a contract parse outcome, or vice versa.
+        contract_path = Path(record.repo_root) / CONTRACT_FILENAME
         try:
-            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract_found = contract_path.exists()
+        except OSError:
+            contract_found = False
+
+        contract_isolation: Optional[str] = None
+        stop_hook_status = SETUP_STATUS_SKIPPED
+        stop_hook_message = "no stop: steps in contract"
+        stop_hook_steps_run = 0
+        try:
             contract = _load_contract(contract_path)
+            contract_isolation = contract.isolation
             if contract.stop:
                 from ..setup.runner import SetupRunner
                 runner = SetupRunner()
                 try:
-                    runner.run(
+                    _stop_result = runner.run(
                         setup=contract.stop,
                         worktree_id=record.id,
                         worktree_path=Path(record.path),
                         branch=_effective_branch(record),
                         port_mapping=record.ports,
                     )
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception:  # noqa: BLE001
-            pass
+                    stop_hook_status = SETUP_STATUS_COMPLETED
+                    stop_hook_steps_run = len(_stop_result.steps)
+                    stop_hook_message = (
+                        f"stop: completed {stop_hook_steps_run} step(s)"
+                    )
+                except Exception as _stop_exc:  # noqa: BLE001
+                    stop_hook_status = SETUP_STATUS_FAILED
+                    stop_hook_message = str(_stop_exc)
+        except Exception as _contract_exc:  # noqa: BLE001
+            stop_hook_status = SETUP_STATUS_FAILED
+            stop_hook_message = str(_contract_exc)
+            contract_isolation = None
+
+        def _stop_hook_outcome(no_op_reason: Optional[str]) -> StopHookOutcome:
+            return StopHookOutcome(
+                status=stop_hook_status,
+                message=stop_hook_message,
+                steps_run=stop_hook_steps_run,
+                contract_found=contract_found,
+                contract_path=contract_path.as_posix(),
+                contract_isolation=contract_isolation,
+                no_op_reason=no_op_reason,
+            )
 
         # No process recorded for this role → graceful no-op (symmetric with
         # the no-op "ready" start).  Avoid delegating to _lifecycle_stop, which
@@ -1698,6 +1827,16 @@ class WorktreeManager:
                 ),
                 role=effective_role,
             )
+            # Ticket #128: distinguish an isolation: none contract's "nothing
+            # to stop, by design" no-op from an ordinary "role never
+            # started" no-op -- both set the same STOP_ATTEMPT_NO_PROCESS_
+            # RECORDED above, so this is the only place that tells them
+            # apart.
+            record.stop_hook_outcome = _stop_hook_outcome(
+                STOP_NO_OP_ISOLATION_NONE
+                if contract_isolation == "none"
+                else STOP_NO_OP_NO_PROCESS_RECORDED
+            )
             # Ticket #110 (review round 2, blocking finding 2): mirror
             # process_lifecycle.stop(), which unconditionally recomputes
             # record.killed_pids on every path -- including to an empty
@@ -1710,13 +1849,21 @@ class WorktreeManager:
             self.state.update(record)
             return record
 
-        return _lifecycle_stop(
+        result = _lifecycle_stop(
             record.id,
             store=self.state,
             role=effective_role,
             timeout=timeout,
             kill_orphans=kill_orphans,
         )
+        # Ticket #128: _lifecycle_stop() hands back a store-loaded record (a
+        # fresh deserialisation for YamlStateStore), which never carries this
+        # transient field -- assign it onto the returned object, not the
+        # pre-call `record` variable, mirroring how shadowed_contract is
+        # propagated explicitly in start() for the same reason. This was not
+        # a no-op, so no_op_reason stays None.
+        result.stop_hook_outcome = _stop_hook_outcome(None)
+        return result
 
     def run_seed_postprocess(self, worktree_id: str) -> "SetupResult":
         """Run the contract's ``seed_postprocess:`` steps in isolation.
@@ -1987,10 +2134,23 @@ class WorktreeManager:
             steps exist -- so a removal that cannot possibly succeed never
             executes a non-idempotent teardown command first.
         3. Run any contract ``teardown:`` steps via ``SetupRunner``. Reached
-           only once both gates above have passed, so a refused attempt is
-           guaranteed side-effect-free with respect to these steps -- a
-           later retry that clears the blocking condition is the FIRST and
-           ONLY execution of ``teardown:`` for this logical removal.
+           only once both gates above have passed AND
+           ``record.teardown_ran`` is not already ``True``, so a refused
+           attempt is guaranteed side-effect-free with respect to these
+           steps -- a later retry that clears the blocking condition is the
+           FIRST and ONLY execution of ``teardown:`` for this logical
+           removal. ``record.teardown_ran`` is set and persisted (best-
+           effort; see ticket #88 caveat below) immediately after the steps
+           run, *before* step 4 is attempted -- this is what additionally
+           guarantees the steps run **at most once per logical removal**
+           (ticket #126) even when step 4 below fails with a *post*-teardown
+           ``DirtyWorktreeError`` and the caller retries with
+           ``force=True`` (which bypasses Gate B). Persisting the marker is
+           a no-op (swallowed ``KeyError``) for the synthesised, never-
+           stored record used by ticket #88's untracked-target removal
+           path -- for that path only, two successive ``remove()`` calls on
+           the same checkout may still re-run ``teardown:``, a documented
+           limitation rather than a bug.
         4. Remove the git worktree checkout.
         5. Release allocated ports (only after step 4 succeeds).
 
@@ -2010,6 +2170,18 @@ class WorktreeManager:
             record.repo_root
         ).resolve():
             raise PrimaryCheckoutError(record.id)
+
+        # Ticket #127: an orphaned record's checkout directory was deleted
+        # externally (e.g. by hand, or by a tool that doesn't know about the
+        # git worktree registration). When the target is already absent,
+        # there is nothing on disk that could block removal or hold a
+        # Windows file handle -- Gate A's blocking-process pre-flight below
+        # is skipped entirely for this case, and Step 4's exit-128 fallback
+        # (which normally requires force=True) is widened to also fire here,
+        # so a plain `remove(worktree_id=...)` with no `force` can clean up
+        # the leftover registration, release ports, and delete the state
+        # record instead of raising GitCommandError and leaking the ports.
+        target_absent = not os.path.exists(record.path)
 
         lifecycle = _lifecycle_module
         if lifecycle is None:
@@ -2173,7 +2345,7 @@ class WorktreeManager:
         #     actually-locked directory that this degraded scan could not
         #     see coming.
         kill_attempted = False
-        if sys.platform == "win32":
+        if sys.platform == "win32" and not target_absent:
             _preflight_scan = _find_blocking_processes(record.path, os.getpid())
             if "open_files:degraded" in getattr(
                 _preflight_scan, "skipped_passes", ()
@@ -2343,9 +2515,11 @@ class WorktreeManager:
             if _dirt:
                 raise DirtyWorktreeError(record.id)
 
-        # Step 3 (ticket #117): run contract teardown: steps. Reached ONLY
-        # when both gates above have passed -- i.e. only when this attempt
-        # is expected to actually proceed to `git worktree remove` below. A
+        # Step 3 (ticket #117, guarded further by #126): run contract
+        # teardown: steps. Reached ONLY when both gates above have passed
+        # -- i.e. only when this attempt is expected to actually proceed to
+        # `git worktree remove` below -- AND only when they have not
+        # already run for this record (`not record.teardown_ran`). A
         # refused attempt (Gate A: a confirmed blocking process with
         # kill_blocking_processes not opted into, or a still-confirmed
         # blocker after a failed kill; Gate B: real uncommitted dirt) never
@@ -2353,8 +2527,16 @@ class WorktreeManager:
         # is the FIRST and ONLY execution of these steps for this logical
         # removal (AC #3) -- a non-idempotent teardown command is never
         # re-run just because an earlier attempt was rejected before any FS
-        # mutation happened.
-        if contract is not None and contract.teardown:
+        # mutation happened. Ticket #126 closes a SECOND path to the same
+        # symptom: teardown: steps run, then Step 4 below fails with a
+        # POST-teardown DirtyWorktreeError (e.g. because a teardown step
+        # itself wrote a file), and the caller retries with force=True --
+        # which bypasses Gate B entirely. Without the `teardown_ran` guard,
+        # that retry would re-enter this block and re-run teardown: a
+        # second time. The marker is set and persisted immediately below,
+        # BEFORE Step 4 is attempted, so it survives exactly the failure
+        # this ticket is about.
+        if contract is not None and contract.teardown and not record.teardown_ran:
             from ..setup.runner import SetupRunner
             runner = SetupRunner()
             try:
@@ -2366,8 +2548,64 @@ class WorktreeManager:
                     port_mapping=record.ports,
                 )
             except Exception:  # noqa: BLE001
-                # Teardown step failure must not block git worktree remove.
+                # Teardown step failure must not block git worktree remove
+                # (#117's policy). Ticket #126 fix cycle (blocking finding):
+                # do NOT set teardown_ran here. A raised exception means the
+                # `teardown:` sequence completed only partially -- e.g. it
+                # failed on step 2 of a 3-step contract -- so whatever
+                # cleanup step 2/3 were supposed to do (release a lock, stop
+                # a service, ...) never ran. Leaving the marker at its prior
+                # value (False, on a first attempt) means a later retry
+                # still re-enters this block and gets a genuine chance to
+                # run -- and this time complete -- those steps, instead of
+                # having them silently and permanently skipped.
                 pass
+            else:
+                # Ticket #126: persist the at-most-once marker now, before
+                # Step 4's `git worktree remove` is attempted -- so it
+                # survives even if that call raises DirtyWorktreeError and
+                # the caller retries with force=True. Only reached when
+                # `runner.run()` above returned without raising, i.e. the
+                # full `teardown:` sequence actually completed --
+                # matching the "at most once, and only once it truly ran"
+                # semantics this ticket requires. `self.state.update()`
+                # raises KeyError for the synthesised, never-stored record
+                # used by ticket #88's untracked-target removal path; that
+                # record has nothing to persist to (see remove()'s
+                # docstring for the documented limitation this implies for
+                # that path), so the KeyError is swallowed rather than
+                # propagated.
+                #
+                # Review round 2 (blocking finding): the teardown steps
+                # above have ALREADY completed successfully at this point --
+                # the only thing that can still fail here is the bookkeeping
+                # write itself. `YamlStateStore.update()` can genuinely
+                # raise `OSError` for I/O reasons (`_atomic_write_yaml()`'s
+                # mkstemp/write/`os.replace` -- disk full, permission
+                # hiccup, ...) and `portalocker.exceptions.LockException`
+                # when it cannot acquire `state.yaml.lock` within
+                # `_LOCK_TIMEOUT` (transient contention from a concurrent
+                # writer). Neither is the same class of error as the
+                # documented ticket #88 `KeyError` case, but both are
+                # equally "the marker didn't persist" rather than "teardown
+                # didn't happen" -- so, mirroring ticket #117's policy that a
+                # teardown-step failure must never block `git worktree
+                # remove`, a persistence failure here must not either. Step
+                # 4 below is the actual thing the caller asked for; this
+                # write is best-effort bookkeeping in service of ticket
+                # #126's at-most-once guarantee, not a precondition for it.
+                # Tradeoff: if this write fails, `record.teardown_ran` stays
+                # False in the caller's copy AND in the store, so a
+                # subsequent retry on this same record could re-run
+                # `teardown:` once more -- a narrower, best-effort
+                # regression of this ticket's own guarantee, but strictly
+                # better than blocking the actual removal over a bookkeeping
+                # write failure.
+                record.teardown_ran = True
+                try:
+                    self.state.update(record)
+                except (KeyError, OSError, portalocker.exceptions.LockException):
+                    pass
 
             # Ticket #117 fix cycle (blocking finding): invalidate the dirt
             # probe's memoised snapshot now that teardown: steps have
@@ -2412,12 +2650,46 @@ class WorktreeManager:
                 # to port release.
                 _phantom_state_cleanup()
                 # Fall through to step 4.
-            elif proc.returncode == 128 and force:
+            elif proc.returncode == 128 and (
+                force
+                or (
+                    target_absent
+                    and "contains modified or untracked files" not in proc.stderr
+                )
+            ):
                 # The .git link is already gone (worktree dir was wiped
                 # externally).  Fall back: delete the directory ourselves,
                 # then prune the stale git metadata.  Both steps are
                 # best-effort so that port release and state removal still
                 # occur even in a degraded state.
+                #
+                # Ticket #127: this fallback used to require force=True, but
+                # an orphaned record (target_absent=True) hits this exact
+                # exit-128 shape through no fault of the caller -- the
+                # directory is gone, git still has a `prunable` admin dir
+                # under `.git/worktrees/<id>`, and the stderr matches neither
+                # the phantom-state branch above nor a dirty-tree phrase (an
+                # absent directory cannot be dirty). Widening the guard to
+                # also fire when target_absent is True lets a plain
+                # remove(worktree_id=...) recover this case without forcing
+                # the caller to pass force=True. When the directory is
+                # genuinely present (target_absent is False), this branch
+                # stays gated on force exactly as before, and the `else`
+                # below still raises GitCommandError.
+                #
+                # The explicit dirty-tree-phrase exclusion on the
+                # target_absent arm (but NOT on the force arm, which must
+                # keep bypassing everything exactly as it did before this
+                # ticket) guards against a nonsensical co-occurrence: a
+                # directory that does not exist cannot genuinely be dirty, so
+                # this can only happen when a caller's own `_run_git` fake
+                # asserts both conditions at once (as one pre-existing
+                # regression test does, pinning the DirtyWorktreeError
+                # message format). Without this exclusion, target_absent
+                # (evaluated on a real, non-existent test path) would steal
+                # that case away from the nested dirty-tree-phrase check
+                # below and silently swallow a refusal the caller needs to
+                # see and act on.
                 shutil.rmtree(record.path, ignore_errors=True)
                 _run_git(
                     ["worktree", "prune"],

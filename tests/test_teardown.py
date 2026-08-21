@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 from typing import List
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -91,6 +91,125 @@ def _no_real_preflight_settle_sleep():
     always wins for its scope and unwinds back to this outer patch on exit.
     """
     with patch("lib_python_worktree.core.manager.time.sleep"):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _target_present_by_default():
+    """Default-patch ``os.path.exists`` (as seen through ``manager.os``) so
+    that BOTH ``target_absent`` probe sites read ``True`` (checkout
+    considered present), while every OTHER ``os.path.exists`` call in
+    ``_teardown`` keeps evaluating against the real, always-absent fake path
+    (ticket #127, fix-pass 2).
+
+    ``_teardown`` probes ``os.path.exists(record.path)`` once, near the top
+    of the function (before any other filesystem check it makes, e.g.
+    contract-file existence), to compute ``target_absent`` -- used to widen
+    the exit-128 fallback and to skip Gate A's Windows pre-flight for an
+    orphaned record whose checkout directory is already gone. ``remove()``
+    ALSO probes ``os.path.exists(record.path)`` once, for its OWN, separate
+    ``target_absent`` local, before ever calling ``_teardown()`` (used to
+    decide whether an unmerged owned branch is tolerated). So a test that
+    reaches ``_teardown()`` via ``manager.remove(...)`` makes TWO calls to
+    the exact same path before any other logic runs, while a test that
+    calls ``manager._teardown(...)`` directly makes only ONE.
+
+    A call-order heuristic ("force True on the very first call in the whole
+    test, real thereafter") breaks the ``remove()`` -> ``_teardown()`` case:
+    ``remove()``'s own probe consumes the single forced slot, so
+    ``_teardown()``'s own probe falls through to the real (always-``False``)
+    filesystem check -- silently computing ``target_absent=True`` inside
+    ``_teardown`` even for a test that is semantically about a *present*
+    checkout, which widens the exit-128 fallback and skips Gate A's Windows
+    pre-flight check it should still be exercising.
+
+    A path-value memo ("force True forever once this path has been forced
+    True") over-corrects: every ``os.path.exists`` call this module ever
+    makes goes through this same ``manager.os.path.exists`` seam and (per
+    the source) is always called with ``record.path`` -- there is no OTHER
+    path value to distinguish a genuine ``target_absent`` probe from the
+    LATER long-path-fallback check and Final guard check in ``_teardown``,
+    which many pre-existing happy-path tests correctly rely on evaluating
+    against the real, always-absent fake path. Memoizing by value alone
+    would force those later checks ``True`` too, spuriously triggering the
+    long-path/robocopy fallback and then the Final guard's
+    ``WorktreeDirLockedError`` on nearly every happy-path test in this
+    module.
+
+    Neither call-order nor path-value alone can tell these call sites
+    apart, since they share both the same relative position (both are
+    "first calls" in one of the two entry patterns above) and the same
+    argument value. What distinguishes them is the call SITE itself: both
+    probe sites are written as ``target_absent = not
+    os.path.exists(record.path)`` (the assignment target's name appears on
+    the calling source line), while the long-path-fallback and Final guard
+    sites are plain ``if os.path.exists(record.path):`` with no such
+    assignment.
+
+    Critically, in this Python version ``pathlib.Path.exists()`` itself
+    delegates to ``os.path.exists()`` internally -- so patching
+    ``manager.os.path.exists`` also intercepts every *other* ``.exists()``
+    check made anywhere during a ``remove()``/``_teardown()`` call (e.g.
+    ``YamlStateStore``'s own ``state.yaml`` existence check, and the
+    contract-file existence check), not just the four explicit
+    ``os.path.exists(record.path)`` call sites in ``manager.py``. Walking
+    the stack to the *nearest* ``manager.py`` frame (rather than the
+    *direct, immediate* caller) would misattribute those unrelated calls:
+    e.g. ``YamlStateStore._load_state()``'s ``self._state_path.exists()``
+    check happens while a ``manager.py`` frame (``_resolve_removal_target``
+    or ``_teardown``) is still on the stack purely as its synchronous
+    ancestor, not as the actual caller -- so this instead identifies the
+    DIRECT caller: it walks outward past ``unittest.mock``'s own internal
+    plumbing frames (``_mock_call``/``_execute_mock_call``/the
+    ``effect(...)`` invocation) to the first real, non-mock frame, and
+    forces ``True`` only when THAT frame is itself in ``manager.py`` AND
+    its source line contains ``target_absent`` -- covering both probe
+    sites (called from ``remove()`` and/or ``_teardown()``, in either
+    order, any number of times) while leaving every other call (state
+    store, contract file, long-path fallback, Final guard -- regardless of
+    whether it goes through ``os.path.exists`` directly or via
+    ``Path.exists()``) to fall through to the real filesystem check,
+    unchanged from the pre-#127 default that every pre-existing happy-path
+    test in this module already relies on.
+
+    Tests that specifically exercise ``target_absent`` behaviour (ticket
+    #127's own ``TestTeardownAbsentTarget``, plus a handful of pre-existing
+    tests that already control ``os.path.exists`` directly for their own
+    reasons, e.g. long-path fallback / robocopy tests) override this via
+    their own nested ``patch(...)`` for the duration of their ``with``
+    block -- an inner ``patch`` on the same target always wins for its
+    scope and unwinds back to this outer patch on exit.
+    """
+    import os as _os_real
+    import traceback
+
+    _real_exists = _os_real.path.exists
+    _manager_suffix = "lib_python_worktree/core/manager.py"
+    _mock_module_suffix = "unittest/mock.py"
+
+    def _mock_exists(path):
+        # Walk from the innermost frame outward (skipping this function's
+        # own frame), stepping over unittest.mock's own internal plumbing
+        # frames, to the first real, non-mock frame -- the actual, direct
+        # caller of os.path.exists (or of Path.exists(), which itself
+        # calls os.path.exists() internally in this Python version). Only
+        # force True when THAT direct caller is a manager.py frame whose
+        # source line contains "target_absent" (the two structural probe
+        # sites); every other caller (state store, contract file,
+        # long-path fallback, Final guard, etc.) falls through to the real
+        # filesystem check untouched.
+        for frame in reversed(traceback.extract_stack()[:-1]):
+            filename = frame.filename.replace("\\", "/")
+            if filename.endswith(_mock_module_suffix):
+                continue
+            if filename.endswith(_manager_suffix):
+                return "target_absent" in (frame.line or "")
+            return _real_exists(path)
+        return _real_exists(path)
+
+    with patch(
+        "lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists
+    ):
         yield
 
 
@@ -1807,12 +1926,26 @@ class TestKillBlockingRecordKilledPids:
                 "lib_python_worktree.core.manager._kill_blocking_processes",
                 return_value=fake_killed,
             ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ) as mock_find,
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             removed = manager.remove(record.id, kill_blocking_processes=True)
 
         assert removed.killed_pids == fake_killed
+        # Fix-pass 2 (ticket #127 blocking finding): the checkout here is
+        # actually present (this record's directory was never externally
+        # deleted), so Gate A's Windows pre-flight blocking-process scan
+        # must genuinely run -- not be silently skipped because
+        # ``_teardown``'s own ``target_absent`` probe was miscomputed as
+        # ``True`` by a buggy test fixture. This pins that regression: it
+        # failed to hold before the fixture's double-probe bug was fixed
+        # (Gate A was skipped even though this test is semantically about a
+        # present checkout).
+        mock_find.assert_called_once_with(record.path, ANY)
 
     def test_yaml_store_remove_returns_killed_pids(self, tmp_path):
         """Regression for blocking #2: YamlStateStore.remove() returns a freshly
@@ -1853,6 +1986,10 @@ class TestKillBlockingRecordKilledPids:
                 "lib_python_worktree.core.manager._kill_blocking_processes",
                 return_value=fake_killed,
             ),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ) as mock_find,
             patch("lib_python_worktree.core.manager.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
@@ -1863,6 +2000,12 @@ class TestKillBlockingRecordKilledPids:
         assert removed.killed_pids == fake_killed, (
             "killed_pids must survive YamlStateStore round-trip via remove()"
         )
+        # Fix-pass 2 (ticket #127 blocking finding): same regression pin as
+        # test_remove_returns_record_with_killed_pids above -- this
+        # record's checkout is present, so Gate A's pre-flight
+        # blocking-process scan must genuinely run rather than being
+        # silently skipped by a miscomputed ``target_absent``.
+        mock_find.assert_called_once_with(record.path, ANY)
 
 
 # ---------------------------------------------------------------------------
@@ -2157,14 +2300,18 @@ class TestLongPathFallback:
         # We must return False for those contract-file checks and True only for
         # the actual worktree-path check at line 897.
         # Strategy: return False for any path that is NOT record.path; return
-        # True for record.path on the first check (line 897) and False on the
-        # second (line 920, the final guard after rmtree succeeds).
+        # True for record.path on the first two checks (call #1 is ticket
+        # #127's target_absent probe, hoisted to the top of _teardown before
+        # any of this runs — the checkout genuinely IS present for this
+        # scenario, so it must read True there too; call #2 is the actual
+        # worktree-path check at line 897) and False from the third call
+        # onward (the final guard after rmtree succeeds).
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] == 1  # True first, False thereafter
+                return _path_calls["n"] <= 2  # True for the first two calls
             # Contract file / other paths → not present.
             return False
 
@@ -2199,14 +2346,16 @@ class TestLongPathFallback:
         rmtree_calls: list = []
 
         # See explanation in test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
-        # Returns True only for the first check of record.path (line 897),
-        # and False for all other paths and all subsequent checks of record.path.
+        # Returns True for the first two checks of record.path (call #1 is
+        # ticket #127's target_absent probe; call #2 is the actual
+        # long-path-fallback check), and False for all other paths and all
+        # subsequent checks of record.path.
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] == 1
+                return _path_calls["n"] <= 2
             return False
 
         def _mock_rmtree(path, **kwargs):
@@ -2255,14 +2404,16 @@ class TestLongPathFallback:
             return MagicMock(returncode=1)  # robocopy exits 1 on success-with-copies
 
         # See explanation in test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
-        # Returns True only for the first check of record.path (line 897),
-        # and False for all other paths and all subsequent checks of record.path.
+        # Returns True for the first two checks of record.path (call #1 is
+        # ticket #127's target_absent probe; call #2 is the actual
+        # long-path-fallback check), and False for all other paths and all
+        # subsequent checks of record.path.
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] == 1
+                return _path_calls["n"] <= 2
             return False
 
         with (
@@ -2566,6 +2717,458 @@ class TestTeardownAlreadyDeregistered:
         assert manager.state.list() == [], (
             "state must be empty after remove() on a phantom (already-deregistered) worktree"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTeardownAbsentTarget -- ticket #127 (orphaned-record cleanup without force)
+# ---------------------------------------------------------------------------
+
+class TestTeardownAbsentTarget:
+    """Ticket #127: a tracked, ``status="orphaned"`` record whose checkout
+    directory was deleted externally must be removable via
+    ``remove(worktree_id=...)`` WITHOUT ``force``, without leaking its port
+    reservations, and without an unmerged owned branch turning an otherwise
+    successful cleanup into a raised exception.
+
+    Root cause: for such a record, ``git worktree remove`` (no ``--force``)
+    exits 128 with stderr matching neither the phantom-state phrase ("is not
+    a working tree") nor a dirty-tree phrase -- so it used to fall through
+    to a bare ``GitCommandError``, and the caller was forced to retry with
+    ``force=True`` just to clean up a directory that was already gone.
+    """
+
+    def test_absent_target_exit128_without_force_does_not_raise(self, tmp_path):
+        """Driving test: exit 128 + non-matching stderr + force=False, but
+        the checkout directory is genuinely absent -- _teardown must not
+        raise; it must fall back to shutil.rmtree + git worktree prune, then
+        release ports, exactly like the force=True fallback does today."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-absent-128", path="/fake/store/wt-absent-128")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        git_calls: list = []
+        rmtree_calls: list = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            git_calls.append(list(args))
+            if args[:2] == ["worktree", "remove"]:
+                # Neither the phantom-state phrase nor a dirty-tree phrase --
+                # the exact shape a `prunable` porcelain block with an
+                # absent checkout directory produces.
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch(
+                "lib_python_worktree.core.manager.shutil.rmtree",
+                side_effect=lambda *a, **kw: rmtree_calls.append((a, kw)),
+            ),
+        ):
+            # Must not raise.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert any(
+            a == (record.path,) and kw.get("ignore_errors") is True
+            for a, kw in rmtree_calls
+        ), f"expected rmtree(record.path, ignore_errors=True), got {rmtree_calls}"
+        prune_calls = [a for a in git_calls if a[:2] == ["worktree", "prune"]]
+        assert prune_calls, "git worktree prune must be called"
+        mock_allocator.release.assert_called_once_with(record.id)
+
+    def test_absent_target_exit128_without_force_full_remove_returns_removed(
+        self, tmp_path
+    ):
+        """Full remove(worktree_id=..., force=False) on an orphaned record:
+        the state record must be deleted and the returned record must carry
+        status="removed", without ever needing force=True."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-absent-full-remove",
+            path="/fake/store/wt-absent-full-remove",
+            branch_created_by_us=False,
+        )
+        manager.state.add(record)
+        assert len(manager.state.list()) == 1
+
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+        ):
+            removed = manager.remove(record.id, force=False)
+
+        assert removed.status == "removed"
+        assert manager.state.list() == [], "state must be empty after remove()"
+        mock_allocator.release.assert_called_once_with(record.id)
+
+    def test_present_target_exit128_without_force_still_raises_git_error(
+        self, tmp_path
+    ):
+        """Over-widening guard: the SAME exit 128 + non-matching stderr, but
+        the checkout directory is actually present -- must still raise
+        GitCommandError exactly as before ticket #127. This pins the
+        existing test_exit128_without_force_non_dirty_stderr_raises_git_error
+        behaviour so the widened fallback can never accidentally swallow a
+        real, unexplained git failure on a checkout that still exists."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-present-128", path="/fake/store/wt-present-128")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+        ):
+            with pytest.raises(GitCommandError):
+                manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+    def test_absent_target_skips_gate_a_preflight_scan(self, tmp_path):
+        """Gate A short-circuit: on win32, with the checkout absent, the
+        Windows blocking-process pre-flight scan must never run -- there is
+        nothing on disk that could hold a file handle."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-absent-gatea", path="/fake/store/wt-absent-gatea")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes"
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        mock_find.assert_not_called()
+
+    def test_present_target_still_runs_gate_a_preflight_scan(self, tmp_path):
+        """Companion to the short-circuit test: when the checkout IS
+        present, Gate A's pre-flight scan still runs exactly as before."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-present-gatea", path="/fake/store/wt-present-gatea")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        mock_find.assert_called_once_with(record.path, os.getpid())
+
+    def test_absent_target_phantom_state_stderr_still_routes_to_phantom_cleanup(
+        self, tmp_path
+    ):
+        """Ordering guard: 'is not a working tree' stderr must still route
+        through _phantom_state_cleanup() first, regardless of target_absent
+        -- the widened exit-128 fallback branch must never shadow the
+        earlier phantom-state branch (ticket #51)."""
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-absent-phantom", path="/fake/store/wt-absent-phantom")
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        mock_allocator = MagicMock()
+        manager._allocator = mock_allocator
+
+        rmtree_calls: list = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(
+                    returncode=128,
+                    stderr=f"fatal: '{record.path}' is not a working tree",
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch(
+                "lib_python_worktree.core.manager.shutil.rmtree",
+                side_effect=lambda *a, **kw: rmtree_calls.append((a, kw)),
+            ),
+        ):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        # Exactly one rmtree call from _phantom_state_cleanup -- the widened
+        # elif branch below it must never also fire for the same attempt.
+        assert len(rmtree_calls) == 1, rmtree_calls
+        mock_allocator.release.assert_called_once_with(record.id)
+
+    def test_primary_checkout_refused_even_with_absent_target(self, tmp_path):
+        """Primary-checkout refusal (ticket #84) still wins over the new
+        absent-target path -- force=True never bypasses it, and neither does
+        an absent target."""
+        from lib_python_worktree.core.manager import PrimaryCheckoutError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-primary-absent",
+            path="/fake/repo",
+            repo_root="/fake/repo",
+            backing="primary",
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+
+        with patch("lib_python_worktree.core.manager.os.path.exists", return_value=False):
+            with pytest.raises(PrimaryCheckoutError):
+                manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+    def test_absent_target_unmerged_owned_branch_warns_and_still_returns_removed(
+        self, tmp_path, caplog
+    ):
+        """Driving test: an owned branch that is unmerged must not turn an
+        otherwise-successful orphaned-record removal into a raised
+        exception. remove() must still return status="removed", the state
+        record must be gone, and a WARNING naming the branch must be
+        logged."""
+        import logging as _logging
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-absent-unmerged",
+            path="/fake/store/wt-absent-unmerged",
+            branch="feature/unmerged",
+            branch_created_by_us=True,
+        )
+        manager.state.add(record)
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            if args[:1] == ["rev-parse"]:
+                return MagicMock(returncode=0, stderr="")  # branch exists
+            if args[:2] == ["branch", "-d"]:
+                return MagicMock(
+                    returncode=1,
+                    stderr="error: branch 'feature/unmerged' is not fully merged",
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+        ):
+            removed = manager.remove(record.id, force=False)
+
+        assert removed.status == "removed"
+        assert manager.state.list() == []
+        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+        assert any("feature/unmerged" in r.message for r in warnings), (
+            f"expected a WARNING naming the unmerged branch, got: "
+            f"{[r.message for r in warnings]}"
+        )
+
+    def test_present_target_unmerged_owned_branch_still_raises(self, tmp_path):
+        """Over-widening guard: the SAME unmerged-branch refusal, but the
+        checkout was actually present (a normal, non-orphaned removal) --
+        must still raise GitCommandError exactly as before ticket #127."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-present-unmerged",
+            path="/fake/store/wt-present-unmerged",
+            branch="feature/unmerged2",
+            branch_created_by_us=True,
+        )
+        manager.state.add(record)
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=0, stderr="")
+            if args[:1] == ["rev-parse"]:
+                return MagicMock(returncode=0, stderr="")  # branch exists
+            if args[:2] == ["branch", "-d"]:
+                return MagicMock(
+                    returncode=1,
+                    stderr="error: branch 'feature/unmerged2' is not fully merged",
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        # No os.path.exists patch here: the module default fixture forces
+        # BOTH remove()'s own target_absent probe AND _teardown()'s own
+        # target_absent probe to read True -- present -- while every other
+        # call (long-path fallback, Final guard) falls through to the real
+        # (always-False, since this is a fake path) filesystem, exactly
+        # like the pre-existing happy-path tests in this file (ticket #127
+        # fix-pass 2: fixed a prior double-probe bug where only the first
+        # of these two probes was forced, silently leaving _teardown()'s
+        # own target_absent computed as True here despite this test being
+        # about a present checkout).
+        #
+        # This is pinned concretely, not just asserted by comment: Gate A's
+        # Windows pre-flight only runs when _teardown() computes
+        # target_absent=False (`sys.platform == "win32" and not
+        # target_absent`), so asserting _find_blocking_processes was
+        # actually called proves _teardown() genuinely saw the checkout as
+        # present.
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ) as mock_find,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(GitCommandError):
+                manager.remove(record.id, force=False)
+
+        mock_find.assert_called_once_with(record.path, ANY)
+
+    def test_absent_target_branch_not_created_by_us_no_branch_call(self, tmp_path):
+        """branch_created_by_us=False: no git branch/rev-parse call is ever
+        made, even on the orphaned-record path."""
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-absent-notowned",
+            path="/fake/store/wt-absent-notowned",
+            branch="feature/notowned",
+            branch_created_by_us=False,
+        )
+        manager.state.add(record)
+
+        branch_calls: list = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            if args and args[0] in ("branch", "rev-parse"):
+                branch_calls.append(list(args))
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+        ):
+            removed = manager.remove(record.id, force=False)
+
+        assert removed.status == "removed"
+        assert branch_calls == [], f"expected no branch-related git calls, got {branch_calls}"
+
+    def test_absent_target_branch_already_gone_no_warning(self, tmp_path, caplog):
+        """Branch already gone (git rev-parse --verify fails): remove()
+        completes with status="removed" and no warning is logged -- there is
+        nothing to warn about."""
+        import logging as _logging
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-absent-branchgone",
+            path="/fake/store/wt-absent-branchgone",
+            branch="feature/gone",
+            branch_created_by_us=True,
+        )
+        manager.state.add(record)
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            if args[:1] == ["rev-parse"]:
+                return MagicMock(returncode=1, stderr="")  # branch already gone
+            return MagicMock(returncode=0, stderr="")
+
+        caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+        ):
+            removed = manager.remove(record.id, force=False)
+
+        assert removed.status == "removed"
+        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
+        assert not any("feature/gone" in r.message for r in warnings), (
+            f"expected no warning, got: {[r.message for r in warnings]}"
+        )
+
+    def test_absent_target_non_unmerged_branch_delete_error_still_raises(
+        self, tmp_path
+    ):
+        """Narrow-scope guard: on the orphaned-record path (target_absent
+        =True), a `git branch -d` failure that is NOT the unmerged-branch
+        refusal (e.g. the branch is checked out elsewhere, or lockfile
+        contention) must still raise GitCommandError. #127's tolerance is
+        specifically for an unmerged owned branch -- it must never widen
+        into swallowing an arbitrary git error just because the checkout
+        directory happened to be absent."""
+        from lib_python_worktree.core.manager import GitCommandError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-absent-checkedout",
+            path="/fake/store/wt-absent-checkedout",
+            branch="feature/checkedout",
+            branch_created_by_us=True,
+        )
+        manager.state.add(record)
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["worktree", "remove"]:
+                return MagicMock(returncode=128, stderr="fatal: unable to stat")
+            if args[:1] == ["rev-parse"]:
+                return MagicMock(returncode=0, stderr="")  # branch exists
+            if args[:2] == ["branch", "-d"]:
+                return MagicMock(
+                    returncode=1,
+                    stderr=(
+                        "error: Cannot delete branch 'feature/checkedout' "
+                        "checked out at '/some/other/worktree'"
+                    ),
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+        ):
+            with pytest.raises(GitCommandError):
+                manager.remove(record.id, force=False)
 
 
 # ---------------------------------------------------------------------------
@@ -4383,6 +4986,521 @@ class TestTicket117TeardownRunsAtMostOnce:
 
 
 # ---------------------------------------------------------------------------
+# TestTicket126TeardownNotReRunOnRetry -- ticket #126
+# ---------------------------------------------------------------------------
+
+class TestTicket126TeardownNotReRunOnRetry:
+    """Ticket #126: a SECOND reachable path to the #117 symptom -- Gate B
+    passes (pre-teardown dirt is clean/exempt), teardown: steps run, but
+    the subsequent `git worktree remove` fails with a POST-teardown
+    DirtyWorktreeError (e.g. because the teardown step itself wrote a
+    file). Following that error's own suggested remedy, the caller retries
+    with force=True, which bypasses Gate B entirely -- without the
+    persisted `teardown_ran` marker, that retry would re-run teardown: a
+    second time."""
+
+    def test_forced_retry_after_post_teardown_dirty_failure_does_not_rerun_teardown(
+        self, tmp_path
+    ):
+        """Driving test: force=False raises DirtyWorktreeError after
+        teardown: has already run once; a subsequent force=True retry on
+        the SAME record must not run teardown: again."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-forced-retry", path="/fake/store/wt-126-forced-retry"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        teardown_ran = [False]
+        runner_calls: List[dict] = []
+
+        def _run_teardown(**kw):
+            runner_calls.append(kw)
+            teardown_ran[0] = True
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = _run_teardown
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_status_call(args):
+                if not teardown_ran[0]:
+                    # Pre-teardown: clean.
+                    return MagicMock(returncode=0, stdout="", stderr="")
+                # Post-teardown: the teardown step left real, non-exempt
+                # dirt behind.
+                return MagicMock(
+                    returncode=0, stdout="?? real_leftover.log\0", stderr=""
+                )
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            if _is_force_remove_call(args):
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(DirtyWorktreeError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+            # Caller follows the error's own suggested remedy.
+            manager._teardown(
+                record,
+                force=True,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        setups_run = [kw["setup"] for kw in runner_calls]
+        assert setups_run.count(fake_contract.teardown) == 1, (
+            f"teardown: steps must run exactly once across both calls, "
+            f"got {setups_run}"
+        )
+        assert record.teardown_ran is True
+
+    def test_retry_after_gate_a_lock_runs_teardown_on_first_successful_attempt(
+        self, tmp_path
+    ):
+        """A retry after a Gate A WorktreeDirLockedError (teardown: never
+        ran on the blocked attempt) must still run teardown: exactly once
+        -- on the first attempt that actually clears the block. Proves the
+        `teardown_ran` marker does not over-suppress steps that never ran
+        in the first place."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-lock-retry", path="/fake/store/wt-126-lock-retry"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        runner_calls: List[dict] = []
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+        persistent = [KilledProcessInfo(pid=9191, name="node.exe", cmdline=["node"])]
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=persistent,
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert runner_calls == [], "teardown: must not run while Gate A is blocked"
+
+        # Blocker clears; this retry is the FIRST successful attempt.
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.manager._find_blocking_processes",
+                return_value=[],
+            ),
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        setups_run = [kw["setup"] for kw in runner_calls]
+        assert setups_run.count(fake_contract.teardown) == 1, (
+            f"teardown: must run exactly once, on the first successful "
+            f"attempt, got {setups_run}"
+        )
+
+    def test_force_true_first_call_still_runs_teardown_once(self, tmp_path):
+        """Additional coverage: a force=True call with no prior attempt
+        (teardown_ran defaults to False) still runs teardown: exactly
+        once -- the new guard must not suppress the very first run."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-force-first", path="/fake/store/wt-126-force-first"
+        )
+        manager.state.add(record)
+        assert record.teardown_ran is False
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1
+        assert record.teardown_ran is True
+
+    def test_no_teardown_steps_never_sets_marker_and_no_extra_status_call(
+        self, tmp_path
+    ):
+        """Additional coverage: protects the existing zero-extra-`git
+        status`-calls invariant (see
+        test_no_teardown_steps_means_no_extra_git_status above) AND
+        confirms the new marker is only ever set when teardown: steps
+        actually exist and run."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-no-teardown", path="/fake/store/wt-126-no-teardown"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run='echo stop', name="stop-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=False, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert not any(_is_status_call(c.args[0]) for c in mock_git.call_args_list)
+        assert record.teardown_ran is False
+
+    def test_untracked_target_persist_swallows_keyerror(self, tmp_path):
+        """Ticket #88 style: a synthesised record never added to the state
+        store (mirrors the untracked-removal-target path). The guarded
+        ``self.state.update(record)`` persist added by this ticket must
+        swallow InMemoryStateStore's KeyError rather than let it
+        propagate, and must not create a spurious store entry."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-untracked", path="/fake/store/wt-126-untracked"
+        )
+        # Deliberately NOT added to manager.state.
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1
+        assert record.teardown_ran is True, "marker still set on the in-memory object"
+        assert manager.state.list() == [], "untracked path must never write to the store"
+
+    def test_partial_teardown_failure_leaves_marker_false_and_retries_run_again(
+        self, tmp_path
+    ):
+        """Driving test (fix-cycle blocking finding): `SetupRunner.run()`
+        raises partway through a multi-step `teardown:` sequence -- e.g. it
+        fails on step 2 of 3. `_teardown()` must (a) swallow the exception
+        per ticket #117's "teardown failure must not block remove" policy,
+        (b) leave `record.teardown_ran` at False rather than force it True
+        (the steps never actually completed), and (c) let a *subsequent*
+        `_teardown()` call on the SAME record attempt the teardown steps
+        again -- the retry must get a genuine chance to finish the cleanup
+        work (e.g. releasing a lock, stopping a service) that the first
+        attempt never got to."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-partial-failure", path="/fake/store/wt-126-partial-failure"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[
+                Step(run='echo one', name="step-1"),
+                Step(run='echo two', name="step-2"),
+                Step(run='echo three', name="step-3"),
+            ],
+        )
+
+        runner_calls: List[dict] = []
+
+        def _raise_partway(**kw):
+            # Simulates the real SetupRunner having executed step 1
+            # successfully, then raising while attempting step 2 -- step 3
+            # never runs either. The mock only models the *outcome*
+            # (`run()` raises) since `run()` is what `_teardown()` calls
+            # and swallows.
+            runner_calls.append(kw)
+            raise RuntimeError("step-2 failed")
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = _raise_partway
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+
+            # First attempt: teardown: raises partway through. Per #117's
+            # policy this must not propagate out of _teardown() and must
+            # not block the (mocked) git worktree remove.
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1, "first attempt must have tried to run teardown:"
+        assert record.teardown_ran is False, (
+            "a partially-failed teardown: run must NOT set the at-most-once "
+            "marker -- steps 2/3 never completed, so a retry must still be "
+            "allowed to run the full sequence again"
+        )
+
+        # Second attempt (retry): this time teardown: completes without
+        # raising.
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 2, (
+            "the retry must attempt teardown: again -- it must not be "
+            "skipped just because a prior attempt failed partway through"
+        )
+        assert record.teardown_ran is True, (
+            "once teardown: actually completes without raising, the "
+            "at-most-once marker must be set"
+        )
+
+    def test_marker_persist_oserror_does_not_block_git_worktree_remove(
+        self, tmp_path
+    ):
+        """Driving test (review round 2, blocking finding): teardown: steps
+        complete successfully, but persisting the `teardown_ran` marker via
+        `self.state.update(record)` raises `OSError` (e.g. disk full,
+        transient state.yaml lock contention, permission hiccup). This must
+        NOT propagate out of `_teardown()` and must NOT prevent Step 4
+        (`git worktree remove`) from running -- the teardown steps already
+        completed; the only failure is a bookkeeping write, and ticket
+        #117's policy (a failure that isn't the removal itself must never
+        block the removal) applies here too."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-126-persist-oserror", path="/fake/store/wt-126-persist-oserror"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            teardown=[Step(run='echo bye', name="teardown-svc")],
+        )
+
+        mock_runner_instance = MagicMock()
+        runner_calls: List[dict] = []
+        mock_runner_instance.run.side_effect = lambda **kw: runner_calls.append(kw)
+
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch.object(
+                manager.state, "update", side_effect=OSError("disk full")
+            ),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            mock_sys.platform = "win32"
+            # Must not raise: the OSError from the marker-persist write must
+            # be swallowed, exactly like the existing KeyError swallow.
+            manager._teardown(
+                record, force=True, kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        assert len(runner_calls) == 1, "teardown: steps must have run"
+        assert record.teardown_ran is True, (
+            "the in-memory record must still reflect completion even though "
+            "persisting it failed"
+        )
+        assert any(
+            _is_force_remove_call(c.args[0]) or _is_plain_remove_call(c.args[0])
+            for c in mock_git.call_args_list
+        ), (
+            "Step 4 (git worktree remove) must still run despite the "
+            "marker-persist OSError -- the persistence failure must not "
+            "block the actual removal"
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestRobocopyTimeoutBounding -- ticket #78
 # ---------------------------------------------------------------------------
 
@@ -4427,12 +5545,15 @@ class TestRobocopyTimeoutBounding:
 
         # See explanation in
         # test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
+        # Returns True for the first two checks of record.path (call #1 is
+        # ticket #127's target_absent probe; call #2 is the actual
+        # long-path-fallback check).
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] == 1
+                return _path_calls["n"] <= 2
             return False
 
         with (
@@ -4520,12 +5641,16 @@ class TestRobocopyTimeoutBounding:
             return MagicMock(returncode=1)
 
         def _make_exists_for(target_path):
+            # Returns True for the first two checks of target_path (call #1
+            # is ticket #127's target_absent probe; call #2 is the actual
+            # long-path-fallback check) -- see the explanation in
+            # test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
             calls = {"n": 0}
 
             def _mock_exists(path):
                 if str(path) == target_path:
                     calls["n"] += 1
-                    return calls["n"] == 1
+                    return calls["n"] <= 2
                 return False
 
             return _mock_exists

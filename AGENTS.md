@@ -18,7 +18,7 @@ The engine is fully implemented under `src/lib_python_worktree/`. Key modules:
 
 - `core/manager.py` — `WorktreeManager` (public facade: create / list / list_repo / remove / adopt / prune / start / stop)
 - `core/checkout.py` — `classify_checkout`, `CheckoutInfo`, `primary_id_for` (primary-vs-linked-worktree classification, ticket #84); `EnvironmentEntry`, `RepoListing`, `list_repo` (repo-scoped listing)
-- `core/state.py` — `StateStore` protocol + `WorktreeRecord` dataclass (`backing: "worktree" | "primary"`, ticket #84; `stop_detail: Optional[StopDetail]` — machine-readable reason for a `"stop_incomplete"` status, ticket #99)
+- `core/state.py` — `StateStore` protocol + `WorktreeRecord` dataclass (`backing: "worktree" | "primary"`, ticket #84; `stop_detail: Optional[StopDetail]` — machine-readable reason for a `"stop_incomplete"` status, ticket #99; `teardown_ran: bool` — at-most-once-teardown marker persisted before `git worktree remove` is attempted, so a `force=True` retry after a post-teardown `DirtyWorktreeError` never re-runs `teardown:`, ticket #126; `stop_hook_outcome: Optional[StopHookOutcome]` — stop-hook + contract diagnostics, ticket #128)
 - `core/yaml_store.py` — `YamlStateStore` (file-backed store), `reconcile`, `adopt`, `ReconcileReport`, `AdoptReport`
 - `core/port_allocator.py` — `PortAllocator` (locked, atomic read-modify-write against `ports.yaml`)
 - `core/process_lifecycle.py` — `start` / `stop` (detached process management, cross-platform); on Windows, `start()` also assigns the spawned process to a Job Object (ticket #95) that `stop()` enumerates/terminates as a ppid-independent containment mechanism (catches `Start-Process`/ShellExecuteEx-delegated grandchildren the ppid-derived process-tree walk cannot reach)

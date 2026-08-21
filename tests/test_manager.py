@@ -1775,6 +1775,30 @@ def test_manager_start_empty_contract_is_noop_ready(tmp_path: Path):
     assert result.variants == {}
 
 
+def test_manager_start_empty_contract_clears_leftover_teardown_ran(tmp_path: Path):
+    """Ticket #126: the no-op "ready" start path never reaches
+    _lifecycle_start, so it needs its own reset of a leftover
+    teardown_ran=True marker (e.g. left by a prior remove() attempt) --
+    a restarted environment is a new logical lifecycle and must earn a
+    fresh teardown."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(teardown_ran=True)
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", start=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        result = mgr.start(record.id)
+
+    mock_start.assert_not_called()
+    assert result.status == "ready"
+    assert result.teardown_ran is False
+    assert mgr.state.get(record.id).teardown_ran is False
+
+
 def test_manager_start_no_contract_is_noop_ready(tmp_path: Path):
     """start() with a missing contract (implicit isolation:none) is a no-op ready start.
 
@@ -2768,6 +2792,272 @@ def test_manager_stop_without_pid_clears_stale_killed_pids(tmp_path: Path):
     assert stored.killed_pids == []
 
 
+# ---------------------------------------------------------------------------
+# Ticket #128: stop_hook_outcome -- contract/isolation diagnostics distinguish
+# an "isolation: none, nothing to stop by design" no-op from an ordinary
+# "role never started" no-op, both of which set the same
+# stop_attempt.outcome == STOP_ATTEMPT_NO_PROCESS_RECORDED.
+# ---------------------------------------------------------------------------
+
+
+def _write_contract(repo_root: Path, text: str) -> Path:
+    """Write a real on-disk `.seretos/worktree-setup.yml` under *repo_root*."""
+    contract_dir = repo_root / ".seretos"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = contract_dir / "worktree-setup.yml"
+    contract_path.write_text(text, encoding="utf-8")
+    return contract_path
+
+
+def test_manager_stop_isolation_none_no_op_is_distinguishable(tmp_path: Path):
+    """Ticket #128: a real on-disk `isolation: none` contract must set
+    stop_hook_outcome.no_op_reason == "isolation_none" on the no-op path --
+    distinct from an ordinary never-started role under a full-isolation
+    contract, which sets "no_process_recorded". _load_contract is
+    deliberately NOT patched here (unlike the older #110 no-op tests) so
+    that contract_path.exists() and the parsed contract can never diverge."""
+    from lib_python_worktree.core.state import STOP_NO_OP_ISOLATION_NONE, STOP_NO_OP_NO_PROCESS_RECORDED
+
+    mgr = _make_mgr_in_memory(tmp_path)
+
+    none_repo = tmp_path / "none-repo"
+    none_repo.mkdir()
+    _write_contract(none_repo, "version: 1\nisolation: none\n")
+    none_record = _make_wt_record(
+        wt_id="wt-isolation-none", repo_root=str(none_repo), status="ready"
+    )
+    mgr.state.add(none_record)
+
+    none_result = mgr.stop(none_record.id)
+
+    assert none_result.stop_hook_outcome is not None
+    assert none_result.stop_hook_outcome.no_op_reason == STOP_NO_OP_ISOLATION_NONE
+
+    full_repo = tmp_path / "full-repo"
+    full_repo.mkdir()
+    _write_contract(full_repo, "version: 1\nisolation: full\nstop: []\n")
+    full_record = _make_wt_record(
+        wt_id="wt-isolation-full", repo_root=str(full_repo), status="ready"
+    )
+    mgr.state.add(full_record)
+
+    full_result = mgr.stop(full_record.id)
+
+    assert full_result.stop_hook_outcome is not None
+    assert full_result.stop_hook_outcome.no_op_reason == STOP_NO_OP_NO_PROCESS_RECORDED
+
+
+def test_manager_stop_reports_contract_diagnostics(tmp_path: Path):
+    """Ticket #128: stop_hook_outcome carries contract_found/contract_path/
+    contract_isolation from a real on-disk isolation: full contract with a
+    stop: step. SetupRunner is patched so the (fake) step never actually
+    spawns a subprocess."""
+    repo_root = tmp_path / "diag-repo"
+    repo_root.mkdir()
+    contract_path = _write_contract(
+        repo_root,
+        "version: 1\nisolation: full\nstop:\n  - run: echo bye\n",
+    )
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-diag", repo_root=str(repo_root), status="ready"
+    )
+    mgr.state.add(record)
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.return_value = SetupResult(worktree_id=record.id)
+
+    with patch(
+        "lib_python_worktree.setup.runner.SetupRunner",
+        return_value=mock_runner_instance,
+    ):
+        result = mgr.stop(record.id)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is True
+    assert result.stop_hook_outcome.contract_path == contract_path.as_posix()
+    assert result.stop_hook_outcome.contract_isolation == "full"
+
+
+def test_manager_stop_reports_stop_steps_run(tmp_path: Path):
+    """Ticket #128: stop_hook_outcome.steps_run reflects the number of
+    stop: steps SetupRunner.run() actually ran, with status "completed"."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(status="ready")
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        stop=[Step(run="one"), Step(run="two")],
+    )
+
+    fake_result = SetupResult(
+        worktree_id=record.id,
+        steps=[
+            SetupStepResult(index=0, name="one", returncode=0, log_path=tmp_path / "a.log"),
+            SetupStepResult(index=1, name="two", returncode=0, log_path=tmp_path / "b.log"),
+        ],
+    )
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.return_value = fake_result
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+    ):
+        result = mgr.stop(record.id)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.steps_run == 2
+    assert result.stop_hook_outcome.status == "completed"
+
+
+def test_manager_stop_reports_skipped_when_no_stop_steps(tmp_path: Path):
+    """Sibling of the steps_run test above: an empty stop: list must report
+    status="skipped" and steps_run == 0."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(status="ready")
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract):
+        result = mgr.stop(record.id)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.steps_run == 0
+    assert result.stop_hook_outcome.status == "skipped"
+
+
+def test_manager_stop_reports_failed_when_setup_runner_raises(tmp_path: Path):
+    """Sibling of the steps_run test above: SetupRunner.run() raising
+    SetupFailedError must report status="failed", steps_run == 0, and
+    message == str(exc) -- and stop() must still complete normally (the
+    no-op branch must still be reached, exactly as before this ticket)."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(status="ready")  # no pids -> no-op branch
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1, isolation="full", stop=[Step(run="will fail")]
+    )
+    exc = SetupFailedError(
+        worktree_id=record.id,
+        step_index=0,
+        step_name="will fail",
+        log_path=tmp_path / "fail.log",
+        returncode=1,
+    )
+
+    mock_runner_instance = MagicMock()
+    mock_runner_instance.run.side_effect = exc
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.setup.runner.SetupRunner", return_value=mock_runner_instance),
+    ):
+        result = mgr.stop(record.id)  # must not raise
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "failed"
+    assert result.stop_hook_outcome.steps_run == 0
+    assert result.stop_hook_outcome.message == str(exc)
+    # The no-op branch was still reached -- stop_attempt was still set.
+    assert result.stop_attempt is not None
+    assert result.stop_attempt.outcome == "no_process_recorded"
+
+
+def test_manager_stop_with_pid_still_reports_contract_diagnostics(tmp_path: Path):
+    """Ticket #128: on the delegated (has-a-pid) path, stop_hook_outcome
+    must be assigned onto the object _lifecycle_stop returns -- NOT onto
+    the pre-call `record` reference, which may be stale for
+    YamlStateStore. Simulated here by having the patched _lifecycle_stop
+    return a different, freshly-constructed WorktreeRecord object."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(pids={"main": 12345})
+    mgr.state.add(record)
+
+    fresh_record = _make_wt_record(pids={"main": 12345})
+    assert fresh_record is not record
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        patch("lib_python_worktree.core.manager._lifecycle_stop", return_value=fresh_record) as mock_lc_stop,
+    ):
+        result = mgr.stop(record.id)
+
+    mock_lc_stop.assert_called_once()
+    assert result is fresh_record
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.no_op_reason is None
+
+
+def test_manager_stop_no_contract_file_reports_implicit_isolation_none(tmp_path: Path):
+    """No `.seretos/worktree-setup.yml` at all -> contract_found is False,
+    but the loader's implicit isolation: none contract still makes this
+    no-op distinguishable as "isolation_none"."""
+    from lib_python_worktree.core.state import STOP_NO_OP_ISOLATION_NONE
+
+    repo_root = tmp_path / "no-contract-repo"
+    repo_root.mkdir()
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-no-contract", repo_root=str(repo_root), status="ready"
+    )
+    mgr.state.add(record)
+
+    result = mgr.stop(record.id)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is False
+    assert result.stop_hook_outcome.no_op_reason == STOP_NO_OP_ISOLATION_NONE
+
+
+def test_manager_stop_unparseable_contract_reports_failed_no_isolation(tmp_path: Path):
+    """A `.seretos/worktree-setup.yml` that exists but fails to parse must
+    report contract_found is True, contract_isolation is None,
+    status="failed", and stop() must not raise."""
+    repo_root = tmp_path / "bad-contract-repo"
+    repo_root.mkdir()
+    _write_contract(repo_root, "{not: valid: yaml: [")
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-bad-contract", repo_root=str(repo_root), status="ready"
+    )
+    mgr.state.add(record)
+
+    result = mgr.stop(record.id)  # must not raise
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is True
+    assert result.stop_hook_outcome.contract_isolation is None
+    assert result.stop_hook_outcome.status == "failed"
+
+
+def test_manager_stop_nonexistent_repo_root_reports_contract_not_found(tmp_path: Path):
+    """record.repo_root pointing at a directory that doesn't exist on disk
+    at all -> contract_found is False, and stop() must not raise."""
+    missing_repo_root = tmp_path / "does-not-exist-at-all"
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-missing-repo-root", repo_root=str(missing_repo_root), status="ready"
+    )
+    mgr.state.add(record)
+
+    result = mgr.stop(record.id)  # must not raise
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is False
+
+
 class TestManagerStopStickyStatus:
     """R6 (ticket #95): the no-pid-for-role no-op path in ``WorktreeManager.stop``
     must not clobber a sticky honest status.
@@ -3536,7 +3826,11 @@ def test_create_never_calls_seed_when_cli_unavailable(
 # Ticket #46: WorktreeManager.run_seed_postprocess()
 # ---------------------------------------------------------------------------
 
-from lib_python_worktree.setup.runner import SetupFailedError, SetupResult  # noqa: E402
+from lib_python_worktree.setup.runner import (  # noqa: E402
+    SetupFailedError,
+    SetupResult,
+    SetupStepResult,
+)
 
 
 def test_manager_run_seed_postprocess_unknown_worktree_raises_not_found(tmp_path: Path):

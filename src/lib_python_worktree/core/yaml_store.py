@@ -327,6 +327,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "variants": dict(rec.variants),
         "stop_detail": _stop_detail_to_dict(rec.stop_detail),
         "setup_outcome": _setup_outcome_to_dict(rec.setup_outcome),
+        "teardown_ran": rec.teardown_ran,
     }
 
 
@@ -355,6 +356,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         variants=dict(d.get("variants") or {}),
         stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
         setup_outcome=_setup_outcome_from_dict(d.get("setup_outcome")),
+        teardown_ran=bool(d.get("teardown_ran", False)),
     )
 
 

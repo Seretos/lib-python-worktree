@@ -147,6 +147,17 @@ root. A missing file or an empty file is treated as an implicit
 When `isolation` is `none`, the `setup`, `teardown`, and `ports` fields must
 all be absent or empty. Providing any of them raises `ContractValidationError`.
 
+Both `start()` and `stop()` succeed silently under `isolation: none` — there
+is no `error` field and no exception: `start()` returns a no-op `"ready"`
+record (there is no `start:` step to run), and `stop()` returns a no-op
+`"stopped"` record (there is no `stop:` step to run, and the schema forbids
+one under `isolation: none` in the first place). On the `stop()` side, a
+caller distinguishes this "nothing to stop, by design" case from an ordinary
+never-started role via `record.stop_hook_outcome.no_op_reason ==
+"isolation_none"` — see "Stop hook outcome and `stop_hook_outcome`" below.
+`start()` has no analogous diagnostic field today — its `isolation: none`
+no-op is not currently distinguishable from any other no-op `"ready"` start.
+
 ### Example
 
 ```yaml
@@ -202,7 +213,7 @@ and `record.status` fields, and recovered differently:
 | Flavour | `tracked` | `record.status` | Recover with |
 |---------|-----------|------------------|---------------|
 | A — untracked but on disk | `False` | `"created"` | `remove(checkout_path=...)` or `adopt()` |
-| B — tracked but deregistered outside this tool | `True` | `"orphaned"` | `remove(worktree_id=...)` |
+| B — tracked but deregistered outside this tool | `True` | `"orphaned"` | `remove(worktree_id=...)` — no `force` needed |
 
 #### Flavour A — untracked but on disk
 
@@ -250,8 +261,19 @@ orphan = next(
     e for e in listing.entries
     if e.tracked and e.record.status == "orphaned"
 )
-manager.remove(orphan.record.id, force=True)
+manager.remove(orphan.record.id)
 ```
+
+`force=True` is **not** required here (ticket #127): when the checkout
+directory is already gone, `remove()` treats the leftover git registration
+as already torn down, releases the reserved ports, and deletes the state
+record without it. If the record's branch was created by this tool
+(`branch_created_by_us=True`) and turns out to be unmerged, that no longer
+blocks the removal either — the branch is left in place and a warning is
+logged naming it and the manual `git branch -D <branch>` remedy, while
+`remove()` still returns `status="removed"`. `force=True` still works as
+before and still removes despite uncommitted changes on a checkout that
+does exist.
 
 The discriminator is `record.status` — there is no dedicated boolean field
 on `EnvironmentEntry` for this. `record.path` for such an entry may not
@@ -662,6 +684,31 @@ every later lifecycle call and cannot distinguish "setup never ran" from
 `status="stopped"`. `setup_outcome` is persisted to `state.yaml` (mirrors
 `stop_detail`, unlike the transient `killed_pids`/`shadowed_contract`) — a
 legacy record with no `setup_outcome` key deserialises to `None`.
+
+### Stop hook outcome and `stop_hook_outcome`
+
+Every `stop()` call sets a transient `stop_hook_outcome` (a `StopHookOutcome`)
+on the returned `WorktreeRecord`, describing whether/how the contract's
+`stop:` hook ran and the contract diagnostics behind that verdict:
+
+| Field | Meaning |
+|---|---|
+| `status` | One of `"completed"`/`"failed"`/`"skipped"` — reuses the same vocabulary as `setup_outcome.status` rather than minting a new one. `"failed"` covers both a `stop:` step raising and the contract itself failing to load/parse. |
+| `message` | `str()` of the exception for `"failed"`; a short summary otherwise. |
+| `steps_run` | The number of `stop:` steps that actually ran (`0` for `"skipped"`/`"failed"`). |
+| `contract_found` | Whether `<repo_root>/.seretos/worktree-setup.yml` exists on disk, checked independently of the parse attempt so a filesystem error on one check can never mask the other. |
+| `contract_path` | The forward-slash contract path that was probed, regardless of whether it was found. |
+| `contract_isolation` | The loaded contract's `isolation` value, or `None` when the contract could not be loaded/parsed. |
+| `no_op_reason` | Set only on `stop()`'s no-op branch (the resolved role has no recorded pid): `"isolation_none"` when `contract_isolation == "none"`, else `"no_process_recorded"`. `None` whenever the call was not a no-op. |
+
+This is what lets a caller tell an `isolation: none` "nothing to stop, by
+design" no-op apart from an ordinary "role never started" no-op — both
+otherwise set the identical `stop_attempt.outcome == "no_process_recorded"`
+on the record's `stop_attempt` (a `StopAttempt`, answering the narrower,
+tracked-PID-only question of what `stop()` found at the tracked PID itself).
+`stop_hook_outcome` is deliberately **transient**, exactly like
+`stop_attempt`: recomputed on every `stop()` call and **not** persisted to
+`state.yaml`.
 
 ## Release
 
