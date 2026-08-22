@@ -9,6 +9,8 @@ caller; ``stop`` terminates it and clears the PID.
 
 from __future__ import annotations
 
+import base64
+import dataclasses
 import logging
 import os
 import signal
@@ -55,6 +57,7 @@ from lib_python_worktree.core.process_lifecycle import (
     stop,
 )
 from lib_python_worktree.core.manager import WorktreeNotFoundError
+from lib_python_worktree.setup.runner import _build_step_command
 from lib_python_worktree.core.state import (
     STOP_ATTEMPT_ALREADY_EXITED,
     STOP_ATTEMPT_KILLED,
@@ -6187,6 +6190,297 @@ class TestKilledPidsIdentifiability:
             "AND cmdline) over one with fewer (name only), not just "
             "any-metadata-vs-none"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestEncodedCommandDecoding -- ticket #132
+# ---------------------------------------------------------------------------
+
+def _psh_argv(*trailing: str) -> List[str]:
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", *trailing]
+
+
+def _encoded_command_malformed_cases():
+    """Build the (case_id, cmdline) pairs for the never-raises degrade test.
+
+    Computed at collection time (module import), not inside the test body,
+    so pytest can use case_id as the parametrized test id.
+    """
+    odd_byte_blob = base64.b64encode(b"a").decode("ascii")  # decodes to 1 byte
+    lone_surrogate_blob = base64.b64encode(bytes([0x00, 0xDC])).decode("ascii")
+    control_char_blob = base64.b64encode(
+        "abc\x01def".encode("utf-16-le")
+    ).decode("ascii")
+    valid_blob = base64.b64encode("Get-Process".encode("utf-16-le")).decode("ascii")
+
+    return [
+        ("invalid_base64", _psh_argv("-EncodedCommand", "not-@@valid-base64!!")),
+        ("odd_byte_count", _psh_argv("-EncodedCommand", odd_byte_blob)),
+        ("non_utf16le_binary", _psh_argv("-EncodedCommand", lone_surrogate_blob)),
+        ("embedded_control_char", _psh_argv("-EncodedCommand", control_char_blob)),
+        ("encodedcommand_no_payload", _psh_argv("-EncodedCommand")),
+        ("not_powershell_interpreter", ["node", "-EncodedCommand", valid_blob]),
+        ("empty_cmdline", []),
+        ("single_token_cmdline", ["powershell.exe"]),
+    ]
+
+
+class TestEncodedCommandDecoding:
+    """Ticket #132: killed_pids[].cmdline should be human-readable when the
+    killed process was launched through this library's own #109
+    PowerShell/pwsh -EncodedCommand transport, while the raw argv this
+    library actually observed is preserved in cmdline_raw."""
+
+    # -- Behaviour 1: an encoded argv is reported as readable text, with
+    #    the original preserved. --------------------------------------------
+
+    def test_killed_process_info_decodes_encoded_command(self):
+        run_line = "npm run dev --prefix C:\\wt\\app"
+        argv = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line,
+        )
+
+        info = KilledProcessInfo(pid=1, name="powershell.exe", cmdline=argv)
+
+        assert run_line in info.cmdline
+        assert not any(_looks_like_base64_blob(tok) for tok in info.cmdline)
+        assert info.cmdline_raw == argv
+
+    def test_killed_process_info_no_substitution_for_plain_argv(self):
+        info = KilledProcessInfo(pid=1, name="node", cmdline=["node", "server.js"])
+
+        assert info.cmdline == ["node", "server.js"]
+        assert info.cmdline_raw is None
+
+    def test_decodes_multiline_run_line_with_crlf(self):
+        run_line = "Write-Host 'a'\r\nWrite-Host 'b'"
+        argv = _build_step_command(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command"], run_line,
+        )
+
+        info = KilledProcessInfo(pid=2, name="pwsh", cmdline=argv)
+
+        assert run_line in info.cmdline
+        assert info.cmdline_raw == argv
+
+    def test_decodes_non_ascii_run_line(self):
+        run_line = "Write-Host 'äöü'"
+        argv = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line,
+        )
+
+        info = KilledProcessInfo(pid=3, name="powershell.exe", cmdline=argv)
+
+        assert run_line in info.cmdline
+        assert info.cmdline_raw == argv
+
+    @pytest.mark.parametrize("flag", ["-enc", "-EC", "-e", "/EncodedCommand"])
+    def test_decodes_encodedcommand_flag_variants(self, flag):
+        run_line = "Get-Process"
+        blob = base64.b64encode(run_line.encode("utf-16-le")).decode("ascii")
+        argv = ["powershell.exe", "-NoProfile", flag, blob]
+
+        info = KilledProcessInfo(pid=4, name="powershell.exe", cmdline=argv)
+
+        assert run_line in info.cmdline
+        assert info.cmdline_raw == argv
+
+    def test_decodes_two_encodedcommand_occurrences(self):
+        run_line_a = "Get-Process"
+        run_line_b = "Get-Service"
+        blob_a = base64.b64encode(run_line_a.encode("utf-16-le")).decode("ascii")
+        blob_b = base64.b64encode(run_line_b.encode("utf-16-le")).decode("ascii")
+        argv = [
+            "powershell.exe",
+            "-EncodedCommand", blob_a,
+            "-EncodedCommand", blob_b,
+        ]
+
+        info = KilledProcessInfo(pid=5, name="powershell.exe", cmdline=argv)
+
+        assert run_line_a in info.cmdline
+        assert run_line_b in info.cmdline
+        assert blob_a not in info.cmdline
+        assert blob_b not in info.cmdline
+        assert info.cmdline_raw == argv
+
+    def test_idempotent_on_already_decoded_argv(self):
+        run_line = "Get-Process"
+        argv = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line,
+        )
+        once = KilledProcessInfo(pid=6, name="powershell.exe", cmdline=argv)
+
+        twice = KilledProcessInfo(
+            pid=6, name="powershell.exe", cmdline=list(once.cmdline),
+        )
+
+        assert twice.cmdline == once.cmdline
+        assert twice.cmdline_raw is None
+
+    # -- Behaviour 2: the decode reaches every killed_pids population path. -
+
+    def test_stop_killed_pids_decodes_encoded_command_for_every_source(self):
+        run_line_tree = "npm run dev"
+        run_line_tracked = "node server.js --watch"
+        run_line_orphan = "python worker.py"
+        run_line_group = "Get-ChildItem"
+        run_line_job = "Get-Process"
+
+        argv_tree = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line_tree,
+        )
+        argv_tracked = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line_tracked,
+        )
+        argv_orphan = _build_step_command(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command"], run_line_orphan,
+        )
+        argv_group = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line_group,
+        )
+        argv_job = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line_job,
+        )
+
+        fake_pid = 93000
+        tree_pid = 93001
+        group_only_pid = 93002
+        job_only_pid = 93003
+        orphan_pid = 93004
+
+        tree_entry = KilledProcessInfo(
+            pid=tree_pid, name="powershell.exe", cmdline=argv_tree, source="tree",
+        )
+        orphan_entry = KilledProcessInfo(
+            pid=orphan_pid, name="pwsh", cmdline=argv_orphan, source="orphan_scan",
+        )
+
+        record = _make_record(
+            "wt-source-all-decoded",
+            pids={DEFAULT_ROLE: fake_pid},
+            job_names={DEFAULT_ROLE: "Local\\fake-job-all"},
+        )
+        store = _make_store(record)
+
+        def _fake_describe(pid):
+            if pid == fake_pid:
+                return ("powershell.exe", argv_tracked)
+            if pid == group_only_pid:
+                return ("powershell.exe", argv_group)
+            if pid == job_only_pid:
+                return ("powershell.exe", argv_job)
+            return ("", [])
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[tree_entry],
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[group_only_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=12345,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=_pl._PartialList([job_only_pid]),
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._terminate_job_object"),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._describe_pid",
+                side_effect=_fake_describe,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([orphan_entry]),
+            ),
+        ):
+            result = stop(
+                "wt-source-all-decoded", store=store, kill_orphans=True, timeout=1.0,
+            )
+
+        by_pid = {info.pid: info for info in result.killed_pids}
+        assert set(by_pid) == {
+            tree_pid, fake_pid, group_only_pid, job_only_pid, orphan_pid,
+        }
+
+        assert run_line_tree in by_pid[tree_pid].cmdline
+        assert by_pid[tree_pid].source == "tree"
+
+        assert run_line_tracked in by_pid[fake_pid].cmdline
+        assert by_pid[fake_pid].source == "tracked"
+
+        assert run_line_group in by_pid[group_only_pid].cmdline
+        assert by_pid[group_only_pid].source == "process_group"
+
+        assert run_line_job in by_pid[job_only_pid].cmdline
+        assert by_pid[job_only_pid].source == "job_object"
+
+        assert run_line_orphan in by_pid[orphan_pid].cmdline
+        assert by_pid[orphan_pid].source == "orphan_scan"
+
+    # -- Behaviour 3: malformed/foreign input degrades silently. ------------
+
+    @pytest.mark.parametrize(
+        "case_id,cmdline", _encoded_command_malformed_cases(),
+        ids=[c[0] for c in _encoded_command_malformed_cases()],
+    )
+    def test_encoded_command_decode_degrades_silently(self, case_id, cmdline):
+        original = list(cmdline)
+
+        info = KilledProcessInfo(pid=99, name="x", cmdline=list(cmdline))
+
+        assert info.cmdline == original
+        assert info.cmdline_raw is None
+
+    # -- Behaviour 4: cmdline_raw cannot be forged or leak stale via
+    #    dataclasses.replace(). ----------------------------------------------
+
+    def test_replace_does_not_leak_stale_cmdline_raw(self):
+        run_line = "Get-Process"
+        argv = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line,
+        )
+        info = KilledProcessInfo(pid=7, name="powershell.exe", cmdline=argv)
+        assert info.cmdline_raw == argv  # sanity: populated on the original
+
+        replaced = dataclasses.replace(info, cmdline=["node", "server.js"])
+
+        assert replaced.cmdline == ["node", "server.js"]
+        assert replaced.cmdline_raw is None
+
+
+def _looks_like_base64_blob(token: str) -> bool:
+    """Heuristic for the test above: a long token drawn only from the
+    base64 alphabet, the shape _build_step_command's blob always has."""
+    if len(token) < 32:
+        return False
+    alphabet = set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+    )
+    return all(ch in alphabet for ch in token)
 
 
 # ---------------------------------------------------------------------------
