@@ -2182,6 +2182,407 @@ class TestTeardownContractStopSteps:
 
 
 # ---------------------------------------------------------------------------
+# TestTicket130TeardownStopHookOutcome -- ticket #130
+#
+# Behavioural requirement: _teardown() must compute a StopHookOutcome for
+# its own best-effort Step 1b (contract stop: hook) run, exactly like
+# WorktreeManager.stop() already does for its own delegated/no-op paths,
+# and assign it onto record.stop_hook_outcome BEFORE any later gate
+# (Gate A / Gate B) can raise. Before this ticket, Step 1b's outcome was
+# discarded via a bare `except Exception: pass`, so a force-removed,
+# still-running environment always reported stop_hook_outcome: null.
+# ---------------------------------------------------------------------------
+
+class TestTicket130TeardownStopHookOutcome:
+    def test_completed_stop_hook_reports_full_diagnostics(self, tmp_path, caplog):
+        """Driving test: a contract with stop: steps that run successfully
+        must leave record.stop_hook_outcome.status == "completed", with
+        steps_run/message/contract diagnostics matching stop()'s own
+        vocabulary, and no_op_reason always None on the teardown path."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.setup.runner import SetupResult, SetupStepResult
+
+        manager = _make_manager(tmp_path)
+        repo_root = tmp_path / "repo-130-completed"
+        repo_root.mkdir()
+        # A real on-disk contract file so contract_found's independent
+        # filesystem probe (contract_path.exists()) agrees with the mocked
+        # _load_contract() below -- the two must never diverge in this test.
+        contract_dir = repo_root / ".seretos"
+        contract_dir.mkdir()
+        (contract_dir / "worktree-setup.yml").write_text(
+            "version: 1\nisolation: full\nstop:\n  - run: one\n  - run: two\n",
+            encoding="utf-8",
+        )
+        record = _make_record(
+            "wt-130-completed",
+            path="/fake/store/wt-130-completed",
+            repo_root=str(repo_root),
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            stop=[Step(run="one"), Step(run="two")],
+        )
+        fake_result = SetupResult(
+            worktree_id=record.id,
+            steps=[
+                SetupStepResult(index=0, name="one", returncode=0, log_path=tmp_path / "a.log"),
+                SetupStepResult(index=1, name="two", returncode=0, log_path=tmp_path / "b.log"),
+            ],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.return_value = fake_result
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+
+        outcome = record.stop_hook_outcome
+        assert outcome is not None
+        assert outcome.status == "completed"
+        assert outcome.steps_run == 2
+        assert outcome.message == "stop: completed 2 step(s)"
+        assert outcome.contract_found is True
+        expected_path = (repo_root / ".seretos" / "worktree-setup.yml").as_posix()
+        assert outcome.contract_path == expected_path
+        assert outcome.contract_isolation == "full"
+        assert outcome.no_op_reason is None
+        # Ticket #130 scope decision: stop_attempt is intentionally NOT
+        # recomputed by _teardown() -- StopAttempt is single-valued but
+        # Step 1 above stops every role in a loop, so there is no
+        # non-arbitrary single attempt to report. This is a documented
+        # scope boundary, not a gap.
+        assert record.stop_attempt is None
+
+    def test_completed_stop_hook_reports_diagnostics_on_non_force_removal_too(
+        self, tmp_path
+    ):
+        """Sibling of the driving test: force=False must populate
+        stop_hook_outcome exactly the same way -- Step 1b runs on both
+        force=True and force=False."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.setup.runner import SetupResult, SetupStepResult
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-130-completed-noforce", path="/fake/store/wt-130-completed-noforce"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="one")]
+        )
+        fake_result = SetupResult(
+            worktree_id=record.id,
+            steps=[SetupStepResult(index=0, name="one", returncode=0, log_path=tmp_path / "a.log")],
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.return_value = fake_result
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert record.stop_hook_outcome is not None
+        assert record.stop_hook_outcome.status == "completed"
+        assert record.stop_hook_outcome.steps_run == 1
+
+    def test_empty_stop_steps_reports_skipped(self, tmp_path):
+        """Contract loads fine but has no stop: steps -> status="skipped",
+        steps_run == 0, matching stop()'s own "no stop: steps" message."""
+        from lib_python_worktree.contract.schema import WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-130-skipped", path="/fake/store/wt-130-skipped")
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        mock_lifecycle = MagicMock()
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        outcome = record.stop_hook_outcome
+        assert outcome is not None
+        assert outcome.status == "skipped"
+        assert outcome.steps_run == 0
+        assert outcome.message == "no stop: steps in contract"
+
+    def test_missing_contract_file_reports_not_found_and_implicit_isolation_none(
+        self, tmp_path
+    ):
+        """No .seretos/worktree-setup.yml at all on a real repo_root ->
+        contract_found is False, but the loader's implicit isolation: none
+        contract still makes contract_isolation == "none" (real _load_contract,
+        not mocked, so contract_found and the parsed isolation can never
+        diverge -- mirrors test_manager.py's #128 no-contract-file test)."""
+        manager = _make_manager(tmp_path)
+        repo_root = tmp_path / "repo-130-no-contract"
+        repo_root.mkdir()
+        record = _make_record(
+            "wt-130-no-contract",
+            path="/fake/store/wt-130-no-contract",
+            repo_root=str(repo_root),
+        )
+        manager.state.add(record)
+
+        mock_lifecycle = MagicMock()
+        with patch("lib_python_worktree.core.manager._run_git") as mock_git:
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        outcome = record.stop_hook_outcome
+        assert outcome is not None
+        assert outcome.contract_found is False
+        assert outcome.contract_isolation == "none"
+        assert outcome.status == "skipped"
+
+    def test_contract_exists_check_oserror_reports_not_found(self, tmp_path):
+        """contract_path.exists() raising OSError on the independent
+        contract_found probe -> contract_found is False, and _teardown()
+        must not raise from that probe itself. _run_git is mocked (no real
+        git subprocess spawned), so patching Path.exists here cannot
+        interfere with subprocess.Popen the way it would in a real-git
+        integration test."""
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        repo_root = tmp_path / "repo-130-exists-oserror"
+        repo_root.mkdir()
+        record = _make_record(
+            "wt-130-exists-oserror",
+            path="/fake/store/wt-130-exists-oserror",
+            repo_root=str(repo_root),
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="one")]
+        )
+        contract_file = repo_root / ".seretos" / "worktree-setup.yml"
+        real_exists = Path.exists
+
+        def _flaky_exists(self, *a, **kw):
+            if self == contract_file:
+                raise OSError("boom")
+            return real_exists(self, *a, **kw)
+
+        mock_lifecycle = MagicMock()
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("pathlib.Path.exists", new=_flaky_exists),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            # Must not raise despite the contract_found probe raising OSError.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert record.stop_hook_outcome is not None
+        assert record.stop_hook_outcome.contract_found is False
+
+    def test_load_contract_raising_reports_failed(self, tmp_path, caplog):
+        """_load_contract() raising (unparseable contract) -> status="failed",
+        steps_run == 0, message == str(exc), and _teardown() must still
+        complete normally (no exception propagates from the hook itself).
+        Also asserts the new warning names the worktree id and the failure
+        message."""
+        import logging
+
+        manager = _make_manager(tmp_path)
+        record = _make_record("wt-130-load-fail", path="/fake/store/wt-130-load-fail")
+        manager.state.add(record)
+
+        exc = ValueError("contract is not valid yaml")
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch("lib_python_worktree.core.manager._load_contract", side_effect=exc),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            caplog.at_level(logging.WARNING, logger="lib_python_worktree.core.manager"),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            # Must not raise despite the contract failing to load.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        outcome = record.stop_hook_outcome
+        assert outcome is not None
+        assert outcome.status == "failed"
+        assert outcome.steps_run == 0
+        assert outcome.message == str(exc)
+        assert outcome.contract_isolation is None
+
+        assert any(
+            record.id in rec.message and str(exc) in rec.message
+            for rec in caplog.records
+        ), "expected a warning naming the worktree id and the failure message"
+
+    def test_setup_runner_raising_reports_failed_and_warns(self, tmp_path, caplog):
+        """Sibling of test_stop_steps_swallow_runner_exception in
+        TestTeardownContractStopSteps: SetupRunner.run() raising must still
+        report status="failed"/steps_run == 0/message == str(exc), AND
+        (new for #130) emit a warning naming the worktree id and message."""
+        import logging
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+        from lib_python_worktree.setup.runner import SetupFailedError
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-130-runner-fail", path="/fake/store/wt-130-runner-fail"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="exit 1", name="boom")]
+        )
+        exc = SetupFailedError(
+            worktree_id=record.id,
+            step_index=0,
+            step_name="boom",
+            log_path=tmp_path / "fail.log",
+            returncode=1,
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = exc
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            caplog.at_level(logging.WARNING, logger="lib_python_worktree.core.manager"),
+        ):
+            mock_git.return_value = MagicMock(returncode=0, stderr="")
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        outcome = record.stop_hook_outcome
+        assert outcome is not None
+        assert outcome.status == "failed"
+        assert outcome.steps_run == 0
+        assert outcome.message == str(exc)
+
+        assert any(
+            record.id in rec.message and str(exc) in rec.message
+            for rec in caplog.records
+        ), "expected a warning naming the worktree id and the failure message"
+
+    def test_hook_failure_does_not_mask_later_gate_error(self, tmp_path):
+        """When Step 1b's hook fails AND a later gate subsequently raises
+        WorktreeDirLockedError, the raised exception must be unchanged
+        (same type as before this ticket's change), but
+        record.stop_hook_outcome must still be populated on the
+        in-place-mutated record -- proving the outcome assignment happens
+        before that gate, not only on a clean-exit path. Reuses the exact
+        lock-signal-then-permission-denied recipe from
+        test_benign_dirt_retry_lock_signal_flag_off_raises_dir_locked
+        (proven to reach the Final guard's WorktreeDirLockedError), adding
+        a contract stop: step whose runner raises."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.contract.schema import Step, WorktreeContract
+
+        manager = _make_manager(tmp_path)
+        record = _make_record(
+            "wt-130-gate-after-hook-fail", path="/fake/store/wt-130-gate-after-hook-fail"
+        )
+        manager.state.add(record)
+
+        fake_contract = WorktreeContract(
+            version=1, isolation="full", stop=[Step(run="boom")]
+        )
+
+        mock_runner_instance = MagicMock()
+        mock_runner_instance.run.side_effect = RuntimeError("stop hook exploded")
+
+        mock_lifecycle = MagicMock()
+
+        def _side_effect(args, cwd=None, **kwargs):
+            if _is_plain_remove_call(args):
+                return MagicMock(returncode=128, stderr=_DIRTY_STDERR)
+            if _is_status_call(args):
+                return MagicMock(returncode=0, stdout="?? .seretos/\0", stderr="")
+            if _is_force_remove_call(args):
+                return MagicMock(returncode=255, stderr="Permission denied")
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+            patch(
+                "lib_python_worktree.setup.runner.SetupRunner",
+                return_value=mock_runner_instance,
+            ),
+            patch(
+                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+            ),
+            patch(
+                "lib_python_worktree.core.manager._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.manager.shutil"),
+        ):
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        mock_kill.assert_not_called()
+
+        # The hook failure must still be recorded despite the later raise.
+        assert record.stop_hook_outcome is not None
+        assert record.stop_hook_outcome.status == "failed"
+        assert record.stop_hook_outcome.message == "stop hook exploded"
+
+
+# ---------------------------------------------------------------------------
 # TestKillBlockingProcessesWindowsInvalidArg -- ticket #31 gap 2
 # ---------------------------------------------------------------------------
 
