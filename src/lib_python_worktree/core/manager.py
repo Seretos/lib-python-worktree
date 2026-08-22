@@ -20,9 +20,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import portalocker
+
+if TYPE_CHECKING:
+    from ..contract.schema import Step
 
 # `subprocess` is kept for CompletedProcess / DEVNULL references inside this
 # module even though _run_git now lives in _git_utils.
@@ -850,6 +853,37 @@ def _build_worktree_env(
     return env
 
 
+def _available_variants(steps: "List[Step]") -> "List[str]":
+    """Compute the variant strings that WOULD resolve against ``start()``'s
+    step-selection block (the tiers at the "Step selection" comment inside
+    ``WorktreeManager.start()``, around lines 1601-1622; ticket #131).
+
+    Returns every explicitly-set step ``name`` (tier 1, in contract order)
+    plus the literal ``"default"`` when either fallback tier is reachable:
+    tier 2 (exactly one step has ``name is None``) or tier 3 (the contract
+    has exactly one ``start:`` step total -- ticket #112). Order-preserving
+    de-dup, so a step explicitly named ``"default"`` is never listed twice.
+
+    This mirrors the selection tiers for *reporting* purposes only -- it is
+    read-only introspection and does not own or alter the real selection
+    logic in ``start()``.
+    """
+    unnamed_steps = [s for s in steps if s.name is None]
+    default_reachable = len(unnamed_steps) == 1 or len(steps) == 1
+
+    candidates = [s.name for s in steps if s.name]
+    if default_reachable:
+        candidates.append("default")
+
+    seen: "set[str]" = set()
+    available: "List[str]" = []
+    for name in candidates:
+        if name not in seen:
+            seen.add(name)
+            available.append(name)
+    return available
+
+
 class WorktreeManager:
     """High-level facade used by the FastMCP tools.
 
@@ -1444,8 +1478,12 @@ class WorktreeManager:
           named step, e.g. ``name: "main"``, works out of the box without
           requiring ``variant="main"``).
         - If no matching step is found (multiple named and/or unnamed steps
-          with no exact match), ``UnknownVariantError`` is raised listing the
-          available named steps. ``UnknownVariantError`` is both a
+          with no exact match), ``UnknownVariantError`` is raised. Its
+          ``.available`` lists every variant string that WOULD have resolved
+          against this contract -- each step's own ``name`` (tier 1) plus the
+          literal ``"default"`` (ticket #131) when either fallback tier above
+          would have reached it, even though the specific *variant* passed to
+          this call didn't match. ``UnknownVariantError`` is both a
           ``WorktreeError`` and a ``ValueError``, so callers may catch either
           base.
 
@@ -1599,7 +1637,7 @@ class WorktreeManager:
             step = contract.start[0]
 
         if step is None:
-            available = [s.name for s in contract.start if s.name]
+            available = _available_variants(contract.start)
             raise UnknownVariantError(variant, available)
 
         from ..setup.runner import _build_step_command, _resolve_shell
