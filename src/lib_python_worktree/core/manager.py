@@ -1270,6 +1270,17 @@ class WorktreeManager:
         This non-fatal handling applies only when the checkout was actually
         absent; when the checkout is present, an unmerged owned branch still
         raises ``GitCommandError`` exactly as before.
+
+        Ticket #130: the returned record's ``stop_hook_outcome`` (a
+        ``state.StopHookOutcome``) now reports the outcome of the contract's
+        ``stop:`` hook that ``_teardown()`` runs best-effort at Step 1b --
+        including on a ``force=True`` removal of a still-running
+        environment, where it previously stayed ``None``. Set on both the
+        tracked and untracked (ticket #88) removal paths. ``no_op_reason``
+        is always ``None`` on this path (that field only distinguishes
+        ``stop()``'s own no-op branch), and ``stop_attempt`` stays whatever
+        an earlier ``stop()`` call left it as -- ``_teardown()`` does not
+        recompute it (see its own docstring for why).
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1306,6 +1317,12 @@ class WorktreeManager:
             # (the field is transient and not written to state.yaml), so we must
             # propagate it explicitly from the object _teardown mutated.
             removed.killed_pids = record.killed_pids
+            # Ticket #130: same transient-field rationale as killed_pids
+            # above -- stop_hook_outcome is not serialised to state.yaml, so
+            # the fresh object self.state.remove() returns never carries the
+            # verdict _teardown() computed and assigned onto the in-memory
+            # `record` a moment ago. Copy it forward explicitly.
+            removed.stop_hook_outcome = record.stop_hook_outcome
         else:
             removed = record
             removed.status = "removed"
@@ -2128,7 +2145,17 @@ class WorktreeManager:
         1. Stop any tracked processes (process lifecycle).
         1b. Run contract ``stop:`` steps via ``SetupRunner`` (best-effort,
             before any FS delete so that daemons with PID files can release
-            file handles gracefully).
+            file handles gracefully). Ticket #130: the outcome is captured
+            into ``record.stop_hook_outcome`` (a ``state.StopHookOutcome``,
+            same vocabulary ``WorktreeManager.stop()`` uses) immediately
+            after this step, before Gate A/B below -- a hook failure never
+            blocks teardown, but is now surfaced (and warn-logged) rather
+            than silently discarded. Scoped to ``stop_hook_outcome`` only:
+            ``record.stop_attempt`` is NOT recomputed here (it stays
+            whatever an earlier ``stop()`` call left it as) since Step 1
+            above stops every role in a loop and ``StopAttempt`` is
+            single-valued -- there is no non-arbitrary single attempt to
+            report.
         2a. Gate A: Windows-only confirmed-blocker pre-flight (see below).
         2b. Gate B: early dirty-tree refusal, only when contract ``teardown:``
             steps exist -- so a removal that cannot possibly succeed never
@@ -2254,11 +2281,27 @@ class WorktreeManager:
         # isolation:none with empty step lists) is silently treated as "no
         # contract", matching create()'s pre-existing swallow-everything
         # pattern.
+        # Ticket #130: contract_found is computed via its OWN independent
+        # try/except, mirroring stop()'s identical split -- a filesystem
+        # error on the .exists() check must never masquerade as (or mask) a
+        # contract parse outcome, or vice versa. contract_isolation and the
+        # load exception's message (previously discarded outright) are
+        # captured here too, both consumed by Step 1b below to build
+        # record.stop_hook_outcome.
+        contract_path = Path(record.repo_root) / CONTRACT_FILENAME
         try:
-            contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+            contract_found = contract_path.exists()
+        except OSError:
+            contract_found = False
+
+        contract_isolation: Optional[str] = None
+        _contract_load_error: Optional[str] = None
+        try:
             contract = _load_contract(contract_path)
-        except Exception:  # noqa: BLE001
+            contract_isolation = contract.isolation
+        except Exception as _contract_exc:  # noqa: BLE001
             contract = None
+            _contract_load_error = str(_contract_exc)
 
         # Step 1: stop any tracked processes before removing the worktree dir.
         if record.pids:
@@ -2274,20 +2317,63 @@ class WorktreeManager:
         # Step 1b: run contract stop: steps before FS deletion so that daemons
         # (e.g. Unity Editor) that write PID files / hold handles have a chance
         # to release them before git worktree remove is attempted.
-        if contract is not None and contract.stop:
+        #
+        # Ticket #130: also compute a StopHookOutcome describing whether/how
+        # the stop: hook ran, mirroring stop()'s own diagnostics block (see
+        # that method's docstring for the full status vocabulary). Deliber-
+        # ately scoped to stop_hook_outcome only -- stop_attempt is NOT
+        # computed here (by design: StopAttempt is single-valued but Step 1
+        # above stops every role in a loop, so there is no non-arbitrary
+        # single attempt to report; record.stop_attempt stays whatever an
+        # earlier stop() call left it as). no_op_reason is always None here
+        # -- that field is populated only by stop()'s own no-op branch.
+        stop_hook_status = SETUP_STATUS_SKIPPED
+        stop_hook_message = "no stop: steps in contract"
+        stop_hook_steps_run = 0
+        if _contract_load_error is not None:
+            stop_hook_status = SETUP_STATUS_FAILED
+            stop_hook_message = _contract_load_error
+        elif contract is not None and contract.stop:
             from ..setup.runner import SetupRunner
             runner = SetupRunner()
             try:
-                runner.run(
+                _stop_result = runner.run(
                     setup=contract.stop,
                     worktree_id=record.id,
                     worktree_path=Path(record.path),
                     branch=record.branch,
                     port_mapping=record.ports,
                 )
-            except Exception:  # noqa: BLE001
+                stop_hook_status = SETUP_STATUS_COMPLETED
+                stop_hook_steps_run = len(_stop_result.steps)
+                stop_hook_message = (
+                    f"stop: completed {stop_hook_steps_run} step(s)"
+                )
+            except Exception as _stop_exc:  # noqa: BLE001
                 # A stop-step failure must not block the rest of teardown.
-                pass
+                stop_hook_status = SETUP_STATUS_FAILED
+                stop_hook_message = str(_stop_exc)
+
+        if stop_hook_status == SETUP_STATUS_FAILED:
+            _logger.warning(
+                "_teardown: worktree '%s' contract stop: hook failed "
+                "(non-blocking): %s",
+                record.id,
+                stop_hook_message,
+            )
+
+        # Set before Gate A/B below: both can raise, and _teardown mutates
+        # `record` in place, so a caller holding the reference must still
+        # see the outcome even when a later gate raises out of this call.
+        record.stop_hook_outcome = StopHookOutcome(
+            status=stop_hook_status,
+            message=stop_hook_message,
+            steps_run=stop_hook_steps_run,
+            contract_found=contract_found,
+            contract_path=contract_path.as_posix(),
+            contract_isolation=contract_isolation,
+            no_op_reason=None,
+        )
 
         # Gate A (Windows only, ticket #76, rewritten for #117): pre-flight
         # blocking-process check BEFORE the destructive `git worktree

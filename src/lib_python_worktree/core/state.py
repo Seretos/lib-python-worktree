@@ -367,8 +367,10 @@ class SetupOutcome:
 @dataclass(frozen=True)
 class StopHookOutcome:
     """Machine-readable verdict of the contract ``stop:`` hook run by
-    ``WorktreeManager.stop()``, plus the contract diagnostics that verdict
-    depends on (ticket #128).
+    ``WorktreeManager.stop()`` -- or, since ticket #130, by
+    ``WorktreeManager.remove()``/``_teardown()`` (Step 1b's best-effort
+    hook run on the force-remove path) -- plus the contract diagnostics
+    that verdict depends on (ticket #128).
 
     Before this field existed, ``stop()`` read ``contract.isolation``
     nowhere and discarded ``SetupRunner.run()``'s return value outright, so
@@ -414,7 +416,7 @@ class StopHookOutcome:
     when the contract could not be loaded/parsed at all.
 
     ``no_op_reason``, one of :data:`STOP_NO_OP_REASONS` or ``None``, is the
-    actual point of this ticket: set only on ``WorktreeManager.stop()``'s
+    actual point of ticket #128: set only on ``WorktreeManager.stop()``'s
     no-op branch (the resolved role has no entry in ``record.pids``) --
 
     - :data:`STOP_NO_OP_ISOLATION_NONE`: ``contract_isolation == "none"`` --
@@ -423,7 +425,11 @@ class StopHookOutcome:
       an ordinary "this role was never started" no-op.
 
     ``None`` on the delegated path (the resolved role *does* have a recorded
-    pid, so ``stop()`` was not a no-op at all) and on every other code path.
+    pid, so ``stop()`` was not a no-op at all) and on every other code path
+    -- including, always, an outcome built by ``_teardown()`` (ticket #130):
+    that path has no "role never started" no-op concept at all (Step 1b
+    runs unconditionally, once, regardless of ``record.pids``), so
+    ``no_op_reason`` is unconditionally ``None`` there.
 
     Deliberately **transient**, exactly like :class:`StopAttempt`: recomputed
     on every ``stop()`` call and never persisted to ``state.yaml``
@@ -632,15 +638,24 @@ class WorktreeRecord:
     """Ticket #128: machine-readable verdict of the most recent ``stop()``
     call's contract ``stop:`` hook, plus contract diagnostics (whether a
     contract file was found, its path, and its ``isolation``), or ``None``.
-    See :class:`StopHookOutcome`'s own docstring for the full rationale --
-    in short, this is orthogonal to ``stop_attempt``: ``stop_attempt``
-    answers what happened to the tracked PID itself, this field answers
-    whether/how the contract's ``stop:`` hook ran and what the contract's
-    isolation was, which is what lets a caller tell an ``isolation: none``
-    "nothing to stop, by design" no-op apart from an ordinary "role never
-    started" no-op. Deliberately **transient**, exactly like
-    ``stop_attempt``: recomputed on every ``stop()`` call and NOT persisted
-    to ``state.yaml``."""
+    Since ticket #130, also set by ``WorktreeManager.remove()`` /
+    ``_teardown()`` (its own best-effort Step 1b hook run) -- so this field
+    now answers "what did the most recent ``stop()`` OR ``remove()`` call's
+    ``stop:`` hook do", not ``stop()`` alone. See :class:`StopHookOutcome`'s
+    own docstring for the full rationale -- in short, this is orthogonal to
+    ``stop_attempt``: ``stop_attempt`` answers what happened to the tracked
+    PID itself, this field answers whether/how the contract's ``stop:``
+    hook ran and what the contract's isolation was, which is what lets a
+    caller tell an ``isolation: none`` "nothing to stop, by design" no-op
+    apart from an ordinary "role never started" no-op (``stop()`` only --
+    ``no_op_reason`` is always ``None`` when this outcome came from
+    ``remove()``/``_teardown()``, which has no no-op concept of its own).
+    Note also that ``stop_attempt`` itself stays whatever an earlier
+    ``stop()`` call left it as (or ``None``) on the teardown path --
+    ``_teardown()`` deliberately does not compute a new one, since it stops
+    every role in a loop and ``StopAttempt`` is single-valued. Deliberately
+    **transient**, exactly like ``stop_attempt``: recomputed on every
+    ``stop()``/``remove()`` call and NOT persisted to ``state.yaml``."""
 
 
 class StateStore(Protocol):

@@ -689,7 +689,11 @@ legacy record with no `setup_outcome` key deserialises to `None`.
 
 Every `stop()` call sets a transient `stop_hook_outcome` (a `StopHookOutcome`)
 on the returned `WorktreeRecord`, describing whether/how the contract's
-`stop:` hook ran and the contract diagnostics behind that verdict:
+`stop:` hook ran and the contract diagnostics behind that verdict. Since
+ticket #130, `remove()` (via `_teardown()`'s own best-effort Step 1b hook
+run, including on a `force=True` removal of a still-running environment)
+populates the same field too, with `no_op_reason` always `None` on that
+path:
 
 | Field | Meaning |
 |---|---|

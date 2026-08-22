@@ -3058,6 +3058,157 @@ def test_manager_stop_nonexistent_repo_root_reports_contract_not_found(tmp_path:
     assert result.stop_hook_outcome.contract_found is False
 
 
+# ---------------------------------------------------------------------------
+# TestTicket130ForceRemoveSurfacesStopHook -- ticket #130
+#
+# WorktreeManager.remove() (via _teardown()) must surface the outcome of
+# the contract's stop: hook onto the returned record's stop_hook_outcome --
+# previously always None on the teardown path (discarded by a bare
+# `except Exception: pass`), including on a force=True removal of a still-
+# running environment, which is the ticket's headline regression.
+# ---------------------------------------------------------------------------
+
+
+def _write_teardown_contract(repo_root: Path, text: str) -> Path:
+    """Write a real on-disk `.seretos/worktree-setup.yml` under *repo_root*."""
+    contract_dir = repo_root / ".seretos"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = contract_dir / "worktree-setup.yml"
+    contract_path.write_text(text, encoding="utf-8")
+    return contract_path
+
+
+@pytest.mark.requires_git
+def test_remove_force_true_surfaces_completed_stop_hook_outcome(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Driving test (ticket #130): remove(force=True) on an environment with
+    a stop: contract must return a record whose stop_hook_outcome reports
+    the hook's own completion -- previously this was always None on the
+    force-remove path."""
+    contract_path = _write_teardown_contract(
+        git_repo, "version: 1\nisolation: full\nstop:\n  - run: echo bye\n"
+    )
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=True)
+
+    assert result.status == "removed"
+    outcome = result.stop_hook_outcome
+    assert outcome is not None
+    assert outcome.status == "completed"
+    assert outcome.steps_run == 1
+    assert outcome.message == "stop: completed 1 step(s)"
+    assert outcome.contract_found is True
+    assert outcome.contract_path == contract_path.as_posix()
+    assert outcome.contract_isolation == "full"
+    assert outcome.no_op_reason is None
+    # Ticket #130 scope decision: stop_attempt is intentionally NOT
+    # recomputed by _teardown() -- StopAttempt is single-valued but Step 1
+    # stops every role in a loop, so there is no non-arbitrary single
+    # attempt to report. This is a documented scope boundary, not a gap.
+    assert result.stop_attempt is None
+
+
+@pytest.mark.requires_git
+def test_remove_force_false_also_surfaces_stop_hook_outcome(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Sibling of the driving test: force=False must populate
+    stop_hook_outcome exactly the same way -- Step 1b runs on both
+    force=True and force=False."""
+    _write_teardown_contract(
+        git_repo, "version: 1\nisolation: full\nstop:\n  - run: echo bye\n"
+    )
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=False)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "completed"
+
+
+@pytest.mark.requires_git
+def test_remove_untracked_target_also_surfaces_stop_hook_outcome(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """The untracked (ticket #88) removal path -- addressed only via
+    checkout_path, synthesised record never written to the state store --
+    must also carry stop_hook_outcome on the returned record."""
+    _write_teardown_contract(
+        git_repo, "version: 1\nisolation: full\nstop:\n  - run: echo bye\n"
+    )
+
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    result = mgr.remove(checkout_path=str(linked_worktree), force=True)
+
+    assert result.status == "removed"
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "completed"
+
+
+@pytest.mark.requires_git
+def test_remove_empty_stop_contract_reports_skipped(
+    manager: WorktreeManager, git_repo: Path
+):
+    """A contract with isolation: full but no stop: steps -> status
+    "skipped", steps_run == 0."""
+    _write_teardown_contract(git_repo, "version: 1\nisolation: full\n")
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=True)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "skipped"
+    assert result.stop_hook_outcome.steps_run == 0
+
+
+@pytest.mark.requires_git
+def test_remove_no_contract_file_reports_not_found_and_implicit_isolation_none(
+    manager: WorktreeManager, git_repo: Path
+):
+    """No `.seretos/worktree-setup.yml` at all -> contract_found is False,
+    but the loader's implicit isolation: none contract still sets
+    contract_isolation == "none"."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=True)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is False
+    assert result.stop_hook_outcome.contract_isolation == "none"
+
+
+@pytest.mark.requires_git
+def test_remove_unparseable_contract_reports_failed(
+    manager: WorktreeManager, git_repo: Path
+):
+    """A `.seretos/worktree-setup.yml` that exists but fails to parse ->
+    contract_found is True, contract_isolation is None, status="failed",
+    and remove() must not raise from the hook failure itself.
+
+    The broken contract is written AFTER create() (which also loads the
+    contract for its own setup: validation and would fail outright on
+    unparseable YAML) so only remove()'s own teardown-time load sees it."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+    _write_teardown_contract(git_repo, "{not: valid: yaml: [")
+
+    result = manager.remove(rec.id, force=True)  # must not raise
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is True
+    assert result.stop_hook_outcome.contract_isolation is None
+    assert result.stop_hook_outcome.status == "failed"
+
+
+
 class TestManagerStopStickyStatus:
     """R6 (ticket #95): the no-pid-for-role no-op path in ``WorktreeManager.stop``
     must not clobber a sticky honest status.
