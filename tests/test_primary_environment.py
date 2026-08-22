@@ -324,8 +324,13 @@ def test_start_unknown_variant_raises(yaml_manager, git_repo: Path):
         "version: 1\nisolation: full\nstart:\n"
         + _step_yaml(_run_line_for_code("pass"), name="named-only"),
     )
-    with pytest.raises(UnknownVariantError):
+    with pytest.raises(UnknownVariantError) as exc_info:
         mgr.start(checkout_path=str(git_repo), variant="nope")
+    # Ticket #131: the lone named step's own name is listed, plus the
+    # implicit "default" fallback (reachable here via the ticket #112
+    # single-step-total tier), even though this specific failed call
+    # requested "nope".
+    assert exc_info.value.available == ["named-only", "default"]
     # No record was written by the failed attempt (variant resolution
     # happens after materialisation lookup but the failure must not corrupt
     # state -- the record, if created, simply has no process running).

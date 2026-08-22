@@ -58,6 +58,7 @@ No ``mcp`` imports; returns plain dataclasses (``WorktreeRecord``).
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import queue
@@ -931,6 +932,124 @@ def _wait_or_kill(pid: int, timeout: float) -> None:
 # Blocking-process detection and kill helpers
 # ---------------------------------------------------------------------------
 
+# Ticket #132: interpreter basenames _decode_encoded_command recognizes as
+# the PowerShell/pwsh -EncodedCommand transport this library itself emits
+# (setup.runner._build_step_command, ticket #109). psutil reports the full
+# interpreter path (e.g. "C:\\Windows\\...\\powershell.exe"), so detection
+# matches on os.path.basename(...).lower() rather than the raw token.
+_ENCODED_COMMAND_INTERPRETER_BASENAMES = frozenset(
+    {"powershell.exe", "powershell", "pwsh.exe", "pwsh"}
+)
+
+# Ticket #132: upper bound on an -EncodedCommand payload token's length
+# before _decode_encoded_command gives up on it without attempting to
+# base64-decode it at all. Defense in depth against spending decode work on
+# an implausibly large token that was never actually produced by
+# _build_step_command.
+_MAX_ENCODED_COMMAND_PAYLOAD_LEN = 65536
+
+# Ticket #132: recognized short-flag aliases for -EncodedCommand that are
+# NOT literal prefixes of the string "encodedcommand" -- PowerShell's own
+# CLI documents "-ec" as a first-class alias (see `pwsh -h`), not merely an
+# abbreviation of the full switch name (its own prefix-of-full-name check
+# would land on "en", not "ec"). Combined with the prefix check in
+# _decode_encoded_command, this set plus "is a prefix of encodedcommand"
+# together cover every variant this ticket enumerates: -EncodedCommand,
+# -enc, -ec, -e, /EncodedCommand. Note "-e" needs no entry here -- it IS
+# already a literal prefix of "encodedcommand", so the prefix check alone
+# covers it.
+_ENCODED_COMMAND_FLAG_ALIASES = frozenset({"ec"})
+
+
+def _try_decode_encoded_command_payload(payload: str) -> Optional[str]:
+    """Best-effort inverse of ``_build_step_command``'s
+    ``base64.b64encode(run_line.encode("utf-16-le")).decode("ascii")``
+    (ticket #109/#132).
+
+    Returns the decoded run-line text on success, or ``None`` when *payload*
+    does not look like a genuine ``-EncodedCommand`` blob this library
+    produced -- never raises. Validation, in order: strict base64 (no
+    non-alphabet characters silently ignored), a length cap, an even decoded
+    byte length (UTF-16 code units are 2 bytes each), strict UTF-16LE
+    decoding, and a check that the decoded text contains no control
+    characters other than ``\\t``/``\\r``/``\\n`` (a genuine PowerShell
+    run-line payload is command text, not arbitrary binary wearing a text
+    disguise).
+    """
+    if not payload or len(payload) > _MAX_ENCODED_COMMAND_PAYLOAD_LEN:
+        return None
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except Exception:  # noqa: BLE001 -- e.g. binascii.Error
+        return None
+    if len(raw) % 2 != 0:
+        return None
+    try:
+        text = raw.decode("utf-16-le", errors="strict")
+    except Exception:  # noqa: BLE001 -- e.g. UnicodeDecodeError
+        return None
+    for ch in text:
+        if ch in ("\t", "\r", "\n"):
+            continue
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            return None
+    return text
+
+
+def _decode_encoded_command(cmdline: List[str]) -> Tuple[List[str], bool]:
+    """Rewrite a PowerShell/pwsh ``-EncodedCommand <base64 blob>`` argv into
+    a human-readable one, for ``KilledProcessInfo.cmdline`` (ticket #132).
+
+    Detection is deliberately narrow, to avoid mangling unrelated argv:
+
+    1. ``os.path.basename(cmdline[0]).lower()`` must be one of
+       :data:`_ENCODED_COMMAND_INTERPRETER_BASENAMES`.
+    2. A later token, after stripping a leading ``-``/``/`` and lowercasing,
+       must be a non-empty prefix of ``"encodedcommand"`` OR a member of
+       :data:`_ENCODED_COMMAND_FLAG_ALIASES` -- together these cover
+       ``-EncodedCommand``, ``-enc``, ``-ec``, ``-e``, ``/EncodedCommand``.
+    3. The token immediately after it (the payload) must pass
+       :func:`_try_decode_encoded_command_payload`'s validation.
+
+    Every occurrence in *cmdline* is handled, not just the first. The
+    ``-EncodedCommand``-equivalent flag token itself is always kept
+    unchanged -- only the payload token right after it is replaced with the
+    decoded text -- mirroring ``SetupRunner._invoke``'s existing log-swap.
+
+    Returns ``(argv, changed)``: *argv* is a NEW list (the input is never
+    mutated in place) equal to *cmdline* except for any substituted payload
+    tokens; *changed* is ``True`` only when at least one substitution
+    actually happened. Never raises -- any unexpected failure degrades to
+    ``(list(cmdline), False)``.
+    """
+    try:
+        if not cmdline:
+            return list(cmdline), False
+        basename = os.path.basename(cmdline[0]).lower()
+        if basename not in _ENCODED_COMMAND_INTERPRETER_BASENAMES:
+            return list(cmdline), False
+
+        result = list(cmdline)
+        changed = False
+        i = 1
+        while i < len(result) - 1:
+            flag_token = result[i].lstrip("-/").lower()
+            if flag_token and (
+                "encodedcommand".startswith(flag_token)
+                or flag_token in _ENCODED_COMMAND_FLAG_ALIASES
+            ):
+                decoded = _try_decode_encoded_command_payload(result[i + 1])
+                if decoded is not None:
+                    result[i + 1] = decoded
+                    changed = True
+                    i += 2
+                    continue
+            i += 1
+        return result, changed
+    except Exception:  # noqa: BLE001 -- must never raise into KilledProcessInfo
+        return list(cmdline), False
+
+
 @dataclass
 class KilledProcessInfo:
     """Information about a process that was killed to unblock worktree removal.
@@ -948,12 +1067,54 @@ class KilledProcessInfo:
     anything this module spawned directly -- ``source`` is what a caller
     should filter/group on, never an empty ``name`` alone (an empty name can
     also mean "psutil could not be queried in time", not "nothing there").
+
+    ``cmdline``/``cmdline_raw`` (ticket #132): PowerShell/pwsh accept a
+    ``-EncodedCommand`` (base64+UTF-16LE) blob in place of a plain
+    ``-Command`` argument -- this library's own setup-step transport
+    (ticket #109, ``setup.runner._build_step_command``) is one source of
+    such argv, but the raw ``psutil.cmdline()`` payload token it produces is
+    an opaque blob, not human-readable, regardless of who emitted it.
+    ``__post_init__`` runs :func:`_decode_encoded_command` against
+    ``cmdline`` and, whenever an argv is ``-EncodedCommand``-shaped
+    (recognized PowerShell/pwsh interpreter basename, a recognized flag
+    token, and a payload that passes
+    :func:`_try_decode_encoded_command_payload`'s strict base64/UTF-16LE
+    validation) and a substitution actually happens, rewrites ``cmdline`` in
+    place to the human-readable run line and stashes the original,
+    untouched argv in ``cmdline_raw``. The heuristic has no way to verify
+    true provenance -- it decodes any argv that fits the shape, including a
+    genuine, unrelated third-party process that happens to invoke
+    PowerShell with ``-EncodedCommand`` and a validly-formed payload, not
+    only commands this library itself built. This is an accepted,
+    intentional trade-off, not a bug: even for such a third-party
+    invocation the decoded text is still an accurate rendering of what
+    actually ran, and the original raw argv remains available via
+    ``cmdline_raw`` for anyone who needs the byte-for-byte original.
+    ``cmdline_raw`` stays ``None`` when no substitution happened --
+    including for every non-PowerShell process, and for a PowerShell
+    process whose argv was never ``-EncodedCommand``-shaped in the first
+    place -- so ``cmdline_raw is None`` is the caller-facing contract for
+    "``cmdline`` is exactly what psutil reported, unmodified". Decoding can
+    never raise (see
+    :func:`_decode_encoded_command`'s own never-raises contract), so this
+    can never turn a previously-safe ``KilledProcessInfo`` construction into
+    one that fails. ``compare=False`` on ``cmdline_raw`` keeps ``__eq__``
+    semantics identical to before this field existed -- two entries that
+    differ only in whether/how their raw argv was captured still compare
+    equal by their (possibly decoded) ``cmdline``, as they always did.
     """
 
     pid: int
     name: str
     cmdline: List[str] = field(default_factory=list)
     source: str = "unknown"
+    cmdline_raw: Optional[List[str]] = field(default=None, compare=False, init=False)
+
+    def __post_init__(self) -> None:
+        decoded_cmdline, changed = _decode_encoded_command(self.cmdline)
+        if changed:
+            self.cmdline_raw = list(self.cmdline)
+            self.cmdline = decoded_cmdline
 
 
 class _PartialList(list):

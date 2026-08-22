@@ -2565,12 +2565,49 @@ def test_manager_start_default_two_unnamed_steps_still_raises(tmp_path: Path):
     ):
         mgr.start(record.id)
 
+    # Ticket #131: two unnamed steps means no fallback tier is reachable
+    # either -- `available` genuinely stays empty -- but the message must
+    # no longer leave a bare `available: []` unexplained; it appends a
+    # remediation clause pointing at the actual fix (distinct `name:`
+    # values).
     assert exc_info.value.available == []
+    assert "no start: step is addressable" in str(exc_info.value)
+    assert "name:" in str(exc_info.value)
+
+
+def test_manager_start_unknown_variant_message_omits_remediation_when_available_nonempty(
+    tmp_path: Path,
+):
+    """The remediation clause added for ticket #131's empty-list case must
+    NOT appear when `available` is non-empty -- it is guarded, not
+    unconditional."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nonexistent")
+
+    assert exc_info.value.available == ["headless", "gui"]
+    assert "no start: step is addressable" not in str(exc_info.value)
 
 
 def test_manager_start_unknown_variant_on_lone_named_step_still_raises(tmp_path: Path):
     """A lone named step ("main") does NOT make every variant name valid --
-    requesting an unrelated variant still raises UnknownVariantError."""
+    requesting an unrelated variant still raises UnknownVariantError. Ticket
+    #131: `available` now also surfaces the implicit "default" fallback --
+    reachable here via the ticket #112 single-step-total tier -- alongside
+    the step's own name, since `variant="default"` would also resolve this
+    contract even though the specific "nope" request didn't."""
     mgr = _make_mgr_in_memory(tmp_path)
     record = _make_wt_record()
     mgr.state.add(record)
@@ -2587,7 +2624,88 @@ def test_manager_start_unknown_variant_on_lone_named_step_still_raises(tmp_path:
     ):
         mgr.start(record.id, variant="nope")
 
-    assert exc_info.value.available == ["main"]
+    assert exc_info.value.available == ["main", "default"]
+
+
+def test_manager_start_unknown_variant_lone_unnamed_step_surfaces_default(
+    tmp_path: Path,
+):
+    """Ticket #131 driving test (the reported defect): a contract with a
+    single unnamed start: step -- which environment_start() with no variant
+    argument resolves successfully via the tier-2 fallback -- must not
+    report available=[] on an unrelated failed variant request. The
+    reachable implicit "default" fallback is surfaced instead of an
+    empty/misleading list."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["default"]
+    assert "default" in str(exc_info.value)
+
+
+def test_manager_start_unknown_variant_mixed_unnamed_and_named_surfaces_default(
+    tmp_path: Path,
+):
+    """Ticket #131: an unnamed step plus a named sibling -- the unnamed step
+    is what "default" resolves to (tier 2 wins over tier 3) -- surfaces both
+    the named sibling's own name and the implicit "default"."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="a"), Step(run="b", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["gui", "default"]
+
+
+def test_manager_start_unknown_variant_explicit_default_name_not_duplicated(
+    tmp_path: Path,
+):
+    """Ticket #131: a step explicitly named "default" must appear in
+    `available` exactly once, even though it is both the tier-1 exact-match
+    name AND independently reachable via the tier-3 single-step-total
+    fallback."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py", name="default")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["default"]
+    assert str(exc_info.value).count("default") == 1  # once in available=[...], no dup
 
 
 def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):
@@ -3056,6 +3174,157 @@ def test_manager_stop_nonexistent_repo_root_reports_contract_not_found(tmp_path:
 
     assert result.stop_hook_outcome is not None
     assert result.stop_hook_outcome.contract_found is False
+
+
+# ---------------------------------------------------------------------------
+# TestTicket130ForceRemoveSurfacesStopHook -- ticket #130
+#
+# WorktreeManager.remove() (via _teardown()) must surface the outcome of
+# the contract's stop: hook onto the returned record's stop_hook_outcome --
+# previously always None on the teardown path (discarded by a bare
+# `except Exception: pass`), including on a force=True removal of a still-
+# running environment, which is the ticket's headline regression.
+# ---------------------------------------------------------------------------
+
+
+def _write_teardown_contract(repo_root: Path, text: str) -> Path:
+    """Write a real on-disk `.seretos/worktree-setup.yml` under *repo_root*."""
+    contract_dir = repo_root / ".seretos"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = contract_dir / "worktree-setup.yml"
+    contract_path.write_text(text, encoding="utf-8")
+    return contract_path
+
+
+@pytest.mark.requires_git
+def test_remove_force_true_surfaces_completed_stop_hook_outcome(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Driving test (ticket #130): remove(force=True) on an environment with
+    a stop: contract must return a record whose stop_hook_outcome reports
+    the hook's own completion -- previously this was always None on the
+    force-remove path."""
+    contract_path = _write_teardown_contract(
+        git_repo, "version: 1\nisolation: full\nstop:\n  - run: echo bye\n"
+    )
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=True)
+
+    assert result.status == "removed"
+    outcome = result.stop_hook_outcome
+    assert outcome is not None
+    assert outcome.status == "completed"
+    assert outcome.steps_run == 1
+    assert outcome.message == "stop: completed 1 step(s)"
+    assert outcome.contract_found is True
+    assert outcome.contract_path == contract_path.as_posix()
+    assert outcome.contract_isolation == "full"
+    assert outcome.no_op_reason is None
+    # Ticket #130 scope decision: stop_attempt is intentionally NOT
+    # recomputed by _teardown() -- StopAttempt is single-valued but Step 1
+    # stops every role in a loop, so there is no non-arbitrary single
+    # attempt to report. This is a documented scope boundary, not a gap.
+    assert result.stop_attempt is None
+
+
+@pytest.mark.requires_git
+def test_remove_force_false_also_surfaces_stop_hook_outcome(
+    manager: WorktreeManager, git_repo: Path
+):
+    """Sibling of the driving test: force=False must populate
+    stop_hook_outcome exactly the same way -- Step 1b runs on both
+    force=True and force=False."""
+    _write_teardown_contract(
+        git_repo, "version: 1\nisolation: full\nstop:\n  - run: echo bye\n"
+    )
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=False)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "completed"
+
+
+@pytest.mark.requires_git
+def test_remove_untracked_target_also_surfaces_stop_hook_outcome(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path, skip_if_no_git  # noqa: ARG001
+):
+    """The untracked (ticket #88) removal path -- addressed only via
+    checkout_path, synthesised record never written to the state store --
+    must also carry stop_hook_outcome on the returned record."""
+    _write_teardown_contract(
+        git_repo, "version: 1\nisolation: full\nstop:\n  - run: echo bye\n"
+    )
+
+    state_dir = tmp_path / "state"
+    store = YamlStateStore(state_dir=state_dir)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=store,
+        reconcile_on_init=False,
+    )
+
+    result = mgr.remove(checkout_path=str(linked_worktree), force=True)
+
+    assert result.status == "removed"
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "completed"
+
+
+@pytest.mark.requires_git
+def test_remove_empty_stop_contract_reports_skipped(
+    manager: WorktreeManager, git_repo: Path
+):
+    """A contract with isolation: full but no stop: steps -> status
+    "skipped", steps_run == 0."""
+    _write_teardown_contract(git_repo, "version: 1\nisolation: full\n")
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=True)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.status == "skipped"
+    assert result.stop_hook_outcome.steps_run == 0
+
+
+@pytest.mark.requires_git
+def test_remove_no_contract_file_reports_not_found_and_implicit_isolation_none(
+    manager: WorktreeManager, git_repo: Path
+):
+    """No `.seretos/worktree-setup.yml` at all -> contract_found is False,
+    but the loader's implicit isolation: none contract still sets
+    contract_isolation == "none"."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+
+    result = manager.remove(rec.id, force=True)
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is False
+    assert result.stop_hook_outcome.contract_isolation == "none"
+
+
+@pytest.mark.requires_git
+def test_remove_unparseable_contract_reports_failed(
+    manager: WorktreeManager, git_repo: Path
+):
+    """A `.seretos/worktree-setup.yml` that exists but fails to parse ->
+    contract_found is True, contract_isolation is None, status="failed",
+    and remove() must not raise from the hook failure itself.
+
+    The broken contract is written AFTER create() (which also loads the
+    contract for its own setup: validation and would fail outright on
+    unparseable YAML) so only remove()'s own teardown-time load sees it."""
+    rec = manager.create(str(git_repo), "feature/alpha")
+    _write_teardown_contract(git_repo, "{not: valid: yaml: [")
+
+    result = manager.remove(rec.id, force=True)  # must not raise
+
+    assert result.stop_hook_outcome is not None
+    assert result.stop_hook_outcome.contract_found is True
+    assert result.stop_hook_outcome.contract_isolation is None
+    assert result.stop_hook_outcome.status == "failed"
+
 
 
 class TestManagerStopStickyStatus:
