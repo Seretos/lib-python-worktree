@@ -2565,12 +2565,49 @@ def test_manager_start_default_two_unnamed_steps_still_raises(tmp_path: Path):
     ):
         mgr.start(record.id)
 
+    # Ticket #131: two unnamed steps means no fallback tier is reachable
+    # either -- `available` genuinely stays empty -- but the message must
+    # no longer leave a bare `available: []` unexplained; it appends a
+    # remediation clause pointing at the actual fix (distinct `name:`
+    # values).
     assert exc_info.value.available == []
+    assert "no start: step is addressable" in str(exc_info.value)
+    assert "name:" in str(exc_info.value)
+
+
+def test_manager_start_unknown_variant_message_omits_remediation_when_available_nonempty(
+    tmp_path: Path,
+):
+    """The remediation clause added for ticket #131's empty-list case must
+    NOT appear when `available` is non-empty -- it is guarded, not
+    unconditional."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nonexistent")
+
+    assert exc_info.value.available == ["headless", "gui"]
+    assert "no start: step is addressable" not in str(exc_info.value)
 
 
 def test_manager_start_unknown_variant_on_lone_named_step_still_raises(tmp_path: Path):
     """A lone named step ("main") does NOT make every variant name valid --
-    requesting an unrelated variant still raises UnknownVariantError."""
+    requesting an unrelated variant still raises UnknownVariantError. Ticket
+    #131: `available` now also surfaces the implicit "default" fallback --
+    reachable here via the ticket #112 single-step-total tier -- alongside
+    the step's own name, since `variant="default"` would also resolve this
+    contract even though the specific "nope" request didn't."""
     mgr = _make_mgr_in_memory(tmp_path)
     record = _make_wt_record()
     mgr.state.add(record)
@@ -2587,7 +2624,88 @@ def test_manager_start_unknown_variant_on_lone_named_step_still_raises(tmp_path:
     ):
         mgr.start(record.id, variant="nope")
 
-    assert exc_info.value.available == ["main"]
+    assert exc_info.value.available == ["main", "default"]
+
+
+def test_manager_start_unknown_variant_lone_unnamed_step_surfaces_default(
+    tmp_path: Path,
+):
+    """Ticket #131 driving test (the reported defect): a contract with a
+    single unnamed start: step -- which environment_start() with no variant
+    argument resolves successfully via the tier-2 fallback -- must not
+    report available=[] on an unrelated failed variant request. The
+    reachable implicit "default" fallback is surfaced instead of an
+    empty/misleading list."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["default"]
+    assert "default" in str(exc_info.value)
+
+
+def test_manager_start_unknown_variant_mixed_unnamed_and_named_surfaces_default(
+    tmp_path: Path,
+):
+    """Ticket #131: an unnamed step plus a named sibling -- the unnamed step
+    is what "default" resolves to (tier 2 wins over tier 3) -- surfaces both
+    the named sibling's own name and the implicit "default"."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="a"), Step(run="b", name="gui")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["gui", "default"]
+
+
+def test_manager_start_unknown_variant_explicit_default_name_not_duplicated(
+    tmp_path: Path,
+):
+    """Ticket #131: a step explicitly named "default" must appear in
+    `available` exactly once, even though it is both the tier-1 exact-match
+    name AND independently reachable via the tier-3 single-step-total
+    fallback."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="python server.py", name="default")],
+    )
+
+    with (
+        patch("lib_python_worktree.core.manager._load_contract", return_value=fake_contract),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nope")
+
+    assert exc_info.value.available == ["default"]
+    assert str(exc_info.value).count("default") == 1  # once in available=[...], no dup
 
 
 def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):

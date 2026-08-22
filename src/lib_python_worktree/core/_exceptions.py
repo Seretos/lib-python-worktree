@@ -279,16 +279,32 @@ class UnknownVariantError(WorktreeError, ValueError):
     documents a ``ValueError`` contract for unknown variants. This class is
     both, so callers catching either base keep working.
 
-    Both ``variant`` (the requested, unmatched name) and ``available`` (the
-    list of step names that *do* exist) are stored as attributes so callers
-    can react programmatically without parsing the message text.
+    Both ``variant`` (the requested, unmatched name) and ``available`` are
+    stored as attributes so callers can react programmatically without
+    parsing the message text. ``available`` is the variant strings that
+    would resolve against this contract, including the implicit
+    ``"default"`` when a fallback tier makes it reachable (ticket #131) --
+    not merely the step names that are literally set. See
+    ``manager._available_variants()`` for exactly how it is computed.
+
+    When ``available`` is genuinely empty -- no step name matches and no
+    fallback tier is reachable either, so the contract has no addressable
+    ``start:`` step at all -- the message appends a short remediation clause
+    (ticket #131) so a bare ``available: []`` isn't itself misleading; the
+    ``available`` attribute itself stays ``[]`` either way.
     """
 
     def __init__(self, variant: str, available: "List[str]") -> None:
-        super().__init__(
+        message = (
             f"no start: step named '{variant}' found in contract "
             f"(available: {available})"
         )
+        if not available:
+            message += (
+                "; no start: step is addressable -- give the steps distinct "
+                "name: values"
+            )
+        super().__init__(message)
         self.variant = variant
         self.available = available
 
