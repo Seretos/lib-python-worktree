@@ -451,6 +451,23 @@ the step to fail silently. `-EncodedCommand` carries no spaces or quotes, so
 neither re-quoting pass can corrupt it, and previously-silent steps like
 this now run correctly. Exit-code semantics are unchanged from `-Command`.
 
+`stop()`'s reported `killed_pids[].cmdline` (ticket #132) reverses this
+transport for readability: when a killed process's argv carries this
+`-EncodedCommand <base64 blob>` shape, the entry's `cmdline` shows the
+decoded, human-readable run line instead of the opaque blob, and the
+original raw argv `psutil` actually reported is preserved in that entry's
+`cmdline_raw` (`None` when no such substitution happened). Detection is
+narrow and never raises — an argv that only looks similar (wrong
+interpreter, invalid/foreign base64 payload, non-UTF-16LE bytes) is left
+untouched — but it has no way to verify true provenance: it decodes any
+argv that fits the `-EncodedCommand` shape, not only commands this
+library's own setup-step transport built, so a genuine, unrelated
+third-party process using `-EncodedCommand` with a validly-formed payload
+gets decoded too. This is an accepted, intentional trade-off: the decoded
+text is still an accurate rendering of what actually ran, and the
+original argv is always available via `cmdline_raw` for anyone who needs
+the byte-for-byte original.
+
 ### Git timeout
 
 `WORKTREE_GIT_TIMEOUT_SEC` controls how long each `git` subprocess may run
