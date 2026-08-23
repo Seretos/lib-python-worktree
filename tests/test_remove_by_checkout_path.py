@@ -58,7 +58,7 @@ def _no_blocking_processes_by_default():
     exit).
     """
     with patch(
-        "lib_python_worktree.core.manager._find_blocking_processes",
+        "lib_python_worktree.core.teardown._find_blocking_processes",
         return_value=[],
     ):
         yield
@@ -384,6 +384,7 @@ def test_remove_phantom_tracked_record_removable_by_id(
     behaviour via _teardown's "is not a working tree" branch, verified here
     so a #88 regression can't quietly break it."""
     import lib_python_worktree.core.manager as manager_module
+    import lib_python_worktree.core.teardown as teardown_module
 
     real_run_git = manager_module._run_git
     rec = manager.create(str(git_repo), "feature/alpha")
@@ -396,7 +397,12 @@ def test_remove_phantom_tracked_record_removable_by_id(
             )
         return real_run_git(args, cwd=cwd, **kwargs)
 
+    # Ticket #135: the "worktree remove" call this test fakes now lives in
+    # teardown.py, but remove() still traverses manager-side git calls
+    # (_resolve_removal_target / _delete_owned_branch) on the way there --
+    # patch both so the fake is observed wherever it's needed.
     monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+    monkeypatch.setattr(teardown_module, "_run_git", _fake_run_git)
 
     removed = manager.remove(rec.id)
 
@@ -414,6 +420,7 @@ def test_remove_phantom_tracked_record_removable_by_checkout_path(
     self.state.list() regardless of git's live porcelain view, so this
     never needs the untracked fallback."""
     import lib_python_worktree.core.manager as manager_module
+    import lib_python_worktree.core.teardown as teardown_module
 
     real_run_git = manager_module._run_git
     rec = manager.create(str(git_repo), "feature/alpha")
@@ -426,7 +433,10 @@ def test_remove_phantom_tracked_record_removable_by_checkout_path(
             )
         return real_run_git(args, cwd=cwd, **kwargs)
 
+    # Ticket #135: see the twin test above for why both patch targets are
+    # needed.
     monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+    monkeypatch.setattr(teardown_module, "_run_git", _fake_run_git)
 
     removed = manager.remove(checkout_path=rec.path)
 
