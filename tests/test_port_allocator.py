@@ -548,7 +548,7 @@ def test_manager_remove_calls_release(tmp_path: Path):
     store.add(record)
 
     with patch(
-        "lib_python_worktree.core.manager._run_git",
+        "lib_python_worktree.core.teardown._run_git",
         return_value=MagicMock(returncode=0, stdout="", stderr=""),
     ):
         with patch.object(mgr, "_delete_owned_branch"):
@@ -721,7 +721,7 @@ def test_teardown_keeps_ports_when_git_remove_fails(tmp_path: Path):
             return MagicMock(returncode=1, stdout="", stderr="error: cannot remove")
         return MagicMock(returncode=0, stdout="", stderr="")
 
-    with patch("lib_python_worktree.core.manager._run_git", side_effect=_fail_git):
+    with patch("lib_python_worktree.core.teardown._run_git", side_effect=_fail_git):
         with pytest.raises(GitCommandError):
             mgr._teardown(record, force=False)
 

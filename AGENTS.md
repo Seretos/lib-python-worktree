@@ -17,6 +17,7 @@ Concretely: any *"where is X defined / what does the code support / which Y exis
 The engine is fully implemented under `src/lib_python_worktree/`. Key modules:
 
 - `core/manager.py` — `WorktreeManager` (public facade: create / list / list_repo / remove / adopt / prune / start / stop)
+- `core/teardown.py` — the `_teardown`/`remove()` phase engine (ticket #135): `_TeardownContext`, `build_context()`, `_target_is_absent()`, `_TEARDOWN_PHASES`, `run_teardown()`. See "Teardown/remove changes" below before touching this path.
 - `core/checkout.py` — `classify_checkout`, `CheckoutInfo`, `primary_id_for` (primary-vs-linked-worktree classification, ticket #84); `EnvironmentEntry`, `RepoListing`, `list_repo` (repo-scoped listing)
 - `core/state.py` — `StateStore` protocol + `WorktreeRecord` dataclass (`backing: "worktree" | "primary"`, ticket #84; `stop_detail: Optional[StopDetail]` — machine-readable reason for a `"stop_incomplete"` status, ticket #99; `teardown_ran: bool` — at-most-once-teardown marker persisted before `git worktree remove` is attempted, so a `force=True` retry after a post-teardown `DirtyWorktreeError` never re-runs `teardown:`, ticket #126; `stop_hook_outcome: Optional[StopHookOutcome]` — stop-hook + contract diagnostics, ticket #128; `base_fetch_fallback: Optional[BaseFetchFallback]` — best-effort `git fetch origin <base>` degrading to the local `base` ref instead of hard-failing `create()`, ticket #134)
 - `core/yaml_store.py` — `YamlStateStore` (file-backed store), `reconcile`, `adopt`, `ReconcileReport`, `AdoptReport`
@@ -46,6 +47,35 @@ in `__all__` directly.
   Behaviour, the git subprocess handling, the contract data model, and the
   setup runner are changed **here**, not in the plugin. The MCP tool docstrings
   (the LLM-facing descriptions) live in the plugin.
+
+### Teardown/remove changes (ticket #135 process rule)
+
+`WorktreeManager._teardown()`/`remove()` had been patched five times in
+four days (tickets #117, #123, #126, #127, #130) before ticket #135
+extracted the logic into `core/teardown.py` as an explicit, ordered
+sequence of named phases (`_TEARDOWN_PHASES`) over a shared
+`_TeardownContext`. Before changing anything on this path:
+
+- Read `docs/teardown-phase-contract.md` first -- it names every phase, in
+  order, with its invariant, and is kept in sync with
+  `teardown._TEARDOWN_PHASES` by `tests/test_teardown_contract_doc.py`.
+- `tests/test_teardown_matrix.py` is the **authoritative** consolidated
+  regression matrix for this code path -- add any new teardown/remove
+  scenario there first, as a parametrized row, not as an ad-hoc one-off
+  test elsewhere.
+- `core/teardown.py` must never import `core/manager.py` (AST-guarded by
+  `tests/test_teardown_phases.py`); it depends only on `_exceptions.py`,
+  `_git_utils.py`, `state.py`, `process_lifecycle.py`, and the contract
+  loader. `manager.py` imports it as `from . import teardown as
+  _teardown_mod` and calls its public functions by module-attribute
+  access (`_teardown_mod.build_context(...)`, `_teardown_mod.run_teardown(...)`)
+  so a single `patch("lib_python_worktree.core.teardown.<X>")` covers every
+  call site of a shared symbol.
+- `teardown._logger` is deliberately `logging.getLogger(
+  "lib_python_worktree.core.manager")`, not `getLogger(__name__)` -- this
+  keeps every `caplog` site (and any downstream consumer) that filters on
+  that logger name working across the module split. Do not "fix" this to
+  `__name__`.
 
 ## Repo specifics (minimal by design)
 

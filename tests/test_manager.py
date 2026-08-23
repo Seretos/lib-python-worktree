@@ -17,6 +17,7 @@ from typing import Callable
 import pytest
 
 from lib_python_worktree.core import manager as manager_module
+from lib_python_worktree.core import teardown as _teardown_mod
 from lib_python_worktree.core import _git_utils as git_utils_module
 from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
@@ -1291,7 +1292,7 @@ def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
             args=["git", *args], returncode=0, stdout="", stderr=""
         )
 
-    monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+    monkeypatch.setattr(_teardown_mod, "_run_git", _fake_run_git)
 
     mgr = WorktreeManager(
         config=ManagerConfig(store_root=Path("/fake/store")),

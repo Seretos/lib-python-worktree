@@ -69,7 +69,7 @@ def _no_blocking_processes_by_default():
     always wins for its scope and unwinds back to this outer patch on exit).
     """
     with patch(
-        "lib_python_worktree.core.manager._find_blocking_processes",
+        "lib_python_worktree.core.teardown._find_blocking_processes",
         return_value=[],
     ):
         yield
@@ -85,130 +85,46 @@ def _no_real_preflight_settle_sleep():
     (non-owned) blocker. Left unpatched, that would cost ~1s of real wall
     time across every foreign-blocker pre-flight test in this module. Tests
     that specifically assert on sleep/retry behaviour override this via
-    their own nested ``patch("lib_python_worktree.core.manager.time")``
+    their own nested ``patch("lib_python_worktree.core.teardown.time")``
     (patching the whole module reference, not just ``.sleep``) for the
     duration of their ``with`` block -- an inner patch on the same target
     always wins for its scope and unwinds back to this outer patch on exit.
     """
-    with patch("lib_python_worktree.core.manager.time.sleep"):
+    with patch("lib_python_worktree.core.teardown.time.sleep"):
         yield
 
 
 @pytest.fixture(autouse=True)
 def _target_present_by_default():
-    """Default-patch ``os.path.exists`` (as seen through ``manager.os``) so
-    that BOTH ``target_absent`` probe sites read ``True`` (checkout
-    considered present), while every OTHER ``os.path.exists`` call in
-    ``_teardown`` keeps evaluating against the real, always-absent fake path
-    (ticket #127, fix-pass 2).
+    """Default-patch ``teardown._target_is_absent`` (ticket #135) so that
+    BOTH ``target_absent`` probe sites (``remove()``'s own probe and
+    ``_teardown()``'s, both of which now call the shared
+    ``teardown._target_is_absent(record)`` seam) read the checkout as
+    PRESENT for every test in this module, while every OTHER
+    ``os.path.exists`` call (the long-path fallback and the Final guard in
+    ``_teardown``, which still call ``os.path.exists`` directly, not through
+    this seam -- see ticket #135's R4) keeps evaluating against the real,
+    always-absent fake path used throughout this module.
 
-    ``_teardown`` probes ``os.path.exists(record.path)`` once, near the top
-    of the function (before any other filesystem check it makes, e.g.
-    contract-file existence), to compute ``target_absent`` -- used to widen
-    the exit-128 fallback and to skip Gate A's Windows pre-flight for an
-    orphaned record whose checkout directory is already gone. ``remove()``
-    ALSO probes ``os.path.exists(record.path)`` once, for its OWN, separate
-    ``target_absent`` local, before ever calling ``_teardown()`` (used to
-    decide whether an unmerged owned branch is tolerated). So a test that
-    reaches ``_teardown()`` via ``manager.remove(...)`` makes TWO calls to
-    the exact same path before any other logic runs, while a test that
-    calls ``manager._teardown(...)`` directly makes only ONE.
+    Replaces the former ~120-line stack-walking version of this fixture
+    (ticket #127 fix-pass 2), which had to distinguish the two
+    ``target_absent = not os.path.exists(record.path)`` call sites from
+    every other ``os.path.exists``/``Path.exists()`` call by walking the
+    stack to the direct caller's source line. Ticket #135 replaced both
+    call sites with a single named seam (``teardown._target_is_absent``),
+    so that stack-walking is no longer needed: patching the seam directly
+    naturally leaves every other filesystem check alone.
 
-    A call-order heuristic ("force True on the very first call in the whole
-    test, real thereafter") breaks the ``remove()`` -> ``_teardown()`` case:
-    ``remove()``'s own probe consumes the single forced slot, so
-    ``_teardown()``'s own probe falls through to the real (always-``False``)
-    filesystem check -- silently computing ``target_absent=True`` inside
-    ``_teardown`` even for a test that is semantically about a *present*
-    checkout, which widens the exit-128 fallback and skips Gate A's Windows
-    pre-flight check it should still be exercising.
-
-    A path-value memo ("force True forever once this path has been forced
-    True") over-corrects: every ``os.path.exists`` call this module ever
-    makes goes through this same ``manager.os.path.exists`` seam and (per
-    the source) is always called with ``record.path`` -- there is no OTHER
-    path value to distinguish a genuine ``target_absent`` probe from the
-    LATER long-path-fallback check and Final guard check in ``_teardown``,
-    which many pre-existing happy-path tests correctly rely on evaluating
-    against the real, always-absent fake path. Memoizing by value alone
-    would force those later checks ``True`` too, spuriously triggering the
-    long-path/robocopy fallback and then the Final guard's
-    ``WorktreeDirLockedError`` on nearly every happy-path test in this
-    module.
-
-    Neither call-order nor path-value alone can tell these call sites
-    apart, since they share both the same relative position (both are
-    "first calls" in one of the two entry patterns above) and the same
-    argument value. What distinguishes them is the call SITE itself: both
-    probe sites are written as ``target_absent = not
-    os.path.exists(record.path)`` (the assignment target's name appears on
-    the calling source line), while the long-path-fallback and Final guard
-    sites are plain ``if os.path.exists(record.path):`` with no such
-    assignment.
-
-    Critically, in this Python version ``pathlib.Path.exists()`` itself
-    delegates to ``os.path.exists()`` internally -- so patching
-    ``manager.os.path.exists`` also intercepts every *other* ``.exists()``
-    check made anywhere during a ``remove()``/``_teardown()`` call (e.g.
-    ``YamlStateStore``'s own ``state.yaml`` existence check, and the
-    contract-file existence check), not just the four explicit
-    ``os.path.exists(record.path)`` call sites in ``manager.py``. Walking
-    the stack to the *nearest* ``manager.py`` frame (rather than the
-    *direct, immediate* caller) would misattribute those unrelated calls:
-    e.g. ``YamlStateStore._load_state()``'s ``self._state_path.exists()``
-    check happens while a ``manager.py`` frame (``_resolve_removal_target``
-    or ``_teardown``) is still on the stack purely as its synchronous
-    ancestor, not as the actual caller -- so this instead identifies the
-    DIRECT caller: it walks outward past ``unittest.mock``'s own internal
-    plumbing frames (``_mock_call``/``_execute_mock_call``/the
-    ``effect(...)`` invocation) to the first real, non-mock frame, and
-    forces ``True`` only when THAT frame is itself in ``manager.py`` AND
-    its source line contains ``target_absent`` -- covering both probe
-    sites (called from ``remove()`` and/or ``_teardown()``, in either
-    order, any number of times) while leaving every other call (state
-    store, contract file, long-path fallback, Final guard -- regardless of
-    whether it goes through ``os.path.exists`` directly or via
-    ``Path.exists()``) to fall through to the real filesystem check,
-    unchanged from the pre-#127 default that every pre-existing happy-path
-    test in this module already relies on.
-
-    Tests that specifically exercise ``target_absent`` behaviour (ticket
-    #127's own ``TestTeardownAbsentTarget``, plus a handful of pre-existing
-    tests that already control ``os.path.exists`` directly for their own
-    reasons, e.g. long-path fallback / robocopy tests) override this via
-    their own nested ``patch(...)`` for the duration of their ``with``
-    block -- an inner ``patch`` on the same target always wins for its
-    scope and unwinds back to this outer patch on exit.
+    Tests that specifically exercise ``target_absent`` behaviour
+    (``TestTeardownAbsentTarget``) override this via their own nested
+    ``patch("lib_python_worktree.core.teardown._target_is_absent", ...)``
+    for the duration of their ``with`` block -- an inner ``patch`` on the
+    same target always wins for its scope and unwinds back to this outer
+    patch on exit.
     """
-    import os as _os_real
-    import traceback
-
-    _real_exists = _os_real.path.exists
-    _manager_suffix = "lib_python_worktree/core/manager.py"
-    _mock_module_suffix = "unittest/mock.py"
-
-    def _mock_exists(path):
-        # Walk from the innermost frame outward (skipping this function's
-        # own frame), stepping over unittest.mock's own internal plumbing
-        # frames, to the first real, non-mock frame -- the actual, direct
-        # caller of os.path.exists (or of Path.exists(), which itself
-        # calls os.path.exists() internally in this Python version). Only
-        # force True when THAT direct caller is a manager.py frame whose
-        # source line contains "target_absent" (the two structural probe
-        # sites); every other caller (state store, contract file,
-        # long-path fallback, Final guard, etc.) falls through to the real
-        # filesystem check untouched.
-        for frame in reversed(traceback.extract_stack()[:-1]):
-            filename = frame.filename.replace("\\", "/")
-            if filename.endswith(_mock_module_suffix):
-                continue
-            if filename.endswith(_manager_suffix):
-                return "target_absent" in (frame.line or "")
-            return _real_exists(path)
-        return _real_exists(path)
-
     with patch(
-        "lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists
+        "lib_python_worktree.core.teardown._target_is_absent",
+        return_value=False,
     ):
         yield
 
@@ -222,7 +138,7 @@ def _run_teardown_with_mocked_git(
 ) -> None:
     """Call _teardown with git subprocess mocked to succeed."""
     with patch(
-        "lib_python_worktree.core.manager._run_git"
+        "lib_python_worktree.core.teardown._run_git"
     ) as mock_git:
         mock_git.return_value = MagicMock(returncode=0, stderr="")
         manager._teardown(record, force=force, _lifecycle_module=lifecycle_module)
@@ -313,7 +229,7 @@ class TestTeardownContractSteps:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -321,7 +237,7 @@ class TestTeardownContractSteps:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git"
+                "lib_python_worktree.core.teardown._run_git"
             ) as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -352,7 +268,7 @@ class TestTeardownContractSteps:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git"
+                "lib_python_worktree.core.teardown._run_git"
             ) as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -375,7 +291,7 @@ class TestTeardownContractSteps:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 side_effect=RuntimeError("disk error"),
             ),
             patch(
@@ -383,7 +299,7 @@ class TestTeardownContractSteps:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git"
+                "lib_python_worktree.core.teardown._run_git"
             ) as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -415,7 +331,7 @@ class TestTeardownContractSteps:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -423,7 +339,7 @@ class TestTeardownContractSteps:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git"
+                "lib_python_worktree.core.teardown._run_git"
             ) as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -477,9 +393,9 @@ class TestTeardownForceExit128:
         mock_lifecycle = MagicMock()
 
         with patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=self._make_mock_git_128(),
-        ), patch("lib_python_worktree.core.manager.shutil"):
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             # Should complete without raising.
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
 
@@ -492,10 +408,10 @@ class TestTeardownForceExit128:
         mock_lifecycle = MagicMock()
 
         with patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=self._make_mock_git_128(),
         ), patch(
-            "lib_python_worktree.core.manager.shutil"
+            "lib_python_worktree.core.teardown.shutil"
         ) as mock_shutil:
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
 
@@ -519,9 +435,9 @@ class TestTeardownForceExit128:
             return MagicMock(returncode=0, stderr="")
 
         with patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=_tracking_git,
-        ), patch("lib_python_worktree.core.manager.shutil"):
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
 
         prune_calls = [
@@ -548,9 +464,9 @@ class TestTeardownForceExit128:
         manager._allocator = mock_allocator
 
         with patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=self._make_mock_git_128(),
-        ), patch("lib_python_worktree.core.manager.shutil"):
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
 
         mock_allocator.release.assert_called_once_with(record.id)
@@ -570,10 +486,10 @@ class TestTeardownForceExit128:
         mock_lifecycle = MagicMock()
 
         with patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=self._make_mock_git_128(),
         ), patch(
-            "lib_python_worktree.core.manager.shutil"
+            "lib_python_worktree.core.teardown.shutil"
         ), patch.object(
             manager, "_teardown", wraps=lambda rec, force, **kw: (
                 # Call the real _teardown but inject the mock lifecycle.
@@ -602,9 +518,9 @@ class TestTeardownForceExit128:
             return MagicMock(returncode=0, stderr="")
 
         with pytest.raises(GitCommandError), patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=_git_exit1,
-        ), patch("lib_python_worktree.core.manager.shutil"):
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
 
     def test_exit128_without_force_raises_dirty_error(self, tmp_path):
@@ -629,9 +545,9 @@ class TestTeardownForceExit128:
             )
 
         with pytest.raises(DirtyWorktreeError) as excinfo, patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=_git_exit128,
-        ), patch("lib_python_worktree.core.manager.shutil"):
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
         msg = str(excinfo.value)
@@ -655,9 +571,9 @@ class TestTeardownForceExit128:
             return MagicMock(returncode=128, stderr="fatal: not a git repo")
 
         with pytest.raises(GitCommandError), patch(
-            "lib_python_worktree.core.manager._run_git",
+            "lib_python_worktree.core.teardown._run_git",
             side_effect=_git_not_a_repo,
-        ), patch("lib_python_worktree.core.manager.shutil"):
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
 
@@ -714,8 +630,8 @@ class TestContractCopyDirtExemption:
         manager._allocator = mock_allocator
 
         with patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
         assert any(_is_force_remove_call(c) for c in calls), (
@@ -742,8 +658,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_mixed_seretos_and_other_untracked_still_raises_dirty_error(self, tmp_path):
@@ -766,8 +682,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_modified_tracked_file_under_seretos_still_raises_dirty_error(
@@ -795,8 +711,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_empty_status_output_still_raises_dirty_error(self, tmp_path):
@@ -818,8 +734,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_status_nonzero_exit_still_raises_dirty_error(self, tmp_path):
@@ -840,8 +756,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_status_non_str_stdout_still_raises_dirty_error(self, tmp_path):
@@ -869,8 +785,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_status_git_timeout_still_raises_dirty_error(self, tmp_path):
@@ -893,8 +809,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_benign_dirt_retry_phantom_state_no_raise(self, tmp_path):
@@ -919,8 +835,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             # Must not raise.
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
@@ -945,8 +861,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(GitCommandError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_benign_dirt_retry_lock_signal_kill_and_retry_succeeds_no_raise(
@@ -985,14 +901,14 @@ class TestContractCopyDirtExemption:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.shutil"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil"),
         ):
             mock_sys.platform = "win32"
             # Must not raise.
@@ -1033,13 +949,13 @@ class TestContractCopyDirtExemption:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.shutil"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1086,15 +1002,15 @@ class TestContractCopyDirtExemption:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.time"),
-            patch("lib_python_worktree.core.manager.shutil"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time"),
+            patch("lib_python_worktree.core.teardown.shutil"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1143,8 +1059,8 @@ class TestContractCopyDirtExemption:
         caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
 
         with patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
         warnings = [r for r in caplog.records if r.levelno == _logging.WARNING]
@@ -1190,9 +1106,9 @@ class TestContractCopyDirtExemption:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1237,8 +1153,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_literal_backslash_in_path_not_normalised_still_raises_dirty_error(
@@ -1269,8 +1185,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with pytest.raises(DirtyWorktreeError), patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
     def test_happy_path_issues_no_status_call(self, tmp_path):
@@ -1289,8 +1205,8 @@ class TestContractCopyDirtExemption:
         mock_lifecycle = MagicMock()
 
         with patch(
-            "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
-        ), patch("lib_python_worktree.core.manager.shutil"):
+            "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
+        ), patch("lib_python_worktree.core.teardown.shutil"):
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
         assert not any(_is_status_call(c) for c in calls), (
@@ -1327,12 +1243,12 @@ class TestKillBlockingProcessesWindows:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -1364,11 +1280,11 @@ class TestKillBlockingProcessesWindows:
             return MagicMock(returncode=255, stderr="Permission denied")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_perm_denied),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_perm_denied),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1406,13 +1322,13 @@ class TestKillBlockingProcessesWindows:
             return MagicMock(returncode=255, stderr="Permission denied")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_always_fail),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_always_fail),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.time"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as exc_info:
@@ -1453,12 +1369,12 @@ class TestKillBlockingProcessesPosix:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
             manager._teardown(
@@ -1493,12 +1409,12 @@ class TestKillBlockingProcessesPosix:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
             manager._teardown(
@@ -1527,13 +1443,13 @@ class TestKillBlockingProcessesPosix:
             return MagicMock(returncode=128, stderr="error: cannot lock worktree")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_always_fail),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_always_fail),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.time"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time"),
         ):
             mock_sys.platform = "linux"
             with pytest.raises(WorktreeDirLockedError) as exc_info:
@@ -1562,11 +1478,11 @@ class TestKillBlockingProcessesPosix:
             return MagicMock(returncode=128, stderr="fatal: not a git repository")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_broken_repo),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_broken_repo),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
             with pytest.raises(GitCommandError):
@@ -1615,11 +1531,11 @@ class TestTicket72LockVsDirtyClassification:
             )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_lock_and_dirty),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_lock_and_dirty),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1654,11 +1570,11 @@ class TestTicket72LockVsDirtyClassification:
             return MagicMock(returncode=255, stderr="Permission denied")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_perm_denied),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_perm_denied),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1688,11 +1604,11 @@ class TestTicket72LockVsDirtyClassification:
             return MagicMock(returncode=255, stderr="Invalid argument")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_invalid_arg),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_invalid_arg),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1725,11 +1641,11 @@ class TestTicket72LockVsDirtyClassification:
             return MagicMock(returncode=1, stderr="fatal: worktree is Locked")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_locked),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_locked),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1766,13 +1682,13 @@ class TestTicket72LockVsDirtyClassification:
             return MagicMock(returncode=255, stderr="Permission denied")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_always_fail),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_always_fail),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.time"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1854,9 +1770,9 @@ class TestKillBlockingFlagOff:
             return MagicMock(returncode=1, stderr="some error")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_rc1),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_rc1),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
         ):
             with pytest.raises(GitCommandError):
@@ -1885,8 +1801,8 @@ class TestKillBlockingFlagOff:
             return MagicMock(returncode=255, stderr="Permission denied")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_perm_denied),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_perm_denied),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -1921,16 +1837,16 @@ class TestKillBlockingRecordKilledPids:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             removed = manager.remove(record.id, kill_blocking_processes=True)
@@ -1981,16 +1897,16 @@ class TestKillBlockingRecordKilledPids:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             removed = manager.remove(record.id, kill_blocking_processes=True)
@@ -2065,19 +1981,19 @@ class TestTeardownContractStopSteps:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 side_effect=_mock_kill,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -2127,14 +2043,14 @@ class TestTeardownContractStopSteps:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             # Must not raise despite SetupFailedError from stop runner
@@ -2162,14 +2078,14 @@ class TestTeardownContractStopSteps:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
@@ -2240,14 +2156,14 @@ class TestTicket130TeardownStopHookOutcome:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
@@ -2298,14 +2214,14 @@ class TestTicket130TeardownStopHookOutcome:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
@@ -2328,10 +2244,10 @@ class TestTicket130TeardownStopHookOutcome:
         mock_lifecycle = MagicMock()
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
@@ -2361,7 +2277,7 @@ class TestTicket130TeardownStopHookOutcome:
         manager.state.add(record)
 
         mock_lifecycle = MagicMock()
-        with patch("lib_python_worktree.core.manager._run_git") as mock_git:
+        with patch("lib_python_worktree.core.teardown._run_git") as mock_git:
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
@@ -2404,10 +2320,10 @@ class TestTicket130TeardownStopHookOutcome:
         mock_lifecycle = MagicMock()
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch("pathlib.Path.exists", new=_flaky_exists),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -2433,8 +2349,8 @@ class TestTicket130TeardownStopHookOutcome:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._load_contract", side_effect=exc),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._load_contract", side_effect=exc),
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             caplog.at_level(logging.WARNING, logger="lib_python_worktree.core.manager"),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -2485,14 +2401,14 @@ class TestTicket130TeardownStopHookOutcome:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             caplog.at_level(logging.WARNING, logger="lib_python_worktree.core.manager"),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -2549,7 +2465,7 @@ class TestTicket130TeardownStopHookOutcome:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -2557,13 +2473,13 @@ class TestTicket130TeardownStopHookOutcome:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.shutil"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError):
@@ -2610,12 +2526,12 @@ class TestKillBlockingProcessesWindowsInvalidArg:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must not raise — currently fails because "Invalid argument" was
@@ -2652,12 +2568,12 @@ class TestKillBlockingProcessesWindowsInvalidArg:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -2696,23 +2612,22 @@ class TestLongPathFallback:
 
         # In Python 3.14, pathlib.Path.exists() calls os.path.exists() directly.
         # _teardown calls _load_contract twice (for stop: and teardown: steps),
-        # each of which calls Path.exists() on the contract file — resulting in
-        # 2 calls before the long-path guard at line 897.
-        # We must return False for those contract-file checks and True only for
-        # the actual worktree-path check at line 897.
-        # Strategy: return False for any path that is NOT record.path; return
-        # True for record.path on the first two checks (call #1 is ticket
-        # #127's target_absent probe, hoisted to the top of _teardown before
-        # any of this runs — the checkout genuinely IS present for this
-        # scenario, so it must read True there too; call #2 is the actual
-        # worktree-path check at line 897) and False from the third call
-        # onward (the final guard after rmtree succeeds).
+        # each of which calls Path.exists() on the contract file — those are
+        # filtered out below since they don't match record.path.
+        # Ticket #135: the target_absent probe now goes through the separately
+        # mockable teardown._target_is_absent seam, patched by the autouse
+        # _target_present_by_default fixture (return_value=False, i.e. present)
+        # — it no longer calls os.path.exists at all. So this mock only needs
+        # to cover the two remaining real os.path.exists(record.path) calls:
+        # call #1 is the long-path-fallback check at line 897 (True, dir still
+        # present after git remove), call #2 is the final guard after rmtree
+        # succeeds (False).
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] <= 2  # True for the first two calls
+                return _path_calls["n"] <= 1  # True for the first call only
             # Contract file / other paths → not present.
             return False
 
@@ -2720,10 +2635,10 @@ class TestLongPathFallback:
             rmtree_calls.append(path)
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.os.path.exists", side_effect=_mock_exists),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -2747,26 +2662,29 @@ class TestLongPathFallback:
         rmtree_calls: list = []
 
         # See explanation in test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
-        # Returns True for the first two checks of record.path (call #1 is
-        # ticket #127's target_absent probe; call #2 is the actual
-        # long-path-fallback check), and False for all other paths and all
-        # subsequent checks of record.path.
+        # Ticket #135: the target_absent probe now goes through the separately
+        # mockable teardown._target_is_absent seam (patched by the autouse
+        # _target_present_by_default fixture) and no longer touches
+        # os.path.exists. This mock only needs to cover the remaining two real
+        # os.path.exists(record.path) calls: call #1 is the long-path-fallback
+        # check (True), and False for all other paths and all subsequent
+        # checks of record.path (the final guard).
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] <= 2
+                return _path_calls["n"] <= 1
             return False
 
         def _mock_rmtree(path, **kwargs):
             rmtree_calls.append(path)
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.os.path.exists", side_effect=_mock_exists),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "linux"
@@ -2805,24 +2723,27 @@ class TestLongPathFallback:
             return MagicMock(returncode=1)  # robocopy exits 1 on success-with-copies
 
         # See explanation in test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
-        # Returns True for the first two checks of record.path (call #1 is
-        # ticket #127's target_absent probe; call #2 is the actual
-        # long-path-fallback check), and False for all other paths and all
-        # subsequent checks of record.path.
+        # Ticket #135: the target_absent probe now goes through the separately
+        # mockable teardown._target_is_absent seam (patched by the autouse
+        # _target_present_by_default fixture) and no longer touches
+        # os.path.exists. This mock only needs to cover the remaining two real
+        # os.path.exists(record.path) calls: call #1 is the long-path-fallback
+        # check (True), and False for all other paths and all subsequent
+        # checks of record.path (the final guard).
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] <= 2
+                return _path_calls["n"] <= 1
             return False
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.os.path.exists", side_effect=_mock_exists),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -2848,9 +2769,9 @@ class TestLongPathFallback:
         rmtree_calls: list = []
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=lambda *a, **kw: rmtree_calls.append(a)),
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=lambda *a, **kw: rmtree_calls.append(a)),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
@@ -2894,13 +2815,13 @@ class TestKillRetryLoop:
                 return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.time") as mock_time,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time") as mock_time,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must not raise.
@@ -2973,14 +2894,14 @@ class TestKillRetryLoop:
             return _git_side_effect(args, cwd=cwd, **kwargs)
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_tracking_git),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_tracking_git),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.time"),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.time"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must NOT raise WorktreeDirLockedError.
@@ -3053,8 +2974,8 @@ class TestTeardownAlreadyDeregistered:
             rmtree_calls.append((path, kwargs))
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
         ):
             # Must not raise.
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
@@ -3102,8 +3023,8 @@ class TestTeardownAlreadyDeregistered:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_git_side_effect),
-            patch("lib_python_worktree.core.manager.shutil"),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_git_side_effect),
+            patch("lib_python_worktree.core.teardown.shutil"),
             patch.object(
                 manager, "_teardown", wraps=lambda rec, force, **kw: (
                     WorktreeManager._teardown(
@@ -3164,10 +3085,10 @@ class TestTeardownAbsentTarget:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
             patch(
-                "lib_python_worktree.core.manager.shutil.rmtree",
+                "lib_python_worktree.core.teardown.shutil.rmtree",
                 side_effect=lambda *a, **kw: rmtree_calls.append((a, kw)),
             ),
         ):
@@ -3206,9 +3127,9 @@ class TestTeardownAbsentTarget:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree"),
         ):
             removed = manager.remove(record.id, force=False)
 
@@ -3239,8 +3160,8 @@ class TestTeardownAbsentTarget:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=False),
         ):
             with pytest.raises(GitCommandError):
                 manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
@@ -3256,12 +3177,12 @@ class TestTeardownAbsentTarget:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes"
+                "lib_python_worktree.core.teardown._find_blocking_processes"
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -3279,12 +3200,12 @@ class TestTeardownAbsentTarget:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -3318,10 +3239,10 @@ class TestTeardownAbsentTarget:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
             patch(
-                "lib_python_worktree.core.manager.shutil.rmtree",
+                "lib_python_worktree.core.teardown.shutil.rmtree",
                 side_effect=lambda *a, **kw: rmtree_calls.append((a, kw)),
             ),
         ):
@@ -3349,7 +3270,7 @@ class TestTeardownAbsentTarget:
 
         mock_lifecycle = MagicMock()
 
-        with patch("lib_python_worktree.core.manager.os.path.exists", return_value=False):
+        with patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True):
             with pytest.raises(PrimaryCheckoutError):
                 manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
@@ -3387,9 +3308,15 @@ class TestTeardownAbsentTarget:
         caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_side_effect,
+            ),  # ticket #135: _delete_owned_branch still calls
+                # manager._run_git directly, so it needs its own patch
+                # alongside the teardown-side one above.
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree"),
         ):
             removed = manager.remove(record.id, force=False)
 
@@ -3446,12 +3373,18 @@ class TestTeardownAbsentTarget:
         # actually called proves _teardown() genuinely saw the checkout as
         # present.
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_side_effect,
+            ),  # ticket #135: _delete_owned_branch still calls
+                # manager._run_git directly, so it needs its own patch
+                # alongside the teardown-side one above.
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(GitCommandError):
@@ -3481,9 +3414,9 @@ class TestTeardownAbsentTarget:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree"),
         ):
             removed = manager.remove(record.id, force=False)
 
@@ -3515,9 +3448,15 @@ class TestTeardownAbsentTarget:
         caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_side_effect,
+            ),  # ticket #135: _delete_owned_branch still calls
+                # manager._run_git directly, so it needs its own patch
+                # alongside the teardown-side one above.
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree"),
         ):
             removed = manager.remove(record.id, force=False)
 
@@ -3564,9 +3503,15 @@ class TestTeardownAbsentTarget:
             return MagicMock(returncode=0, stderr="")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git", side_effect=_side_effect),
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
-            patch("lib_python_worktree.core.manager.shutil.rmtree"),
+            patch("lib_python_worktree.core.teardown._run_git", side_effect=_side_effect),
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_side_effect,
+            ),  # ticket #135: _delete_owned_branch still calls
+                # manager._run_git directly, so it needs its own patch
+                # alongside the teardown-side one above.
+            patch("lib_python_worktree.core.teardown._target_is_absent", return_value=True),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree"),
         ):
             with pytest.raises(GitCommandError):
                 manager.remove(record.id, force=False)
@@ -3598,8 +3543,8 @@ class TestLongPathFallbackLockedGuard:
         manager._allocator = mock_allocator
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=False),
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.os.path.exists", return_value=False),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             # Must not raise.
@@ -3621,17 +3566,17 @@ class TestLongPathFallbackLockedGuard:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager.os.path.exists",
+                "lib_python_worktree.core.teardown.os.path.exists",
                 return_value=True,
             ),
             patch(
-                "lib_python_worktree.core.manager.shutil.rmtree",
+                "lib_python_worktree.core.teardown.shutil.rmtree",
                 side_effect=OSError("path too long / locked"),
             ),
-            patch("lib_python_worktree.core.manager.subprocess.run", return_value=MagicMock(returncode=1)),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.subprocess.run", return_value=MagicMock(returncode=1)),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -3683,15 +3628,15 @@ class TestWindowsPreflightBlockingCheck:
         fake_blockers = [KilledProcessInfo(pid=4444, name="node.exe", cmdline=["node"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes"
+                "lib_python_worktree.core.teardown._kill_blocking_processes"
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -3721,12 +3666,12 @@ class TestWindowsPreflightBlockingCheck:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -3770,18 +3715,18 @@ class TestWindowsPreflightBlockingCheck:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git",
+                "lib_python_worktree.core.teardown._run_git",
                 side_effect=_git_side_effect,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 side_effect=_mock_kill,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must not raise.
@@ -3817,24 +3762,24 @@ class TestWindowsPreflightBlockingCheck:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ),
             patch(
-                "lib_python_worktree.core.manager.os.path.exists",
+                "lib_python_worktree.core.teardown.os.path.exists",
                 return_value=True,
             ),
             patch(
-                "lib_python_worktree.core.manager.shutil.rmtree",
+                "lib_python_worktree.core.teardown.shutil.rmtree",
                 side_effect=OSError("still locked"),
             ),
             patch(
-                "lib_python_worktree.core.manager.subprocess.run",
+                "lib_python_worktree.core.teardown.subprocess.run",
                 return_value=MagicMock(returncode=1),
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -3880,15 +3825,15 @@ class TestWindowsPreflightBlockingCheck:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git",
+                "lib_python_worktree.core.teardown._run_git",
                 side_effect=_git_always_fail,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.time"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -3922,15 +3867,15 @@ class TestWindowsPreflightBlockingCheck:
         fake_blockers = [KilledProcessInfo(pid=7777, name="python", cmdline=["python"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ) as mock_find,
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes"
+                "lib_python_worktree.core.teardown._kill_blocking_processes"
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "linux"
@@ -3977,12 +3922,12 @@ class TestWindowsPreflightBlockingCheck:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=degraded,
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4022,12 +3967,12 @@ class TestWindowsPreflightBlockingCheck:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=degraded,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
             caplog.at_level("WARNING", logger="lib_python_worktree.core.manager"),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -4075,18 +4020,18 @@ class TestWindowsPreflightBlockingCheck:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git",
+                "lib_python_worktree.core.teardown._run_git",
                 side_effect=_git_side_effect,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=degraded,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 side_effect=_mock_kill,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must not raise.
@@ -4126,12 +4071,12 @@ class TestWindowsPreflightBlockingCheck:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=degraded_with_blocker,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4177,12 +4122,12 @@ class TestWindowsPreflightBlockingCheck:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=truncated,
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4226,15 +4171,15 @@ class TestTicket117PreflightFalsePositive:
         transient = [KilledProcessInfo(pid=4444, name="claude", cmdline=["claude"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 side_effect=[transient, []],
             ) as mock_find,
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes"
+                "lib_python_worktree.core.teardown._kill_blocking_processes"
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4274,12 +4219,12 @@ class TestTicket117PreflightFalsePositive:
         persistent = [KilledProcessInfo(pid=4444, name="node.exe", cmdline=["node"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -4325,18 +4270,18 @@ class TestTicket117PreflightFalsePositive:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git",
+                "lib_python_worktree.core.teardown._run_git",
                 side_effect=_git_side_effect,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 side_effect=_mock_kill,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -4367,12 +4312,12 @@ class TestTicket117PreflightFalsePositive:
         ]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
             caplog.at_level("WARNING", logger="lib_python_worktree.core.manager"),
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
@@ -4394,10 +4339,8 @@ class TestTicket117PreflightFalsePositive:
         """The settle window is bounded: at most _PREFLIGHT_SETTLE_RETRIES
         sleep calls and at most 2 total scan calls, even for a persistent
         blocker."""
-        from lib_python_worktree.core.manager import (
-            WorktreeDirLockedError,
-            _PREFLIGHT_SETTLE_RETRIES,
-        )
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+        from lib_python_worktree.core.teardown import _PREFLIGHT_SETTLE_RETRIES
         from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
 
         manager = _make_manager(tmp_path)
@@ -4410,13 +4353,13 @@ class TestTicket117PreflightFalsePositive:
         persistent = [KilledProcessInfo(pid=6262, name="node.exe", cmdline=["node"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.time") as mock_time,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time") as mock_time,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4444,12 +4387,12 @@ class TestTicket117PreflightFalsePositive:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4472,11 +4415,11 @@ class TestTicket117PreflightFalsePositive:
         mock_lifecycle = MagicMock()
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes"
+                "lib_python_worktree.core.teardown._find_blocking_processes"
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "linux"
@@ -4538,12 +4481,12 @@ class TestTicket117OwnedBlocker:
         foreign_hit = KilledProcessInfo(pid=5555, name="claude", cmdline=["claude"])
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 side_effect=[[owned_hit, foreign_hit], [owned_hit]],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4588,13 +4531,13 @@ class TestTicket117OwnedBlocker:
         owned_hit = [KilledProcessInfo(pid=4444, name="daemon", cmdline=["daemon"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=owned_hit,
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.time") as mock_time,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time") as mock_time,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4639,19 +4582,19 @@ class TestTicket117OwnedBlocker:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git",
+                "lib_python_worktree.core.teardown._run_git",
                 side_effect=_git_side_effect,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=owned_hit,
             ) as mock_find,
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 side_effect=_mock_kill,
             ),
-            patch("lib_python_worktree.core.manager.time") as mock_time,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time") as mock_time,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -4714,12 +4657,12 @@ class TestTicket117FixCycleDegradedConfirmation:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 side_effect=[foreign_hit, degraded_rescan],
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4759,12 +4702,12 @@ class TestTicket117FixCycleDegradedConfirmation:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=degraded,
             ) as mock_find,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4814,16 +4757,16 @@ class TestTicket117FixCycleDegradedConfirmation:
         )
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=degraded_kill_result,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -4874,18 +4817,18 @@ class TestTicket117FixCycleDegradedConfirmation:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git",
+                "lib_python_worktree.core.teardown._run_git",
                 side_effect=_git_side_effect,
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 side_effect=_mock_kill,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must not raise.
@@ -4938,19 +4881,19 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5000,7 +4943,7 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -5008,9 +4951,9 @@ class TestTicket117TeardownRunsAtMostOnce:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(DirtyWorktreeError):
@@ -5046,15 +4989,15 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5130,7 +5073,7 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -5138,9 +5081,9 @@ class TestTicket117TeardownRunsAtMostOnce:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(DirtyWorktreeError):
@@ -5197,7 +5140,7 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -5205,9 +5148,9 @@ class TestTicket117TeardownRunsAtMostOnce:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             # Must not raise.
@@ -5253,7 +5196,7 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -5261,9 +5204,9 @@ class TestTicket117TeardownRunsAtMostOnce:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -5298,15 +5241,15 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ) as mock_load,
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5362,7 +5305,7 @@ class TestTicket117TeardownRunsAtMostOnce:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -5370,9 +5313,9 @@ class TestTicket117TeardownRunsAtMostOnce:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             manager._teardown(
@@ -5451,7 +5394,7 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
@@ -5459,9 +5402,9 @@ class TestTicket126TeardownNotReRunOnRetry:
                 return_value=mock_runner_instance,
             ),
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(DirtyWorktreeError):
@@ -5520,19 +5463,19 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=persistent,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5549,19 +5492,19 @@ class TestTicket126TeardownNotReRunOnRetry:
         # Blocker clears; this retry is the FIRST successful attempt.
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=[],
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5605,15 +5548,15 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5652,15 +5595,15 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5700,15 +5643,15 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5770,15 +5713,15 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5804,15 +5747,15 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -5864,15 +5807,15 @@ class TestTicket126TeardownNotReRunOnRetry:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._load_contract",
+                "lib_python_worktree.core.teardown._load_contract",
                 return_value=fake_contract,
             ),
             patch(
                 "lib_python_worktree.setup.runner.SetupRunner",
                 return_value=mock_runner_instance,
             ),
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
             patch.object(
                 manager.state, "update", side_effect=OSError("disk full")
             ),
@@ -5946,23 +5889,26 @@ class TestRobocopyTimeoutBounding:
 
         # See explanation in
         # test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
-        # Returns True for the first two checks of record.path (call #1 is
-        # ticket #127's target_absent probe; call #2 is the actual
-        # long-path-fallback check).
+        # Ticket #135: the target_absent probe now goes through the
+        # separately mockable teardown._target_is_absent seam (patched by
+        # the autouse _target_present_by_default fixture) and no longer
+        # touches os.path.exists. This mock only needs to cover the
+        # remaining real os.path.exists(record.path) call: the
+        # long-path-fallback check (True).
         _path_calls = {"n": 0}
 
         def _mock_exists(path):
             if str(path) == record.path:
                 _path_calls["n"] += 1
-                return _path_calls["n"] <= 2
+                return _path_calls["n"] <= 1
             return False
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
-            patch("lib_python_worktree.core.manager.os.path.exists", side_effect=_mock_exists),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown.os.path.exists", side_effect=_mock_exists),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -6005,17 +5951,17 @@ class TestRobocopyTimeoutBounding:
             raise subprocess_module.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             # Leftover dir stays present throughout (robocopy never got the
             # chance to mirror it empty), so both the long-path guard and
             # the Final guard see it as still there. Contract-file loads
             # are wrapped in broad try/except in _teardown so a "True" for
             # those paths too is harmless (matches the existing
             # test_directory_still_exists_after_fallback_raises pattern).
-            patch("lib_python_worktree.core.manager.os.path.exists", return_value=True),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.os.path.exists", return_value=True),
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -6042,16 +5988,19 @@ class TestRobocopyTimeoutBounding:
             return MagicMock(returncode=1)
 
         def _make_exists_for(target_path):
-            # Returns True for the first two checks of target_path (call #1
-            # is ticket #127's target_absent probe; call #2 is the actual
-            # long-path-fallback check) -- see the explanation in
+            # Ticket #135: the target_absent probe now goes through the
+            # separately mockable teardown._target_is_absent seam (patched
+            # by the autouse _target_present_by_default fixture) and no
+            # longer touches os.path.exists. This mock only needs to cover
+            # the remaining real os.path.exists(target_path) call: the
+            # long-path-fallback check (True) -- see the explanation in
             # test_directory_still_exists_after_git_remove_triggers_longpath_deletion.
             calls = {"n": 0}
 
             def _mock_exists(path):
                 if str(path) == target_path:
                     calls["n"] += 1
-                    return calls["n"] <= 2
+                    return calls["n"] <= 1
                 return False
 
             return _mock_exists
@@ -6064,14 +6013,14 @@ class TestRobocopyTimeoutBounding:
         monkeypatch.setenv("WORKTREE_ROBOCOPY_TIMEOUT_SEC", "12.5")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager.os.path.exists",
+                "lib_python_worktree.core.teardown.os.path.exists",
                 side_effect=_make_exists_for(record_override.path),
             ),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -6087,14 +6036,14 @@ class TestRobocopyTimeoutBounding:
         monkeypatch.setenv("WORKTREE_ROBOCOPY_TIMEOUT_SEC", "")
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager.os.path.exists",
+                "lib_python_worktree.core.teardown.os.path.exists",
                 side_effect=_make_exists_for(record_disabled.path),
             ),
-            patch("lib_python_worktree.core.manager.shutil.rmtree", side_effect=_mock_rmtree),
-            patch("lib_python_worktree.core.manager.subprocess.run", side_effect=_mock_subprocess_run),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil.rmtree", side_effect=_mock_rmtree),
+            patch("lib_python_worktree.core.teardown.subprocess.run", side_effect=_mock_subprocess_run),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_git.return_value = MagicMock(returncode=0, stderr="")
             mock_sys.platform = "win32"
@@ -6123,16 +6072,16 @@ class TestRobocopyTimeoutBounding:
         fake_blockers = [KilledProcessInfo(pid=9999, name="node.exe", cmdline=["node"])]
 
         with (
-            patch("lib_python_worktree.core.manager._run_git") as mock_git,
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes"
+                "lib_python_worktree.core.teardown._kill_blocking_processes"
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.subprocess.run") as mock_robocopy,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.subprocess.run") as mock_robocopy,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -6198,16 +6147,16 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes"
+                "lib_python_worktree.core.teardown._kill_blocking_processes"
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
@@ -6253,13 +6202,13 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -6299,13 +6248,13 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -6344,9 +6293,9 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
@@ -6388,9 +6337,9 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
             with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
@@ -6430,14 +6379,14 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._kill_blocking_processes",
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
                 return_value=fake_killed,
             ) as mock_kill,
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.time"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.time"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
@@ -6485,10 +6434,10 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
-            patch("lib_python_worktree.core.manager.shutil"),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.shutil"),
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -6532,13 +6481,13 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
@@ -6593,13 +6542,13 @@ class TestCombinedBlockingConditions:
 
         with (
             patch(
-                "lib_python_worktree.core.manager._run_git", side_effect=_side_effect
+                "lib_python_worktree.core.teardown._run_git", side_effect=_side_effect
             ),
             patch(
-                "lib_python_worktree.core.manager._find_blocking_processes",
+                "lib_python_worktree.core.teardown._find_blocking_processes",
                 return_value=fake_blockers,
             ),
-            patch("lib_python_worktree.core.manager.sys") as mock_sys,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
             mock_sys.platform = "win32"
             with pytest.raises(WorktreeDirLockedError) as excinfo:
