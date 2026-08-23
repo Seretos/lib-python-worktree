@@ -2320,7 +2320,9 @@ def test_manager_start_uses_encoded_command_argv(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
-def test_manager_start_real_spawn_native_exit_code_propagates(tmp_path: Path):
+def test_manager_start_real_spawn_native_exit_code_propagates(
+    tmp_path: Path, generous_early_exit_wait
+):
     """Ticket #134 review fix-loop (nit): a `start:` step's real native exit
     code must be reported faithfully via WorktreeManager.start()'s recorded
     result, not collapsed to a bare 1 -- proving the ticket #134 fix also
@@ -2332,7 +2334,16 @@ def test_manager_start_real_spawn_native_exit_code_propagates(tmp_path: Path):
     (`test_teardown_style_step_reports_faithful_nonzero_exit_code` in
     tests/test_setup_runner.py) -- this is the missing `start:`-side
     equivalent, using the identical `cmd /c "echo before-exit & exit 3"`
-    native-command shape."""
+    native-command shape.
+
+    Ticket #137: uses the ``generous_early_exit_wait`` fixture -- the real
+    `start:` step spawns `powershell.exe` (per `_build_step_command`), whose
+    startup on `windows-latest` CI runners routinely exceeds the production
+    0.25s `_EARLY_EXIT_WAIT_SEC` window structurally, not marginally, making
+    the exit-code assertion below flake on `status="running"` rather than
+    exercising the exit-code-faithfulness behaviour this test is actually
+    about. See the fixture's docstring for why this costs no real time in
+    the passing case."""
     wt_path = tmp_path / "wt"
     wt_path.mkdir()
 

@@ -20,9 +20,18 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+# Ticket #137: bind the REAL shutil.rmtree function object now, before any
+# test patches "lib_python_worktree.core.teardown.shutil.rmtree" (which
+# patches the attribute on this same `shutil` module, since teardown.py just
+# does a plain `import shutil`). A lookup of `shutil.rmtree` performed later,
+# inside a test, would resolve to the patched mock instead of the real
+# function and recurse infinitely.
+_real_rmtree = shutil.rmtree
 
 import pytest
 
@@ -512,6 +521,48 @@ class TestMatrixBoundaryConditions:
         manager.state.add(record)
         mock_lifecycle = MagicMock()
 
+        def _real_rmtree_side_effect(*_args, **_kwargs):
+            # Ticket #137: `sys.platform` is mocked module-wide above so
+            # Gate A can be exercised as "win32" on any host, but that same
+            # mocked platform is read a SECOND time in
+            # `_phase_filesystem_fallback`, which then builds a Windows
+            # "\\?\"-prefixed extended path and hands it to `shutil.rmtree`.
+            # On a real non-Windows host that string is nonsensical and
+            # `shutil.rmtree` raises OSError, falling through to the
+            # robocopy fallback (also unavailable there) and finally
+            # `WorktreeDirLockedError` -- reproducing the reported CI
+            # failure rather than exercising the fallback deletion this row
+            # means to test. Redirect the call to a REAL recursive delete of
+            # the actual `checkout_path` -- but only AFTER pinning that the
+            # path argument the code under test actually passed genuinely
+            # references `checkout_path` (see the assertions immediately
+            # below). That way a regression in `_phase_filesystem_fallback`'s
+            # own path-building (wrong variable, missing abspath, wrong
+            # prefix, ...) fails loudly here instead of being silently
+            # masked by this side effect deleting the right directory
+            # regardless of what argument it was actually given. Tolerating
+            # the exact *string form* of a nonsense-but-correctly-derived
+            # extended path on a non-Windows host (forward slashes from
+            # posixpath's `abspath`, etc.) is still fine -- that's what the
+            # prefix-strip + `Path(...).resolve()` comparison below
+            # normalizes away. Do not remove this as "redundant" -- it is
+            # load-bearing for cross-platform CI determinism.
+            called_path = _args[0] if _args else _kwargs.get("path")
+            if platform == "win32":
+                assert called_path.startswith("\\\\?\\"), (
+                    f"expected a win32 extended-path prefix, got {called_path!r}"
+                )
+                stripped = Path(called_path[4:])
+                assert os.path.normcase(str(stripped.resolve())) == os.path.normcase(
+                    str(checkout_path.resolve())
+                ), f"extended path {called_path!r} does not point at {checkout_path!r}"
+            else:
+                assert os.path.normcase(str(called_path)) == os.path.normcase(
+                    str(checkout_path)
+                ), f"rmtree called with {called_path!r}, expected {checkout_path!r}"
+            if checkout_path.exists():
+                _real_rmtree(str(checkout_path))
+
         with (
             patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
@@ -519,6 +570,10 @@ class TestMatrixBoundaryConditions:
                 return_value=[],
             ) as mock_find,
             patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_real_rmtree_side_effect,
+            ),
         ):
             mock_git.return_value = _ok()
             mock_sys.platform = platform
@@ -529,6 +584,13 @@ class TestMatrixBoundaryConditions:
             mock_find.assert_called_once_with(record.path, os.getpid())
         else:
             mock_find.assert_not_called()
+
+        if not target_absent:
+            # Pin that the filesystem-fallback seam actually ran (and
+            # actually deleted the real directory) on both simulated
+            # platforms, rather than this row passing "by accident" because
+            # nothing on disk needed cleaning up.
+            assert not checkout_path.exists()
 
     @pytest.mark.parametrize(
         "scenario",
