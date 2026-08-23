@@ -284,7 +284,9 @@ def test_powershell_step_argv_uses_encoded_command(tmp_path: Path, monkeypatch):
     blob = argv[-1]
     assert argv == ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", blob]
     assert all(part != run_line for part in argv)
-    assert base64.b64decode(blob).decode("utf-16-le") == run_line
+    # ticket #134: the blob now carries run_line + an exit-code epilogue, so
+    # it starts with (not equals) the original run line.
+    assert base64.b64decode(blob).decode("utf-16-le").startswith(run_line)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
@@ -452,8 +454,10 @@ def test_build_step_command_pwsh_matches_powershell_encoding():
         ps_cmd[-1],
     ]
     assert pwsh_cmd == ["pwsh", "-NoProfile", "-NonInteractive", "-EncodedCommand", pwsh_cmd[-1]]
-    assert base64.b64decode(ps_cmd[-1]).decode("utf-16-le") == run_line
-    assert base64.b64decode(pwsh_cmd[-1]).decode("utf-16-le") == run_line
+    # ticket #134: the blob now carries run_line + an exit-code epilogue, so
+    # it starts with (not equals) the original run line.
+    assert base64.b64decode(ps_cmd[-1]).decode("utf-16-le").startswith(run_line)
+    assert base64.b64decode(pwsh_cmd[-1]).decode("utf-16-le").startswith(run_line)
 
 
 def test_build_step_command_unknown_shell_raises_via_resolve_shell():
@@ -479,7 +483,9 @@ def test_build_step_command_powershell_round_trips_special_characters(run_line):
     shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
     cmd = _build_step_command(shell_cmd, run_line)
     blob = cmd[-1]
-    assert base64.b64decode(blob).decode("utf-16-le") == run_line
+    # ticket #134: the blob now carries run_line + an exit-code epilogue, so
+    # it starts with (not equals) the original run line.
+    assert base64.b64decode(blob).decode("utf-16-le").startswith(run_line)
 
 
 def test_build_step_command_posix_argv_shape_pinned():
@@ -498,6 +504,220 @@ def test_build_step_command_posix_argv_shape_pinned():
         "-c",
         "npm install",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Ticket #134: a setup/teardown/stop/start step's real process exit code is
+# collapsed to a bare 1 on Windows. Root cause: a -Command/-EncodedCommand
+# script that ends without its own `exit` statement gets its *host* exit
+# code derived from `$?` (0/1), discarding `$LASTEXITCODE` -- so a native
+# child's real exit code (e.g. `cmd /c "... & exit 3"`, or a self-wrapped
+# inner `powershell ... -Command "exit 3"`) is silently collapsed. Fix: append
+# an exit-code-propagating epilogue to the run line before it is encoded.
+# ---------------------------------------------------------------------------
+
+
+def test_powershell_step_argv_appends_exit_code_epilogue():
+    """The -EncodedCommand blob built for a PowerShell-routed step must carry
+    the original run line followed by *something* extra (the exit-code
+    epilogue) -- not the run line alone. This is the driving test: it uses
+    only pre-existing symbols (``_build_step_command``) so that against
+    pre-fix code it fails with a genuine AssertionError (decoded == run_line,
+    nothing appended), not an ImportError for a not-yet-existing constant --
+    see ``test_powershell_step_argv_epilogue_matches_constant`` below for the
+    exact-content follow-up check."""
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    run_line = 'cmd /c "echo before-exit & exit 3"'
+    shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    cmd = _build_step_command(shell_cmd, run_line)
+    decoded = base64.b64decode(cmd[-1]).decode("utf-16-le")
+    assert decoded.startswith(run_line)
+    assert decoded != run_line, "expected an exit-code epilogue appended after the run line"
+
+
+def test_powershell_step_argv_epilogue_matches_constant():
+    """Follow-up exact-content check: the appended text is precisely the
+    module's ``_PS_EXIT_CODE_EPILOGUE`` constant."""
+    from lib_python_worktree.setup.runner import (  # noqa: PLC0415
+        _build_step_command,
+        _PS_EXIT_CODE_EPILOGUE,
+    )
+
+    run_line = 'cmd /c "echo before-exit & exit 3"'
+    shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    cmd = _build_step_command(shell_cmd, run_line)
+    decoded = base64.b64decode(cmd[-1]).decode("utf-16-le")
+    assert decoded.endswith(_PS_EXIT_CODE_EPILOGUE)
+    assert decoded == run_line + _PS_EXIT_CODE_EPILOGUE
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        "Write-Output 'hi'  # a trailing comment",
+        "Write-Output 'hi'\n",
+        "",
+    ],
+)
+def test_powershell_step_argv_epilogue_survives_edge_case_run_lines(run_line):
+    """A run line ending in a `#` comment, a trailing newline, or an empty
+    run line must not swallow or corrupt the appended epilogue -- the
+    epilogue's leading `\\n` guards exactly this."""
+    from lib_python_worktree.setup.runner import (  # noqa: PLC0415
+        _build_step_command,
+        _PS_EXIT_CODE_EPILOGUE,
+    )
+
+    shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    cmd = _build_step_command(shell_cmd, run_line)
+    decoded = base64.b64decode(cmd[-1]).decode("utf-16-le")
+    assert decoded == run_line + _PS_EXIT_CODE_EPILOGUE
+
+
+def test_build_step_command_bash_unaffected_by_epilogue():
+    """bash/sh argv must stay byte-identical to today -- the epilogue is
+    PowerShell/pwsh-only, POSIX shells already propagate exit status via
+    their own return code."""
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    assert _build_step_command(["bash", "-c"], "exit 3") == ["bash", "-c", "exit 3"]
+    assert _build_step_command(["sh", "-c"], "exit 3") == ["sh", "-c", "exit 3"]
+
+
+def _run_single_step_returncode(
+    tmp_path: Path, run_line: str, *, worktree_id: str, shell: Optional[str] = None
+) -> int:
+    """Run one real (non-faked) step and return its returncode, whether the
+    step succeeded or raised ``SetupFailedError``."""
+    wt = tmp_path / "wt"
+    wt.mkdir(exist_ok=True)
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    try:
+        res = runner.run(
+            setup=[_PlainStep(run=run_line, name="probe", shell=shell)],
+            worktree_id=worktree_id,
+            worktree_path=wt,
+            branch="main",
+        )
+        return res.steps[0].returncode
+    except SetupFailedError as exc:
+        return exc.returncode
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
+def test_native_command_exit_code_is_propagated(tmp_path: Path):
+    """The driving test for ticket #134: a native child's real exit code
+    (here 3, via `cmd /c "... & exit 3"`) must survive a PowerShell-routed
+    step -- not collapse to a bare 1 -- and the log must show the real code
+    plus the stdout produced before the exit."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run='cmd /c "echo before-exit & exit 3"', name="native")],
+            worktree_id="wt-native-exit",
+            worktree_path=wt,
+            branch="main",
+        )
+    assert exc_info.value.returncode == 3
+    text = exc_info.value.log_path.read_text(encoding="utf-8")
+    assert "# returncode: 3" in text
+    assert "before-exit" in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
+@pytest.mark.parametrize(
+    "run_line,expected_rc",
+    [
+        # ticket #109 shape: a self-wrapped inner `powershell ... -Command
+        # "exit 3"` is a native child of the outer PowerShell host.
+        ('powershell -NoProfile -NonInteractive -Command "exit 3"', 3),
+        # A bare `exit N` with no native command anywhere already worked
+        # before this fix (confirmed by the plan's verification spike) --
+        # pinned here so the epilogue doesn't regress it.
+        ("if ($true) { exit 3 } else { exit 0 }", 3),
+        ("exit 0", 0),
+        ("Write-Output 'ok'", 0),
+        # A failing cmdlet (non-native failure path) still surfaces non-zero.
+        ('Get-Item -Path "C:\\this\\does\\not\\exist\\at\\all.xyz"', 1),
+        # Exit-code boundary coverage: 255 and an above-255 value.
+        ("exit 255", 255),
+        ("exit 500", 500),
+    ],
+)
+def test_powershell_step_exit_codes_propagate(tmp_path: Path, run_line, expected_rc):
+    rc = _run_single_step_returncode(
+        tmp_path, run_line, worktree_id=f"wt-rc-{expected_rc}-{abs(hash(run_line))}"
+    )
+    assert rc == expected_rc
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix-only pin")
+def test_posix_bash_exit_code_propagates_unaffected_by_epilogue(tmp_path: Path):
+    """POSIX shells were never touched by the epilogue fix -- pin that a
+    real `bash -c 'exit 3'` step still reports 3, exactly as before."""
+    rc = _run_single_step_returncode(tmp_path, "exit 3", worktree_id="wt-posix-rc", shell="bash")
+    assert rc == 3
+
+
+# ---------------------------------------------------------------------------
+# Ticket #134, behavioural requirement 3: shared-call-site coverage -- the
+# fix lands in the single _build_step_command seam shared by SetupRunner
+# (setup:/teardown:) and WorktreeManager.start (start:).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
+def test_teardown_style_step_reports_faithful_nonzero_exit_code(tmp_path: Path):
+    """A teardown: step (modeled here as any SetupRunner.run() call, since
+    teardown steps funnel through the same run()/_invoke() path as setup:)
+    with a non-1 exit code must report that exact code, not a collapsed 1."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    with pytest.raises(SetupFailedError) as exc_info:
+        runner.run(
+            setup=[_PlainStep(run='cmd /c "exit 7"', name="teardown-step")],
+            worktree_id="wt-teardown-exit",
+            worktree_path=wt,
+            branch="main",
+        )
+    assert exc_info.value.returncode == 7
+
+
+# ---------------------------------------------------------------------------
+# Ticket #134 review fix-loop: known, accepted limitation around a stale
+# *global* $LASTEXITCODE misattributed to the wrong statement's failure in a
+# mixed native+cmdlet script. See _build_step_command's docstring for the
+# full writeup. This is a pinning test for the CURRENT (accepted) behavior,
+# not an assertion that the reported code is "correct" -- resolution option
+# (b) from the review (document + pin), not option (a) (correlate the
+# failure to $LASTEXITCODE, which is hard in general and out of scope for a
+# fix loop).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
+def test_powershell_step_stale_lastexitcode_from_earlier_statement_is_a_known_limitation(
+    tmp_path: Path,
+):
+    # NOTE: this pins a documented KNOWN LIMITATION (see _build_step_command's
+    # docstring, "Known limitation -- stale global $LASTEXITCODE"), not
+    # desired behavior -- do not "fix" this test by changing the expected
+    # value if the underlying epilogue logic changes; update the docstring
+    # and this comment together with any such change instead.
+    rc = _run_single_step_returncode(
+        tmp_path,
+        'cmd /c "exit 7"; Get-Item C:\\this\\does\\not\\exist.xyz',
+        worktree_id="wt-stale-lastexitcode",
+    )
+    # The actual failure is the Get-Item cmdlet (no numeric exit code of its
+    # own, would report a generic 1 under bare-$? semantics), not the
+    # already-completed `cmd /c "exit 7"` earlier in the script -- but
+    # $LASTEXITCODE is a global, so the stale 7 is what gets reported.
+    assert rc == 7
 
 
 def test_log_dir_for_default():

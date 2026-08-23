@@ -17,6 +17,7 @@ from typing import Callable
 import pytest
 
 from lib_python_worktree.core import manager as manager_module
+from lib_python_worktree.core import teardown as _teardown_mod
 from lib_python_worktree.core import _git_utils as git_utils_module
 from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
@@ -39,6 +40,7 @@ from lib_python_worktree.core.state import (
     InMemoryStateStore,
     StopDetail,
     WorktreeRecord,
+    _BASE_FETCH_STDERR_MAX_CHARS,
 )
 from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive
 
@@ -1290,7 +1292,7 @@ def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
             args=["git", *args], returncode=0, stdout="", stderr=""
         )
 
-    monkeypatch.setattr(manager_module, "_run_git", _fake_run_git)
+    monkeypatch.setattr(_teardown_mod, "_run_git", _fake_run_git)
 
     mgr = WorktreeManager(
         config=ManagerConfig(store_root=Path("/fake/store")),
@@ -1356,6 +1358,7 @@ def test_find_by_branch_matches_after_create_forward_slash_input(
 # Ticket #25: WorktreeManager.start reads cmd from contract; stop runs steps
 # ---------------------------------------------------------------------------
 
+import sys  # noqa: E402 – after sys-level imports
 from unittest.mock import MagicMock, call, patch  # noqa: E402 – after sys-level imports
 
 from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: E402
@@ -2314,6 +2317,53 @@ def test_manager_start_uses_encoded_command_argv(tmp_path: Path, monkeypatch):
 
     call_kwargs = mock_start.call_args
     assert call_kwargs.args[1] == expected_cmd
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
+def test_manager_start_real_spawn_native_exit_code_propagates(
+    tmp_path: Path, generous_early_exit_wait
+):
+    """Ticket #134 review fix-loop (nit): a `start:` step's real native exit
+    code must be reported faithfully via WorktreeManager.start()'s recorded
+    result, not collapsed to a bare 1 -- proving the ticket #134 fix also
+    covers the `start:` seam, not just `setup:`/`teardown:`. `manager.start()`
+    and `SetupRunner._invoke` funnel through the identical
+    `_build_step_command`/`_resolve_shell` seam (confirmed: only two call
+    sites exist), and a teardown-side regression test already pins this for
+    `setup:`/`teardown:`
+    (`test_teardown_style_step_reports_faithful_nonzero_exit_code` in
+    tests/test_setup_runner.py) -- this is the missing `start:`-side
+    equivalent, using the identical `cmd /c "echo before-exit & exit 3"`
+    native-command shape.
+
+    Ticket #137: uses the ``generous_early_exit_wait`` fixture -- the real
+    `start:` step spawns `powershell.exe` (per `_build_step_command`), whose
+    startup on `windows-latest` CI runners routinely exceeds the production
+    0.25s `_EARLY_EXIT_WAIT_SEC` window structurally, not marginally, making
+    the exit-code assertion below flake on `status="running"` rather than
+    exercising the exit-code-faithfulness behaviour this test is actually
+    about. See the fixture's docstring for why this costs no real time in
+    the passing case."""
+    wt_path = tmp_path / "wt"
+    wt_path.mkdir()
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(path=str(wt_path))
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run='cmd /c "echo before-exit & exit 3"')],
+    )
+
+    with patch(
+        "lib_python_worktree.core.manager._load_contract", return_value=fake_contract
+    ):
+        result = mgr.start(record.id)
+
+    assert result.status == "exited"
+    assert result.returncode == 3
 
 
 def test_manager_start_unknown_variant_raises_worktree_error(tmp_path: Path):
@@ -4361,17 +4411,265 @@ def test_create_fetch_false_uses_local_ref(manager: WorktreeManager, git_repo: P
 
 
 @pytest.mark.requires_git
-def test_create_fetch_true_raises_git_command_error_when_no_origin(
+def test_create_fetch_failure_falls_back_to_local_base(
+    manager: WorktreeManager, git_repo: Path, caplog
+):
+    """Driving test (ticket #134, Befund 2): with the default fetch=True, a
+    `git fetch` that fails (git_repo's fixture has no `origin` remote, so
+    this fetch genuinely fails) no longer hard-fails create() outright --
+    since the local `main` ref still exists, create() falls back to it,
+    logs a WARNING, and records the degradation on
+    `rec.base_fetch_fallback`.
+
+    Before the fix this raised GitCommandError instead (the old assertion,
+    preserved as `test_create_fetch_failure_without_local_base_still_raises`
+    for the case where the local base is genuinely gone too)."""
+    import logging as _logging
+
+    caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+    local_main = subprocess.run(
+        ["git", "rev-parse", "main"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    rec = manager.create(str(git_repo), "feature/no-origin", base="main")
+
+    wt_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=rec.path,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert wt_head == local_main
+
+    fallback = rec.base_fetch_fallback
+    assert fallback is not None
+    assert fallback.reason == "fetch_failed"
+    assert fallback.base == "main"
+    assert fallback.returncode is not None
+    assert fallback.returncode != 0
+    assert fallback.stderr
+    assert any(r.message == fallback.message for r in caplog.records), (
+        "the logged WARNING message must be identical to fallback.message"
+    )
+
+
+@pytest.mark.requires_git
+def test_create_fetch_failure_truncates_stderr_at_construction_time(
+    manager: WorktreeManager, git_repo: Path, monkeypatch
+):
+    """Ticket #134 review fix-loop (nit): `BaseFetchFallback.stderr` must be
+    capped at `_BASE_FETCH_STDERR_MAX_CHARS` at construction time in
+    manager.py's fetch-failed branch -- not only later, at YAML
+    serialize/deserialize time in yaml_store.py -- so the in-process record
+    `create()` returns (before any disk round-trip) already carries a
+    bounded stderr, matching `BaseFetchFallback`'s own docstring claim."""
+    real_run_git = manager_module._run_git
+    huge_stderr = "x" * (_BASE_FETCH_STDERR_MAX_CHARS * 3)
+
+    def fake_run_git(args, **kwargs):
+        if list(args[:1]) == ["fetch"]:
+            return subprocess.CompletedProcess(
+                args=["git", "fetch", "origin", "main"],
+                returncode=1,
+                stdout="",
+                stderr=huge_stderr,
+            )
+        return real_run_git(args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_run_git", fake_run_git)
+
+    rec = manager.create(str(git_repo), "feature/huge-stderr", base="main")
+
+    fallback = rec.base_fetch_fallback
+    assert fallback is not None
+    assert fallback.reason == "fetch_failed"
+    assert len(fallback.stderr) == _BASE_FETCH_STDERR_MAX_CHARS
+    assert fallback.stderr == huge_stderr[:_BASE_FETCH_STDERR_MAX_CHARS]
+
+
+@pytest.mark.requires_git
+def test_create_fetch_timeout_falls_back_to_local_base(
+    manager: WorktreeManager, git_repo: Path, monkeypatch, caplog
+):
+    """A `git fetch` that times out (GitTimeoutError) degrades exactly like a
+    non-zero-exit fetch failure -- fall back to the local `base` ref,
+    reason="fetch_timeout", returncode is None, elapsed_sec is populated."""
+    import logging as _logging
+
+    real_run_git = manager_module._run_git
+
+    def fake_run_git(args, **kwargs):
+        if list(args[:1]) == ["fetch"]:
+            raise GitTimeoutError(["git", "fetch", "origin", "main"], 12.3)
+        return real_run_git(args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "_run_git", fake_run_git)
+    caplog.set_level(_logging.WARNING, logger="lib_python_worktree.core.manager")
+
+    rec = manager.create(str(git_repo), "feature/fetch-timeout", base="main")
+
+    fallback = rec.base_fetch_fallback
+    assert fallback is not None
+    assert fallback.reason == "fetch_timeout"
+    assert fallback.base == "main"
+    assert fallback.returncode is None
+    assert fallback.stderr is None
+    assert fallback.elapsed_sec == 12.3
+    assert any(r.message == fallback.message for r in caplog.records)
+
+
+@pytest.mark.requires_git
+def test_create_fetch_failure_without_local_base_still_raises(
+    manager: WorktreeManager, git_repo: Path, monkeypatch
+):
+    """TOCTOU coverage: the pre-fetch guard sees `base` exist locally, but a
+    (simulated) concurrent branch deletion means the post-fetch-failure
+    re-verify no longer finds it -- create() must still raise
+    GitCommandError, not silently fall back, and must not add a record to
+    the store."""
+    base_check_calls = {"count": 0}
+    real_branch_exists = WorktreeManager._branch_exists
+
+    def fake_branch_exists(self, repo_path, branch):
+        if branch == "ghost-base":
+            base_check_calls["count"] += 1
+            # 1st call = the pre-fetch guard (pretend it exists); 2nd call =
+            # the post-fetch-failure re-verify (pretend it's now gone).
+            return base_check_calls["count"] == 1
+        return real_branch_exists(self, repo_path, branch)
+
+    monkeypatch.setattr(WorktreeManager, "_branch_exists", fake_branch_exists)
+
+    with pytest.raises(GitCommandError):
+        manager.create(str(git_repo), "feature/toctou", base="ghost-base")
+
+    assert base_check_calls["count"] == 2
+    assert manager.list() == []
+
+
+def test_create_fetch_timeout_without_local_base_reraises_git_timeout_error(
+    monkeypatch,
+):
+    """A fetch timeout whose base re-verify (post-timeout) no longer finds
+    the local ref -- simulating a concurrent deletion between the pre-fetch
+    guard and the fetch itself -- re-raises the original GitTimeoutError
+    unchanged. It must never be downgraded to a GitCommandError."""
+    store = InMemoryStateStore()
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("/fake/store")),
+        state=store,
+        reconcile_on_init=False,
+    )
+    monkeypatch.setattr(mgr, "_validate_repo", lambda repo_root: Path("/fake/repo"))
+
+    base_check_calls = {"count": 0}
+
+    def fake_branch_exists(repo_path, branch):
+        if branch == "main":
+            base_check_calls["count"] += 1
+            # 1st call = the pre-fetch guard (pretend it exists); 2nd call =
+            # the post-timeout re-verify (pretend it's now gone).
+            return base_check_calls["count"] == 1
+        return False  # the new branch itself never exists
+
+    monkeypatch.setattr(mgr, "_branch_exists", fake_branch_exists)
+
+    def fake_run_git(args, **kwargs):
+        if list(args[:1]) == ["fetch"]:
+            raise GitTimeoutError(["git", "fetch", "origin", "main"], 5.0)
+        raise AssertionError(f"unexpected _run_git call: {args}")
+
+    monkeypatch.setattr(manager_module, "_run_git", fake_run_git)
+
+    with pytest.raises(GitTimeoutError):
+        mgr.create("/fake/repo", "feature/timeout-no-base", base="main")
+
+    assert base_check_calls["count"] == 2
+
+
+def test_create_no_fetch_no_base_explicit_base_absent_raises_branch_not_found_before_fetch(
+    monkeypatch,
+):
+    """An explicit base absent locally still raises BranchNotFoundError
+    before any fetch is attempted -- the fetch call must never happen."""
+    store = InMemoryStateStore()
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("/fake/store")),
+        state=store,
+        reconcile_on_init=False,
+    )
+    monkeypatch.setattr(mgr, "_validate_repo", lambda repo_root: Path("/fake/repo"))
+    monkeypatch.setattr(mgr, "_branch_exists", lambda repo_path, branch: False)
+
+    calls = []
+
+    def spy_run_git(args, **kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager_module, "_run_git", spy_run_git)
+
+    with pytest.raises(BranchNotFoundError):
+        mgr.create("/fake/repo", "feature/no-base-anywhere", base="missing-base")
+
+    assert calls == [], "no git command (including fetch) may run before the guard raises"
+
+
+@pytest.mark.requires_git
+@pytest.mark.parametrize(
+    "create_kwargs",
+    [
+        {"fetch": False},
+        {},  # base defaulted (no `base=` kwarg)
+    ],
+)
+def test_create_base_fetch_fallback_none_on_non_degraded_paths(
+    manager: WorktreeManager, git_repo: Path, create_kwargs
+):
+    """base_fetch_fallback stays None on every path that never hits a
+    degraded fetch: fetch=False, and a defaulted base (never fetched)."""
+    rec = manager.create(str(git_repo), "feature/no-degradation", **create_kwargs)
+    assert rec.base_fetch_fallback is None
+
+
+@pytest.mark.requires_git
+def test_create_base_fetch_fallback_none_when_branch_already_exists(
     manager: WorktreeManager, git_repo: Path
 ):
-    """With the default fetch=True, create() must raise GitCommandError when
-    the repo has no origin remote (fetch fails).
+    """base_fetch_fallback stays None when `branch` already exists (the
+    fetch block is gated on `not branch_exists` and never runs)."""
+    rec = manager.create(str(git_repo), "feature/alpha")  # pre-existing branch
+    assert rec.base_fetch_fallback is None
 
-    This guards that the default path does NOT silently fall back to the
-    local ref — it must surface the network/remote failure instead.
-    """
-    with pytest.raises(GitCommandError):
-        manager.create(str(git_repo), "feature/no-origin", base="main")
+
+@pytest.mark.requires_git
+def test_create_base_fetch_fallback_none_on_successful_fetch(tmp_path: Path, skip_if_no_git):  # noqa: ARG001
+    """base_fetch_fallback stays None when the fetch itself genuinely
+    succeeds (a real `origin` remote is fetchable) -- only the degraded
+    paths ever populate it."""
+    upstream = tmp_path / "upstream.git"
+    upstream.mkdir()
+    _git("init", "--bare", "-b", "main", cwd=upstream)
+
+    local = tmp_path / "local"
+    local.mkdir()
+    _git("init", "-q", "-b", "main", cwd=local)
+    _git("config", "user.email", "test@example.com", cwd=local)
+    _git("config", "user.name", "Test", cwd=local)
+    (local / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=local)
+    _git("commit", "-q", "-m", "init", cwd=local)
+    _git("remote", "add", "origin", str(upstream), cwd=local)
+    _git("push", "-u", "origin", "main", cwd=local)
+
+    store_root = tmp_path / "store"
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=store_root),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+    rec = mgr.create(str(local), "feature/fetch-succeeds", base="main")
+    assert rec.base_fetch_fallback is None
 
 
 @pytest.mark.requires_git

@@ -343,10 +343,15 @@ class TestStart:
 # ---------------------------------------------------------------------------
 
 class TestStartOutputCaptureAndEarlyExit:
-    def test_start_detects_immediate_exit(self, tmp_path):
+    def test_start_detects_immediate_exit(self, tmp_path, generous_early_exit_wait):
         """Ticket #81: an immediately-exiting command is surfaced as
         status='exited' with its returncode, and its output is captured to
-        the start log file rather than being lost to DEVNULL."""
+        the start log file rather than being lost to DEVNULL.
+
+        Ticket #137: uses the ``generous_early_exit_wait`` fixture -- a real
+        child process's startup can occasionally exceed the production
+        0.25s early-exit poll window on a loaded CI runner, which would
+        otherwise flake this test's status/returncode assertions."""
         record = _make_record("wt-exit")
         store = _make_store(record)
 
@@ -424,11 +429,14 @@ class TestStartOutputCaptureAndEarlyExit:
         assert log_path.exists()
         assert str(fake_default) in str(log_path)
 
-    def test_start_exited_status_persisted(self):
+    def test_start_exited_status_persisted(self, generous_early_exit_wait):
         """After an immediate-exit start, store.get(id) round-trips status,
         returncode, and start_log_paths -- proving these survive
         store.update()/serialization (see YamlStateStore round-trip test for
-        the on-disk serialization path)."""
+        the on-disk serialization path).
+
+        Ticket #137: uses the ``generous_early_exit_wait`` fixture -- see
+        ``test_start_detects_immediate_exit`` above for why."""
         record = _make_record("wt-exit-persist")
         store = _make_store(record)
 
@@ -6245,6 +6253,28 @@ class TestEncodedCommandDecoding:
 
         assert run_line in info.cmdline
         assert not any(_looks_like_base64_blob(tok) for tok in info.cmdline)
+        assert info.cmdline_raw == argv
+
+    def test_decoded_cmdline_strips_ps_exit_code_epilogue(self):
+        """Ticket #134 regression fix: `_build_step_command` (ticket #134's
+        Befund 1) appends `_PS_EXIT_CODE_EPILOGUE` to every PowerShell/pwsh
+        run line before base64-encoding it, so the decode path here must
+        strip that epilogue back off -- otherwise `KilledProcessInfo.cmdline`
+        leaks ~6 lines of internal exit-code plumbing after the real run
+        line, contradicting the documented "human-readable run line"
+        contract. Reviewer's confirmed repro: `cmdline[-1]` must equal the
+        bare run line exactly, with no epilogue suffix."""
+        run_line = "Write-Output hello"
+        argv = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line,
+        )
+
+        info = KilledProcessInfo(pid=1, name="powershell.exe", cmdline=argv)
+
+        assert info.cmdline[-1] == run_line
+        assert "__wt_ok" not in info.cmdline[-1]
+        assert "__wt_rc" not in info.cmdline[-1]
         assert info.cmdline_raw == argv
 
     def test_killed_process_info_no_substitution_for_plain_argv(self):

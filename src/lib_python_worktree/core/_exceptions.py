@@ -113,6 +113,26 @@ class GitTimeoutError(WorktreeError):
         self.elapsed = elapsed
 
 
+class GitCommandError(WorktreeError):
+    """Raised when a ``git`` subprocess exits non-zero for a reason that has
+    no more specific engine-level exception.
+
+    Ticket #135: relocated here (from ``core/manager.py``) as the sole
+    prerequisite for ``core/teardown.py`` to depend on nothing in
+    ``manager.py`` -- ``manager.py`` re-exports this class via its existing
+    ``from ._exceptions import (...)  # noqa: F401 -- re-exported`` line, so
+    ``manager.GitCommandError`` keeps the same class identity as before.
+    """
+
+    def __init__(self, command: List[str], returncode: int, stderr: str) -> None:
+        super().__init__(
+            f"git command failed (exit {returncode}): {' '.join(command)}\n{stderr.strip()}"
+        )
+        self.command = command
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 class DirtyWorktreeError(WorktreeError):
     """Raised when ``git worktree remove`` refuses because the worktree has
     uncommitted changes and ``force=False`` was passed.
@@ -439,6 +459,7 @@ class CheckoutTargetError(WorktreeError, ValueError):
 __all__ = [
     "CheckoutTargetError",
     "DirtyWorktreeError",
+    "GitCommandError",
     "GitTimeoutError",
     "InvalidRepoError",
     "PrimaryCheckoutError",
