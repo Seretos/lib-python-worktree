@@ -17,6 +17,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Iterator, List
+from unittest.mock import patch
 
 import pytest
 
@@ -226,3 +227,39 @@ def yaml_manager(
             except Exception:  # noqa: BLE001
                 pass
             shutil.rmtree(wt_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# generous_early_exit_wait: widen process_lifecycle._EARLY_EXIT_WAIT_SEC for
+# real-spawn early-exit tests (ticket #137)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def generous_early_exit_wait() -> Iterator[None]:
+    """Patch ``process_lifecycle._EARLY_EXIT_WAIT_SEC`` to a generous value
+    for the duration of a test.
+
+    The production default (0.25s, ticket #81) bounds the real early-exit
+    poll -- ``proc.wait(timeout=_EARLY_EXIT_WAIT_SEC)`` in
+    ``core/process_lifecycle.py`` -- and is deliberately left untouched here;
+    this fixture never patches it in production code, only for a test's own
+    call. A handful of tests spawn a REAL child process (a bare
+    ``sys.executable -c ...``, or -- for the ``start:`` seam -- a
+    ``powershell.exe``-wrapped step command) and assert on the early-exit
+    outcome. On a loaded CI runner, process startup can structurally exceed
+    0.25s (this is especially true of PowerShell startup on
+    ``windows-latest``), so ``proc.wait`` times out, the early-exit branch is
+    never taken, and the test flakes with ``status="running"`` instead of
+    reaching the exited/returncode assertion it actually means to check.
+    Widening the window here only affects *this test's* wait: ``proc.wait()``
+    still returns the instant the child actually exits, so this costs no
+    real wall-clock time in the (overwhelmingly common) fast-exit case -- it
+    is a bounded deterministic wait, not a sleep. The constant is read as a
+    module global at call time, so patching it here also takes effect
+    transparently through ``WorktreeManager.start()``'s delegation into
+    ``_lifecycle_start``.
+    """
+    with patch(
+        "lib_python_worktree.core.process_lifecycle._EARLY_EXIT_WAIT_SEC", 30.0
+    ):
+        yield

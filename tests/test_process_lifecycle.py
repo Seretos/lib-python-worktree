@@ -343,10 +343,15 @@ class TestStart:
 # ---------------------------------------------------------------------------
 
 class TestStartOutputCaptureAndEarlyExit:
-    def test_start_detects_immediate_exit(self, tmp_path):
+    def test_start_detects_immediate_exit(self, tmp_path, generous_early_exit_wait):
         """Ticket #81: an immediately-exiting command is surfaced as
         status='exited' with its returncode, and its output is captured to
-        the start log file rather than being lost to DEVNULL."""
+        the start log file rather than being lost to DEVNULL.
+
+        Ticket #137: uses the ``generous_early_exit_wait`` fixture -- a real
+        child process's startup can occasionally exceed the production
+        0.25s early-exit poll window on a loaded CI runner, which would
+        otherwise flake this test's status/returncode assertions."""
         record = _make_record("wt-exit")
         store = _make_store(record)
 
@@ -424,11 +429,14 @@ class TestStartOutputCaptureAndEarlyExit:
         assert log_path.exists()
         assert str(fake_default) in str(log_path)
 
-    def test_start_exited_status_persisted(self):
+    def test_start_exited_status_persisted(self, generous_early_exit_wait):
         """After an immediate-exit start, store.get(id) round-trips status,
         returncode, and start_log_paths -- proving these survive
         store.update()/serialization (see YamlStateStore round-trip test for
-        the on-disk serialization path)."""
+        the on-disk serialization path).
+
+        Ticket #137: uses the ``generous_early_exit_wait`` fixture -- see
+        ``test_start_detects_immediate_exit`` above for why."""
         record = _make_record("wt-exit-persist")
         store = _make_store(record)
 
