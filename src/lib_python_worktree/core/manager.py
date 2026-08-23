@@ -65,6 +65,8 @@ from .process_lifecycle import (
     stop as _lifecycle_stop,
 )
 from .state import (
+    BASE_FETCH_FALLBACK_REASON_FETCH_FAILED,
+    BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT,
     SETUP_STATUS_COMPLETED,
     SETUP_STATUS_FAILED,
     SETUP_STATUS_SKIPPED,
@@ -73,7 +75,9 @@ from .state import (
     STOP_ATTEMPT_NO_PROCESS_RECORDED,
     STOP_NO_OP_ISOLATION_NONE,
     STOP_NO_OP_NO_PROCESS_RECORDED,
+    BaseFetchFallback,
     InMemoryStateStore,
+    _BASE_FETCH_STDERR_MAX_CHARS,
     SetupOutcome,
     ShadowedContract,
     StateStore,
@@ -955,6 +959,23 @@ class WorktreeManager:
         stale local ref. Pass ``fetch=False`` to branch from the local ref
         without any network call.
 
+        **Best-effort fetch (ticket #134):** when that fetch fails (no
+        ``origin`` remote, auth failure, unknown remote ref, DNS/network
+        error) or times out (``WORKTREE_GIT_TIMEOUT_SEC``), ``create()`` no
+        longer hard-fails outright as long as *base* still exists as a local
+        branch: it logs a ``WARNING``, falls back to branching from the
+        local ``base`` ref instead of ``origin/<base>``, and records the
+        degradation on the returned record's ``base_fetch_fallback``
+        (:class:`~.state.BaseFetchFallback`, reason ``"fetch_failed"`` or
+        ``"fetch_timeout"``) so a caller can tell the branch may not reflect
+        the latest remote tip. ``base_fetch_fallback`` is ``None`` on every
+        other path (fetch succeeded, ``fetch=False``, or a defaulted base).
+        Still fatal, and never downgraded to a fallback: the local ``base``
+        ref not existing either (raises ``GitCommandError``/
+        ``GitTimeoutError``, exactly as before this ticket), and a missing
+        ``git`` binary (``OSError``/``FileNotFoundError`` -- an environment
+        fault, not a remote-reachability degradation).
+
         If *branch* does not exist and *base* is omitted (``None``), it
         defaults to the branch currently checked out at the main clone (the
         repo resolved from *repo_root* by ``_validate_repo()`` -- not
@@ -1010,14 +1031,75 @@ class WorktreeManager:
         # When creating a new branch from a base and fetch=True, fetch the
         # base branch from origin so the new worktree starts from the latest
         # remote commit rather than a potentially stale local ref.
+        #
+        # Ticket #134 (Befund 2, Option A -- best-effort fetch with visible
+        # degradation): a fetch failure or timeout no longer unconditionally
+        # hard-fails create(). Exactly two situations count as "fetch
+        # failed" here: a non-zero `git fetch` returncode, and a
+        # `GitTimeoutError` raised out of `_run_git`. On either, the local
+        # `base` ref is re-verified (closes a TOCTOU window against the
+        # branch_exists guard above -- a concurrent branch deletion between
+        # that guard and this fetch) -- if it's still there, this degrades to
+        # a warning + fallback (fetch_base is flipped to False so the
+        # ref-selection below picks the local `base`, not `origin/<base>`);
+        # if it's gone, this re-raises exactly as before this ticket. Never
+        # caught here: OSError/FileNotFoundError (missing git binary -- an
+        # environment fault, not a remote-reachability degradation) and any
+        # exception raised outside this single `_run_git(["fetch", ...])`
+        # call.
+        base_fetch_fallback: Optional[BaseFetchFallback] = None
         if not branch_exists and base is not None and fetch_base:
-            fetch_proc = _run_git(["fetch", "origin", base], cwd=repo_path)
-            if fetch_proc.returncode != 0:
-                raise GitCommandError(
-                    ["git", "fetch", "origin", base],
-                    fetch_proc.returncode,
-                    fetch_proc.stderr,
+            try:
+                fetch_proc = _run_git(["fetch", "origin", base], cwd=repo_path)
+            except GitTimeoutError as _fetch_timeout_exc:
+                if not self._branch_exists(repo_path, base):
+                    raise
+                message = (
+                    f"git fetch origin {base} timed out after "
+                    f"{_fetch_timeout_exc.elapsed:.1f}s. Falling back to the "
+                    f"local base ref '{base}'; branch '{branch}' may not "
+                    f"reflect the latest origin/{base} tip."
                 )
+                _logger.warning("%s", message)
+                base_fetch_fallback = BaseFetchFallback(
+                    reason=BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT,
+                    base=base,
+                    message=message,
+                    elapsed_sec=_fetch_timeout_exc.elapsed,
+                )
+                fetch_base = False
+            else:
+                if fetch_proc.returncode != 0:
+                    if not self._branch_exists(repo_path, base):
+                        raise GitCommandError(
+                            ["git", "fetch", "origin", base],
+                            fetch_proc.returncode,
+                            fetch_proc.stderr,
+                        )
+                    stderr = fetch_proc.stderr or ""
+                    stripped = stderr.strip()
+                    first_line = stripped.splitlines()[0] if stripped else ""
+                    message = (
+                        f"git fetch origin {base} failed (exit "
+                        f"{fetch_proc.returncode}): {first_line}. Falling "
+                        f"back to the local base ref '{base}'; branch "
+                        f"'{branch}' may not reflect the latest "
+                        f"origin/{base} tip."
+                    )
+                    _logger.warning("%s", message)
+                    base_fetch_fallback = BaseFetchFallback(
+                        reason=BASE_FETCH_FALLBACK_REASON_FETCH_FAILED,
+                        base=base,
+                        message=message,
+                        returncode=fetch_proc.returncode,
+                        # Truncated here (not just at YAML serialize/deserialize
+                        # time) so the in-process record create() returns --
+                        # before any disk round-trip -- already carries a
+                        # bounded stderr, matching this dataclass's own
+                        # docstring claim (ticket #134 review fix-loop).
+                        stderr=stderr[:_BASE_FETCH_STDERR_MAX_CHARS],
+                    )
+                    fetch_base = False
 
         worktree_id = f"{repo_slug}-{_slug(branch)}-{_short_uuid()}"
         target_path = self.config.store_root / repo_slug / worktree_id
@@ -1077,6 +1159,7 @@ class WorktreeManager:
                 path=target_path.as_posix(),
                 branch_created_by_us=not branch_exists,
                 ports=port_mapping,
+                base_fetch_fallback=base_fetch_fallback,
             )
             self.state.add(record)
         except Exception:

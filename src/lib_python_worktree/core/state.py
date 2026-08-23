@@ -448,6 +448,85 @@ class StopHookOutcome:
     no_op_reason: Optional[str] = None
 
 
+# Reason vocabulary for ``BaseFetchFallback.reason`` (ticket #134) -- the two
+# situations in which ``WorktreeManager.create()``'s best-effort
+# ``git fetch origin <base>`` for an explicit ``base=`` falls back to the
+# local ``base`` ref instead of hard-failing.
+BASE_FETCH_FALLBACK_REASON_FETCH_FAILED = "fetch_failed"
+BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT = "fetch_timeout"
+
+BASE_FETCH_FALLBACK_REASONS: Tuple[str, ...] = (
+    BASE_FETCH_FALLBACK_REASON_FETCH_FAILED,
+    BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT,
+)
+
+# Cap on how many characters of git's stderr ``BaseFetchFallback.stderr`` may
+# carry verbatim -- mirrors ``StopDetail``'s ``survivor_pids`` cap pattern:
+# bound the persisted payload rather than writing an unbounded blob to
+# state.yaml.
+_BASE_FETCH_STDERR_MAX_CHARS = 2000
+
+
+@dataclass(frozen=True)
+class BaseFetchFallback:
+    """Machine-readable record of a best-effort ``git fetch origin <base>``
+    degrading to the local ``base`` ref instead of hard-failing
+    ``WorktreeManager.create()`` (ticket #134).
+
+    Before this field existed, an explicit ``base=`` whose ``git fetch``
+    failed (no ``origin`` remote, auth failure, unknown remote ref, DNS/
+    network error) or timed out unconditionally raised -- turning a purely
+    local operation (branching off an already-locally-present ``base``) into
+    a hard failure, or a ``WORKTREE_GIT_TIMEOUT_SEC``-bounded stall, for no
+    reason beyond the remote being unreachable. ``create()`` now re-verifies
+    the local ``base`` ref exists at fallback time and, when it does, warns
+    and proceeds from the local ref instead.
+
+    ``reason`` is always one of :data:`BASE_FETCH_FALLBACK_REASONS`, except
+    when loaded from a ``state.yaml`` written by a *future* engine version,
+    in which case an unrecognised value is preserved verbatim rather than
+    rejected (forward compatibility -- mirrors :class:`StopDetail`'s
+    convention, see ``yaml_store._base_fetch_fallback_from_dict``):
+
+    - ``"fetch_failed"``: ``git fetch origin <base>`` exited non-zero.
+      ``returncode``/``stderr`` are populated; ``elapsed_sec`` is ``None``.
+    - ``"fetch_timeout"``: the fetch was killed by ``_run_git``'s own
+      timeout (``GitTimeoutError``). ``elapsed_sec`` is populated;
+      ``returncode``/``stderr`` are ``None``.
+
+    ``base`` is the explicit base ref that was requested (the exact string
+    passed as ``create(base=...)``).
+
+    ``message`` is the exact human-readable string also passed to
+    ``_logger.warning(...)`` for the same fallback, so the log line and this
+    field can never drift apart (mirrors :class:`StopDetail`'s
+    message-parity convention).
+
+    ``stderr`` is git's stderr output, truncated to
+    :data:`_BASE_FETCH_STDERR_MAX_CHARS` characters.
+
+    Deliberately an ``Optional[BaseFetchFallback]`` rather than a bare
+    ``bool`` on :class:`WorktreeRecord` -- the *reason* and git's stderr are
+    the actionable part a caller needs to decide whether the created
+    worktree's ``base`` might be stale.
+
+    Persisted through ``state.yaml`` (mirrors ``stop_detail``) -- a legacy
+    record with no ``base_fetch_fallback`` key deserialises to ``None``.
+    Written **only** by the explicit-base fetch block in ``create()``; never
+    touched by ``start``/``stop``/``reconcile``/``adopt``/``remove``/
+    ``list_repo``. ``None`` means "no fallback happened" -- either the fetch
+    succeeded, or no fetch was attempted at all (``fetch=False``, or the
+    base was defaulted rather than explicit).
+    """
+
+    reason: str
+    base: str
+    message: str
+    returncode: Optional[int] = None
+    stderr: Optional[str] = None
+    elapsed_sec: Optional[float] = None
+
+
 @dataclass
 class WorktreeRecord:
     """A single tracked worktree (or, since ticket #84, a primary checkout).
@@ -657,6 +736,19 @@ class WorktreeRecord:
     **transient**, exactly like ``stop_attempt``: recomputed on every
     ``stop()``/``remove()`` call and NOT persisted to ``state.yaml``."""
 
+    base_fetch_fallback: Optional[BaseFetchFallback] = None
+    """Ticket #134: machine-readable record of a best-effort
+    ``git fetch origin <base>`` degrading to the local ``base`` ref instead
+    of hard-failing ``create()``, or ``None``. See
+    :class:`BaseFetchFallback`'s own docstring for the full rationale and
+    invariant -- in short: written ONLY by the explicit-base fetch block in
+    ``WorktreeManager.create()``; never touched by ``start``/``stop``/
+    ``reconcile``/``adopt``/``remove``/``list_repo``. Persisted through
+    ``state.yaml`` (mirrors ``stop_detail``) -- a legacy record with no
+    ``base_fetch_fallback`` key deserialises to ``None``. ``None`` means "no
+    fallback happened" (fetch succeeded, or no fetch was attempted at all --
+    ``fetch=False``, or a defaulted rather than explicit ``base``)."""
+
 
 class StateStore(Protocol):
     """Interface that W7 will re-implement against a persistent backing store."""
@@ -716,6 +808,10 @@ class InMemoryStateStore:
 
 
 __all__: Iterable[str] = (
+    "BaseFetchFallback",
+    "BASE_FETCH_FALLBACK_REASONS",
+    "BASE_FETCH_FALLBACK_REASON_FETCH_FAILED",
+    "BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT",
     "InMemoryStateStore",
     "SetupOutcome",
     "SETUP_STATUSES",

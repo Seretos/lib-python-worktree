@@ -975,6 +975,16 @@ def _try_decode_encoded_command_payload(payload: str) -> Optional[str]:
     characters other than ``\\t``/``\\r``/``\\n`` (a genuine PowerShell
     run-line payload is command text, not arbitrary binary wearing a text
     disguise).
+
+    Ticket #134 regression fix: ``_build_step_command`` appends
+    ``_PS_EXIT_CODE_EPILOGUE`` to every PowerShell/pwsh run line before
+    encoding it, so a genuine inverse must also undo that append -- a
+    trailing exact match of the epilogue is stripped from the decoded text
+    before it is returned, so ``KilledProcessInfo.cmdline`` keeps showing
+    the plain, human-readable run line (this function's only callsite is
+    already gated to the PowerShell/pwsh interpreters by
+    :func:`_decode_encoded_command`, so a bash/sh payload is never routed
+    through here and needs no special-casing).
     """
     if not payload or len(payload) > _MAX_ENCODED_COMMAND_PAYLOAD_LEN:
         return None
@@ -993,6 +1003,10 @@ def _try_decode_encoded_command_payload(payload: str) -> Optional[str]:
             continue
         if ord(ch) < 0x20 or ord(ch) == 0x7F:
             return None
+    from ..setup.runner import _PS_EXIT_CODE_EPILOGUE  # noqa: PLC0415
+
+    if text.endswith(_PS_EXIT_CODE_EPILOGUE):
+        text = text[: -len(_PS_EXIT_CODE_EPILOGUE)]
     return text
 
 

@@ -196,7 +196,7 @@ at construction to clean up stale records.
 
 | Method | Signature | Returns | Description |
 |--------|-----------|---------|-------------|
-| `create` | `(repo_root: str, branch: str, base: Optional[str] = None, *, fetch: bool = True)` | `WorktreeRecord` | Add a git worktree, allocate ports per the contract, and persist state. If `branch` doesn't exist, pass `base` to create it from; if `base` is omitted, it defaults to the branch currently checked out at the main clone (local ref only, never fetched). With an explicit `base`, `fetch=True` (default) fetches `origin/<base>` first; `fetch=False` branches from the local ref. Raises `BranchNotFoundError` if `branch` is missing and no `base` is given while the main clone's HEAD is detached or unborn. |
+| `create` | `(repo_root: str, branch: str, base: Optional[str] = None, *, fetch: bool = True)` | `WorktreeRecord` | Add a git worktree, allocate ports per the contract, and persist state. If `branch` doesn't exist, pass `base` to create it from; if `base` is omitted, it defaults to the branch currently checked out at the main clone (local ref only, never fetched). With an explicit `base`, `fetch=True` (default) fetches `origin/<base>` first (best-effort — see "Base fetch fallback" below); `fetch=False` branches from the local ref. Raises `BranchNotFoundError` if `branch` is missing and no `base` is given while the main clone's HEAD is detached or unborn. |
 | `list` | `()` | `List[WorktreeRecord]` | Return all tracked worktree records. |
 | `list_repo` | `(path: str)` | `RepoListing` | Repo-scoped listing (primary + linked worktrees) for any path inside a repo, joining git's live `worktree list --porcelain` view against tracked records. Entries not yet persisted (the primary before its first `start()`, or a linked worktree never `adopt()`-ed) are synthesised with `tracked=False`. A tracked record whose checkout is no longer registered with git (deregistered outside this tool) is still listed too, as `tracked=True` with `record.status == "orphaned"`. See "Orphan worktree recovery" below for both flavours. |
 | `remove` | `(worktree_id: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False, *, checkout_path: Optional[str] = None)` | `WorktreeRecord` | Run teardown, remove git worktree, release ports, delete state. Target by `worktree_id` **or** `checkout_path`; a `checkout_path` pointing at an untracked/orphaned linked worktree is removed without needing `adopt()` first (see "Orphan worktree recovery" below — `checkout_path` for an untracked orphan, `worktree_id` for a tracked-but-deregistered one). `force=True` removes despite uncommitted changes; never bypasses the primary-checkout refusal. |
@@ -449,7 +449,25 @@ argv re-quoting (`list2cmdline`) and PowerShell's own `-Command` re-parsing,
 which can mangle such a self-wrapped run line's quote structure and cause
 the step to fail silently. `-EncodedCommand` carries no spaces or quotes, so
 neither re-quoting pass can corrupt it, and previously-silent steps like
-this now run correctly. Exit-code semantics are unchanged from `-Command`.
+this now run correctly.
+
+**PowerShell step exit codes:** a `-Command`/`-EncodedCommand` script that
+ends without executing its own `exit` statement gets its *host* process exit
+code derived from `$?` (`0` when true, `1` when false), discarding
+`$LASTEXITCODE` entirely — so a native child's real exit code (e.g. `cmd /c
+"... & exit 3"`, or a self-wrapped inner `powershell ... -Command "exit
+3"`) used to be silently collapsed to a bare `1`, and `setup_outcome`'s
+`returncode`/the step log's `# returncode:` line lied about why the step
+failed. `_build_step_command` now appends a small exit-code-propagating
+epilogue to every `pwsh`/`powershell` run line before encoding it: it keeps
+`$?` as the authoritative pass/fail verdict and only reads `$LASTEXITCODE`
+to recover the real numeric code on failure, so it can never turn an
+existing pass into a fail or vice versa. A run line that itself ends in an
+`exit` statement (e.g. `if (...) { exit 3 } else { exit 0 }`) already
+propagated correctly before this fix, since `exit` terminates the host
+directly — the epilogue only matters for the native-child-collapse case
+above. `bash -c`/`sh -c` steps are untouched: POSIX shells already
+propagate the last command's status via their own exit code.
 
 `stop()`'s reported `killed_pids[].cmdline` (ticket #132) reverses this
 transport for readability: when a killed process's argv carries this
@@ -701,6 +719,37 @@ every later lifecycle call and cannot distinguish "setup never ran" from
 `status="stopped"`. `setup_outcome` is persisted to `state.yaml` (mirrors
 `stop_detail`, unlike the transient `killed_pids`/`shadowed_contract`) — a
 legacy record with no `setup_outcome` key deserialises to `None`.
+
+### Base fetch fallback and `base_fetch_fallback`
+
+With an explicit `base=` and the default `fetch=True`, `create()` fetches
+`origin/<base>` before branching so the new branch reflects the latest
+remote tip. That fetch is **best-effort**: when it fails (no `origin`
+remote, auth failure, unknown remote ref, DNS/network error) or times out
+(`WORKTREE_GIT_TIMEOUT_SEC`), `create()` no longer hard-fails outright as
+long as `base` still exists as a local branch — it logs a `WARNING`, falls
+back to branching from the local `base` ref instead of `origin/<base>`, and
+records the degradation on the returned record's `base_fetch_fallback` (a
+`BaseFetchFallback`, or `None`):
+
+| `base_fetch_fallback.reason` | Meaning |
+|---|---|
+| `None` (the field itself) | No fallback happened — the fetch succeeded, or no fetch was attempted at all (`fetch=False`, or `base` was defaulted rather than explicit). |
+| `"fetch_failed"` | `git fetch origin <base>` exited non-zero. `returncode`/`stderr` are populated; `elapsed_sec` is `None`. |
+| `"fetch_timeout"` | The fetch was killed by `WORKTREE_GIT_TIMEOUT_SEC`. `elapsed_sec` is populated; `returncode`/`stderr` are `None`. |
+
+`message` is the exact string also logged at `WARNING`, so the log line and
+`base_fetch_fallback.message` can never drift apart. Still fatal, and never
+downgraded to a fallback: the local `base` ref not existing either (raises
+`GitCommandError`/`GitTimeoutError`, exactly as before this fallback
+existed — closing a TOCTOU window against the pre-fetch existence guard via
+a second, cheap local-ref check at fallback time), and a missing `git`
+binary (`OSError`/`FileNotFoundError` — an environment fault, not a
+remote-reachability degradation). `base_fetch_fallback` is persisted to
+`state.yaml` (mirrors `stop_detail`/`setup_outcome`) — a legacy record with
+no `base_fetch_fallback` key deserialises to `None`. The ~30s stall on an
+unreachable remote is not removed by this fallback (the fetch is still
+attempted); there is no separate, shorter fetch-specific timeout.
 
 ### Stop hook outcome and `stop_hook_outcome`
 

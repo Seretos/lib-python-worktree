@@ -71,6 +71,7 @@ from .core.process_lifecycle import (
 from .core.plugin_install import PluginInstallResult, install_enabled_plugins
 from .core.port_allocator import PortAllocator
 from .core.state import (
+    BASE_FETCH_FALLBACK_REASONS,
     SETUP_STATUSES,
     SETUP_STATUS_COMPLETED,
     SETUP_STATUS_FAILED,
@@ -81,6 +82,7 @@ from .core.state import (
     STOP_NO_OP_NO_PROCESS_RECORDED,
     STOP_NO_OP_REASONS,
     STOP_REASONS,
+    BaseFetchFallback,
     InMemoryStateStore,
     SetupOutcome,
     ShadowedContract,
@@ -160,6 +162,8 @@ __all__ = [
     "SETUP_STATUS_SKIPPED",
     "ShadowedContract",
     "SHADOW_REASONS",
+    "BaseFetchFallback",
+    "BASE_FETCH_FALLBACK_REASONS",
     # yaml state store (W7)
     "YamlStateStore",
     "ReconcileReport",

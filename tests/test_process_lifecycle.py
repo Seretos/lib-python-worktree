@@ -6247,6 +6247,28 @@ class TestEncodedCommandDecoding:
         assert not any(_looks_like_base64_blob(tok) for tok in info.cmdline)
         assert info.cmdline_raw == argv
 
+    def test_decoded_cmdline_strips_ps_exit_code_epilogue(self):
+        """Ticket #134 regression fix: `_build_step_command` (ticket #134's
+        Befund 1) appends `_PS_EXIT_CODE_EPILOGUE` to every PowerShell/pwsh
+        run line before base64-encoding it, so the decode path here must
+        strip that epilogue back off -- otherwise `KilledProcessInfo.cmdline`
+        leaks ~6 lines of internal exit-code plumbing after the real run
+        line, contradicting the documented "human-readable run line"
+        contract. Reviewer's confirmed repro: `cmdline[-1]` must equal the
+        bare run line exactly, with no epilogue suffix."""
+        run_line = "Write-Output hello"
+        argv = _build_step_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"],
+            run_line,
+        )
+
+        info = KilledProcessInfo(pid=1, name="powershell.exe", cmdline=argv)
+
+        assert info.cmdline[-1] == run_line
+        assert "__wt_ok" not in info.cmdline[-1]
+        assert "__wt_rc" not in info.cmdline[-1]
+        assert info.cmdline_raw == argv
+
     def test_killed_process_info_no_substitution_for_plain_argv(self):
         info = KilledProcessInfo(pid=1, name="node", cmdline=["node", "server.js"])
 
