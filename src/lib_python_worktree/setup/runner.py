@@ -191,6 +191,25 @@ def log_dir_for(worktree_id: str, env: Optional[Dict[str, str]] = None) -> Path:
 # "-Command <text>" argument to "-EncodedCommand <base64 blob>" (ticket #109).
 _POWERSHELL_INTERPRETERS = ("powershell.exe", "pwsh")
 
+# Appended (ticket #134) to every PowerShell/pwsh run line before it is
+# base64-encoded. When a -Command/-EncodedCommand script ends without
+# executing an `exit` statement of its own, the PowerShell host derives its
+# *own* process exit code from `$?` (0 when true, 1 when false) and discards
+# `$LASTEXITCODE` entirely -- so a native child's real exit code (e.g. `cmd
+# /c "... & exit 3"`, or a self-wrapped `powershell ... -Command "exit 3"`)
+# is silently collapsed to a bare 1. This epilogue recovers the real code on
+# failure while leaving PowerShell's own pass/fail verdict (`$?`) as the
+# authoritative signal -- see `_build_step_command`'s docstring for the full
+# rationale and the design decisions already made for this shape.
+_PS_EXIT_CODE_EPILOGUE = (
+    "\n$__wt_ok = $?\n"
+    "$__wt_rc = Get-Variable -Name LASTEXITCODE -Scope Global -ValueOnly "
+    "-ErrorAction SilentlyContinue\n"
+    "if ($__wt_ok) { exit 0 }\n"
+    "if ($null -ne $__wt_rc -and $__wt_rc -ne 0) { exit $__wt_rc }\n"
+    "exit 1\n"
+)
+
 
 def _resolve_shell(step_shell: Optional[str]) -> List[str]:
     """Return the ``[shell, "-c"/"-Command"-equivalent]`` prefix for a step.
@@ -215,6 +234,10 @@ def _resolve_shell(step_shell: Optional[str]) -> List[str]:
     verbatim (ticket #109: raw ``-Command <text>`` round-trips through both
     ``subprocess.list2cmdline`` re-quoting and PowerShell's own re-parsing,
     which mangles a self-wrapped ``run:`` value's quote structure).
+    ``_build_step_command`` also appends an exit-code-propagating epilogue
+    to the encoded blob for these two interpreters only (ticket #134) --
+    see its docstring, including the **known limitation** around a stale
+    global ``$LASTEXITCODE`` documented there.
     """
 
     if step_shell:
@@ -248,8 +271,49 @@ def _build_step_command(shell_cmd: List[str], run_line: str) -> List[str]:
     spaces or quotes, so neither ``subprocess.list2cmdline`` (Windows argv
     re-quoting) nor PowerShell's own command-line re-parsing (backslash is
     not an escape character there) can mangle a self-wrapped ``run:`` value's
-    quote structure, e.g. ``powershell -NoProfile -Command "..."``. Exit-code
-    semantics are identical to ``-Command``.
+    quote structure, e.g. ``powershell -NoProfile -Command "..."``.
+
+    **Exit-code caveat (ticket #134):** unlike a plain native command, a
+    ``-Command``/``-EncodedCommand`` script that ends without its own
+    ``exit`` statement gets its *host* exit code derived from ``$?`` (0/1),
+    discarding ``$LASTEXITCODE`` -- so a native child's real exit code (e.g.
+    ``cmd /c "... & exit 3"``, or a self-wrapped inner ``powershell ...
+    -Command "exit 3"``) silently collapses to a bare ``1``. To recover the
+    real code, ``_PS_EXIT_CODE_EPILOGUE`` is appended to ``run_line`` before
+    it is encoded, for the PowerShell/pwsh interpreters only -- it is never
+    appended for ``bash -c``/``sh -c``, since POSIX shells already propagate
+    the last command's status via their own exit code. The epilogue emits
+    nothing on stdout/stderr and keeps ``$?`` as the authoritative
+    pass/fail verdict, only using ``$LASTEXITCODE`` to refine the numeric
+    value on failure (so it can never turn an existing pass into a fail or
+    vice versa). A run line that itself ends in an ``exit`` statement (e.g.
+    the bare ``if (...) { exit 3 } else { exit 0 }`` shape) already
+    propagates correctly without the epilogue's help, since ``exit``
+    terminates the host directly.
+
+    **Known limitation -- stale global ``$LASTEXITCODE`` (ticket #134
+    review):** ``$__wt_rc`` is read from ``$LASTEXITCODE``, which is a
+    *global* that any earlier native command in the script can have set,
+    regardless of whether that earlier command is the actual cause of the
+    script's final failure. The common/reported case -- the failing
+    statement IS the one that set ``$LASTEXITCODE`` (the script ends in
+    ``exit N``, or the last statement is the failing native command) -- is
+    fixed correctly by this epilogue. A script that chains an earlier
+    *successful-but-nonzero-setting* native call with a later, unrelated
+    failing statement (typically a cmdlet, which has no numeric exit code
+    of its own) is a known edge case where the reported code can be
+    misleading: e.g. ``run_line = 'cmd /c "exit 7"; Get-Item C:\\does\\not\\
+    exist.xyz'`` reports ``7`` (the stale code left over from the earlier
+    ``cmd /c`` call) even though the actual failure is the ``Get-Item``
+    cmdlet, which would report a generic ``1`` under bare-``$?`` semantics.
+    This is an accepted limitation, not a regression of the epilogue's own
+    protected invariant (a native failure followed by a recovering
+    non-failing statement, e.g. ``cmd /c exit 3; Write-Host ok``, still
+    reports success/``0``) -- detecting whether the last statement's
+    failure genuinely correlates with ``$LASTEXITCODE`` is hard in general
+    and is deliberately out of scope here. Pinned by
+    ``test_powershell_step_stale_lastexitcode_from_earlier_statement_is_a_
+    known_limitation`` in ``tests/test_setup_runner.py``.
 
     Any other shell prefix (``bash -c`` / ``sh -c`` / an unrecognised
     prefix) is appended to verbatim, unchanged from before this fix.
@@ -257,7 +321,8 @@ def _build_step_command(shell_cmd: List[str], run_line: str) -> List[str]:
 
     if shell_cmd and shell_cmd[0] in _POWERSHELL_INTERPRETERS:
         prefix = shell_cmd[:-1] if shell_cmd[-1] == "-Command" else shell_cmd
-        blob = base64.b64encode(run_line.encode("utf-16-le")).decode("ascii")
+        full_line = run_line + _PS_EXIT_CODE_EPILOGUE
+        blob = base64.b64encode(full_line.encode("utf-16-le")).decode("ascii")
         return [*prefix, "-EncodedCommand", blob]
     return [*shell_cmd, run_line]
 

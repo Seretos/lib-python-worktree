@@ -28,9 +28,12 @@ import yaml
 import subprocess
 
 from lib_python_worktree.core.state import (
+    BASE_FETCH_FALLBACK_REASON_FETCH_FAILED,
+    BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT,
     SETUP_STATUS_COMPLETED,
     SETUP_STATUS_FAILED,
     STOP_REASON_SURVIVORS,
+    BaseFetchFallback,
     SetupOutcome,
     StopDetail,
     WorktreeRecord,
@@ -2030,6 +2033,185 @@ class TestSetupOutcomePersistence:
         rec = store.get("wt-falsy-setup")
         assert rec is not None
         assert rec.setup_outcome is None
+
+
+# ---------------------------------------------------------------------------
+# TestBaseFetchFallbackPersistence -- ticket #134
+# ---------------------------------------------------------------------------
+
+class TestBaseFetchFallbackPersistence:
+    """``base_fetch_fallback`` persists through ``state.yaml`` exactly like
+    ``stop_detail``/``setup_outcome``: a legacy record with no
+    ``base_fetch_fallback`` key still loads (defaulting to ``None``), and an
+    unrecognised ``reason`` / extra key inside it is silently forward-
+    compatible."""
+
+    def test_base_fetch_fallback_round_trips(self, state_dir: Path):
+        """Driving test: a record with a fully-populated BaseFetchFallback
+        round-trips through a fresh YamlStateStore load, field-by-field."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-base-fetch-fallback")
+        record.base_fetch_fallback = BaseFetchFallback(
+            reason=BASE_FETCH_FALLBACK_REASON_FETCH_FAILED,
+            base="main",
+            message=(
+                "git fetch origin main failed (exit 128): fatal: 'origin' "
+                "does not appear to be a git repository. Falling back to "
+                "the local base ref 'main'; branch 'feature/x' may not "
+                "reflect the latest origin/main tip."
+            ),
+            returncode=128,
+            stderr="fatal: 'origin' does not appear to be a git repository\n",
+            elapsed_sec=None,
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-base-fetch-fallback")
+        assert reloaded is not None
+        assert reloaded.base_fetch_fallback == record.base_fetch_fallback
+
+    def test_base_fetch_fallback_timeout_variant_round_trips(self, state_dir: Path):
+        """A `reason="fetch_timeout"` fallback (returncode/stderr None,
+        elapsed_sec populated) round-trips too."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-base-fetch-timeout")
+        record.base_fetch_fallback = BaseFetchFallback(
+            reason=BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT,
+            base="main",
+            message="git fetch origin main timed out after 30.0s. Falling back...",
+            returncode=None,
+            stderr=None,
+            elapsed_sec=30.0,
+        )
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-base-fetch-timeout")
+        assert reloaded is not None
+        assert reloaded.base_fetch_fallback == record.base_fetch_fallback
+        assert reloaded.base_fetch_fallback.returncode is None
+        assert reloaded.base_fetch_fallback.stderr is None
+        assert reloaded.base_fetch_fallback.elapsed_sec == 30.0
+
+    def test_legacy_record_without_base_fetch_fallback_key_defaults_to_none(
+        self, state_dir: Path
+    ):
+        """A pre-#134 state.yaml entry with no `base_fetch_fallback` key at
+        all must still deserialise, defaulting to None."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-fetch": {
+                    "id": "legacy-wt-fetch",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-fetch",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    # no "base_fetch_fallback" key at all -- simulates a
+                    # pre-#134 state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-fetch")
+        assert legacy is not None
+        assert legacy.base_fetch_fallback is None
+
+    def test_unknown_base_fetch_fallback_reason_and_extra_key_preserved(
+        self, state_dir: Path
+    ):
+        """Forward compat: a state.yaml written by a future engine version
+        may carry an unrecognised `reason` value and extra keys inside
+        `base_fetch_fallback` this version does not know about -- both must
+        be handled without raising; the extra key is silently ignored and
+        the unrecognised reason is preserved verbatim."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "future-wt-fetch": {
+                    "id": "future-wt-fetch",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/future-wt-fetch",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "base_fetch_fallback": {
+                        "reason": "fetch_dns_resolution_failed",
+                        "base": "main",
+                        "message": "future msg",
+                        "future_field_this_version_predates": "surprise",
+                    },
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        future = store.get("future-wt-fetch")
+        assert future is not None
+        assert future.base_fetch_fallback is not None
+        assert future.base_fetch_fallback.reason == "fetch_dns_resolution_failed"
+        assert future.base_fetch_fallback.base == "main"
+
+    @pytest.mark.parametrize("raw_value", [None, {}])
+    def test_base_fetch_fallback_null_and_empty_dict_deserialize_to_none(
+        self, state_dir: Path, raw_value
+    ):
+        """`base_fetch_fallback: null` and `base_fetch_fallback: {}` both
+        deserialise to None, mirroring `stop_detail`/`setup_outcome`'s
+        falsy-dict handling."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "wt-falsy-fetch": {
+                    "id": "wt-falsy-fetch",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/wt-falsy-fetch",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "job_names": {},
+                    "base_fetch_fallback": raw_value,
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        rec = store.get("wt-falsy-fetch")
+        assert rec is not None
+        assert rec.base_fetch_fallback is None
+
+    def test_base_fetch_fallback_none_round_trips_as_none(self, state_dir: Path):
+        """A record whose base_fetch_fallback is None (the common case --
+        fetch succeeded or was never attempted) round-trips as None."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-no-fallback")
+        assert record.base_fetch_fallback is None
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-no-fallback")
+        assert reloaded is not None
+        assert reloaded.base_fetch_fallback is None
 
 
 # ---------------------------------------------------------------------------

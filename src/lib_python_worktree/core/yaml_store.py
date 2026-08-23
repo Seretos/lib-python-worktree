@@ -39,7 +39,14 @@ import portalocker
 import yaml
 
 from ._git_utils import _run_git
-from .state import SetupOutcome, StopDetail, WorktreeRecord, _STOP_DETAIL_MAX_PIDS
+from .state import (
+    BaseFetchFallback,
+    SetupOutcome,
+    StopDetail,
+    WorktreeRecord,
+    _BASE_FETCH_STDERR_MAX_CHARS,
+    _STOP_DETAIL_MAX_PIDS,
+)
 
 _STATE_FILE = "state.yaml"
 _PORTS_FILE = "ports.yaml"
@@ -284,6 +291,62 @@ def _setup_outcome_from_dict(d: Optional[Dict[str, Any]]) -> Optional[SetupOutco
     )
 
 
+def _base_fetch_fallback_to_dict(
+    fallback: Optional[BaseFetchFallback],
+) -> Optional[Dict[str, Any]]:
+    """Serialise a :class:`~.state.BaseFetchFallback` to a plain dict of
+    scalars (ticket #134), or ``None`` when *fallback* is ``None``. Mirrors
+    :func:`_setup_outcome_to_dict`. ``stderr`` is re-truncated defensively at
+    :data:`~.state._BASE_FETCH_STDERR_MAX_CHARS` even though the dataclass is
+    already constructed within that cap.
+    """
+    if fallback is None:
+        return None
+    stderr = fallback.stderr
+    if stderr is not None:
+        stderr = stderr[:_BASE_FETCH_STDERR_MAX_CHARS]
+    return {
+        "reason": fallback.reason,
+        "base": fallback.base,
+        "message": fallback.message,
+        "returncode": fallback.returncode,
+        "stderr": stderr,
+        "elapsed_sec": fallback.elapsed_sec,
+    }
+
+
+def _base_fetch_fallback_from_dict(
+    d: Optional[Dict[str, Any]],
+) -> Optional[BaseFetchFallback]:
+    """Reconstruct a :class:`~.state.BaseFetchFallback` from its serialised
+    dict, or ``None`` when *d* is ``None``/absent/empty (ticket #134).
+
+    Field-by-field with defaults for missing keys -- deliberately NOT
+    ``BaseFetchFallback(**d)`` -- so a legacy record with no
+    ``base_fetch_fallback`` key at all, or a state.yaml written by a future
+    engine version carrying extra keys this version does not know about,
+    both deserialise without raising: unknown keys are silently ignored,
+    missing keys fall back to the same defaults :class:`~.state.
+    BaseFetchFallback` itself uses. ``reason`` is preserved verbatim even if
+    it is not a value in ``state.BASE_FETCH_FALLBACK_REASONS`` -- forward
+    compatibility with a reason vocabulary this version predates. Mirrors
+    :func:`_setup_outcome_from_dict`.
+    """
+    if not d:
+        return None
+    stderr = d.get("stderr")
+    if stderr is not None:
+        stderr = str(stderr)[:_BASE_FETCH_STDERR_MAX_CHARS]
+    return BaseFetchFallback(
+        reason=d.get("reason", ""),
+        base=d.get("base", ""),
+        message=d.get("message", ""),
+        returncode=d.get("returncode"),
+        stderr=stderr,
+        elapsed_sec=d.get("elapsed_sec"),
+    )
+
+
 def _start_log_paths_from_dict(d: Any) -> Dict[str, str]:
     """Reconstruct the ``start_log_paths`` per-role mapping (ticket #119)
     from its serialised form, tolerating anything a legacy or corrupt
@@ -328,6 +391,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "stop_detail": _stop_detail_to_dict(rec.stop_detail),
         "setup_outcome": _setup_outcome_to_dict(rec.setup_outcome),
         "teardown_ran": rec.teardown_ran,
+        "base_fetch_fallback": _base_fetch_fallback_to_dict(rec.base_fetch_fallback),
     }
 
 
@@ -357,6 +421,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
         setup_outcome=_setup_outcome_from_dict(d.get("setup_outcome")),
         teardown_ran=bool(d.get("teardown_ran", False)),
+        base_fetch_fallback=_base_fetch_fallback_from_dict(d.get("base_fetch_fallback")),
     )
 
 
