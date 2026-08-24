@@ -81,12 +81,64 @@ sequence of named phases (`_TEARDOWN_PHASES`) over a shared
 
 - **Language:** Python, src-layout under `src/`, package `lib_python_worktree`.
 - **Tests:** `python -m pytest`. Install dev deps with
-  `pip install -e ".[test]"`.
+  `pip install -e ".[test]"`. **Never run the whole suite in one go from an
+  agent session** -- see "Running the suite" below; it is the single most
+  common way an automated run on this repo dies.
 - **Branch discipline:** All feature work happens on a feature branch in a git
   worktree, never on `main`. Assume the worktree and branch already exist and
   that you are inside them.
 - **AI attribution:** The project-issues MCP automatically prefixes every
   comment and PR body with `#ai-generated`. Never type that prefix yourself.
+
+### Running the suite (agent sessions: read this before you run pytest)
+
+The full suite takes **~567 s for 1162 tests**. That is longer than an agent
+session can wait for, and working around it the obvious way is fatal:
+
+> **Never start the full suite as a background task and end your turn waiting
+> for it.** In a headless session (`claude -p`, which is how every automated
+> run on this repo executes) **ending the turn ends the process**. Nothing
+> wakes the session back up: the background task is not suspended, it is
+> orphaned along with the run. No error is written -- the session just stops,
+> mid-pipeline, with its work uncommitted.
+
+This is not theoretical. On 2026-08-24 five consecutive automated sessions
+across tickets #139 and #140 died at exactly this point, each having reached
+its own conclusion that it should "wait for the suite and pick up after".
+One of them even diagnosed the mechanism correctly and still lost, by moving
+the background run from a subagent into its own turn -- the turn still ended.
+Raising `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` does not help (tried at 2 h;
+the session died without ever reaching the ceiling), and setting it to `0`
+makes it worse -- `0` means *wait zero*, not *wait forever*.
+
+**Instead: run the suite in chunks, synchronously, inside a single turn.** Each
+chunk must finish well under the ~600 s ceiling a blocking call has, so target
+roughly 3-4 minutes per chunk. Measured chunks:
+
+| chunk | files | tests | time |
+|---|---|---|---|
+| A | `test_process_lifecycle.py` | 273 | 100 s (measured) |
+| B | `test_manager.py`, `test_teardown*.py` | 403 | 345 s (measured) |
+| C | everything else under `tests/` | 486 | ~120 s (remainder of the 567 s) |
+
+Chunk B is the one to watch: at 345 s it still fits, but not comfortably once
+the machine is busy, and it is worth splitting -- the five slowest cases in it
+are all `test_manager.py` remove tests at ~20.5 s each, so `test_manager.py`
+alone carries most of that number and `test_teardown*.py` is cheap.
+
+Note that test *count* does not predict runtime here: chunk A holds the most
+tests but is the second cheapest, because the expensive tests are the few that
+spawn real processes and enumerate the Windows handle table (a single
+`TestWindowsJobObjectContainment` case costs ~30 s). When you add tests, check
+your chunk with `--durations=10` rather than assuming.
+
+Run the chunks one after another in the same turn, and treat a chunk boundary
+as a good place to commit. **Commit and push before any turn that might end**
+-- the cost of the mechanism above is not the lost minutes, it is the
+uncommitted work that goes with them.
+
+CI runs the suite as a whole; chunking is a constraint on *agent sessions*
+only, not on the workflow.
 
 ### Env vars
 
