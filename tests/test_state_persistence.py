@@ -24,9 +24,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
+import portalocker
 
 import subprocess
 
+from lib_python_worktree.core._exceptions import GitTimeoutError
 from lib_python_worktree.core.state import (
     BASE_FETCH_FALLBACK_REASON_FETCH_FAILED,
     BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT,
@@ -1133,6 +1135,476 @@ def _fake_run_git_ok(output: str):
             stderr="",
         )
     return _patched
+
+
+# ---------------------------------------------------------------------------
+# reconcile(): Phase 3 branch healing (ticket #139)
+#
+# A tracked record whose stored branch is non-ASCII mojibake (the Windows
+# cp1252-decoded-UTF-8 corruption this ticket fixes going forward in
+# _run_git) and differs from git's live porcelain branch for that path is
+# rewritten to git's value, and the record id (NOT the branch string) is
+# reported in report.healed_branches. Gated to non-ASCII stored branches
+# only; best-effort and must never raise (it runs on every list()).
+# ---------------------------------------------------------------------------
+
+GOOD_UNICODE_BRANCH = "wt-edge-56851-Ünïcödé-测试"
+
+
+def test_reconcile_heals_mojibake_branch(state_dir: Path, tmp_path: Path, monkeypatch):
+    """R3 driving test: a tracked record's persisted mojibake branch is
+    rewritten to git's live (correctly-decoded) porcelain value and
+    persisted, with the record's id -- not the branch string -- appended to
+    report.healed_branches.
+    """
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    wt_path = tmp_path / "wt-uni"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-uni",
+        repo_root="/repos/myrepo",
+        branch=mangled,
+        path=str(wt_path),  # OS-native separators
+    ))
+
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"),
+        _wt_block(wt_path.as_posix(), good),  # forward slashes, as real git emits
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    report = reconcile(store)
+
+    assert report.healed_branches == ["wt-uni"], (
+        "healed_branches carries record ids, not branch strings"
+    )
+
+    # Re-read from a fresh YamlStateStore on the same state_dir to prove the
+    # heal was actually persisted, not just returned in-memory (mirrors
+    # test_records_survive_store_reload).
+    reread_store = YamlStateStore(state_dir=state_dir)
+    healed = reread_store.get("wt-uni")
+    assert healed is not None
+    assert healed.branch == good
+
+
+def test_reconcile_matches_porcelain_path_with_forward_slashes(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Finding 2: the path-matching rule must be pathlib Path-object equality
+    on .resolve() output, not a string compare -- a stored OS-native path
+    must still match a porcelain path git emits with forward slashes (git
+    ALWAYS emits forward slashes, even on Windows). A naive string compare
+    leaves healed_branches empty on Windows; this goes red under that bug."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    wt_path = tmp_path / "wt-uni"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-uni", repo_root="/repos/myrepo", branch=mangled, path=str(wt_path),
+    ))
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _wt_block(wt_path.as_posix(), good),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    report = reconcile(store)
+
+    assert report.healed_branches == ["wt-uni"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path casing")
+def test_reconcile_matches_porcelain_path_case_insensitively_on_windows(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The matching rule inherits WindowsPath's case-folded comparison
+    (unlike adopt()'s case-sensitive string compare) -- a porcelain path
+    whose drive letter / last component casing differs from the stored path
+    must still match on Windows."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    wt_path = tmp_path / "wt-uni"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-uni", repo_root="/repos/myrepo", branch=mangled, path=str(wt_path),
+    ))
+
+    posix = wt_path.as_posix()
+    drive, rest = posix.split(":", 1)
+    upper_last = rest.rsplit("/", 1)
+    upper_path = f"{drive.upper()}:{'/'.join(upper_last[:-1] + [upper_last[-1].upper()])}"
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _wt_block(upper_path, good),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    report = reconcile(store)
+
+    assert report.healed_branches == ["wt-uni"]
+
+
+def test_reconcile_all_ascii_makes_no_git_call(state_dir: Path, tmp_path: Path, monkeypatch):
+    """Zero-cost steady state: with only ASCII branches, the healing phase
+    must make zero git calls and zero extra lock acquisitions -- reconcile()
+    runs on every WorktreeManager.__init__ and before every list()."""
+    wt_path = tmp_path / "wt-ascii"
+    wt_path.mkdir()
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(id="wt-ascii", branch="feature/x", path=str(wt_path)))
+
+    calls = {"n": 0}
+
+    def _counting_run_git(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError("git must not be called when all branches are ASCII")
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _counting_run_git)
+
+    report = reconcile(store)
+
+    assert calls["n"] == 0
+    assert report.healed_branches == []
+
+
+def test_reconcile_skips_primary_backed_record(state_dir: Path, tmp_path: Path, monkeypatch):
+    """A backing='primary' record is never looked up or written by the
+    healing phase -- gated on `rec.backing`, not merely on `rec.branch`
+    being falsy (in production `branch` is always None on a primary record
+    by design, #84, but that alone would make this indistinguishable from a
+    truthiness-only gate; here the branch is a truthy, non-ASCII candidate
+    value, so the ONLY thing excluding it is the `backing == "primary"`
+    check)."""
+    wt_path = tmp_path / "wt-primary"
+    wt_path.mkdir()
+    store = YamlStateStore(state_dir=state_dir)
+    rec = _make_record(
+        id="wt-primary", branch=GOOD_UNICODE_BRANCH, path=str(wt_path),
+    )
+    rec.backing = "primary"
+    store.add(rec)
+
+    # Counter incremented BEFORE raising: a bare AssertionError raised
+    # directly would be swallowed by the healing phase's own mandated
+    # try/except Exception, making a wrongly-gated implementation look
+    # green (git gets called, the AssertionError is caught and logged, and
+    # healed_branches still comes back [] because the fake output doesn't
+    # match anyway). Counting calls makes "git was never called" the actual
+    # observable, independent of the phase's exception handling.
+    calls = {"n": 0}
+
+    def _fail_run_git(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError("git must not be called for a primary-backed record")
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fail_run_git)
+
+    report = reconcile(store)
+
+    assert calls["n"] == 0, "healing phase must not call git for a primary-backed record"
+    assert report.healed_branches == []
+
+
+def test_reconcile_detached_block_keeps_stored_branch(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A porcelain block with no `branch` line (detached HEAD) must leave the
+    stored value in place rather than nulling it."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    wt_path = tmp_path / "wt-detached-heal"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-detached-heal", repo_root="/repos/myrepo", branch=mangled, path=str(wt_path),
+    ))
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _detached_block(wt_path.as_posix()),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    report = reconcile(store)
+
+    assert report.healed_branches == []
+    updated = store.get("wt-detached-heal")
+    assert updated is not None
+    assert updated.branch == mangled
+
+
+def test_reconcile_no_matching_block_leaves_record_untouched(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A porcelain listing that names a different path than the stored
+    record leaves the record untouched -- no match, no heal."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    wt_path = tmp_path / "wt-nomatch"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-nomatch", repo_root="/repos/myrepo", branch=mangled, path=str(wt_path),
+    ))
+    other_path = (tmp_path / "wt-somewhere-else").as_posix()
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _wt_block(other_path, good),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    report = reconcile(store)
+
+    assert report.healed_branches == []
+    updated = store.get("wt-nomatch")
+    assert updated is not None
+    assert updated.branch == mangled
+
+
+def test_reconcile_heals_only_branch_not_id_or_path(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Only `branch` is written by a heal -- `id` and `path` must be
+    byte-identical afterwards (no migration/rename of the slug or store
+    directory)."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    wt_path = tmp_path / "wt-idpath"
+    wt_path.mkdir()
+    original_path = str(wt_path)
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-idpath", repo_root="/repos/myrepo", branch=mangled, path=original_path,
+    ))
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _wt_block(wt_path.as_posix(), good),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    reconcile(store)
+
+    updated = store.get("wt-idpath")
+    assert updated is not None
+    assert updated.id == "wt-idpath"
+    # _record_from_dict normalizes path separators to forward slashes on
+    # every load (pre-existing, unrelated to #139's healing phase -- it is
+    # the store's own self-healing for legacy backslash-written paths), so
+    # the correctness bar for "path untouched by a heal" is the normalized
+    # form, not byte-identity with the OS-native string -- a plain
+    # `store.get()` with NO healing at all shows the same normalization.
+    assert updated.path == original_path.replace("\\", "/")
+    assert updated.branch == good
+
+
+def test_reconcile_one_git_call_per_repo_root(state_dir: Path, tmp_path: Path, monkeypatch):
+    """Two mangled records under the same repo_root must trigger exactly one
+    git call for that repo_root; a third mangled record under a different
+    repo_root triggers a second call -- one per DISTINCT repo_root, not per
+    candidate record."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+
+    wt_a1 = tmp_path / "repoA" / "wt-a1"
+    wt_a2 = tmp_path / "repoA" / "wt-a2"
+    wt_b1 = tmp_path / "repoB" / "wt-b1"
+    for p in (wt_a1, wt_a2, wt_b1):
+        p.mkdir(parents=True)
+
+    repo_a = (tmp_path / "repoA").as_posix()
+    repo_b = (tmp_path / "repoB").as_posix()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(id="wt-a1", repo_root=repo_a, branch=mangled, path=str(wt_a1)))
+    store.add(_make_record(id="wt-a2", repo_root=repo_a, branch=mangled, path=str(wt_a2)))
+    store.add(_make_record(id="wt-b1", repo_root=repo_b, branch=mangled, path=str(wt_b1)))
+
+    calls: list = []
+
+    def _spy_run_git(args, cwd=None, **kwargs):
+        calls.append(str(cwd))
+        if str(cwd) == repo_a.replace("/", os.sep) or str(cwd) == repo_a:
+            porcelain = _porcelain(
+                _main_block(repo_a),
+                _wt_block(wt_a1.as_posix(), good),
+                _wt_block(wt_a2.as_posix(), good),
+            )
+        else:
+            porcelain = _porcelain(_main_block(repo_b), _wt_block(wt_b1.as_posix(), good))
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=0, stdout=porcelain, stderr="",
+        )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _spy_run_git)
+
+    report = reconcile(store)
+
+    assert len(calls) == 2, f"expected exactly one git call per distinct repo_root, got {calls}"
+    # Test-critic finding: assert the recorded cwd values are the two
+    # DISTINCT repo_roots, not just that there were two calls -- normalize
+    # via Path() so the assertion is agnostic to which separator form the
+    # implementation happened to pass through.
+    assert {str(Path(c)) for c in calls} == {str(Path(repo_a)), str(Path(repo_b))}, calls
+    assert sorted(report.healed_branches) == ["wt-a1", "wt-a2", "wt-b1"]
+
+
+def test_reconcile_non_ascii_but_already_correct_is_not_rewritten(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A stored branch that is already non-ASCII AND already matches git's
+    live porcelain value must not be reported as healed (no rewrite, no
+    _save_state churn)."""
+    good = GOOD_UNICODE_BRANCH
+    wt_path = tmp_path / "wt-already-good"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-already-good", repo_root="/repos/myrepo", branch=good, path=str(wt_path),
+    ))
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _wt_block(wt_path.as_posix(), good),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    # Test-critic finding: "no _save_state churn" was asserted with no spy
+    # behind it. Spy on the real method so "no rewrite" is an observable,
+    # not just a restatement of the branch value the test itself wrote.
+    save_calls = {"n": 0}
+    real_save = YamlStateStore._save_state
+
+    def _counting_save(self, records):
+        save_calls["n"] += 1
+        return real_save(self, records)
+
+    monkeypatch.setattr(YamlStateStore, "_save_state", _counting_save)
+
+    report = reconcile(store)
+
+    assert report.healed_branches == []
+    assert save_calls["n"] == 0, "an already-correct branch must not trigger a _save_state write"
+    assert store.get("wt-already-good").branch == good
+
+
+def test_reconcile_report_defaults_healed_branches_empty():
+    """The additive field defaults to [] for every existing caller that
+    doesn't touch branch healing at all."""
+    assert ReconcileReport().healed_branches == []
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["returncode_nonzero", "git_timeout", "lock_timeout", "save_state_oserror"],
+)
+def test_reconcile_healing_phase_never_raises(
+    state_dir: Path, tmp_path: Path, monkeypatch, caplog, failure_mode
+):
+    """Finding 1 -- the phase-level (not just git-call-level) guarantee: on
+    ANY failure inside the healing phase's try block, reconcile() returns
+    normally with healed_branches == [], the candidate record is untouched
+    on disk, the WARNING is logged naming the exception type, and -- the
+    real ordering guard for "healing runs after the ports phase" -- the
+    earlier phases' results (orphaned, freed_ports) are still populated in
+    the returned report.
+    """
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+
+    heal_path = tmp_path / "wt-uni-abort"
+    heal_path.mkdir()
+    orphan_path = str(tmp_path / "gone" / "wt-orphan-abort")
+    unused_port = 19994
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-uni-abort", repo_root="/repos/myrepo", branch=mangled, path=str(heal_path),
+    ))
+    store.add(_make_record(id="wt-orphan-abort", path=orphan_path))
+    store._ports._save({"wt-gone-abort:web": unused_port})
+
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"), _wt_block(heal_path.as_posix(), good),
+    )
+
+    if failure_mode == "returncode_nonzero":
+        def _bad_run_git(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=["git", "worktree", "list", "--porcelain"],
+                returncode=1, stdout="", stderr="fatal: simulated failure",
+            )
+        monkeypatch.setattr(yaml_store_module, "_run_git", _bad_run_git)
+    elif failure_mode == "git_timeout":
+        def _timeout_run_git(*args, **kwargs):
+            raise GitTimeoutError(["git", "worktree", "list", "--porcelain"], 30.0)
+        monkeypatch.setattr(yaml_store_module, "_run_git", _timeout_run_git)
+    elif failure_mode == "lock_timeout":
+        monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+        real_lock = YamlStateStore._with_state_lock
+        lock_calls = {"n": 0}
+
+        def _counting_lock(self):
+            lock_calls["n"] += 1
+            if lock_calls["n"] == 2:
+                raise portalocker.exceptions.LockException("simulated lock timeout")
+            return real_lock(self)
+
+        monkeypatch.setattr(YamlStateStore, "_with_state_lock", _counting_lock)
+    elif failure_mode == "save_state_oserror":
+        monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+        real_save = YamlStateStore._save_state
+        save_calls = {"n": 0}
+
+        def _counting_save(self, records):
+            save_calls["n"] += 1
+            if save_calls["n"] == 2:
+                raise OSError("simulated disk full")
+            return real_save(self, records)
+
+        monkeypatch.setattr(YamlStateStore, "_save_state", _counting_save)
+
+    with caplog.at_level(logging.WARNING, logger="lib_python_worktree.core.yaml_store"):
+        report = reconcile(store)
+
+    assert report.healed_branches == []
+    assert report.orphaned == ["wt-orphan-abort"], (
+        "the earlier orphan phase's result must survive a healing-phase abort"
+    )
+    assert report.freed_ports == ["wt-gone-abort:web"], (
+        "the earlier ports phase's result must survive a healing-phase abort"
+    )
+
+    # Re-read to prove the candidate record was never rewritten on disk.
+    untouched = YamlStateStore(state_dir=state_dir).get("wt-uni-abort")
+    assert untouched is not None
+    assert untouched.branch == mangled
+
+    # Test-critic finding: a bare `except Exception: _log.warning("skipped")`
+    # would satisfy a substring-only "branch healing" check even though the
+    # plan pins the log line to include `type(exc).__name__`. Tighten to
+    # also require the actual exception TYPE NAME for this failure_mode,
+    # so a handler that discards the exception object (and its type) can no
+    # longer pass.
+    expected_exc_type_name = {
+        "returncode_nonzero": "RuntimeError",
+        "git_timeout": "GitTimeoutError",
+        "lock_timeout": "LockException",
+        "save_state_oserror": "OSError",
+    }[failure_mode]
+    assert any(
+        "branch healing" in rec.message
+        and expected_exc_type_name in rec.message
+        and rec.levelname == "WARNING"
+        for rec in caplog.records
+    ), (
+        f"the abort must be logged at WARNING naming the healing phase and "
+        f"the exception type ({expected_exc_type_name}); records: "
+        f"{[rec.message for rec in caplog.records]}"
+    )
 
 
 def test_adopt_imports_out_of_band_worktree(state_dir: Path, monkeypatch):

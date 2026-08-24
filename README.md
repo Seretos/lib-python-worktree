@@ -101,6 +101,23 @@ collision-avoidance check) or whether any PID happens to be alive. A
 stopped-but-still-tracked environment's reservation is therefore never
 wiped, and it survives to its next `start()`.
 
+`reconcile()`'s branch-healing rule (ticket #139): after the orphan/PID and
+port-freeing phases, a final best-effort phase repairs `state.yaml` records
+whose persisted `branch` is mojibake -- the Windows cp1252-decoded-UTF-8
+corruption produced by a pre-#139 `_run_git`. It is gated to stored branches
+that are **non-ASCII** (`not rec.branch.isascii()`) and not `backing="primary"`;
+an ASCII branch divergence is a legitimate manual `git checkout`, handled
+separately by `checkout.list_repo`'s read-only refresh, and is never touched
+here. In the all-ASCII steady state this phase makes **zero** git calls and
+acquires **zero** extra locks. The whole phase body -- one `git worktree list
+--porcelain` per distinct `repo_root`, the second state-lock acquisition, and
+the write-back -- is wrapped in a single `try/except Exception` and **never
+raises**: any failure (a lock timeout, a git timeout, a disk error) is logged
+at WARNING and leaves state as-is, because `reconcile()` runs on every
+`WorktreeManager.__init__` and before every `list()`/`list_repo()` call. A
+healed record's id (not its branch string) is reported in the additive
+`ReconcileReport.healed_branches` field.
+
 ## On-disk layout
 
 | Root | Default path | Env var override |

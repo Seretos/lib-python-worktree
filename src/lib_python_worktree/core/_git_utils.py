@@ -92,6 +92,16 @@ def _run_git(
     derived in ``GitTimeoutError.__init__`` from ``cmd``) so a caller has a
     retry-worthy signal. No retry/backoff or timeout-value change is made
     here -- diagnostics only.
+
+    Ticket #139: ``encoding="utf-8", errors="replace"`` is pinned
+    unconditionally (no ``sys.platform`` branch) so git's UTF-8 stdout/stderr
+    is never decoded with the Windows ANSI/OEM codepage default -- the root
+    cause of Unicode branch names coming back mojibake-corrupted.
+    ``errors="replace"`` is deliberate: ``"strict"`` would turn today's
+    working-but-lossy calls into a hard ``UnicodeDecodeError``, and
+    ``"surrogateescape"``'s lone surrogates blow up later at
+    ``yaml.safe_dump`` time in ``yaml_store``. ``text=True`` stays -- it is
+    what selects text mode; ``encoding=`` only overrides the locale default.
     """
     effective_timeout = _resolve_git_timeout(timeout)
 
@@ -101,6 +111,8 @@ def _run_git(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if sys.platform == "win32":
         # Suppress the brief console-window flash when the packaged worktree.exe

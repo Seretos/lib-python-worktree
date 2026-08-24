@@ -435,6 +435,13 @@ def _run_install(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        # Ticket #139: pin UTF-8 decoding unconditionally (no sys.platform
+        # branch) so a Unicode plugin key/output never gets decoded with the
+        # Windows ANSI/OEM codepage default -- mirrors _git_utils._run_git's
+        # same fix. errors="replace" for the same reason: "strict" would
+        # turn a working-but-lossy call into a hard UnicodeDecodeError.
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]

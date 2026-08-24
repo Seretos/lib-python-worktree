@@ -516,6 +516,11 @@ class ReconcileReport:
     orphaned: List[str] = field(default_factory=list)
     stopped: List[str] = field(default_factory=list)
     freed_ports: List[str] = field(default_factory=list)
+    # Ticket #139: ids (not branch strings) of records whose persisted
+    # mojibake branch was rewritten to git's live porcelain value by
+    # reconcile()'s branch-healing phase. Additive field -- every existing
+    # caller that never touches branch healing gets [].
+    healed_branches: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +806,96 @@ def reconcile(
         if to_free:
             store._ports._save(allocated)
 
+    # --- Phase 3: branch healing (ticket #139) ---
+    # Best-effort mojibake repair: a record's persisted branch that is
+    # non-ASCII (the cp1252-decoded-UTF-8 corruption pre-#139 _run_git
+    # produced on Windows) and differs from git's live porcelain branch for
+    # that path is rewritten to git's value. Gated to non-ASCII stored
+    # branches only -- an ASCII branch divergence is a legitimate manual
+    # `git checkout`, which `checkout.list_repo`'s read-only branch refresh
+    # already handles; this phase never touches that case, and costs zero
+    # git calls / zero extra lock acquisitions in the (overwhelmingly
+    # common) all-ASCII steady state. `backing="primary"` records are
+    # skipped -- their `branch` is always `None` by design (#84). Runs LAST
+    # (after Phases 1-2) so it can never starve them, and its own body --
+    # every git call, the second lock acquisition, the reload, the apply
+    # and the `_save_state` -- lives inside one `try/except Exception` so a
+    # failure here (lock contention, a git timeout, a disk error) can never
+    # make reconcile() itself raise: reconcile() runs on every
+    # `WorktreeManager.__init__` and before every `list()`/`list_repo()`
+    # call. The git call is deliberately outside the state lock
+    # (`_LOCK_TIMEOUT` is 10s, shorter than the 30s default
+    # `WORKTREE_GIT_TIMEOUT_SEC`, so holding the lock across it could starve
+    # a concurrent process).
+    candidates: Dict[str, str] = {
+        wt_id: rec.repo_root
+        for wt_id, rec in records.items()
+        if rec.backing != "primary" and rec.branch and not rec.branch.isascii()
+    }
+    if candidates:
+        try:
+            repo_roots = sorted(set(candidates.values()))
+            porcelain_by_root: Dict[str, str] = {}
+            for repo_root in repo_roots:
+                proc = _run_git(
+                    ["worktree", "list", "--porcelain"], cwd=Path(repo_root),
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"git worktree list --porcelain failed for repo "
+                        f"'{repo_root}' (returncode {proc.returncode}): "
+                        f"{(proc.stderr or '').strip()}"
+                    )
+                porcelain_by_root[repo_root] = proc.stdout or ""
+
+            with store._with_state_lock():
+                fresh_records = store._load_state()
+                # Path-matching rule reuses checkout.list_repo's convention
+                # verbatim: pathlib.Path object equality on .resolve()
+                # output, NOT string equality. This is case-insensitive on
+                # Windows (PureWindowsPath.__eq__ case-folds) and tolerates
+                # git's porcelain forward slashes against an OS-native
+                # stored path.
+                records_by_path: Dict[Path, WorktreeRecord] = {
+                    Path(rec.path).resolve(): rec
+                    for wt_id, rec in fresh_records.items()
+                    if wt_id in candidates
+                }
+                pending_ids: List[str] = []
+                for repo_root, stdout in porcelain_by_root.items():
+                    for block in _parse_worktree_porcelain_ys(stdout):
+                        wt_path_raw = block.get("path")
+                        if not wt_path_raw:
+                            continue
+                        live_branch = block.get("branch")
+                        if not live_branch:
+                            # Detached HEAD / no branch line -- keep the
+                            # stored value rather than nulling it.
+                            continue
+                        rec = records_by_path.get(Path(wt_path_raw).resolve())
+                        if rec is None or rec.branch == live_branch:
+                            continue
+                        # Only `branch` is written -- `id`/path/slug are
+                        # never migrated or renamed by a heal.
+                        _log.warning(
+                            "reconcile: worktree '%s' stored branch %r looks "
+                            "like mojibake; healed to live git value %r",
+                            rec.id, rec.branch, live_branch,
+                        )
+                        rec.branch = live_branch
+                        pending_ids.append(rec.id)
+                if pending_ids:
+                    store._save_state(fresh_records)
+                    # Only append to the report AFTER a successful save --
+                    # a save that raises must leave report.healed_branches
+                    # empty (caught by the outer except below).
+                    report.healed_branches.extend(pending_ids)
+        except Exception as exc:  # noqa: BLE001 -- best-effort, must never raise.
+            _log.warning(
+                "reconcile: branch healing phase aborted (%s: %s); state left as-is",
+                type(exc).__name__, exc,
+            )
+
     return report
 
 
@@ -816,6 +911,56 @@ def _port_in_use(port: int) -> bool:
 # ---------------------------------------------------------------------------
 # adopt()
 # ---------------------------------------------------------------------------
+
+def _parse_worktree_porcelain_ys(stdout: str) -> List[Dict[str, Optional[str]]]:
+    """Parse ``git worktree list --porcelain`` output into per-worktree blocks.
+
+    Lifted out of ``adopt()`` (ticket #139) so the reconcile() branch-healing
+    phase can reuse the exact same parser instead of a third inline copy.
+    ``yaml_store`` does not import ``checkout``, so this is a separate
+    (behaviourally identical) parser from ``checkout._parse_worktree_porcelain``
+    -- the import graph documented in README.md stays unchanged.
+
+    Format (one block per worktree, blank line between blocks)::
+
+        worktree /path/to/wt
+        HEAD <sha>
+        branch refs/heads/<name>   -- OR --
+        detached
+
+    The first block is always the main worktree.
+    """
+    blocks: List[Dict[str, Optional[str]]] = []
+    current: Dict[str, Optional[str]] = {}
+
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            if current:
+                blocks.append(current)
+                current = {}
+            continue
+        if line.startswith("worktree "):
+            current["path"] = line[len("worktree "):].strip()
+        elif line.startswith("branch "):
+            # "branch refs/heads/<name>"
+            ref = line[len("branch "):].strip()
+            prefix = "refs/heads/"
+            if ref.startswith(prefix):
+                current["branch"] = ref[len(prefix):]
+            else:
+                current["branch"] = ref
+        elif line == "detached":
+            current["detached"] = "true"
+        elif line.startswith("prunable"):
+            current["prunable"] = "true"
+
+    # Flush the last block (no trailing blank line at EOF in some git versions).
+    if current:
+        blocks.append(current)
+
+    return blocks
+
 
 def adopt(
     store: YamlStateStore,
@@ -874,42 +1019,8 @@ def adopt(
     repo_root_str = main_path.as_posix()
 
     # --- Phase 2: parse porcelain output (CPU only, no I/O) ---
-    # Format (one block per worktree, blank line between blocks):
-    #   worktree /path/to/wt
-    #   HEAD <sha>
-    #   branch refs/heads/<name>   -- OR --
-    #   detached
-    #
     # The first block is always the main worktree.
-
-    blocks: List[Dict[str, Optional[str]]] = []
-    current: Dict[str, Optional[str]] = {}
-
-    for raw_line in (proc.stdout or "").splitlines():
-        line = raw_line.rstrip()
-        if not line:
-            if current:
-                blocks.append(current)
-                current = {}
-            continue
-        if line.startswith("worktree "):
-            current["path"] = line[len("worktree "):].strip()
-        elif line.startswith("branch "):
-            # "branch refs/heads/<name>"
-            ref = line[len("branch "):].strip()
-            prefix = "refs/heads/"
-            if ref.startswith(prefix):
-                current["branch"] = ref[len(prefix):]
-            else:
-                current["branch"] = ref
-        elif line == "detached":
-            current["detached"] = "true"
-        elif line.startswith("prunable"):
-            current["prunable"] = "true"
-
-    # Flush the last block (no trailing blank line at EOF in some git versions).
-    if current:
-        blocks.append(current)
+    blocks = _parse_worktree_porcelain_ys(proc.stdout or "")
 
     if not blocks:
         return report

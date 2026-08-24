@@ -19,6 +19,7 @@ import pytest
 from lib_python_worktree.core import manager as manager_module
 from lib_python_worktree.core import teardown as _teardown_mod
 from lib_python_worktree.core import _git_utils as git_utils_module
+from lib_python_worktree.core import checkout as checkout_module
 from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
@@ -554,6 +555,67 @@ def test_run_git_closes_stdin(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #139: _run_git must decode subprocess output as UTF-8 explicitly,
+# not the locale/OEM-codepage default (the Windows mojibake root cause).
+# ---------------------------------------------------------------------------
+
+def test_run_git_decodes_output_as_utf8(monkeypatch):
+    """R1 driving test: ``_run_git``'s Popen kwargs must pin
+    ``encoding="utf-8", errors="replace"`` unconditionally (no
+    ``sys.platform`` branch) so a Unicode branch name never gets decoded
+    with the Windows ANSI/OEM codepage default.
+    """
+
+    captured_kwargs: dict = {}
+
+    class _RecordingPopen:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _RecordingPopen)
+    _run_git(["--version"])
+    assert captured_kwargs.get("encoding") == "utf-8"
+    assert captured_kwargs.get("errors") == "replace"
+    # Test-critic finding: a dropped `text=True` in the same edit that adds
+    # the encoding kwargs would not be caught by test_run_git_still_returns_str
+    # (its patched Popen returns plain str regardless of kwargs) -- assert it
+    # directly here, on the kwargs actually recorded.
+    assert captured_kwargs.get("text") is True
+
+
+def test_run_git_still_returns_str(monkeypatch):
+    """Additional coverage for R1: dropping ``text=True`` while adding
+    ``encoding=``/``errors=`` would be a regression -- a patched Popen
+    returning plain str stdout/stderr must still surface as ``str`` on the
+    ``CompletedProcess`` (this already passes; it guards against losing
+    ``text=True`` in the same edit that adds the encoding kwargs)."""
+
+    class _StrPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("out", "err")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _StrPopen)
+    result = _run_git(["--version"])
+    assert isinstance(result.stdout, str)
+    assert isinstance(result.stderr, str)
+    assert result.stdout == "out"
+    assert result.stderr == "err"
+
+
+# ---------------------------------------------------------------------------
 # Ticket #102: GitTimeoutError network-vs-local classification
 # ---------------------------------------------------------------------------
 
@@ -862,6 +924,88 @@ def test_remove_unmerged_branch_without_force_cleans_state_and_raises(
     assert rec.id not in remaining_ids, (
         "State record must be removed even when branch-delete raises"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #139: Unicode branch names must not come back mojibake-corrupted.
+#
+# The `core.quotePath` probe (run once on Windows -- git version
+# 2.53.0.windows.1 -- and captured as raw bytes, never `text=True`, which is
+# the very bug under test) found NO quoting: `git worktree list --porcelain`
+# emits the UTF-8 branch name as raw, unquoted bytes
+# (`branch refs/heads/\xc3\x9cn\xc3\xafc\xc3\xb6d\xc3\xa9-...`), byte-identical
+# to the same command run with `-c core.quotePath=false`. So no
+# `_unquote_git_c_style` helper is needed (R4 dropped) and this end-to-end
+# round-trip test is the permanent guard: if a future git version starts
+# quoting, this test goes red and the helper gets added then. The probe's
+# step 4 also found the illegal-branch-name `fatal: ...` stderr echoes the
+# name unquoted (raw UTF-8 bytes), so the third, stronger assertion in
+# test_illegal_branch_name_error_message_not_mangled below is enabled.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_unicode_branch_survives_porcelain_roundtrip(git_repo: Path):
+    """R1b driving test: a real git repo with branch
+    'wt-edge-56851-Ünïcödé-测试' yields that exact string from the engine's
+    read paths -- not cp1252 mojibake.
+
+    Expected RED reason (pre-fix): on Windows (the `windows-latest` CI leg
+    and the developer's Windows box), the locale/OEM-codepage decode in
+    `_run_git` turns the UTF-8 branch bytes into mojibake, so neither
+    assertion below matches the true branch string. On `ubuntu-22.04` (UTF-8
+    locale) this test already passes pre-fix -- that is expected and is
+    exactly why the end-to-end regression guard, not just the R1 kwargs
+    check, is needed for this ticket.
+    """
+    branch = "wt-edge-56851-Ünïcödé-测试"
+    wt_path = git_repo.parent / "unicode-wt"
+    _git("branch", branch, cwd=git_repo)
+    _git("worktree", "add", str(wt_path), branch, cwd=git_repo)
+
+    # (a) the raw _run_git read path carries the exact branch string.
+    proc = _run_git(["worktree", "list", "--porcelain"], cwd=git_repo)
+    assert branch in proc.stdout
+
+    # (b) checkout.list_repo's read path resolves the same exact string.
+    listing = checkout_module.list_repo(git_repo, records=[])
+    branches = [entry.record.branch for entry in listing.entries]
+    assert branch in branches
+
+
+@pytest.mark.requires_git
+def test_illegal_branch_name_error_message_not_mangled(
+    manager: WorktreeManager, git_repo: Path
+):
+    """R1b additional coverage: `manager.create()` with a git-illegal branch
+    name (a space makes 'Ünïcödé test' invalid) must raise with the TRUE
+    branch string embedded -- never the cp1252-mojibake form, and never a
+    message where both occurrences are uniformly (and therefore
+    indistinguishably) mangled.
+
+    Expected RED reason (pre-fix, Windows): `_run_git`'s locale decode
+    mangles `proc.stderr`, so the git-stderr-sourced occurrence in the
+    raised message is the cp1252 form, not the true branch string --
+    assertion 2 fails (the mojibake form IS present) and assertion 3 fails
+    (fewer than 2 true-string occurrences). On `ubuntu-22.04` this already
+    passes pre-fix, same caveat as test_unicode_branch_survives_porcelain_roundtrip.
+    """
+    branch = "Ünïcödé test"  # contains a space -> git-illegal
+
+    with pytest.raises(GitCommandError) as excinfo:
+        manager.create(str(git_repo), branch)
+
+    message = str(excinfo.value)
+    # 1. The caller's own literal branch string appears.
+    assert branch in message
+    # 2. The cp1252-mojibake form appears nowhere -- this is what makes
+    #    "both occurrences mangled identically" fail the test.
+    mangled = branch.encode("utf-8").decode("cp1252")
+    assert mangled not in message
+    # 3. Both the engine-side occurrence (the literal branch passed into
+    #    git_args) and the git-stderr-sourced occurrence are the true
+    #    string -- enabled because the probe found git's stderr echoes the
+    #    illegal name unquoted (git 2.53.0.windows.1).
+    assert message.count(branch) >= 2
 
 
 # ---------------------------------------------------------------------------
