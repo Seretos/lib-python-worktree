@@ -87,6 +87,42 @@ def _no_real_settle_sleep():
         yield
 
 
+def _win32_rmtree_side_effect(checkout_path: Path):
+    """Ticket #140 fix, same idiom as ``test_gate_a_runs_only_on_windows_
+    with_present_target``'s ticket #137 comment above: a row that mocks
+    ``sys.platform`` to "win32" on a real (possibly non-Windows) host AND
+    creates a real ``checkout_path`` on disk drives
+    ``_phase_filesystem_fallback`` into building a genuine Windows
+    "\\?\"-prefixed extended path and handing it to ``shutil.rmtree``. On
+    real Windows that deletes the directory; on a non-Windows CI host the
+    string is nonsensical, ``shutil.rmtree`` raises OSError, the robocopy
+    fallback is also unavailable there, and the directory survives --
+    which then makes ``_phase_final_guard`` raise ``WorktreeDirLockedError``
+    for a reason that has nothing to do with the behaviour the row is
+    actually pinning. Redirect the mocked call to a REAL recursive delete
+    of ``checkout_path``, but only after asserting the extended-path
+    argument the code under test built genuinely resolves to it -- so a
+    regression in the path-building itself still fails loudly instead of
+    being silently papered over. This makes the row's outcome independent
+    of the host OS -- host-independent-by-construction, rather than a
+    host-conditional skip.
+    """
+
+    def _side_effect(*args, **kwargs):
+        called_path = args[0] if args else kwargs.get("path")
+        assert called_path.startswith("\\\\?\\"), (
+            f"expected a win32 extended-path prefix, got {called_path!r}"
+        )
+        stripped = Path(called_path[4:])
+        assert os.path.normcase(str(stripped.resolve())) == os.path.normcase(
+            str(checkout_path.resolve())
+        ), f"extended path {called_path!r} does not point at {checkout_path!r}"
+        if checkout_path.exists():
+            _real_rmtree(str(checkout_path))
+
+    return _side_effect
+
+
 # ---------------------------------------------------------------------------
 # Part 1: one row per historical ticket
 # ---------------------------------------------------------------------------
@@ -1057,6 +1093,10 @@ class TestMatrixOrphanScan:
                 return_value=_PartialList([hit]),
             ) as mock_kill,
             patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_win32_rmtree_side_effect(checkout_path),
+            ),
         ):
             mock_git.return_value = _ok()
             mock_sys.platform = "win32"
@@ -1159,6 +1199,10 @@ class TestMatrixOrphanScan:
                 ),
             ),
             patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_win32_rmtree_side_effect(checkout_path),
+            ),
         ):
             mock_git.return_value = _ok()
             mock_sys.platform = "win32"
@@ -1207,6 +1251,10 @@ class TestMatrixOrphanScan:
                 side_effect=RuntimeError("boom"),
             ),
             patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_win32_rmtree_side_effect(checkout_path),
+            ),
         ):
             mock_git.return_value = _ok()
             mock_sys.platform = "win32"
@@ -1405,6 +1453,10 @@ class TestMatrixOrphanScan:
                 return_value=kill_result,
             ),
             patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_win32_rmtree_side_effect(checkout_path),
+            ),
         ):
             mock_git.return_value = _ok()
             mock_sys.platform = "win32"
