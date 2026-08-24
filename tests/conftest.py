@@ -263,3 +263,43 @@ def generous_early_exit_wait() -> Iterator[None]:
         "lib_python_worktree.core.process_lifecycle._EARLY_EXIT_WAIT_SEC", 30.0
     ):
         yield
+
+
+# ---------------------------------------------------------------------------
+# _no_orphan_scan_by_default: stub the ticket #140 orphan-scan phase's own
+# psutil discovery call for every real-git removal test
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _no_orphan_scan_by_default() -> Iterator[None]:
+    """Autouse: stub ``teardown._find_blocking_processes`` to a clean,
+    complete, empty result for every test in this suite by default.
+
+    Ticket #140's new all-platform ``_phase_orphan_scan`` teardown phase
+    calls ``_find_blocking_processes`` on EVERY present-target removal,
+    regardless of platform -- unlike the pre-#140 Windows-only Gate A call,
+    this one is not gated on ``sys.platform``. Without this stub, every
+    real-git removal test in the requires_git files (``test_manager.py``,
+    ``test_primary_environment.py``, ``test_list_repo.py``,
+    ``test_port_allocator.py``, ``test_pinned_ports.py``, ``test_state*.py``,
+    and this file's own fixtures) would pay a full psutil scan on every
+    single removal -- on Windows, Pass 1c's handle-table scan alone can burn
+    up to ``_HANDLE_SCAN_BUDGET_SEC`` (15s) against the 90s per-test
+    ``timeout`` configured in ``pyproject.toml``.
+
+    Tests that specifically exercise the orphan-scan phase (or Gate A, which
+    already carries its own such patches) override this with their own
+    nested ``patch(...)`` for ``teardown._find_blocking_processes`` --
+    ``tests/test_teardown.py`` and ``tests/test_remove_by_checkout_path.py``
+    already followed this idiom before this fixture existed;
+    ``tests/test_teardown_matrix.py``'s ticket-#140 rows are the first
+    in-repo consumers of the nested-override idiom against this new autouse
+    default specifically.
+    """
+    from lib_python_worktree.core.process_lifecycle import _PartialList
+
+    with patch(
+        "lib_python_worktree.core.teardown._find_blocking_processes",
+        return_value=_PartialList([], complete=True),
+    ):
+        yield

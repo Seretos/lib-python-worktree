@@ -1081,6 +1081,36 @@ class WorktreeManager:
         ``stop()``'s own no-op branch), and ``stop_attempt`` stays whatever
         an earlier ``stop()`` call left it as -- ``_teardown()`` does not
         recompute it (see its own docstring for why).
+
+        Ticket #140: ``force`` and ``kill_blocking_processes`` guard TWO
+        DIFFERENT gates, and neither substitutes for the other. Gate A
+        (Windows only) refuses on a confirmed blocking process and is
+        bypassed only by ``kill_blocking_processes=True`` -- ``force=True``
+        alone still raises ``WorktreeDirLockedError``. Gate B refuses on
+        real uncommitted dirt and is bypassed only by ``force=True`` --
+        ``kill_blocking_processes=True`` alone still raises
+        ``DirtyWorktreeError``. Neither gate runs on POSIX at all (Gate A is
+        win32-only; POSIX unlinks files even under an open handle, so a
+        blocking process there was previously silently orphaned rather than
+        refused or reported).
+
+        New in this ticket: an additional, all-platform, **warn-only**
+        teardown phase now scans for exactly that previously-silent POSIX
+        case (and, on any platform, any process this engine never tracked
+        that still holds the checkout) after the contract's ``teardown:``
+        steps run but before the destructive ``git worktree remove``. It
+        never refuses the removal and never turns a working removal into a
+        failure -- every hit is reported on the returned record's
+        ``orphan_scan`` (a ``state.OrphanScanReport``, or ``None`` when the
+        scan was clean). Only when the caller ALSO opts into
+        ``kill_blocking_processes=True``, and the scan found at least one
+        hit, is the reused kill-and-retry remedy invoked -- making that flag
+        meaningful on POSIX for the first time. **Caveat:** with
+        ``kill_blocking_processes=True``, a heuristic hit (a cmdline-token
+        match, a Windows handle-table match, or an open-file match -- not
+        only an exact cwd match) becomes a KILL TARGET, not merely a
+        warning: an editor or AV scanner that merely holds a handle or an
+        open file under the checkout can be terminated by an opt-in caller.
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1126,6 +1156,10 @@ class WorktreeManager:
             # verdict _teardown() computed and assigned onto the in-memory
             # `record` a moment ago. Copy it forward explicitly.
             removed.stop_hook_outcome = record.stop_hook_outcome
+            # Ticket #140: same transient-field rationale as killed_pids/
+            # stop_hook_outcome above -- orphan_scan is not serialised to
+            # state.yaml either, so copy it forward explicitly.
+            removed.orphan_scan = record.orphan_scan
         else:
             removed = record
             removed.status = "removed"
@@ -1953,8 +1987,9 @@ class WorktreeManager:
         parameters, then runs the ordered phase sequence in
         ``teardown.run_teardown``. See ``docs/teardown-phase-contract.md``
         for the full phase-by-phase contract (Stop, ``stop:`` hook, Gate A,
-        Gate B, ``teardown:``, ``git worktree remove``, FS fallback, final
-        guard, port release) and ``tests/test_teardown_matrix.py`` for the
+        Gate B, ``teardown:``, orphan scan (ticket #140), ``git worktree
+        remove``, FS fallback, final guard, port release) and
+        ``tests/test_teardown_matrix.py`` for the
         consolidated regression matrix covering the eleven historical
         scenarios (#76, #84, #88, #103, #107, #117, #121, #123, #126, #127,
         #130) this delegation must keep reproducing bit-for-bit.

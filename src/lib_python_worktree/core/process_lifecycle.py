@@ -1116,12 +1116,28 @@ class KilledProcessInfo:
     semantics identical to before this field existed -- two entries that
     differ only in whether/how their raw argv was captured still compare
     equal by their (possibly decoded) ``cmdline``, as they always did.
+
+    ``match_pass`` (ticket #140) is finer-grained provenance than
+    ``source``: which of :func:`_find_blocking_processes`' four detection
+    passes produced this hit -- ``"cwd"`` (Pass 1, cwd match), ``"cmdline"``
+    (Pass 1b, Windows cmdline-token fallback), ``"handle_scan"`` (Pass 1c,
+    Windows OS-level handle-table scan), or ``"open_files"`` (Pass 2, open
+    file handle match) -- using the same literal tags the existing
+    ``skipped_passes`` machinery already uses. It is set only at those four
+    construction sites; every other construction site (``_process_tree``'s
+    ``source="tree"``, ``"tracked"``, ``"process_group"``, ``"job_object"``)
+    leaves it ``None``. ``source`` itself stays the uniform
+    ``"orphan_scan"`` literal for all four passes -- ``match_pass`` is the
+    intentionally new, more granular axis, not a replacement for ``source``.
+    ``compare=False`` for the same reason as ``cmdline_raw``: two entries
+    differing only in which pass found them still compare equal.
     """
 
     pid: int
     name: str
     cmdline: List[str] = field(default_factory=list)
     source: str = "unknown"
+    match_pass: Optional[str] = field(default=None, compare=False)
     cmdline_raw: Optional[List[str]] = field(default=None, compare=False, init=False)
 
     def __post_init__(self) -> None:
@@ -2876,6 +2892,7 @@ def _find_blocking_processes(
                             name=proc.info["name"] or "",
                             cmdline=proc.info["cmdline"] or [],
                             source="orphan_scan",
+                            match_pass="cwd",
                         )
                     )
             except (psutil.AccessDenied, psutil.NoSuchProcess):
@@ -2913,6 +2930,7 @@ def _find_blocking_processes(
                                 name=proc.info["name"] or "",
                                 cmdline=cmdline,
                                 source="orphan_scan",
+                                match_pass="cmdline",
                             ))
                             break
                 except (psutil.AccessDenied, psutil.NoSuchProcess):
@@ -2976,6 +2994,7 @@ def _find_blocking_processes(
                     KilledProcessInfo(
                         pid=pid, name=proc_name or "", cmdline=cmdline,
                         source="orphan_scan",
+                        match_pass="handle_scan",
                     )
                 )
         else:
@@ -3037,6 +3056,7 @@ def _find_blocking_processes(
                                 name=proc.info["name"] or "",
                                 cmdline=proc.info["cmdline"] or [],
                                 source="orphan_scan",
+                                match_pass="open_files",
                             )
                         )
                         break

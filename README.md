@@ -454,6 +454,15 @@ be blocked by dirt, so there is nothing to probe or report) and is
 memoised per removal attempt, so it never issues more than one extra
 `git status` call.
 
+`force` and `kill_blocking_processes` guard two different refusal gates, and
+neither substitutes for the other (ticket #140): the Windows-only confirmed-
+blocker pre-flight (`WorktreeDirLockedError`) is bypassed only by
+`kill_blocking_processes=True` -- `force=True` alone still raises it -- and
+the real-dirt refusal (`DirtyWorktreeError`) is bypassed only by
+`force=True` -- `kill_blocking_processes=True` alone still raises it.
+Neither gate runs on POSIX at all; see "Orphan process scan and
+`orphan_scan`" below for what surfaces a blocking process there instead.
+
 ## Cross-platform notes
 
 ### Shell auto-detection
@@ -811,6 +820,42 @@ tracked-PID-only question of what `stop()` found at the tracked PID itself).
 `stop_hook_outcome` is deliberately **transient**, exactly like
 `stop_attempt`: recomputed on every `stop()` call and **not** persisted to
 `state.yaml`.
+
+### Orphan process scan and `orphan_scan`
+
+Every `remove()` call runs an all-platform, **warn-only** scan (ticket #140)
+for a process holding the checkout -- as cwd, a cmdline token, a Windows
+handle, or an open file -- that this engine never tracked. Before this,
+such a process was silently orphaned once `git worktree remove` succeeded
+around it; there was no signal at all, especially on POSIX, where the
+Windows-only pre-flight gate above never ran. This new phase runs on
+**every** platform, after the contract's `teardown:` steps but before the
+destructive `git worktree remove` call, and it never turns a working
+removal into a failure -- it only ever warns.
+
+The result is a transient `orphan_scan` (an `OrphanScanReport`, or `None`
+for a clean, complete scan) on the returned `WorktreeRecord`:
+
+| Field | Meaning |
+|---|---|
+| `message` | The same string logged at `WARNING`, naming the worktree id and the hit count (or the degradation reason). |
+| `entries` | A tuple of `OrphanScanEntry(info, owned, killed)` — uncapped, unlike `StopDetail`'s survivor cap. `info` is a `KilledProcessInfo`; `owned` reflects whether the pid was one this environment itself tracked; `killed` is `True` only for a pid the kill call actually confirmed killed. |
+| `skipped_passes` | The scan's (and, if a kill ran, the kill's) degradation tags, e.g. `"open_files:degraded"`, plus the synthetic `"scan:failed"` marker on an unexpected exception. |
+| `kill_attempted` | `True` iff a kill was actually attempted this invocation (set before the call, so it is `True` even when the call itself raised). |
+
+`kill_blocking_processes=True` makes this phase call the same
+`_kill_blocking_processes` remedy the Windows pre-flight gate uses -- and
+only when the scan found at least one hit, so a clean scan never pays the
+~5s kill call. This is what makes `kill_blocking_processes=True` meaningful
+on POSIX for the first time. **Kill-target caveat:** a heuristic hit --
+matched via cmdline, a Windows handle scan, or an open file, not only an
+exact cwd match -- becomes a kill target too when the flag is set: an
+editor or an AV scanner that merely holds a handle or an open file under
+the checkout can be terminated by an opt-in caller.
+
+`orphan_scan` is deliberately **transient**, like `stop_hook_outcome` above:
+it describes one live removal attempt's scan, not a stored verdict, and is
+never persisted to `state.yaml`.
 
 ## Release
 

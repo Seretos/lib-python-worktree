@@ -3,9 +3,9 @@ no-cycle/logger-name/exception-identity guards for core/teardown.py.
 
 Covers the plan's R1, R2, R3, R4, R7 behavioural requirements:
 
-- R1: teardown._TEARDOWN_PHASES is a tuple of ten callables in documented
-  order; run_teardown executes exactly it, in order, aborting on the first
-  raise.
+- R1: teardown._TEARDOWN_PHASES is a tuple of eleven callables (ticket #140
+  adds ``_phase_orphan_scan`` at index 6) in documented order; run_teardown
+  executes exactly it, in order, aborting on the first raise.
 - R2: each phase is unit-testable standalone over a hand-built
   _TeardownContext (no WorktreeManager needed).
 - R3: the dirt memo's force-gating and two-phase reset semantics.
@@ -69,9 +69,9 @@ def _make_ctx(record=None, **overrides) -> teardown._TeardownContext:
 # R1: phase tuple shape + run_teardown ordering/abort semantics
 # ---------------------------------------------------------------------------
 
-def test_teardown_phases_is_tuple_of_ten_callables():
+def test_teardown_phases_is_tuple_of_eleven_callables():
     assert isinstance(teardown._TEARDOWN_PHASES, tuple)
-    assert len(teardown._TEARDOWN_PHASES) == 10
+    assert len(teardown._TEARDOWN_PHASES) == 11
     assert all(callable(p) for p in teardown._TEARDOWN_PHASES)
 
 
@@ -84,6 +84,7 @@ def test_teardown_phases_documented_order():
         "_phase_gate_a_blocking_preflight",
         "_phase_gate_b_early_dirty",
         "_phase_run_teardown_steps",
+        "_phase_orphan_scan",
         "_phase_git_worktree_remove",
         "_phase_filesystem_fallback",
         "_phase_final_guard",
