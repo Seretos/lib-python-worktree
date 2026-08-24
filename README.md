@@ -104,19 +104,34 @@ wiped, and it survives to its next `start()`.
 `reconcile()`'s branch-healing rule (ticket #139): after the orphan/PID and
 port-freeing phases, a final best-effort phase repairs `state.yaml` records
 whose persisted `branch` is mojibake -- the Windows cp1252-decoded-UTF-8
-corruption produced by a pre-#139 `_run_git`. It is gated to stored branches
-that are **non-ASCII** (`not rec.branch.isascii()`) and not `backing="primary"`;
-an ASCII branch divergence is a legitimate manual `git checkout`, handled
-separately by `checkout.list_repo`'s read-only refresh, and is never touched
-here. In the all-ASCII steady state this phase makes **zero** git calls and
-acquires **zero** extra locks. The whole phase body -- one `git worktree list
---porcelain` per distinct `repo_root`, the second state-lock acquisition, and
-the write-back -- is wrapped in a single `try/except Exception` and **never
-raises**: any failure (a lock timeout, a git timeout, a disk error) is logged
-at WARNING and leaves state as-is, because `reconcile()` runs on every
-`WorktreeManager.__init__` and before every `list()`/`list_repo()` call. A
-healed record's id (not its branch string) is reported in the additive
-`ReconcileReport.healed_branches` field.
+corruption produced by a pre-#139 `_run_git`. Candidacy is gated to stored
+branches that are **non-ASCII** (`not rec.branch.isascii()`) and not
+`backing="primary"`; an ASCII branch divergence is a legitimate manual `git
+checkout`, handled separately by `checkout.list_repo`'s read-only refresh,
+and is never touched here. A candidate whose stored value differs from
+git's live porcelain branch at that path is only actually rewritten once
+`_is_utf8_mojibake_of` verifies the stored value is a plausible
+UTF-8-encoded-then-cp1252/latin-1-decoded round trip of the live value --
+review round-1 finding: without this check, a genuine manual branch switch
+at a healing candidate's path (not mojibake at all) would otherwise also
+match the coarser "non-ASCII and differs" gate and get silently retargeted,
+which -- because a heal never re-derives `branch_created_by_us` -- could
+make a later `remove()` delete a branch the tool never created via
+`manager._delete_owned_branch()`. In the all-ASCII steady state this phase
+makes **zero** git calls and acquires **zero** extra locks. The `git
+worktree list --porcelain` call is made once per distinct `repo_root`; a
+failure for one `repo_root` (non-zero returncode or a raised exception,
+e.g. a git timeout) is isolated to that repo -- logged at WARNING naming
+the exception type, then skipped -- and never aborts healing for the other
+candidate repos (review round-1 finding, mirroring `adopt()`'s per-repo
+contract). The remainder of the phase body -- the second state-lock
+acquisition, the reload, the apply, and the write-back -- is wrapped in its
+own `try/except Exception` and **never raises**: any phase-level failure (a
+lock timeout, a disk error) is logged at WARNING and leaves state as-is,
+because `reconcile()` runs on every `WorktreeManager.__init__` and before
+every `list()`/`list_repo()` call. A healed record's id (not its branch
+string) is reported in the additive `ReconcileReport.healed_branches`
+field.
 
 ## On-disk layout
 

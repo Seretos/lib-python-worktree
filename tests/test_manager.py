@@ -43,7 +43,7 @@ from lib_python_worktree.core.state import (
     WorktreeRecord,
     _BASE_FETCH_STDERR_MAX_CHARS,
 )
-from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive
+from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive, reconcile
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -899,6 +899,75 @@ def test_remove_tolerates_already_deleted_branch(
     removed = manager.remove(rec.id)
     assert removed.id == rec.id
     assert manager.list() == []
+
+
+@pytest.mark.requires_git
+def test_reconcile_heal_never_endangers_owned_branch_deletion(
+    yaml_manager: Callable[..., WorktreeManager], git_repo: Path
+):
+    """Ticket #139 review round-1 blocking finding 1 (deletion-safety pin):
+    a manual ``git checkout`` inside a tool-owned worktree to a genuinely
+    unrelated branch must not, via reconcile()'s branch-healing phase, get
+    silently adopted into the record's ``branch`` field while
+    ``branch_created_by_us`` stays ``True``. Before the tightened
+    ``_is_utf8_mojibake_of`` gate, the healing phase's only check was
+    "stored is non-ASCII and differs from git's live branch at that path" --
+    which this scenario satisfies even though the live branch is NOT a
+    mojibake mis-decoding of the stored one, just an unrelated checkout. A
+    heal that retargeted ``branch`` here, with ``branch_created_by_us``
+    left stale at ``True``, would make ``remove()`` delete a branch the
+    tool never created via ``manager._delete_owned_branch()``.
+
+    End-to-end through a real ``YamlStateStore``-backed manager (reconcile()
+    only runs for that backing): create a worktree on a non-ASCII branch,
+    manually check out an unrelated branch inside it, run ``reconcile()``
+    (what ``WorktreeManager.__init__``/``list()`` would do with
+    ``reconcile_on_init=True``, the default the ``yaml_manager`` fixture
+    overrides for unrelated reasons), then ``remove()`` -- and assert the
+    unrelated branch survives while the tool's own branch is the one
+    actually deleted.
+    """
+    mgr = yaml_manager()
+    owned_branch = "wt-safety-Ünïcödé-测试"
+    rec = mgr.create(str(git_repo), owned_branch, base="main", fetch=False)
+    assert rec.branch_created_by_us is True
+
+    unrelated_branch = "hotfix/unrelated-manual-checkout"
+    _git("checkout", "-b", unrelated_branch, cwd=Path(rec.path))
+
+    # The yaml_manager fixture builds its WorktreeManager with
+    # reconcile_on_init=False (so list() alone would not exercise the
+    # healing phase here) -- call reconcile() directly against the same
+    # YamlStateStore, exactly as WorktreeManager.__init__/list() would with
+    # that flag on. The tightened gate must leave the record's branch (and
+    # therefore what remove() targets) as the tool's own branch, not the
+    # unrelated one now checked out at that path.
+    reconcile(mgr.state)
+    reloaded = mgr.state.get(rec.id)
+    assert reloaded is not None
+    assert reloaded.branch == owned_branch, (
+        "a genuine unrelated branch switch must not be healed into the record"
+    )
+    assert reloaded.branch_created_by_us is True
+
+    mgr.remove(rec.id, force=True)
+
+    unrelated_check = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{unrelated_branch}"],
+        cwd=git_repo, capture_output=True,
+    )
+    assert unrelated_check.returncode == 0, (
+        "the unrelated manually-checked-out branch must survive remove() -- "
+        "the tool never created it"
+    )
+
+    owned_check = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{owned_branch}"],
+        cwd=git_repo, capture_output=True,
+    )
+    assert owned_check.returncode != 0, (
+        "the tool's own (owned) branch must still be deleted by remove()"
+    )
 
 
 @pytest.mark.requires_git

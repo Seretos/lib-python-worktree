@@ -1491,6 +1491,167 @@ def test_reconcile_non_ascii_but_already_correct_is_not_rewritten(
     assert store.get("wt-already-good").branch == good
 
 
+def test_is_utf8_mojibake_of_accepts_true_mojibake_pair():
+    """Unit-level pin for the review-finding-1 gate helper: a stored value
+    that really is `live` encoded UTF-8 and mis-decoded as cp1252 (the
+    documented pre-#139 corruption model) is accepted."""
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+    assert yaml_store_module._is_utf8_mojibake_of(mangled, good) is True
+
+
+def test_is_utf8_mojibake_of_rejects_unrelated_branch():
+    """The gate helper must reject a stored value that is simply a
+    different, unrelated (but also non-ASCII) branch -- not an encoding
+    round-trip of `live` at all."""
+    live = GOOD_UNICODE_BRANCH
+    unrelated = "hotfix/unrelated-Ünïcödé"
+    assert yaml_store_module._is_utf8_mojibake_of(unrelated, live) is False
+
+
+def test_is_utf8_mojibake_of_rejects_plain_ascii_divergence():
+    """An ASCII stored value that merely differs from an ASCII live branch
+    is never a mojibake pairing (this case is excluded further upstream by
+    the non-ASCII candidate gate too, but the helper itself must also be
+    correct in isolation)."""
+    assert yaml_store_module._is_utf8_mojibake_of("feature/a", "feature/b") is False
+
+
+def test_reconcile_genuine_branch_switch_not_healed(
+    state_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Blocking review finding 1 (deletion-safety pin): a checkout that has
+    genuinely been switched to a different, unrelated branch at a
+    healing-candidate's path must NOT be silently retargeted -- even though
+    the stored branch is non-ASCII (so it passes the coarse candidate gate)
+    and differs from the live porcelain branch (so it would have matched
+    the pre-fix gate, which only checked "non-ASCII and differs"). The
+    tightened gate (`_is_utf8_mojibake_of`) must reject the pairing because
+    the live branch, re-encoded through the mojibake codecs, does not
+    reproduce the stored value.
+
+    This is the interaction that made the original bug destructive:
+    `branch_created_by_us` is never re-derived by a heal, so a wrongly
+    retargeted record paired with a stale `branch_created_by_us=True` would
+    make a later `remove()` delete a branch the tool never created via
+    `manager._delete_owned_branch()`. Pinning "record untouched" here also
+    pins that `branch_created_by_us` -- and therefore what a subsequent
+    delete would target -- stays correct. (A full end-to-end pin through a
+    real `WorktreeManager.remove()` call lives in
+    `test_manager.py::test_reconcile_heal_never_endangers_owned_branch_deletion`.)
+    """
+    original_branch = GOOD_UNICODE_BRANCH  # non-ASCII, created by this tool
+    live_switched_branch = "hotfix/unrelated-manual-checkout"  # genuinely different
+
+    wt_path = tmp_path / "wt-switched"
+    wt_path.mkdir()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(
+        id="wt-switched",
+        repo_root="/repos/myrepo",
+        branch=original_branch,
+        path=str(wt_path),
+        branch_created_by_us=True,
+    ))
+    porcelain = _porcelain(
+        _main_block("/repos/myrepo"),
+        _wt_block(wt_path.as_posix(), live_switched_branch),
+    )
+    monkeypatch.setattr(yaml_store_module, "_run_git", _fake_run_git_ok(porcelain))
+
+    report = reconcile(store)
+
+    assert report.healed_branches == [], (
+        "a genuine branch switch must not be reported as a heal"
+    )
+    updated = store.get("wt-switched")
+    assert updated is not None
+    assert updated.branch == original_branch, (
+        "the record must keep the branch the tool actually created/tracked, "
+        "not be silently retargeted to whatever the checkout now points at"
+    )
+    assert updated.branch_created_by_us is True, (
+        "branch_created_by_us must remain correct for the branch this record "
+        "still names -- a wrong retarget here paired with a stale True would "
+        "make _delete_owned_branch() delete a branch the tool never created"
+    )
+
+
+def test_reconcile_partial_git_failure_heals_healthy_repo_only(
+    state_dir: Path, tmp_path: Path, monkeypatch, caplog
+):
+    """Blocking review finding 2: with two distinct repo roots, one whose
+    git call fails (returncode != 0), the failing repo must be skipped, not
+    abort the whole healing phase -- the healthy repo's record must still
+    heal and appear in healed_branches, the failing repo's record must be
+    left untouched, and reconcile() must not raise. Before the fix, the
+    single git failure raised RuntimeError, which propagated past the
+    per-repo loop to the phase's outer `except Exception`, discarding the
+    porcelain already fetched for the healthy repo.
+    """
+    good = GOOD_UNICODE_BRANCH
+    mangled = good.encode("utf-8").decode("cp1252")
+
+    wt_ok = tmp_path / "repoOK" / "wt-ok"
+    wt_bad = tmp_path / "repoBad" / "wt-bad"
+    wt_ok.mkdir(parents=True)
+    wt_bad.mkdir(parents=True)
+
+    repo_ok = (tmp_path / "repoOK").as_posix()
+    repo_bad = (tmp_path / "repoBad").as_posix()
+
+    store = YamlStateStore(state_dir=state_dir)
+    store.add(_make_record(id="wt-ok", repo_root=repo_ok, branch=mangled, path=str(wt_ok)))
+    store.add(_make_record(id="wt-bad", repo_root=repo_bad, branch=mangled, path=str(wt_bad)))
+
+    def _spy_run_git(args, cwd=None, **kwargs):
+        if str(Path(cwd)) == str(Path(repo_bad)):
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout="",
+                stderr="fatal: simulated failure",
+            )
+        porcelain = _porcelain(_main_block(repo_ok), _wt_block(wt_ok.as_posix(), good))
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=0, stdout=porcelain, stderr="",
+        )
+
+    monkeypatch.setattr(yaml_store_module, "_run_git", _spy_run_git)
+
+    with caplog.at_level(logging.WARNING, logger="lib_python_worktree.core.yaml_store"):
+        report = reconcile(store)
+
+    assert report.healed_branches == ["wt-ok"], (
+        "the healthy repo's record must still heal even though the other "
+        "repo's git call failed"
+    )
+    healed = store.get("wt-ok")
+    assert healed is not None
+    assert healed.branch == good
+
+    untouched = store.get("wt-bad")
+    assert untouched is not None
+    assert untouched.branch == mangled, (
+        "the failing repo's record must be left untouched, not partially "
+        "processed or corrupted"
+    )
+
+    # The never-raise contract still applies per-repo: the failure is still
+    # logged at WARNING naming the healing phase and the exception type
+    # (RuntimeError, from the returncode != 0 branch), it is just scoped to
+    # that one repo instead of aborting the whole phase.
+    assert any(
+        "branch healing" in rec.message
+        and "RuntimeError" in rec.message
+        and rec.levelname == "WARNING"
+        for rec in caplog.records
+    ), (
+        f"the skipped repo must still be logged at WARNING naming the "
+        f"healing phase and RuntimeError; records: "
+        f"{[rec.message for rec in caplog.records]}"
+    )
+
+
 def test_reconcile_report_defaults_healed_branches_empty():
     """The additive field defaults to [] for every existing caller that
     doesn't touch branch healing at all."""

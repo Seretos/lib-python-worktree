@@ -687,6 +687,48 @@ class YamlStateStore:
 # reconcile()
 # ---------------------------------------------------------------------------
 
+# Windows codepages that plausibly produced the pre-#139 mojibake: a UTF-8
+# byte stream read back through the locale's ANSI codepage. cp1252 is the
+# default Western-locale codepage and the corruption model the ticket's
+# repro and the driving tests use (`GOOD.encode("utf-8").decode("cp1252")`);
+# latin-1 (iso-8859-1) is a strict superset of cp1252's decodable byte range
+# and never raises on decode, so it is included as a permissive fallback.
+# This list exists only to distinguish "this differs because it is mojibake
+# of the SAME branch" from "this differs because the checkout has genuinely
+# been switched to a different branch" -- see `_is_utf8_mojibake_of` and its
+# use in reconcile()'s Phase 3 gate below (review round-1 blocking finding 1).
+_MOJIBAKE_CANDIDATE_CODECS = ("cp1252", "latin-1")
+
+
+def _is_utf8_mojibake_of(stored: str, live: str) -> bool:
+    """Return True only if ``stored`` is plausibly ``live`` corrupted by the
+    pre-#139 UTF-8-encoded-then-locale-decoded round trip, never merely
+    because the two strings differ.
+
+    Review round-1 blocking finding 1: the healing phase's original gate was
+    "stored is non-ASCII and differs from git's live branch at that path",
+    which can also match a genuine manual branch switch at a healed path --
+    not just mojibake of the same branch. Retargeting a record onto an
+    unrelated live branch is dangerous because `branch_created_by_us` is
+    never re-derived by a heal, so a wrongly retargeted record paired with a
+    stale `branch_created_by_us=True` would make a later `remove()` delete a
+    branch the tool never created via `manager._delete_owned_branch()`. This
+    helper is the tighter gate that keeps the phase scoped to exactly the
+    encoding-corruption class it exists to repair.
+    """
+    try:
+        utf8_bytes = live.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    for codec in _MOJIBAKE_CANDIDATE_CODECS:
+        try:
+            if utf8_bytes.decode(codec) == stored:
+                return True
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return False
+
+
 def reconcile(
     store: YamlStateStore,
     *,
@@ -809,24 +851,37 @@ def reconcile(
     # --- Phase 3: branch healing (ticket #139) ---
     # Best-effort mojibake repair: a record's persisted branch that is
     # non-ASCII (the cp1252-decoded-UTF-8 corruption pre-#139 _run_git
-    # produced on Windows) and differs from git's live porcelain branch for
-    # that path is rewritten to git's value. Gated to non-ASCII stored
-    # branches only -- an ASCII branch divergence is a legitimate manual
-    # `git checkout`, which `checkout.list_repo`'s read-only branch refresh
-    # already handles; this phase never touches that case, and costs zero
-    # git calls / zero extra lock acquisitions in the (overwhelmingly
-    # common) all-ASCII steady state. `backing="primary"` records are
-    # skipped -- their `branch` is always `None` by design (#84). Runs LAST
-    # (after Phases 1-2) so it can never starve them, and its own body --
-    # every git call, the second lock acquisition, the reload, the apply
-    # and the `_save_state` -- lives inside one `try/except Exception` so a
-    # failure here (lock contention, a git timeout, a disk error) can never
-    # make reconcile() itself raise: reconcile() runs on every
-    # `WorktreeManager.__init__` and before every `list()`/`list_repo()`
-    # call. The git call is deliberately outside the state lock
-    # (`_LOCK_TIMEOUT` is 10s, shorter than the 30s default
-    # `WORKTREE_GIT_TIMEOUT_SEC`, so holding the lock across it could starve
-    # a concurrent process).
+    # produced on Windows), differs from git's live porcelain branch for
+    # that path, AND verifies (`_is_utf8_mojibake_of`, review finding 1) as
+    # a plausible encoding round-trip of that live value is rewritten to
+    # git's value. A non-ASCII stored value that merely differs but fails
+    # that verification is a genuine branch switch at that path -- left
+    # alone, same as the ASCII case `checkout.list_repo`'s read-only refresh
+    # already handles, because retargeting it would also leave
+    # `branch_created_by_us` stale (see `_is_utf8_mojibake_of`'s docstring).
+    # Gated to non-ASCII stored branches only, which costs zero git calls /
+    # zero extra lock acquisitions in the (overwhelmingly common) all-ASCII
+    # steady state. `backing="primary"` records are skipped -- their
+    # `branch` is always `None` by design (#84). Runs LAST (after Phases
+    # 1-2) so it can never starve them.
+    #
+    # Two independent failure scopes (review finding 2):
+    #   - PER-REPO: a `git worktree list --porcelain` failure (non-zero
+    #     returncode or a raised exception, e.g. a git timeout) for one
+    #     `repo_root` is caught right at that call, logged at WARNING
+    #     (naming the healing phase and the exception type, same contract
+    #     as the phase-level abort below) and SKIPS only that repo, mirroring
+    #     `adopt()`'s per-repo-failure contract -- it must never discard
+    #     porcelain already fetched for repos whose git call succeeded.
+    #   - PHASE-LEVEL: the second state-lock acquisition, the reload, the
+    #     apply and the `_save_state` still live inside one
+    #     `try/except Exception` so a failure there (lock contention, a disk
+    #     error) can never make reconcile() itself raise: reconcile() runs
+    #     on every `WorktreeManager.__init__` and before every
+    #     `list()`/`list_repo()` call.
+    # The git calls are deliberately outside the state lock (`_LOCK_TIMEOUT`
+    # is 10s, shorter than the 30s default `WORKTREE_GIT_TIMEOUT_SEC`, so
+    # holding the lock across them could starve a concurrent process).
     candidates: Dict[str, str] = {
         wt_id: rec.repo_root
         for wt_id, rec in records.items()
@@ -837,16 +892,29 @@ def reconcile(
             repo_roots = sorted(set(candidates.values()))
             porcelain_by_root: Dict[str, str] = {}
             for repo_root in repo_roots:
-                proc = _run_git(
-                    ["worktree", "list", "--porcelain"], cwd=Path(repo_root),
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"git worktree list --porcelain failed for repo "
-                        f"'{repo_root}' (returncode {proc.returncode}): "
-                        f"{(proc.stderr or '').strip()}"
+                try:
+                    proc = _run_git(
+                        ["worktree", "list", "--porcelain"], cwd=Path(repo_root),
                     )
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"git worktree list --porcelain failed for repo "
+                            f"'{repo_root}' (returncode {proc.returncode}): "
+                            f"{(proc.stderr or '').strip()}"
+                        )
+                except Exception as repo_exc:  # noqa: BLE001 -- per-repo isolation (finding 2).
+                    _log.warning(
+                        "reconcile: branch healing phase skipped repo '%s' "
+                        "(%s: %s); other repos unaffected",
+                        repo_root, type(repo_exc).__name__, repo_exc,
+                    )
+                    continue
                 porcelain_by_root[repo_root] = proc.stdout or ""
+
+            if not porcelain_by_root:
+                # Every candidate repo's git call failed -- nothing to heal;
+                # skip the lock acquisition/reload entirely (no-op).
+                return report
 
             with store._with_state_lock():
                 fresh_records = store._load_state()
@@ -874,6 +942,16 @@ def reconcile(
                             continue
                         rec = records_by_path.get(Path(wt_path_raw).resolve())
                         if rec is None or rec.branch == live_branch:
+                            continue
+                        # Review finding 1: verify the mismatch is actually
+                        # an encoding round-trip of the SAME branch before
+                        # rewriting -- a non-ASCII stored value that fails
+                        # this check is a genuine branch switch, not
+                        # mojibake, and is left alone (see
+                        # `_is_utf8_mojibake_of`'s docstring for why: a wrong
+                        # retarget here would leave `branch_created_by_us`
+                        # stale and dangerous).
+                        if not _is_utf8_mojibake_of(rec.branch, live_branch):
                             continue
                         # Only `branch` is written -- `id`/path/slug are
                         # never migrated or renamed by a heal.
