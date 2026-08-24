@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from lib_python_worktree.core import plugin_install as plugin_install_module
 from lib_python_worktree.core.plugin_install import (
     PluginInstallResult,
     _already_registered,
@@ -26,6 +27,7 @@ from lib_python_worktree.core.plugin_install import (
     _read_enabled_plugins,
     _resolve_claude_exe,
     _resolve_install_timeout,
+    _run_install,
     install_enabled_plugins,
 )
 from lib_python_worktree.setup.runner import LOG_ROOT_ENV, _slug, log_dir_for
@@ -946,3 +948,44 @@ def test_install_repairs_broken_registration(tmp_path: Path, monkeypatch):
         if e.get("projectPath") == str(worktree_path) and e.get("installPath") == valid_install_path
     ]
     assert len(repaired) == 1, "a repaired clone with the valid installPath must be added"
+
+
+# ---------------------------------------------------------------------------
+# Ticket #139: _run_install must decode subprocess output as UTF-8
+# explicitly, not the locale/OEM-codepage default -- same root cause and
+# same fix shape as _git_utils._run_git's R1.
+# ---------------------------------------------------------------------------
+
+
+def test_run_install_decodes_output_as_utf8(tmp_path: Path, monkeypatch):
+    """R2 driving test: the non-``runner`` ``_run_install`` Popen kwargs must
+    pin ``encoding="utf-8", errors="replace"`` unconditionally. This is a
+    kwargs-level requirement only -- no claim is made about install-log file
+    content (``_write_install_log`` already opens with ``encoding="utf-8"``
+    and simply receives an already-correctly-decoded ``str`` afterwards)."""
+
+    captured_kwargs: dict = {}
+
+    class _RecordingPopen:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setattr(plugin_install_module.subprocess, "Popen", _RecordingPopen)
+
+    _run_install(
+        "claude",
+        "k",
+        str(tmp_path),
+        timeout=1.0,
+        log_path=tmp_path / "install.log",
+    )
+
+    assert captured_kwargs.get("encoding") == "utf-8"
+    assert captured_kwargs.get("errors") == "replace"

@@ -39,3 +39,4 @@ htmlcov/
 *.swp
 .process-ticket-result.json
 .claude-session/
+.adev/

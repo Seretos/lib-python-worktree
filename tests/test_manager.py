@@ -19,6 +19,7 @@ import pytest
 from lib_python_worktree.core import manager as manager_module
 from lib_python_worktree.core import teardown as _teardown_mod
 from lib_python_worktree.core import _git_utils as git_utils_module
+from lib_python_worktree.core import checkout as checkout_module
 from lib_python_worktree.core.manager import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
@@ -42,7 +43,7 @@ from lib_python_worktree.core.state import (
     WorktreeRecord,
     _BASE_FETCH_STDERR_MAX_CHARS,
 )
-from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive
+from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive, reconcile
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -554,6 +555,67 @@ def test_run_git_closes_stdin(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #139: _run_git must decode subprocess output as UTF-8 explicitly,
+# not the locale/OEM-codepage default (the Windows mojibake root cause).
+# ---------------------------------------------------------------------------
+
+def test_run_git_decodes_output_as_utf8(monkeypatch):
+    """R1 driving test: ``_run_git``'s Popen kwargs must pin
+    ``encoding="utf-8", errors="replace"`` unconditionally (no
+    ``sys.platform`` branch) so a Unicode branch name never gets decoded
+    with the Windows ANSI/OEM codepage default.
+    """
+
+    captured_kwargs: dict = {}
+
+    class _RecordingPopen:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _RecordingPopen)
+    _run_git(["--version"])
+    assert captured_kwargs.get("encoding") == "utf-8"
+    assert captured_kwargs.get("errors") == "replace"
+    # Test-critic finding: a dropped `text=True` in the same edit that adds
+    # the encoding kwargs would not be caught by test_run_git_still_returns_str
+    # (its patched Popen returns plain str regardless of kwargs) -- assert it
+    # directly here, on the kwargs actually recorded.
+    assert captured_kwargs.get("text") is True
+
+
+def test_run_git_still_returns_str(monkeypatch):
+    """Additional coverage for R1: dropping ``text=True`` while adding
+    ``encoding=``/``errors=`` would be a regression -- a patched Popen
+    returning plain str stdout/stderr must still surface as ``str`` on the
+    ``CompletedProcess`` (this already passes; it guards against losing
+    ``text=True`` in the same edit that adds the encoding kwargs)."""
+
+    class _StrPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("out", "err")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _StrPopen)
+    result = _run_git(["--version"])
+    assert isinstance(result.stdout, str)
+    assert isinstance(result.stderr, str)
+    assert result.stdout == "out"
+    assert result.stderr == "err"
+
+
+# ---------------------------------------------------------------------------
 # Ticket #102: GitTimeoutError network-vs-local classification
 # ---------------------------------------------------------------------------
 
@@ -840,6 +902,75 @@ def test_remove_tolerates_already_deleted_branch(
 
 
 @pytest.mark.requires_git
+def test_reconcile_heal_never_endangers_owned_branch_deletion(
+    yaml_manager: Callable[..., WorktreeManager], git_repo: Path
+):
+    """Ticket #139 review round-1 blocking finding 1 (deletion-safety pin):
+    a manual ``git checkout`` inside a tool-owned worktree to a genuinely
+    unrelated branch must not, via reconcile()'s branch-healing phase, get
+    silently adopted into the record's ``branch`` field while
+    ``branch_created_by_us`` stays ``True``. Before the tightened
+    ``_is_utf8_mojibake_of`` gate, the healing phase's only check was
+    "stored is non-ASCII and differs from git's live branch at that path" --
+    which this scenario satisfies even though the live branch is NOT a
+    mojibake mis-decoding of the stored one, just an unrelated checkout. A
+    heal that retargeted ``branch`` here, with ``branch_created_by_us``
+    left stale at ``True``, would make ``remove()`` delete a branch the
+    tool never created via ``manager._delete_owned_branch()``.
+
+    End-to-end through a real ``YamlStateStore``-backed manager (reconcile()
+    only runs for that backing): create a worktree on a non-ASCII branch,
+    manually check out an unrelated branch inside it, run ``reconcile()``
+    (what ``WorktreeManager.__init__``/``list()`` would do with
+    ``reconcile_on_init=True``, the default the ``yaml_manager`` fixture
+    overrides for unrelated reasons), then ``remove()`` -- and assert the
+    unrelated branch survives while the tool's own branch is the one
+    actually deleted.
+    """
+    mgr = yaml_manager()
+    owned_branch = "wt-safety-Ünïcödé-测试"
+    rec = mgr.create(str(git_repo), owned_branch, base="main", fetch=False)
+    assert rec.branch_created_by_us is True
+
+    unrelated_branch = "hotfix/unrelated-manual-checkout"
+    _git("checkout", "-b", unrelated_branch, cwd=Path(rec.path))
+
+    # The yaml_manager fixture builds its WorktreeManager with
+    # reconcile_on_init=False (so list() alone would not exercise the
+    # healing phase here) -- call reconcile() directly against the same
+    # YamlStateStore, exactly as WorktreeManager.__init__/list() would with
+    # that flag on. The tightened gate must leave the record's branch (and
+    # therefore what remove() targets) as the tool's own branch, not the
+    # unrelated one now checked out at that path.
+    reconcile(mgr.state)
+    reloaded = mgr.state.get(rec.id)
+    assert reloaded is not None
+    assert reloaded.branch == owned_branch, (
+        "a genuine unrelated branch switch must not be healed into the record"
+    )
+    assert reloaded.branch_created_by_us is True
+
+    mgr.remove(rec.id, force=True)
+
+    unrelated_check = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{unrelated_branch}"],
+        cwd=git_repo, capture_output=True,
+    )
+    assert unrelated_check.returncode == 0, (
+        "the unrelated manually-checked-out branch must survive remove() -- "
+        "the tool never created it"
+    )
+
+    owned_check = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{owned_branch}"],
+        cwd=git_repo, capture_output=True,
+    )
+    assert owned_check.returncode != 0, (
+        "the tool's own (owned) branch must still be deleted by remove()"
+    )
+
+
+@pytest.mark.requires_git
 def test_remove_unmerged_branch_without_force_cleans_state_and_raises(
     manager: WorktreeManager, git_repo: Path
 ):
@@ -862,6 +993,88 @@ def test_remove_unmerged_branch_without_force_cleans_state_and_raises(
     assert rec.id not in remaining_ids, (
         "State record must be removed even when branch-delete raises"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #139: Unicode branch names must not come back mojibake-corrupted.
+#
+# The `core.quotePath` probe (run once on Windows -- git version
+# 2.53.0.windows.1 -- and captured as raw bytes, never `text=True`, which is
+# the very bug under test) found NO quoting: `git worktree list --porcelain`
+# emits the UTF-8 branch name as raw, unquoted bytes
+# (`branch refs/heads/\xc3\x9cn\xc3\xafc\xc3\xb6d\xc3\xa9-...`), byte-identical
+# to the same command run with `-c core.quotePath=false`. So no
+# `_unquote_git_c_style` helper is needed (R4 dropped) and this end-to-end
+# round-trip test is the permanent guard: if a future git version starts
+# quoting, this test goes red and the helper gets added then. The probe's
+# step 4 also found the illegal-branch-name `fatal: ...` stderr echoes the
+# name unquoted (raw UTF-8 bytes), so the third, stronger assertion in
+# test_illegal_branch_name_error_message_not_mangled below is enabled.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_git
+def test_unicode_branch_survives_porcelain_roundtrip(git_repo: Path):
+    """R1b driving test: a real git repo with branch
+    'wt-edge-56851-Ünïcödé-测试' yields that exact string from the engine's
+    read paths -- not cp1252 mojibake.
+
+    Expected RED reason (pre-fix): on Windows (the `windows-latest` CI leg
+    and the developer's Windows box), the locale/OEM-codepage decode in
+    `_run_git` turns the UTF-8 branch bytes into mojibake, so neither
+    assertion below matches the true branch string. On `ubuntu-22.04` (UTF-8
+    locale) this test already passes pre-fix -- that is expected and is
+    exactly why the end-to-end regression guard, not just the R1 kwargs
+    check, is needed for this ticket.
+    """
+    branch = "wt-edge-56851-Ünïcödé-测试"
+    wt_path = git_repo.parent / "unicode-wt"
+    _git("branch", branch, cwd=git_repo)
+    _git("worktree", "add", str(wt_path), branch, cwd=git_repo)
+
+    # (a) the raw _run_git read path carries the exact branch string.
+    proc = _run_git(["worktree", "list", "--porcelain"], cwd=git_repo)
+    assert branch in proc.stdout
+
+    # (b) checkout.list_repo's read path resolves the same exact string.
+    listing = checkout_module.list_repo(git_repo, records=[])
+    branches = [entry.record.branch for entry in listing.entries]
+    assert branch in branches
+
+
+@pytest.mark.requires_git
+def test_illegal_branch_name_error_message_not_mangled(
+    manager: WorktreeManager, git_repo: Path
+):
+    """R1b additional coverage: `manager.create()` with a git-illegal branch
+    name (a space makes 'Ünïcödé test' invalid) must raise with the TRUE
+    branch string embedded -- never the cp1252-mojibake form, and never a
+    message where both occurrences are uniformly (and therefore
+    indistinguishably) mangled.
+
+    Expected RED reason (pre-fix, Windows): `_run_git`'s locale decode
+    mangles `proc.stderr`, so the git-stderr-sourced occurrence in the
+    raised message is the cp1252 form, not the true branch string --
+    assertion 2 fails (the mojibake form IS present) and assertion 3 fails
+    (fewer than 2 true-string occurrences). On `ubuntu-22.04` this already
+    passes pre-fix, same caveat as test_unicode_branch_survives_porcelain_roundtrip.
+    """
+    branch = "Ünïcödé test"  # contains a space -> git-illegal
+
+    with pytest.raises(GitCommandError) as excinfo:
+        manager.create(str(git_repo), branch)
+
+    message = str(excinfo.value)
+    # 1. The caller's own literal branch string appears.
+    assert branch in message
+    # 2. The cp1252-mojibake form appears nowhere -- this is what makes
+    #    "both occurrences mangled identically" fail the test.
+    mangled = branch.encode("utf-8").decode("cp1252")
+    assert mangled not in message
+    # 3. Both the engine-side occurrence (the literal branch passed into
+    #    git_args) and the git-stderr-sourced occurrence are the true
+    #    string -- enabled because the probe found git's stderr echoes the
+    #    illegal name unquoted (git 2.53.0.windows.1).
+    assert message.count(branch) >= 2
 
 
 # ---------------------------------------------------------------------------
