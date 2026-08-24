@@ -8627,3 +8627,196 @@ class TestWindowsJobObjectContainment:
             result = stop("wt-job-survivor", store=store, timeout=1.0)
 
         assert result.status == "stop_incomplete"
+
+
+# ---------------------------------------------------------------------------
+# Ticket #140, R8: match_pass provenance on KilledProcessInfo
+# ---------------------------------------------------------------------------
+
+class TestMatchPass:
+    """Ticket #140, R8: each of _find_blocking_processes' four detection
+    passes (cwd, cmdline, handle_scan, open_files) must tag its own hits
+    with a new ``KilledProcessInfo.match_pass`` field, using the same
+    literal tags the existing ``skipped_passes`` machinery already uses
+    (``"cwd"``, ``"cmdline"``, ``"handle_scan"``, ``"open_files"``).
+
+    Reuses the same psutil-mocking patterns as TestFindBlockingProcesses
+    (Pass 1/2), TestFindBlockingProcessesWindows (Pass 1b), and
+    TestWinHandleHoldersIntegration (Pass 1c) above -- this class only adds
+    the ``match_pass``/``source`` assertions those existing tests don't make.
+    """
+
+    def test_pass1_cwd_match_tags_match_pass_cwd(self):
+        """Driving test (one of four): Pass 1 (cwd match) tags its hit
+        ``match_pass == "cwd"``."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+        proc_match = _make_fake_proc(19001, "node", ["node", "server.js"], target)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_match]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].match_pass == "cwd"
+        assert result[0].source == "orphan_scan"
+
+    def test_pass1b_cmdline_match_tags_match_pass_cmdline(self):
+        """Driving test (one of four): Pass 1b (Windows cmdline-token
+        fallback) tags its hit ``match_pass == "cmdline"``."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_win = MagicMock()
+        proc_win.info = {
+            "pid": 19002,
+            "name": "code.exe",
+            "cmdline": ["code.exe", "/fake/worktree/src/main.py"],
+        }
+        proc_win.cwd.side_effect = psutil.AccessDenied(19002)
+        proc_win.open_files.side_effect = psutil.AccessDenied(19002)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_win]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].match_pass == "cmdline"
+        assert result[0].source == "orphan_scan"
+
+    def test_pass1c_handle_scan_match_tags_match_pass_handle_scan(self):
+        """Driving test (one of four): Pass 1c (Windows OS-level handle-table
+        scan) tags its hit ``match_pass == "handle_scan"``."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_foreign = MagicMock()
+        proc_foreign.info = {"pid": 19003, "name": "", "cmdline": ["some.exe", "--flag"]}
+        proc_foreign.cwd.side_effect = psutil.AccessDenied(19003)
+        proc_foreign.open_files.side_effect = psutil.AccessDenied(19003)
+
+        def _process_side_effect(pid):
+            m = MagicMock()
+            if pid == host_pid:
+                m.parents.return_value = []
+            else:
+                m.cmdline.return_value = ["some.exe", "--flag"]
+                m.name.return_value = "some.exe"
+            return m
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_foreign]),
+            patch.object(psutil, "Process", side_effect=_process_side_effect),
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                return_value=[(19003, "some.exe")],
+            ),
+        ):
+            mock_sys.platform = "win32"
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].match_pass == "handle_scan"
+        assert result[0].source == "orphan_scan"
+
+    def test_pass2_open_files_match_tags_match_pass_open_files(self):
+        """Driving test (one of four): Pass 2 (open file handle match) tags
+        its hit ``match_pass == "open_files"``."""
+        import psutil
+
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        proc_daemon = MagicMock()
+        proc_daemon.info = {"pid": 19004, "name": "unity", "cmdline": ["unity"]}
+        proc_daemon.cwd.return_value = "/other/path"
+        file_info = MagicMock()
+        file_info.path = "/fake/worktree/Assets/scene.unity"
+        proc_daemon.open_files.return_value = [file_info]
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc_daemon]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            result = _find_blocking_processes(target, host_pid)
+
+        assert len(result) == 1
+        assert result[0].match_pass == "open_files"
+        assert result[0].source == "orphan_scan"
+
+    # -- Additional coverage (non-driving; may already pass) ----------------
+
+    def test_bare_construction_defaults_match_pass_to_none(self):
+        """A KilledProcessInfo built without match_pass= (every non-scan
+        construction site: _process_tree, tracked, process_group,
+        job_object, and any pre-#140 test fixture) must default to None."""
+        info = KilledProcessInfo(pid=19005, name="x", cmdline=["x"])
+        assert info.match_pass is None
+
+    def test_process_tree_entries_have_match_pass_none(self):
+        """_process_tree()-sourced entries (source="tree") never carry a
+        match_pass tag -- that provenance vocabulary is scoped to
+        _find_blocking_processes' own four passes.
+
+        Uses a real child (not an empty children() list) so the `all(...)`
+        assertion below is non-vacuous -- an empty `result` would make
+        `all(...)` trivially True even for a broken implementation that,
+        say, always set match_pass to something non-None."""
+        from lib_python_worktree.core.process_lifecycle import _process_tree
+        import psutil
+
+        host_pid = os.getpid()
+        root_pid = 19006
+        child_pid = 19007
+
+        child = MagicMock()
+        child.pid = child_pid
+        child.ppid.return_value = root_pid
+        child.name.return_value = "child"
+        child.cmdline.return_value = ["child"]
+
+        def _process_side_effect(pid):
+            if pid == host_pid:
+                m = MagicMock()
+                m.parents.return_value = []
+                return m
+            if pid == root_pid:
+                m = MagicMock()
+                m.children.return_value = [child]
+                return m
+            raise AssertionError(f"unexpected psutil.Process({pid}) call")
+
+        with patch.object(psutil, "Process", side_effect=_process_side_effect):
+            result = _process_tree(root_pid)
+
+        assert len(result) > 0, (
+            "test setup must produce at least one descendant, otherwise "
+            "the all(...) assertion below is vacuously true"
+        )
+        assert all(e.match_pass is None and e.source == "tree" for e in result)

@@ -6,9 +6,9 @@
 regression in the same code path. This module is the structural extraction
 of that method into an explicit, ordered sequence of named phases over a
 single shared context object (:class:`_TeardownContext`), so each phase --
-Stop, ``stop:`` hook, Gate A, Gate B, ``teardown:``, ``git worktree
-remove``, FS fallback, final guard, port release -- is individually
-testable and its invariant is stated in one place.
+Stop, ``stop:`` hook, Gate A, Gate B, ``teardown:``, orphan scan (ticket
+#140), ``git worktree remove``, FS fallback, final guard, port release --
+is individually testable and its invariant is stated in one place.
 
 See ``docs/teardown-phase-contract.md`` for the full phase-by-phase
 contract (kept in sync with :data:`_TEARDOWN_PHASES` by
@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Set
 
 import portalocker
 
@@ -49,6 +49,7 @@ from ._exceptions import (
 )
 from ._git_utils import _run_git
 from .process_lifecycle import (
+    KilledProcessInfo,
     ProcessLifecycleError,
     ProcessNotRunningError,
     _find_blocking_processes,
@@ -58,6 +59,8 @@ from .state import (
     SETUP_STATUS_COMPLETED,
     SETUP_STATUS_FAILED,
     SETUP_STATUS_SKIPPED,
+    OrphanScanEntry,
+    OrphanScanReport,
     StateStore,
     StopHookOutcome,
     WorktreeRecord,
@@ -301,6 +304,30 @@ def _is_lock_signal(stderr: str) -> bool:
     )
 
 
+def _merge_killed_pids(
+    record: "WorktreeRecord", new_entries: Iterable["KilledProcessInfo"]
+) -> None:
+    """First-wins, pid-deduped, in-place merge of *new_entries* into
+    ``record.killed_pids`` (ticket #140, R7).
+
+    Two plain-assignment sites (``_resolve_lock_or_raise`` and Gate A) used
+    to overwrite ``record.killed_pids`` outright on every kill, silently
+    dropping whatever an earlier phase of the SAME removal attempt (or an
+    earlier ``stop()`` call) had already recorded there. This mirrors
+    ``_kill_blocking_processes``' own ``seen_pids`` idiom: a pid already
+    present keeps its existing entry (first-wins -- the earliest-recorded
+    :class:`~.process_lifecycle.KilledProcessInfo` for a given pid is kept,
+    not replaced by a later, possibly less-detailed rediscovery of the same
+    pid), and a genuinely new pid is appended in the order encountered.
+    """
+    existing_pids = {info.pid for info in record.killed_pids}
+    for info in new_entries:
+        if info.pid in existing_pids:
+            continue
+        record.killed_pids.append(info)
+        existing_pids.add(info.pid)
+
+
 def _resolve_lock_or_raise(
     args: List[str],
     record: "WorktreeRecord",
@@ -354,7 +381,7 @@ def _resolve_lock_or_raise(
         raise WorktreeDirLockedError(record.id, killed=[], kill_attempted=False)
 
     killed = _kill_blocking_processes(record.path)
-    record.killed_pids = killed
+    _merge_killed_pids(record, killed)
     retry_result = None
     phantom_on_retry = False
     for attempt in range(_POST_KILL_RETRIES):
@@ -712,10 +739,27 @@ def _phase_gate_a_blocking_preflight(ctx: _TeardownContext) -> None:
         the backstop for an actually-locked directory this degraded scan
         could not see coming (ticket #121: a degraded/partial scan result
         never blocks removal on its own).
+
+    Ticket #140: both scan calls below (initial pre-flight and the settle-
+    window confirm rescan) and the confirmed-blocker kill call further down
+    are individually guarded against an unexpected exception (e.g. the bare
+    ``RuntimeError`` ticket #107 documents) -- degrading to "no confirmed
+    blocker"/"kill not confirmed" for THIS gate rather than propagating and
+    aborting the whole removal before the new all-platform orphan-scan
+    phase (index 6) gets a chance to run and report the same condition.
     """
     record = ctx.record
     if sys.platform == "win32" and not ctx.target_absent:
-        _preflight_scan = _find_blocking_processes(record.path, os.getpid())
+        try:
+            _preflight_scan = _find_blocking_processes(record.path, os.getpid())
+        except Exception as _scan_exc:  # noqa: BLE001 -- ticket #107/#140
+            _logger.warning(
+                "_teardown: worktree '%s' Gate A blocking-process scan "
+                "failed unexpectedly (%s); treating as no confirmed "
+                "blocker for this attempt.",
+                record.id, _scan_exc,
+            )
+            _preflight_scan = []
         if "open_files:degraded" in getattr(
             _preflight_scan, "skipped_passes", ()
         ):
@@ -737,7 +781,21 @@ def _phase_gate_a_blocking_preflight(ctx: _TeardownContext) -> None:
             # only a pid still present on the confirming re-scan counts.
             for _ in range(_PREFLIGHT_SETTLE_RETRIES):
                 time.sleep(_PREFLIGHT_SETTLE_SLEEP)
-                _confirm_scan = _find_blocking_processes(record.path, os.getpid())
+                try:
+                    _confirm_scan = _find_blocking_processes(record.path, os.getpid())
+                except Exception as _scan_exc:  # noqa: BLE001 -- ticket #107/#140
+                    # Same conservative treatment as a degraded confirming
+                    # rescan just below: an unexpected failure here tells us
+                    # nothing about whether the pending foreign hit(s) are
+                    # still there, so do NOT clear them.
+                    _logger.warning(
+                        "_teardown: worktree '%s' Gate A confirming rescan "
+                        "failed unexpectedly (%s); conservatively treating "
+                        "%d pending foreign hit(s) as still-blocking rather "
+                        "than clearing them.",
+                        record.id, _scan_exc, len(_foreign),
+                    )
+                    break
                 if "open_files:degraded" in getattr(
                     _confirm_scan, "skipped_passes", ()
                 ):
@@ -815,49 +873,65 @@ def _phase_gate_a_blocking_preflight(ctx: _TeardownContext) -> None:
                     record.id, killed=[], kill_attempted=False, dirty_paths=_dirt
                 )
             if ctx.kill_blocking_processes:
-                killed = _kill_blocking_processes(record.path)
-                record.killed_pids = killed
+                # Ticket #140: kill_attempted is set BEFORE the call (not
+                # after, as before this ticket) so an attempt that raises
+                # mid-way is still recorded honestly -- mirrors the new
+                # orphan-scan phase's own convention.
                 ctx.kill_attempted = True
-                if not killed:
-                    if "open_files:degraded" in getattr(
-                        killed, "skipped_passes", ()
-                    ):
-                        # Ticket #117 fix cycle (blocking finding 2):
-                        # `_kill_blocking_processes` returns a
-                        # `_PartialList` -- a `list` subclass -- so an empty
-                        # `killed` is falsy-equal both when the blocker
-                        # genuinely exited before the kill ran AND when the
-                        # kill's own internal rescan was degraded and
-                        # therefore never actually looked for anything to
-                        # kill. `not killed` alone cannot tell those apart.
-                        # Restore the pre-#117 guard for the degraded case:
-                        # a still-live, twice-confirmed blocker (Gate A
-                        # above already confirmed it via two scans) must not
-                        # be silently treated as cleared just because the
-                        # kill's rescan happened to be blind. Raise rather
-                        # than fall through to the destructive git remove
-                        # call.
-                        raise WorktreeDirLockedError(
-                            record.id, killed=list(killed), kill_attempted=True
-                        )
-                    # Ticket #117, AC #2: kill_blocking_processes was opted
-                    # into, the blocker was twice-confirmed live above, and
-                    # the kill's own rescan was NOT degraded (handled
-                    # above) -- so an empty result here means it genuinely
-                    # exited in the interval between confirmation and the
-                    # kill call, not that nothing was ever really there.
-                    # Log and proceed rather than raise (the pre-#117
-                    # behaviour treated this the same as a still-degraded
-                    # rescan and always refused, which is what made
-                    # kill_blocking_processes=True + empty killed_pids the
-                    # normal, misleading outcome this ticket fixes).
+                try:
+                    killed = _kill_blocking_processes(record.path)
+                except Exception as _kill_exc:  # noqa: BLE001 -- ticket #107/#140
+                    # An unexpected kill failure must not block removal --
+                    # the new orphan-scan phase (index 6) makes its own
+                    # kill attempt and reports the degradation there.
                     _logger.warning(
-                        "_teardown: worktree '%s' kill_blocking_processes "
-                        "found nothing left to kill (confirmed "
-                        "blocker(s) exited before the kill ran); "
-                        "proceeding.",
-                        record.id,
+                        "_teardown: worktree '%s' Gate A kill attempt "
+                        "failed unexpectedly (%s); proceeding without "
+                        "confirming a kill.",
+                        record.id, _kill_exc,
                     )
+                else:
+                    _merge_killed_pids(record, killed)
+                    if not killed:
+                        if "open_files:degraded" in getattr(
+                            killed, "skipped_passes", ()
+                        ):
+                            # Ticket #117 fix cycle (blocking finding 2):
+                            # `_kill_blocking_processes` returns a
+                            # `_PartialList` -- a `list` subclass -- so an empty
+                            # `killed` is falsy-equal both when the blocker
+                            # genuinely exited before the kill ran AND when the
+                            # kill's own internal rescan was degraded and
+                            # therefore never actually looked for anything to
+                            # kill. `not killed` alone cannot tell those apart.
+                            # Restore the pre-#117 guard for the degraded case:
+                            # a still-live, twice-confirmed blocker (Gate A
+                            # above already confirmed it via two scans) must not
+                            # be silently treated as cleared just because the
+                            # kill's rescan happened to be blind. Raise rather
+                            # than fall through to the destructive git remove
+                            # call.
+                            raise WorktreeDirLockedError(
+                                record.id, killed=list(killed), kill_attempted=True
+                            )
+                        # Ticket #117, AC #2: kill_blocking_processes was opted
+                        # into, the blocker was twice-confirmed live above, and
+                        # the kill's own rescan was NOT degraded (handled
+                        # above) -- so an empty result here means it genuinely
+                        # exited in the interval between confirmation and the
+                        # kill call, not that nothing was ever really there.
+                        # Log and proceed rather than raise (the pre-#117
+                        # behaviour treated this the same as a still-degraded
+                        # rescan and always refused, which is what made
+                        # kill_blocking_processes=True + empty killed_pids the
+                        # normal, misleading outcome this ticket fixes).
+                        _logger.warning(
+                            "_teardown: worktree '%s' kill_blocking_processes "
+                            "found nothing left to kill (confirmed "
+                            "blocker(s) exited before the kill ran); "
+                            "proceeding.",
+                            record.id,
+                        )
                 # Fall through to the (now-safe) git remove phase below.
             else:
                 # Caller did not opt into the kill-and-retry remedy: raise
@@ -955,6 +1029,166 @@ def _phase_run_teardown_steps(ctx: _TeardownContext) -> None:
         # had not already run): when there are none, nothing changed on
         # disk, so the existing single-probe memoisation still holds.
         ctx.invalidate_dirt()
+
+
+def _phase_orphan_scan(ctx: _TeardownContext) -> None:
+    """Phase (index 6, ticket #140): all-platform, warn-only scan for a
+    process holding *record.path* (as cwd, cmdline token, Windows handle,
+    or open file) that was never tracked by this engine -- previously
+    silently orphaned once ``git worktree remove`` succeeded around it.
+
+    Runs on EVERY platform (unlike win32-only Gate A), AFTER the contract
+    ``teardown:`` steps have run but BEFORE the destructive
+    ``git worktree remove`` phase -- a fresh, full-budget
+    (``_find_blocking_processes(record.path, os.getpid())``, no
+    ``deadline``) scan, deliberately not a reuse of Gate A's own result:
+    Gate A never runs on POSIX or against an absent target, and the
+    ``teardown:`` steps that just ran may have changed the picture. On
+    win32 with a present target this means a removal now pays two full
+    scans -- an accepted, documented cost.
+
+    No-ops (``record.orphan_scan`` stays ``None``) when ``ctx.target_absent``
+    -- there is nothing on disk to hold a handle on -- mirroring Gate A's
+    own ticket #127 skip.
+
+    ``_kill_blocking_processes(record.path)`` (the SAME reused remedy Gate A
+    and ``_resolve_lock_or_raise`` use -- no hand-rolled signal/wait logic)
+    is called only when ``ctx.kill_blocking_processes`` AND the scan found
+    at least one hit -- a clean scan skips the ~5s call entirely even with
+    the flag set. This is what makes ``kill_blocking_processes=True``
+    meaningful on POSIX for the first time (ticket #140's second goal).
+    ``ctx.kill_attempted`` is set immediately before that call so an
+    attempt that raises mid-way is still recorded honestly. Only the
+    entries the kill call actually confirms killed are merged into
+    ``record.killed_pids`` (via :func:`_merge_killed_pids` -- first-wins,
+    pid-deduped, never overwriting an earlier phase's kills).
+
+    ``record.orphan_scan`` (an :class:`~.state.OrphanScanReport`) is the
+    **union** of the warn scan and the kill result, first-wins pid-deduped,
+    preserving scan order then kill-only order: a pid the scan found but the
+    kill's own tighter rescan did not confirm is reported ``killed=False``;
+    a pid the scan found AND the kill confirmed is upgraded to
+    ``killed=True``; a lineage-only pid the kill's ``_process_tree``
+    expansion added (never seen by the scan itself) is reported
+    ``killed=True`` with ``owned`` computed the same way as any other entry
+    (``ctx.owned_pids`` membership). ``owned`` reflects Gate A's own
+    owned/foreign distinction, not a NEW classification.
+
+    **Warn-only, hard invariant:** this phase never raises and never adds a
+    new refusal condition or a new ``force`` requirement. The entire body
+    (scan AND kill) is wrapped in a single ``except Exception`` that logs
+    once, appends the synthetic ``"scan:failed"`` marker to
+    ``skipped_passes``, and proceeds with whatever partial results were
+    already collected before the failure -- this is what protects against
+    ``_find_blocking_processes`` (or the reused kill call) re-raising a bare
+    ``RuntimeError`` (ticket #107) and turning a working removal into a
+    failure.
+
+    ``record.orphan_scan`` is assigned exactly once per invocation (to
+    ``None`` for a clean, complete scan with no hits and no incompleteness
+    to report, or to a populated :class:`~.state.OrphanScanReport`
+    otherwise) so a stale report from an earlier failed attempt can never
+    leak forward. Exactly one ``_logger.warning(...)`` is emitted for an
+    abnormal outcome, with the identical string also stored as the report's
+    ``message`` (message-parity convention, matching
+    ``StopDetail``/``BaseFetchFallback``).
+
+    **Kill-target caveat:** with ``kill_blocking_processes=True``, a
+    heuristic hit from Pass 1b (``cmdline``), Pass 1c (``handle_scan``), or
+    Pass 2 (``open_files``) -- not just a Pass 1 exact-cwd match -- becomes
+    a KILL TARGET, not merely a warning: an editor or AV scanner that merely
+    holds a handle or an open file under the checkout can be terminated by
+    an opt-in caller. See ``WorktreeManager.remove()``'s docstring for the
+    same caveat stated at the public API surface.
+    """
+    record = ctx.record
+    record.orphan_scan = None
+    if ctx.target_absent:
+        return
+
+    entries: List[OrphanScanEntry] = []
+    skipped_passes: List[str] = []
+    kill_attempted = False
+    fail_reason: Optional[str] = None
+
+    try:
+        scan_result = _find_blocking_processes(record.path, os.getpid())
+        for _tag in getattr(scan_result, "skipped_passes", ()):
+            if _tag not in skipped_passes:
+                skipped_passes.append(_tag)
+
+        scan_pid_seen: Set[int] = set()
+        for info in scan_result:
+            if info.pid in scan_pid_seen:
+                continue
+            scan_pid_seen.add(info.pid)
+            entries.append(
+                OrphanScanEntry(
+                    info=info, owned=info.pid in ctx.owned_pids, killed=False,
+                )
+            )
+
+        if ctx.kill_blocking_processes and scan_pid_seen:
+            kill_attempted = True
+            ctx.kill_attempted = True
+            kill_result = _kill_blocking_processes(record.path)
+            _merge_killed_pids(record, kill_result)
+            for _tag in getattr(kill_result, "skipped_passes", ()):
+                if _tag not in skipped_passes:
+                    skipped_passes.append(_tag)
+
+            kill_pid_seen: Set[int] = set()
+            for info in kill_result:
+                if info.pid in kill_pid_seen:
+                    continue
+                kill_pid_seen.add(info.pid)
+                if info.pid in scan_pid_seen:
+                    # Upgrade the existing (killed=False) scan entry in
+                    # place -- the kill's own tighter rescan confirmed it.
+                    for _idx, _existing in enumerate(entries):
+                        if _existing.info.pid == info.pid:
+                            entries[_idx] = OrphanScanEntry(
+                                info=_existing.info,
+                                owned=_existing.owned,
+                                killed=True,
+                            )
+                            break
+                else:
+                    # Lineage-only pid (_process_tree expansion): never seen
+                    # by the scan itself.
+                    entries.append(
+                        OrphanScanEntry(
+                            info=info, owned=info.pid in ctx.owned_pids, killed=True,
+                        )
+                    )
+    except Exception as _exc:  # noqa: BLE001 -- ticket #107/#140: never let scan/kill failure block removal; partial results already collected are kept.
+        fail_reason = str(_exc)
+        if "scan:failed" not in skipped_passes:
+            skipped_passes.append("scan:failed")
+
+    if not entries and not skipped_passes:
+        # Clean, complete scan: nothing to warn about.
+        return
+
+    if fail_reason is not None:
+        message = (
+            f"_teardown: worktree '{record.id}' orphan scan degraded "
+            f"unexpectedly ({fail_reason}); reporting best-effort results "
+            f"({len(entries)} process(es) found before the failure)."
+        )
+    else:
+        message = (
+            f"_teardown: worktree '{record.id}' orphan scan found "
+            f"{len(entries)} untracked process(es) holding the checkout."
+        )
+    _logger.warning("%s", message)
+
+    record.orphan_scan = OrphanScanReport(
+        message=message,
+        entries=tuple(entries),
+        skipped_passes=tuple(skipped_passes),
+        kill_attempted=kill_attempted,
+    )
 
 
 def _phase_git_worktree_remove(ctx: _TeardownContext) -> None:
@@ -1223,6 +1457,7 @@ _TEARDOWN_PHASES = (
     _phase_gate_a_blocking_preflight,
     _phase_gate_b_early_dirty,
     _phase_run_teardown_steps,
+    _phase_orphan_scan,
     _phase_git_worktree_remove,
     _phase_filesystem_fallback,
     _phase_final_guard,

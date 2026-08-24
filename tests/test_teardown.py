@@ -1861,7 +1861,12 @@ class TestKillBlockingRecordKilledPids:
         # failed to hold before the fixture's double-probe bug was fixed
         # (Gate A was skipped even though this test is semantically about a
         # present checkout).
-        mock_find.assert_called_once_with(record.path, ANY)
+        # Ticket #140: the new all-platform orphan-scan phase (index 6) also
+        # calls _find_blocking_processes on this same present target, AFTER
+        # Gate A -- so the total is now 2 calls, not 1. Both calls use the
+        # same (record.path, <our own pid>) shape.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, ANY)
 
     def test_yaml_store_remove_returns_killed_pids(self, tmp_path):
         """Regression for blocking #2: YamlStateStore.remove() returns a freshly
@@ -1921,7 +1926,10 @@ class TestKillBlockingRecordKilledPids:
         # record's checkout is present, so Gate A's pre-flight
         # blocking-process scan must genuinely run rather than being
         # silently skipped by a miscomputed ``target_absent``.
-        mock_find.assert_called_once_with(record.path, ANY)
+        # Ticket #140: plus the new orphan-scan phase's own call -- see the
+        # sibling test's comment above for the full rationale.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, ANY)
 
 
 # ---------------------------------------------------------------------------
@@ -3211,7 +3219,11 @@ class TestTeardownAbsentTarget:
             mock_sys.platform = "win32"
             manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
 
-        mock_find.assert_called_once_with(record.path, os.getpid())
+        # Ticket #140: the new all-platform orphan-scan phase (index 6) also
+        # calls _find_blocking_processes on this same present target, AFTER
+        # Gate A -- so the total is now 2 calls, not 1.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, os.getpid())
 
     def test_absent_target_phantom_state_stderr_still_routes_to_phantom_cleanup(
         self, tmp_path
@@ -3390,7 +3402,11 @@ class TestTeardownAbsentTarget:
             with pytest.raises(GitCommandError):
                 manager.remove(record.id, force=False)
 
-        mock_find.assert_called_once_with(record.path, ANY)
+        # Ticket #140: the new all-platform orphan-scan phase (index 6) also
+        # calls _find_blocking_processes on this same present target, AFTER
+        # Gate A -- so the total is now 2 calls, not 1.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, ANY)
 
     def test_absent_target_branch_not_created_by_us_no_branch_call(self, tmp_path):
         """branch_created_by_us=False: no git branch/rev-parse call is ever
@@ -3683,7 +3699,12 @@ class TestWindowsPreflightBlockingCheck:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        mock_find.assert_called_once_with(record.path, os.getpid())
+        # Ticket #140: the new all-platform orphan-scan phase (index 6) also
+        # calls _find_blocking_processes on this same present target, AFTER
+        # Gate A -- so the total is now 2 calls, not 1. Both find nothing,
+        # so no kill call is made and record.orphan_scan stays None.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, os.getpid())
         mock_git.assert_called_once()
 
     def test_preflight_flag_on_kills_before_git_remove_and_succeeds(self, tmp_path):
@@ -3737,8 +3758,15 @@ class TestWindowsPreflightBlockingCheck:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        assert call_order == ["kill", "git_remove"], (
-            f"expected pre-flight kill before git remove, got {call_order}"
+        # Ticket #140: the new all-platform orphan-scan phase (index 6) runs
+        # AFTER Gate A but still BEFORE `git worktree remove` -- it sees the
+        # same mocked blocker via its own fresh _find_blocking_processes
+        # call, and (kill_blocking_processes=True, >=1 hit) makes its own
+        # reused _kill_blocking_processes call too. So a second "kill" now
+        # legitimately lands before "git_remove"; what this test still pins
+        # is that NEITHER kill happens after git_remove.
+        assert call_order == ["kill", "kill", "git_remove"], (
+            f"expected pre-flight kill(s) before git remove, got {call_order}"
         )
         assert record.killed_pids == fake_blockers
 
@@ -3850,11 +3878,19 @@ class TestWindowsPreflightBlockingCheck:
 
     def test_preflight_skipped_entirely_on_posix(self, tmp_path):
         """POSIX: even if _find_blocking_processes were to report a blocker,
-        the Windows-only pre-flight must never run on non-Windows platforms
-        -- _find_blocking_processes must not be called at all, and `git
-        worktree remove` must proceed as the sole removal mechanism (POSIX
-        unlinks files even under an open handle, so a naive pre-flight there
-        would incorrectly block/kill on a merely-cwd'd process)."""
+        the Windows-only Gate A pre-flight must never run on non-Windows
+        platforms -- POSIX unlinks files even under an open handle, so a
+        naive pre-flight there would incorrectly block/kill on a merely-
+        cwd'd process. `git worktree remove` must proceed as the sole
+        removal mechanism (no WorktreeDirLockedError, no refusal).
+
+        Ticket #140: _find_blocking_processes is no longer uncalled on
+        POSIX overall -- the new all-platform, warn-only orphan-scan phase
+        (index 6) now calls it too, exactly once, AFTER Gate A's own
+        (still-skipped) win32-only slot. What this test still pins is
+        Gate A's specific absence: no kill (flag is off) and no refusal --
+        the mocked blocker is only ever warn-reported by the new phase, not
+        acted on."""
         from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
 
         manager = _make_manager(tmp_path)
@@ -3887,7 +3923,7 @@ class TestWindowsPreflightBlockingCheck:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        mock_find.assert_not_called()
+        mock_find.assert_called_once_with(record.path, os.getpid())
         mock_kill.assert_not_called()
         mock_git.assert_called_once()
 
@@ -3939,9 +3975,12 @@ class TestWindowsPreflightBlockingCheck:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        # Only one scan: an empty (owned+foreign both empty) result never
-        # enters the settle-window rescan.
-        mock_find.assert_called_once_with(record.path, os.getpid())
+        # Gate A itself only issues one scan: an empty (owned+foreign both
+        # empty) result never enters the settle-window rescan. Ticket #140:
+        # the new orphan-scan phase (index 6) makes its own additional call
+        # after Gate A, so the module-wide total is 2, not 1.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, os.getpid())
         # The destructive `git worktree remove` call did run.
         assert any(
             (call_args.args[0] if call_args.args else call_args.kwargs.get("args"))[
@@ -4140,7 +4179,11 @@ class TestWindowsPreflightBlockingCheck:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        mock_find.assert_called_once_with(record.path, os.getpid())
+        # Gate A itself only issues one scan for an empty result. Ticket
+        # #140: the new orphan-scan phase (index 6) makes its own additional
+        # call after Gate A, so the module-wide total is 2, not 1.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, os.getpid())
         mock_git.assert_called_once()
 
 
@@ -4174,7 +4217,13 @@ class TestTicket117PreflightFalsePositive:
             patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
                 "lib_python_worktree.core.teardown._find_blocking_processes",
-                side_effect=[transient, []],
+                # Ticket #140: a THIRD entry for the new orphan-scan phase's
+                # own post-Gate-A call (index 6) -- an empty result, so it
+                # stays a clean, silent scan and does not itself add a
+                # "scan:failed" marker (which a StopIteration from an
+                # exhausted 2-item side_effect list would otherwise trigger,
+                # since the phase's `except Exception` also catches that).
+                side_effect=[transient, [], []],
             ) as mock_find,
             patch(
                 "lib_python_worktree.core.teardown._kill_blocking_processes"
@@ -4191,7 +4240,7 @@ class TestTicket117PreflightFalsePositive:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        assert mock_find.call_count == 2
+        assert mock_find.call_count == 3
         mock_kill.assert_not_called()
         assert any(
             (call_args.args[0] if call_args.args else call_args.kwargs.get("args"))[
@@ -4291,7 +4340,12 @@ class TestTicket117PreflightFalsePositive:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        assert call_order == ["kill", "git_remove"]
+        # Ticket #140: the new orphan-scan phase (index 6) runs after Gate A
+        # but still before `git worktree remove`; it sees the same mocked
+        # persistent blocker via its own fresh find call and (kill flag on,
+        # >=1 hit) makes its own reused kill call too -- a second "kill"
+        # legitimately lands before "git_remove".
+        assert call_order == ["kill", "kill", "git_remove"]
         assert record.killed_pids == persistent
 
     def test_settle_warning_names_pid_and_process_name(self, tmp_path, caplog):
@@ -4405,9 +4459,15 @@ class TestTicket117PreflightFalsePositive:
             )
 
     def test_posix_never_scans(self, tmp_path):
-        """Retrospective coverage: the Windows-only guard is unaffected by
-        the Gate A rewrite -- POSIX never calls _find_blocking_processes at
-        all (existing coverage, re-asserted here for the new gate)."""
+        """Retrospective coverage: Gate A's Windows-only guard is unaffected
+        by the Gate A rewrite -- Gate A itself never calls
+        _find_blocking_processes on POSIX (existing coverage, re-asserted
+        here for the new gate).
+
+        Ticket #140: _find_blocking_processes is no longer uncalled on
+        POSIX overall -- the new all-platform, warn-only orphan-scan phase
+        (index 6) now calls it too, exactly once, independently of Gate A's
+        own (still win32-only) slot."""
         manager = _make_manager(tmp_path)
         record = _make_record("wt-117-posix", path="/fake/store/wt-117-posix")
         manager.state.add(record)
@@ -4417,7 +4477,8 @@ class TestTicket117PreflightFalsePositive:
         with (
             patch("lib_python_worktree.core.teardown._run_git") as mock_git,
             patch(
-                "lib_python_worktree.core.teardown._find_blocking_processes"
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                return_value=[],
             ) as mock_find,
             patch("lib_python_worktree.core.teardown.sys") as mock_sys,
         ):
@@ -4430,7 +4491,7 @@ class TestTicket117PreflightFalsePositive:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        mock_find.assert_not_called()
+        mock_find.assert_called_once_with(record.path, os.getpid())
 
 
 # ---------------------------------------------------------------------------
@@ -4604,9 +4665,18 @@ class TestTicket117OwnedBlocker:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        assert call_order == ["kill", "git_remove"]
+        # Ticket #140: the new orphan-scan phase (index 6) runs after Gate A
+        # but still before `git worktree remove`; it sees the same mocked
+        # owned hit via its own fresh find call and (kill flag on, >=1 hit)
+        # makes its own reused kill call too -- a second "kill" legitimately
+        # lands before "git_remove", and _find_blocking_processes is now
+        # called twice module-wide (Gate A's own immediate-confirm call,
+        # still with no settle-window rescan since the hit is owned, plus
+        # the new phase's call).
+        assert call_order == ["kill", "kill", "git_remove"]
         assert record.killed_pids == owned_hit
-        mock_find.assert_called_once_with(record.path, os.getpid())
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, os.getpid())
         mock_time.sleep.assert_not_called()
 
 
@@ -4720,8 +4790,12 @@ class TestTicket117FixCycleDegradedConfirmation:
             )
 
         # No prior hit -> `_foreign` is empty -> the settle loop (and thus
-        # any confirming rescan) is never entered at all.
-        mock_find.assert_called_once_with(record.path, os.getpid())
+        # any confirming rescan) is never entered at all -- Gate A itself
+        # issues only one scan. Ticket #140: the new orphan-scan phase
+        # (index 6) makes its own additional call after Gate A, so the
+        # module-wide total is 2, not 1.
+        assert mock_find.call_count == 2
+        mock_find.assert_any_call(record.path, os.getpid())
         mock_git.assert_called_once()
 
     def test_kill_blocking_processes_degraded_result_does_not_clear_confirmed_blocker(
@@ -4839,7 +4913,12 @@ class TestTicket117FixCycleDegradedConfirmation:
                 _lifecycle_module=mock_lifecycle,
             )
 
-        assert call_order == ["kill", "git_remove"]
+        # Ticket #140: the new orphan-scan phase (index 6) runs after Gate A
+        # but still before `git worktree remove`; it sees the same mocked
+        # persistent blocker via its own fresh find call and (kill flag on,
+        # >=1 hit) makes its own reused (also empty-result) kill call too --
+        # a second "kill" legitimately lands before "git_remove".
+        assert call_order == ["kill", "kill", "git_remove"]
 
 
 # ---------------------------------------------------------------------------

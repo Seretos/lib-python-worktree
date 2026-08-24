@@ -84,6 +84,8 @@ from .core.state import (
     STOP_REASONS,
     BaseFetchFallback,
     InMemoryStateStore,
+    OrphanScanEntry,
+    OrphanScanReport,
     SetupOutcome,
     ShadowedContract,
     StateStore,
@@ -164,6 +166,8 @@ __all__ = [
     "SHADOW_REASONS",
     "BaseFetchFallback",
     "BASE_FETCH_FALLBACK_REASONS",
+    "OrphanScanEntry",
+    "OrphanScanReport",
     # yaml state store (W7)
     "YamlStateStore",
     "ReconcileReport",
