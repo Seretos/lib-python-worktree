@@ -9011,6 +9011,7 @@ class TestDiscoveryCompleteness:
             "instead propagate the inner result's own tags"
         )
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
     def test_handle_scan_incomplete_with_no_own_tags_falls_back_to_truncated(self):
         """R4 additional coverage (test-critic finding): the sibling test
         above only proves tag-FORWARDING (inner tags present -> propagated)
@@ -9023,7 +9024,20 @@ class TestDiscoveryCompleteness:
         ``skipped_passes``) must still fall back to the legacy
         "handle_scan:truncated" string -- proving D5 does not just
         "forward-or-nothing" but actually falls back when the inner result
-        itself carries nothing to forward."""
+        itself carries nothing to forward.
+
+        Marked win32-only (same as the sibling test above): the D5 branch
+        this exercises lives entirely inside `_find_blocking_processes`'
+        ``if sys.platform == "win32":`` Pass-1c block (process_lifecycle.py,
+        around line 3374). That gate is not incidental -- `_win_handle_holders`
+        makes raw ``ctypes`` calls into ``ntdll``/``kernel32``
+        (``NtQuerySystemInformation``, ``NtQueryObject``, ...) that have no
+        POSIX equivalent, so the whole Pass 1c block, D5 included, is
+        unreachable on POSIX regardless of what `_win_handle_holders` is
+        patched to return. This test originally ran unconditionally, which
+        is why it passed locally on Windows but failed on the POSIX CI
+        runner: `skipped_passes` never gets populated off win32, so the
+        assertion has nothing to find."""
         target = "/fake/worktree"
         host_pid = os.getpid()
 
