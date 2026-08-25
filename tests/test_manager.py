@@ -2971,6 +2971,437 @@ def test_manager_start_unknown_variant_explicit_default_name_not_duplicated(
     assert str(exc_info.value).count("default") == 1  # once in available=[...], no dup
 
 
+# ---------------------------------------------------------------------------
+# Ticket #146: start_variants -- populated by create()/start() from the
+# loaded contract, closing the []-vs-null response inconsistency at its
+# source. See core/state.py's WorktreeRecord.start_variants docstring and
+# manager._available_variants()/available_variants() for the 3-tier
+# semantics reused here unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _fake_git_success_start_variants(args, cwd=None, **kwargs):
+    """Stub for _run_git that always returns returncode=0 (mirrors
+    test_setup_steps_create.py's _fake_git_success idiom -- duplicated
+    locally rather than imported, since that file is a read-only idiom
+    reference for this ticket, not a shared helper module)."""
+    return MagicMock(returncode=0, stderr="", stdout="")
+
+
+class TestStartVariantsOnCreate:
+    """create() must populate the returned record's start_variants from the
+    contract it already loads at create()-time, reusing
+    _available_variants()'s exact 3-tier semantics (ticket #131) rather than
+    re-deriving them."""
+
+    @pytest.mark.requires_git
+    def test_create_with_no_contract_file_at_all_yields_empty_list(
+        self, git_repo: Path, manager_factory: Callable[..., WorktreeManager]
+    ):
+        """R2 driving test -- the ticket's literal repro: the plain
+        git_repo fixture has no .seretos/ directory at all, so
+        loader.load() returns the implicit isolation:none contract whose
+        start defaults to []. create() must still surface a real [],
+        never None/missing."""
+        mgr = manager_factory()
+        rec = mgr.create(str(git_repo), "feature/no-contract-start-variants")
+
+        assert rec.start_variants == []
+        assert rec.start_variants is not None
+
+    def test_create_populates_start_variants_from_contract(self, tmp_path: Path):
+        """R2 driving test: two named start: steps -> start_variants in
+        contract order."""
+        manager = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=InMemoryStateStore(),
+            reconcile_on_init=False,
+        )
+        fake_contract = WorktreeContract(
+            version=1,
+            isolation="full",
+            start=[
+                Step(run="python api.py", name="api"),
+                Step(run="python web.py", name="web"),
+            ],
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_fake_git_success_start_variants,
+            ),
+            patch.object(manager, "_validate_repo", return_value=Path("/fake/repo")),
+            patch.object(manager, "_branch_exists", return_value=True),
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+        ):
+            record = manager.create("/fake/repo", "feature/start-variants-contract")
+
+        assert record.start_variants == ["api", "web"]
+
+    @pytest.mark.parametrize(
+        "contract_kwargs, expected",
+        [
+            pytest.param(
+                dict(isolation="none"), [], id="isolation-none-explicit"
+            ),
+            pytest.param(
+                dict(isolation="full", start=[Step(run="python server.py")]),
+                ["default"],
+                id="single-unnamed-step",
+            ),
+            pytest.param(
+                dict(
+                    isolation="full",
+                    start=[Step(run="python server.py", name="web")],
+                ),
+                ["web", "default"],
+                id="single-named-step",
+            ),
+            pytest.param(
+                dict(
+                    isolation="full",
+                    start=[Step(run="python a.py"), Step(run="python b.py")],
+                ),
+                [],
+                id="two-unnamed-steps",
+            ),
+        ],
+    )
+    def test_create_populates_start_variants_edge_cases(
+        self, tmp_path: Path, contract_kwargs: dict, expected: list
+    ):
+        """R2 edge cases (already-passing coverage once R2's driving test is
+        green -- these pin the same _available_variants 3-tier semantics
+        for the shapes not covered by the two-named-step driving test
+        above)."""
+        manager = WorktreeManager(
+            config=ManagerConfig(store_root=tmp_path / "store"),
+            state=InMemoryStateStore(),
+            reconcile_on_init=False,
+        )
+        fake_contract = WorktreeContract(version=1, **contract_kwargs)
+
+        with (
+            patch(
+                "lib_python_worktree.core.manager._run_git",
+                side_effect=_fake_git_success_start_variants,
+            ),
+            patch.object(manager, "_validate_repo", return_value=Path("/fake/repo")),
+            patch.object(manager, "_branch_exists", return_value=True),
+            patch(
+                "lib_python_worktree.core.manager._load_contract",
+                return_value=fake_contract,
+            ),
+        ):
+            record = manager.create(
+                "/fake/repo", f"feature/start-variants-{'-'.join(expected) or 'empty'}"
+            )
+
+        assert record.start_variants == expected
+
+    @pytest.mark.requires_git
+    def test_create_empty_contract_file_yields_empty_start_variants(
+        self, git_repo: Path, manager_factory: Callable[..., WorktreeManager]
+    ):
+        """R2 edge case: an existing-but-empty (0-byte) contract file must
+        also yield [] -- exercised through the REAL loader (loader.load()
+        treats an empty file identically to a missing one), not a mock."""
+        seretos_dir = git_repo / ".seretos"
+        seretos_dir.mkdir()
+        (seretos_dir / "worktree-setup.yml").write_text("", encoding="utf-8")
+
+        mgr = manager_factory()
+        rec = mgr.create(str(git_repo), "feature/empty-contract-start-variants")
+
+        assert rec.start_variants == []
+
+
+def test_start_no_op_ready_path_sets_start_variants_to_empty(tmp_path: Path):
+    """R3 driving test: start() with a contract that has no start: steps
+    (the no-op 'ready' path) must reset start_variants to [] on the
+    returned/updated record -- proving active assignment, not merely
+    reliance on the dataclass default. The stored record is first seeded
+    with a stale start_variants=['stale'] (mimicking a prior create() call
+    against a since-changed contract) so the assertion cannot be satisfied
+    by a record that was simply never touched."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    record.start_variants = ["stale"]
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="none")
+
+    with patch(
+        "lib_python_worktree.core.manager._load_contract", return_value=fake_contract
+    ):
+        result = mgr.start(record.id)
+
+    assert result.status == "ready"
+    assert result.start_variants == []
+
+
+def test_start_real_spawn_sets_start_variants_on_returned_record(tmp_path: Path):
+    """R3 driving test: on the real-spawn path, start() must set the
+    returned record's start_variants to the FULL available list from the
+    contract (not just the selected variant), even though _lifecycle_start
+    hands back a fresh, store-loaded record that never carries this
+    transient field beyond its bare [] default -- mirrors how
+    shadowed_contract is propagated explicitly onto the same `result` for
+    the identical reason (see manager.start()'s own comment there)."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    gui_step = Step(run="python server.py --gui", name="gui")
+    headless_step = Step(run="python server.py --headless", name="headless")
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[gui_step, headless_step],
+    )
+
+    # Mimics process_lifecycle.start()'s real return shape: a fresh
+    # WorktreeRecord (as a YamlStateStore deserialisation would produce),
+    # never carrying start_variants beyond its bare default.
+    fresh_record = WorktreeRecord(
+        id=record.id,
+        repo_root=record.repo_root,
+        branch=record.branch,
+        path=record.path,
+    )
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+        patch(
+            "lib_python_worktree.core.manager._lifecycle_start",
+            return_value=fresh_record,
+        ),
+    ):
+        result = mgr.start(record.id, variant="gui")
+
+    assert result.start_variants == ["gui", "headless"]
+
+
+def test_start_unknown_variant_available_unaffected_by_rename(tmp_path: Path):
+    """Guard (R3): UnknownVariantError.available's 3-tier semantics must
+    stay byte-identical once _available_variants is promoted to the public
+    available_variants() (kept as a back-compat alias) -- this assertion
+    already holds today (baseline GREEN) and must keep holding unchanged
+    after the rename."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="headless"), Step(run="cmd2", name="gui")],
+    )
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+        pytest.raises(UnknownVariantError) as exc_info,
+    ):
+        mgr.start(record.id, variant="nonexistent")
+
+    assert exc_info.value.available == ["headless", "gui"]
+
+
+def test_start_load_contract_called_once_when_populating_start_variants(
+    tmp_path: Path,
+):
+    """Guard (R3): start() must still call _load_contract exactly once
+    while also populating start_variants from that same already-loaded
+    contract object -- no second load introduced by the new population
+    logic. This already holds today (baseline GREEN, start() has always
+    loaded the contract exactly once) and must keep holding unchanged."""
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record()
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[Step(run="cmd1", name="api"), Step(run="cmd2", name="web")],
+    )
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ) as mock_load,
+        patch("lib_python_worktree.core.manager._lifecycle_start") as mock_start,
+    ):
+        mock_start.return_value = record
+        mgr.start(record.id, variant="api")
+
+    assert mock_load.call_count == 1
+
+
+def test_available_variants_private_alias_still_resolves():
+    """R5 driving test: the private _available_variants must remain a
+    back-compat alias for the promoted public available_variants -- the
+    identical function object, not a re-implementation that could drift."""
+    assert manager_module._available_variants is manager_module.available_variants
+
+
+class TestStartVariantsTypeInvariant:
+    """R6 (ticket #146's actual acceptance criterion): start_variants must
+    be a list instance on every path that returns/exposes a WorktreeRecord
+    -- never None, never missing. create()/start() populate it from the
+    contract; every other path (list/list_repo/adopt/reconcile/stop/remove)
+    leaves it at its default empty list, since none of them ever load or
+    act on a contract's start: steps."""
+
+    @pytest.mark.requires_git
+    def test_start_variants_is_always_a_list_across_paths(
+        self, tmp_path: Path, git_repo: Path, yaml_manager, skip_if_no_git  # noqa: ARG001
+    ):
+        seretos_dir = git_repo / ".seretos"
+        seretos_dir.mkdir()
+        (seretos_dir / "worktree-setup.yml").write_text(
+            "version: 1\n"
+            "isolation: full\n"
+            "start:\n"
+            "  - run: python api.py\n"
+            "    name: api\n"
+            "  - run: python web.py\n"
+            "    name: web\n",
+            encoding="utf-8",
+        )
+
+        mgr = yaml_manager()
+
+        # create()
+        record = mgr.create(str(git_repo), "feature/start-variants-invariant")
+        assert isinstance(record.start_variants, list)
+        assert record.start_variants == ["api", "web"]
+
+        # start() -- the real spawn seam is mocked out so no process is
+        # actually spawned; the mock mimics process_lifecycle.start()'s
+        # real fresh-record return shape.
+        fresh_record = WorktreeRecord(
+            id=record.id,
+            repo_root=record.repo_root,
+            branch=record.branch,
+            path=record.path,
+        )
+        with patch(
+            "lib_python_worktree.core.manager._lifecycle_start",
+            return_value=fresh_record,
+        ):
+            started = mgr.start(record.id, variant="api")
+        assert isinstance(started.start_variants, list)
+
+        # list()
+        listed = mgr.list()
+        rec_from_list = next(r for r in listed if r.id == record.id)
+        assert isinstance(rec_from_list.start_variants, list)
+        assert rec_from_list.start_variants == []
+
+        # list_repo()
+        listing = mgr.list_repo(str(git_repo))
+        entry = next(e for e in listing.entries if e.record.id == record.id)
+        assert isinstance(entry.record.start_variants, list)
+        assert entry.record.start_variants == []
+
+        # adopt() -- an out-of-band worktree gets a synthesised record.
+        oot_path = tmp_path / "oot-start-variants-invariant"
+        subprocess.run(
+            ["git", "worktree", "add", str(oot_path), "feature/alpha"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        try:
+            mgr.adopt(str(git_repo))
+            adopted_rec = next(
+                r for r in mgr.list() if r.branch == "feature/alpha"
+            )
+            assert isinstance(adopted_rec.start_variants, list)
+            assert adopted_rec.start_variants == []
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(oot_path)],
+                cwd=git_repo,
+                capture_output=True,
+            )
+
+        # reconcile()
+        reconcile(mgr.state)
+        reconciled = mgr.state.get(record.id)
+        assert isinstance(reconciled.start_variants, list)
+        assert reconciled.start_variants == []
+
+        # stop() -- no process was actually started (the real spawn was
+        # mocked out above), so this exercises the no-op stop path.
+        stopped = mgr.stop(record.id, role="main")
+        assert isinstance(stopped.start_variants, list)
+        assert stopped.start_variants == []
+
+        # remove() -- last, since it deletes the record.
+        removed = mgr.remove(record.id, force=True)
+        assert isinstance(removed.start_variants, list)
+        assert removed.start_variants == []
+
+
+def test_in_memory_store_shares_start_variants_by_reference_and_never_yields_none(
+    tmp_path: Path,
+):
+    """R6b driving test: for an InMemoryStateStore-backed manager,
+    start_variants is subject to the same store-by-reference caveat
+    documented on killed_pids/shadowed_contract -- InMemoryStateStore never
+    copies a record, so a value create() set keeps appearing on later
+    get()/list() calls verbatim (the stale/shared value, not reset to []).
+    This positively pins that reference-sharing behaviour as intentional,
+    not merely a "not None" check -- see WorktreeRecord.killed_pids's
+    docstring for the precedent this mirrors."""
+    manager = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=InMemoryStateStore(),
+        reconcile_on_init=False,
+    )
+    fake_contract = WorktreeContract(
+        version=1,
+        isolation="full",
+        start=[
+            Step(run="python api.py", name="api"),
+            Step(run="python web.py", name="web"),
+        ],
+    )
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._run_git",
+            side_effect=_fake_git_success_start_variants,
+        ),
+        patch.object(manager, "_validate_repo", return_value=Path("/fake/repo")),
+        patch.object(manager, "_branch_exists", return_value=True),
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+    ):
+        record = manager.create("/fake/repo", "feature/start-variants-shared-ref")
+
+    assert record.start_variants == ["api", "web"]
+
+    fetched = manager.state.get(record.id)
+    assert fetched is not None
+    assert fetched.start_variants == ["api", "web"]
+    assert fetched.start_variants is not None
+
+
 def test_manager_start_unknown_worktree_raises_not_found(tmp_path: Path):
     """start() raises WorktreeNotFoundError when the worktree id is not in the store."""
     mgr = _make_mgr_in_memory(tmp_path)

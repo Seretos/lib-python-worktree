@@ -831,6 +831,36 @@ class WorktreeRecord:
     no incompleteness to report) -- both indistinguishable and both
     correctly "nothing to warn about"."""
 
+    start_variants: List[str] = field(default_factory=list)
+    """Ticket #146: the full list of variant strings that WOULD resolve
+    against ``start()``'s step-selection tiers for the contract ``create()``
+    or ``start()`` just loaded -- i.e. ``manager.available_variants(contract
+    .start)`` (the promoted, public form of the former private
+    ``_available_variants`` helper). Populated by ``create()`` (from the
+    contract it loads while building the record) and by both of ``start()``'s
+    return paths (the no-op ``"ready"`` path and the real-spawn path), always
+    from the FULL available-variants list for the contract, not just the one
+    variant that was selected/started.
+
+    Non-Optional, defaulting to ``[]`` -- deliberately never ``None``, unlike
+    the ``Optional[...]`` fields above: closing the ``worktree_create``
+    ``[]``-vs-``null`` inconsistency at its source is the entire point of
+    this field, so any caller can rely on ``list(record.start_variants)``
+    unconditionally, with no ``is None`` guard.
+
+    Deliberately **transient**, exactly like ``killed_pids``/
+    ``shadowed_contract``/``stop_attempt``/``stop_hook_outcome``/
+    ``orphan_scan``: never persisted to ``state.yaml`` (``yaml_store
+    ._record_to_dict`` never serialises it) -- it is a live recomputation
+    from the contract, not a stored verdict, so a legacy record round-tripped
+    through ``YamlStateStore`` always comes back with ``start_variants ==
+    []``. Subject to the same in-memory-store-by-reference caveat documented
+    on ``killed_pids`` for ``InMemoryStateStore``-backed managers: because
+    ``InMemoryStateStore.update()`` stores the record object by reference (no
+    copy), a value set by one ``create()``/``start()`` call can keep
+    appearing on later ``get()``/``list()`` calls until the next call that
+    assigns it overwrites it."""
+
 
 class StateStore(Protocol):
     """Interface that W7 will re-implement against a persistent backing store."""

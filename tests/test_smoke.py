@@ -40,3 +40,15 @@ def test_stop_detail_surface_importable_from_package_root() -> None:
     for name in names:
         assert hasattr(lib_python_worktree, name), f"missing: {name}"
         assert name in lib_python_worktree.__all__, f"not in __all__: {name}"
+
+
+def test_available_variants_surface_importable_from_package_root() -> None:
+    """Ticket #146 (R5): the promoted public available_variants() helper
+    must be importable directly from the package root, not just from
+    lib_python_worktree.core.manager. Mirrors
+    test_stop_detail_surface_importable_from_package_root immediately
+    above."""
+    from lib_python_worktree import available_variants  # noqa: F401
+
+    assert hasattr(lib_python_worktree, "available_variants")
+    assert "available_variants" in lib_python_worktree.__all__

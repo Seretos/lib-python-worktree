@@ -305,6 +305,7 @@ def test_two_worktrees_pinning_same_port_collide(tmp_path: Path):
         mock_contract = MagicMock(spec=WorktreeContract)
         mock_contract.ports = [PortSlot(name="app", port=31000)]
         mock_contract.setup = []
+        mock_contract.start = []
         mock_load.return_value = mock_contract
 
         with patch.object(mgr, "_validate_repo", return_value=repo_root):
@@ -355,6 +356,7 @@ def test_two_worktrees_pinning_same_port_second_succeeds_after_first_removed(
         mock_contract = MagicMock(spec=WorktreeContract)
         mock_contract.ports = [PortSlot(name="app", port=31000)]
         mock_contract.setup = []
+        mock_contract.start = []
         mock_load.return_value = mock_contract
 
         with patch.object(mgr, "_validate_repo", return_value=repo_root):

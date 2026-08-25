@@ -305,7 +305,7 @@ class UnknownVariantError(WorktreeError, ValueError):
     would resolve against this contract, including the implicit
     ``"default"`` when a fallback tier makes it reachable (ticket #131) --
     not merely the step names that are literally set. See
-    ``manager._available_variants()`` for exactly how it is computed.
+    ``manager.available_variants()`` for exactly how it is computed.
 
     When ``available`` is genuinely empty -- no step name matches and no
     fallback tier is reachable either, so the contract has no addressable
