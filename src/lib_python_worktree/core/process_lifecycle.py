@@ -38,7 +38,14 @@ Platform differences
 --------------------
 - Windows: ``CREATE_NEW_PROCESS_GROUP`` to detach from the MCP host's
   process group while still allowing ``CTRL_BREAK_EVENT`` delivery;
-  ``TerminateProcess`` (via ctypes) for force-kill. ``start()`` also creates
+  ``TerminateProcess`` (via ctypes) for force-kill. Ticket #147:
+  ``CTRL_BREAK_EVENT`` targets a console PROCESS GROUP id, not an arbitrary
+  pid, so it is only ever sent to a pid the caller has explicitly confirmed
+  is the leader of a group WE created -- in practice, only ``stop()``'s own
+  tracked pid. Every other pid this module signals (descendant-tree nodes,
+  path-heuristic-discovered orphans) falls straight through to the
+  wait/force-kill fallback instead. See ``_send_graceful_signal``'s
+  docstring. ``start()`` also creates
   a Windows Job Object (ticket #95) and assigns the spawned process to it --
   a ppid-INDEPENDENT containment mechanism that ``stop()`` enumerates and
   terminates as a unit, closing the gap the ppid-derived process-tree walk
@@ -816,24 +823,62 @@ def _close_job_object_handle(job_handle: int) -> None:
 # Internal signal / kill helpers
 # ---------------------------------------------------------------------------
 
-def _send_graceful_signal(pid: int) -> None:
+def _send_graceful_signal(pid: int, *, group_leader: bool = False) -> bool:
     """Send the platform-appropriate graceful-stop signal to *pid*.
 
     Windows: CTRL_BREAK_EVENT (sent to the process group).
     POSIX:   SIGTERM.
+
+    ``GenerateConsoleCtrlEvent`` (what ``os.kill(pid, CTRL_BREAK_EVENT)``
+    invokes on win32) targets a console PROCESS GROUP id, not an arbitrary
+    pid. Handing it a pid we never confirmed is the leader of a process
+    group WE created (via ``CREATE_NEW_PROCESS_GROUP``) is at best a no-op
+    and at worst misdirects the break to an unrelated process group sharing
+    the same console. ``group_leader=True`` is therefore how the caller
+    explicitly asserts that *pid* is such a confirmed leader; on win32 the
+    break is only ever issued when that assertion is made. ``group_leader``
+    is ignored on POSIX, where ``SIGTERM`` is already pid-precise.
+
+    Refused unconditionally (no ``os.kill`` call, returns ``False``) when
+    *pid* is non-positive or is our own pid — the latter mirrors
+    ``_signal_process_group``'s "never our own group" rule and applies even
+    when ``group_leader=True``.
+
+    Returns ``True`` if the signal was actually delivered (``os.kill``
+    raised no exception), ``False`` otherwise (refused, or the process had
+    already exited and ``os.kill`` raised ``OSError``).
+
+    Known limitation: like ``stop()`` itself (see its docstring), the
+    tracked pid is trusted as-is with no identity check — ``group_leader``
+    confirms only that the CALLER asserts leadership, not that *pid* has
+    not been reused by an unrelated process since it was last observed
+    alive.
     """
+    if pid <= 0 or pid == os.getpid():
+        return False
+
     if sys.platform == "win32":
+        if group_leader is not True:
+            _logger.debug(
+                "skipping CTRL_BREAK_EVENT for pid %s: process-group "
+                "leadership not confirmed; falling through to "
+                "wait/force-kill",
+                pid,
+            )
+            return False
         try:
             os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
         except OSError:
             # Process may have already exited between the liveness check and
             # the signal call — treat as a no-op.
-            pass
+            return False
+        return True
     else:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
-            pass
+            return False
+        return True
 
 
 def _force_kill(pid: int) -> None:
@@ -1576,11 +1621,17 @@ def _kill_process_tree(
     n = len(tree)
 
     for info in tree:
-        _send_graceful_signal(info.pid)
+        delivered = _send_graceful_signal(info.pid, group_leader=False)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            # Budget exhausted -- signal already sent; skip the wait for this
-            # node and all subsequent ones (they will also only be signalled).
+            # Budget exhausted. If the graceful signal was actually
+            # delivered, leave this node (and all subsequent ones) merely
+            # signalled, as before. If it was refused/not delivered (e.g. a
+            # withheld win32 CTRL_BREAK_EVENT for a non-leader pid), there is
+            # no wait budget left to fall back on -- force-kill immediately
+            # instead of leaving the node running unmanaged.
+            if not delivered:
+                _wait_or_kill(info.pid, timeout=0.0)
             continue
         per_pid_budget = min(remaining, timeout / n)
         _wait_or_kill(info.pid, timeout=per_pid_budget)
@@ -3162,11 +3213,17 @@ def _kill_blocking_processes(
         # Always send the graceful signal, even if the budget is exhausted.
         # This ensures every orphan is notified regardless of how much time
         # is left.  Only the _wait_or_kill call is gated on remaining budget.
-        _send_graceful_signal(info.pid)
+        delivered = _send_graceful_signal(info.pid, group_leader=False)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            # Budget exhausted — signal already sent; skip the wait for this
-            # orphan and all subsequent ones (they will also only be signalled).
+            # Budget exhausted. If the graceful signal was actually
+            # delivered, leave this orphan (and all subsequent ones) merely
+            # signalled, as before. If it was refused/not delivered (e.g. a
+            # withheld win32 CTRL_BREAK_EVENT for an unconfirmed orphan),
+            # there is no wait budget left to fall back on -- force-kill
+            # immediately instead of leaving the orphan running unmanaged.
+            if not delivered:
+                _wait_or_kill(info.pid, timeout=0.0)
             continue
         per_pid_budget = min(remaining, timeout / n)
         _wait_or_kill(info.pid, timeout=per_pid_budget)
@@ -3722,7 +3779,7 @@ def stop(
 
     pid_was_alive = _pid_alive(pid)
     if pid_was_alive:
-        _send_graceful_signal(pid)
+        _send_graceful_signal(pid, group_leader=True)
         _wait_or_kill(pid, max(0.0, min(deadline - time.monotonic(), primary_cap)))
 
     # Kill the snapshotted descendant tree, plus any process-group members
