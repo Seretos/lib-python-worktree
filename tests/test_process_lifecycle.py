@@ -80,6 +80,115 @@ from lib_python_worktree.core.state import (
 _REAL_SCAN_TEST_BUDGET_SEC = 120.0
 
 
+def _is_query_worker_thread(t: "threading.Thread") -> bool:
+    """``True`` iff *t* is a daemon thread backing a ``_BoundedQueryWorker``.
+
+    Module-level (hoisted out of ``TestHandleScanThreadPlateau``, CI-red
+    follow-up to ticket #148) so both that test's own measurement AND
+    ``_wait_for_query_worker_threads_to_clear`` below share exactly one
+    identity check. Thread OBJECT identity/target, not ``Thread.ident``
+    (recycled by the OS): a daemon thread whose bound ``_target`` is the
+    ``_run`` method of a live ``_BoundedQueryWorker`` instance, or --
+    fallback, for the brief window after a thread starts but before it
+    still carries an inspectable ``_target`` -- one named by Python's
+    default ``"Thread-N (_run)"`` scheme, which nothing else in this
+    codebase produces (only ``_BoundedQueryWorker.__init__`` constructs an
+    unnamed ``Thread(target=self._run, daemon=True)``).
+    """
+    if not t.daemon:
+        return False
+    target = getattr(t, "_target", None)
+    if target is not None:
+        owner = getattr(target, "__self__", None)
+        if owner is not None:
+            return isinstance(owner, _pl._BoundedQueryWorker)
+    name = t.name
+    return name.startswith("Thread-") and name.endswith("(_run)")
+
+
+def _wait_for_query_worker_threads_to_clear(
+    timeout: float = 5.0, poll: float = 0.02
+) -> None:
+    """Best-effort bounded wait for every query-worker daemon thread to exit.
+
+    CI-red follow-up to ticket #148's own headline test
+    (``TestHandleScanThreadPlateau``): a *wedged* ``_BoundedQueryWorker``'s
+    thread only actually exits once its blocking callable finally returns.
+    Tests in this module that simulate wedging (there are roughly twenty)
+    set their local ``release`` Event in their own ``finally`` block before
+    returning, but most do not additionally join the (possibly several,
+    once-retired-and-replaced) worker threads that unblocks -- those threads
+    exit asynchronously, on their own OS scheduling, sometime after control
+    already returned to pytest.
+
+    That asynchrony is not benign: each exiting worker's ``_run()`` also
+    decrements the *process-wide* ``core.process_lifecycle._wedged_worker_count``
+    global unconditionally, with no notion of which test "owns" that
+    decrement. If such a straggler is still alive when a LATER test's own
+    fixture setup has already reset that counter to 0 and started its own
+    accounting, the straggler's eventual decrement -- landing at an
+    arbitrary later point, more likely the busier/slower the machine --
+    silently frees up capacity the later test's own logic never expected,
+    letting it create genuinely new worker threads it believed were capped.
+    This is exactly the mechanism behind CI observing a small, load-
+    dependent number of "new" leaked query-worker threads in
+    ``TestHandleScanThreadPlateau`` (baseline inflated by many still-
+    unwinding stragglers from earlier tests in this file, a few of which
+    then finish -- and decrement the shared counter -- mid-measurement).
+
+    Called from this module's autouse fixture teardown, once per test, so
+    every worker any test created has already had its blocking ``release``
+    Event set by the time this runs (a test's own ``finally`` always
+    executes before the wrapping fixture's teardown resumes) -- in practice
+    this resolves almost immediately. The bounded timeout is defense against
+    a genuinely wedged case (e.g. an actual bug, or a test that forgets to
+    release its blocking Event) turning into a hung suite rather than a
+    loud, later, easier-to-diagnose failure; never raises on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(_is_query_worker_thread(t) for t in threading.enumerate()):
+            return
+        time.sleep(poll)
+
+
+def _stable_query_worker_snapshot(
+    timeout: float = 2.0, poll: float = 0.05, stable_checks: int = 3
+) -> "List[threading.Thread]":
+    """Return the currently-alive query-worker threads once their count has
+    stopped changing for *stable_checks* consecutive polls (or *timeout*).
+
+    Defense-in-depth for ``TestHandleScanThreadPlateau`` (CI-red follow-up,
+    ticket #148): the module-scoped
+    ``_wait_for_query_worker_threads_to_clear()`` fixture teardown above
+    already closes the main window for cross-test contamination, but a
+    snapshot taken at a single fixed instant is still, in principle,
+    vulnerable to catching a thread transitioning exactly at that instant
+    (e.g. under unusually heavy CI scheduling load). Polling for the count
+    to plateau rather than reading it once makes both the baseline and the
+    final snapshot robust to that without loosening what either snapshot
+    actually asserts.
+    """
+    last_count = None
+    stable = 0
+    deadline = time.monotonic() + timeout
+    snapshot: "List[threading.Thread]" = []
+    while True:
+        snapshot = [t for t in threading.enumerate() if _is_query_worker_thread(t)]
+        count = len(snapshot)
+        if count == last_count:
+            stable += 1
+            if stable >= stable_checks:
+                break
+        else:
+            stable = 0
+            last_count = count
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll)
+    return snapshot
+
+
 @pytest.fixture(autouse=True)
 def _redirect_start_log_root(tmp_path, monkeypatch):
     """Redirect WORKTREE_LOG_ROOT to a tmp dir for every test in this module.
@@ -120,11 +229,28 @@ def _reset_wedged_object_registry(monkeypatch):
     test would leak into and poison a later test's thread-count or
     scan-start-gate assertions, exactly the same class of cross-test
     pollution this fixture already guards against for the #121 registry.
+
+    CI-red follow-up to ticket #148: the teardown half additionally calls
+    ``_wait_for_query_worker_threads_to_clear()`` AFTER
+    ``_reset_handle_scan_state()``. Resetting the module globals alone does
+    not stop an already-retired (wedged) worker's real OS thread from
+    running on -- it exits on its own schedule once its blocking call
+    returns, and its exit path decrements the very same
+    ``_wedged_worker_count`` global this fixture just reset for the NEXT
+    test. Without waiting here, a straggler from THIS test can finish and
+    decrement that counter while a LATER test is already mid-flight,
+    silently handing it capacity its own accounting never expected to have
+    and letting it create genuinely new worker threads it believed were
+    capped (see that helper's docstring for the full mechanism -- this is
+    what produced CI's "3 new leaked threads" in
+    ``TestHandleScanThreadPlateau`` against a baseline inflated by many such
+    still-unwinding stragglers).
     """
     monkeypatch.setattr(_pl, "_wedged_object_keys", OrderedDict())
     _pl._reset_handle_scan_state()
     yield
     _pl._reset_handle_scan_state()
+    _wait_for_query_worker_threads_to_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -5265,17 +5391,6 @@ class TestHandleScanThreadPlateau:
         )
         monkeypatch.setattr(psutil, "process_iter", lambda *a, **kw: iter([]))
 
-        def _is_query_worker_thread(t: "threading.Thread") -> bool:
-            if not t.daemon:
-                return False
-            target = getattr(t, "_target", None)
-            if target is not None:
-                owner = getattr(target, "__self__", None)
-                if owner is not None:
-                    return isinstance(owner, _pl._BoundedQueryWorker)
-            name = t.name
-            return name.startswith("Thread-") and name.endswith("(_run)")
-
         try:
             with patch(
                 "lib_python_worktree.core.teardown._find_blocking_processes",
@@ -5292,10 +5407,11 @@ class TestHandleScanThreadPlateau:
                     rec = mgr.create(str(git_repo), "feature/alpha")
                     mgr.remove(rec.id)
 
+                # Poll for the thread count to plateau rather than reading it
+                # at a single fixed instant -- see
+                # _stable_query_worker_snapshot's docstring.
                 baseline = {
-                    id(t): t
-                    for t in threading.enumerate()
-                    if _is_query_worker_thread(t)
+                    id(t): t for t in _stable_query_worker_snapshot()
                 }
 
                 measured_cycles = 10
@@ -5303,9 +5419,7 @@ class TestHandleScanThreadPlateau:
                     rec = mgr.create(str(git_repo), "feature/alpha")
                     mgr.remove(rec.id)
 
-                after = [
-                    t for t in threading.enumerate() if _is_query_worker_thread(t)
-                ]
+                after = _stable_query_worker_snapshot()
                 new_survivors = [t for t in after if id(t) not in baseline]
 
             assert len(new_survivors) <= 1, (
