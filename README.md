@@ -564,7 +564,13 @@ entirely (diagnostic use only).
 ### Process lifecycle
 
 Process detachment on Windows uses `CREATE_NEW_PROCESS_GROUP` so that
-`CTRL_BREAK_EVENT` can be delivered for graceful stop. On POSIX,
+`CTRL_BREAK_EVENT` can be delivered for graceful stop. `CTRL_BREAK_EVENT`
+targets a console process group id, not an arbitrary pid, so it is only
+ever sent to a pid confirmed to be the leader of a group this module
+created — in practice, only `stop()`'s own tracked pid. Every other pid
+this module signals (a descendant-tree node, or a process discovered by the
+`kill_orphans` orphan scan) is never asserted as a leader and falls
+straight through to the wait/force-kill fallback instead. On POSIX,
 `start_new_session=True` is used and `SIGTERM` / `SIGKILL` are used for
 graceful and force stops respectively.
 

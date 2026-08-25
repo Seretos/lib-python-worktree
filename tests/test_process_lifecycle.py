@@ -915,6 +915,619 @@ class TestRoleLogSlug:
 
 
 # ---------------------------------------------------------------------------
+# TestGracefulSignalGroupLeadership -- ticket #147
+#
+# GenerateConsoleCtrlEvent (what os.kill(pid, CTRL_BREAK_EVENT) invokes on
+# win32) targets a console PROCESS GROUP id, not an arbitrary pid. Handing it
+# a pid we never confirmed is the leader of a process group WE created (via
+# CREATE_NEW_PROCESS_GROUP) is at best a no-op (ERROR_INVALID_PARAMETER) and
+# at worst misdirects the break to an unrelated process group sharing the
+# same console. These tests pin _send_graceful_signal's new
+# ``group_leader: bool = False`` keyword-only guard: the Windows break is
+# only ever issued when the caller explicitly asserts leadership, own-pid
+# and non-positive-pid are refused on both platforms regardless of
+# group_leader, POSIX SIGTERM is unaffected (it is already pid-precise), and
+# the two call sites that scan for pids we never spawned ourselves
+# (_kill_process_tree, _kill_blocking_processes's orphan scan) must never
+# assert leadership -- only stop()'s own tracked pid (spawned by this module
+# with CREATE_NEW_PROCESS_GROUP) may.
+# ---------------------------------------------------------------------------
+
+class TestGracefulSignalGroupLeadership:
+    # -- R1: the guard itself -------------------------------------------
+
+    def test_send_graceful_signal_skips_ctrl_break_when_leadership_unconfirmed(
+        self, caplog
+    ):
+        """Driving test (R1): without group_leader=True, no CTRL_BREAK_EVENT
+        may be issued at all on win32 -- the caller must explicitly assert
+        process-group leadership before this module aims a break at a pid."""
+        caplog.set_level(
+            logging.DEBUG, logger="lib_python_worktree.core.process_lifecycle"
+        )
+
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "kill") as mock_kill,
+        ):
+            mock_sys.platform = "win32"
+            result = _send_graceful_signal(4242)
+
+        mock_kill.assert_not_called()
+        refusal_records = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.DEBUG and "4242" in rec.message
+        ]
+        assert len(refusal_records) == 1, (
+            f"expected exactly one DEBUG refusal record naming pid 4242, "
+            f"got: {[r.message for r in caplog.records]}"
+        )
+        assert result is False
+
+    def test_send_graceful_signal_sends_ctrl_break_for_confirmed_leader(self):
+        """group_leader=True is the only way to get a CTRL_BREAK_EVENT."""
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "kill") as mock_kill,
+        ):
+            mock_sys.platform = "win32"
+            result = _send_graceful_signal(4243, group_leader=True)
+
+        mock_kill.assert_called_once_with(4243, signal.CTRL_BREAK_EVENT)
+        assert result is True
+
+    def test_send_graceful_signal_confirmed_leader_swallows_oserror(self):
+        """The existing except OSError: pass swallow must survive the new
+        guard unchanged -- a race between the liveness check and the signal
+        call must not raise, and must report False (not delivered)."""
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "kill", side_effect=OSError("no such process")),
+        ):
+            mock_sys.platform = "win32"
+            result = _send_graceful_signal(4244, group_leader=True)
+
+        assert result is False
+
+    @pytest.mark.parametrize("group_leader", [False, True])
+    def test_send_graceful_signal_posix_sigterm_ignores_group_leader_flag(
+        self, group_leader
+    ):
+        """POSIX SIGTERM is already pid-precise -- group_leader is a
+        win32-only concern and must not change POSIX behaviour either way."""
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "kill") as mock_kill,
+        ):
+            mock_sys.platform = "linux"
+            result = _send_graceful_signal(4245, group_leader=group_leader)
+
+        mock_kill.assert_called_once_with(4245, signal.SIGTERM)
+        assert result is True
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    @pytest.mark.parametrize("group_leader", [False, True])
+    def test_send_graceful_signal_refuses_own_pid_even_when_leader(
+        self, platform, group_leader
+    ):
+        """Mirrors _signal_process_group's 'never our own group' rule: even
+        an asserted leader must never be our own pid, on either platform."""
+        own_pid = os.getpid()
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "kill") as mock_kill,
+        ):
+            mock_sys.platform = platform
+            result = _send_graceful_signal(own_pid, group_leader=group_leader)
+
+        mock_kill.assert_not_called()
+        assert result is False
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    @pytest.mark.parametrize("group_leader", [False, True])
+    @pytest.mark.parametrize("pid", [0, -1])
+    def test_send_graceful_signal_refuses_non_positive_pid(
+        self, pid, platform, group_leader
+    ):
+        """pid <= 0 is refused unconditionally -- 0 in particular would
+        strike the WHOLE console on win32 (GenerateConsoleCtrlEvent's
+        group-id 0 means every process sharing the console)."""
+        with (
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch.object(os, "kill") as mock_kill,
+        ):
+            mock_sys.platform = platform
+            result = _send_graceful_signal(pid, group_leader=group_leader)
+
+        mock_kill.assert_not_called()
+        assert result is False
+
+    # -- R2: stop()'s tracked pid vs. everything else --------------------
+
+    def test_stop_asserts_leadership_only_for_tracked_pid(self):
+        """Driving test (R2): stop()'s own tracked pid (the one it spawned
+        via CREATE_NEW_PROCESS_GROUP) is the only pid allowed to assert
+        group_leader=True -- its snapshotted descendant-tree nodes (pids
+        this module never spawned itself) must never do so."""
+        fake_pid = 51000
+        descendants = [
+            KilledProcessInfo(pid=51001, name="child1", cmdline=["child1"]),
+            KilledProcessInfo(pid=51002, name="child2", cmdline=["child2"]),
+        ]
+        record = _make_record("wt-leadership-tracked", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        signal_calls = []
+
+        def _spy(pid, **kw):
+            signal_calls.append((pid, kw.get("group_leader", False)))
+            return True
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=descendants,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                side_effect=_spy,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+        ):
+            stop("wt-leadership-tracked", store=store, timeout=1.0)
+
+        calls_by_pid = dict(signal_calls)
+        assert calls_by_pid.get(fake_pid) is True, (
+            f"tracked pid {fake_pid} must be signalled with group_leader=True, "
+            f"got calls: {signal_calls}"
+        )
+        assert calls_by_pid.get(51001) is False, (
+            f"descendant 51001 must never assert leadership, got: {signal_calls}"
+        )
+        assert calls_by_pid.get(51002) is False, (
+            f"descendant 51002 must never assert leadership, got: {signal_calls}"
+        )
+
+    def test_kill_process_tree_never_asserts_leadership(self):
+        """_kill_process_tree signals pids this module never itself spawned
+        as a process-group leader -- it must always pass group_leader=False
+        (explicitly, not by omission)."""
+        tree = [
+            KilledProcessInfo(pid=52001, name="a", cmdline=["a"]),
+            KilledProcessInfo(pid=52002, name="b", cmdline=["b"]),
+            KilledProcessInfo(pid=52003, name="c", cmdline=["c"]),
+        ]
+        signal_calls = []
+
+        def _spy(pid, **kw):
+            signal_calls.append((pid, kw.get("group_leader", "MISSING")))
+            return True
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                side_effect=_spy,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            _kill_process_tree(tree, timeout=1.0)
+
+        assert signal_calls == [(52001, False), (52002, False), (52003, False)], (
+            f"every node in the tree kill must be signalled with "
+            f"group_leader=False, got {signal_calls}"
+        )
+
+    # -- R3: the kill_orphans=True orphan scan (AC3) ---------------------
+
+    def test_stop_kill_orphans_scan_never_asserts_leadership_for_discovered_orphans(
+        self,
+    ):
+        """Driving test (R3/AC3): a pid discovered by the path-heuristic
+        orphan scan (kill_orphans=True) was never spawned by this module and
+        must never assert group_leader=True, while stop()'s own tracked pid
+        still does."""
+        fake_pid = 53000
+        orphan_pid = 53500
+        record = _make_record("wt-orphan-leadership", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        fake_orphan = [
+            KilledProcessInfo(pid=orphan_pid, name="orphan", cmdline=["orphan"])
+        ]
+
+        signal_calls = []
+
+        def _spy(pid, **kw):
+            signal_calls.append((pid, kw.get("group_leader", False)))
+            return True
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_orphan,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                side_effect=_spy,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+            patch("lib_python_worktree.core.process_lifecycle._force_kill"),
+        ):
+            stop(
+                "wt-orphan-leadership",
+                store=store,
+                kill_orphans=True,
+                timeout=5.0,
+            )
+
+        signalled_pids = [p for p, _ in signal_calls]
+        assert orphan_pid in signalled_pids, (
+            f"the kill_orphans=True scan must actually signal the discovered "
+            f"orphan pid {orphan_pid} -- got {signal_calls}"
+        )
+        calls_by_pid = dict(signal_calls)
+        assert calls_by_pid.get(orphan_pid) is False, (
+            "a path-heuristic-discovered orphan must never be asserted as a "
+            f"confirmed process-group leader, got {signal_calls}"
+        )
+        assert calls_by_pid.get(fake_pid) is True, (
+            f"the tracked pid must still be signalled with group_leader=True, "
+            f"got {signal_calls}"
+        )
+
+    def test_stop_without_kill_orphans_runs_no_orphan_scan(self):
+        """Sanity counterpart: kill_orphans=False must never even invoke the
+        discovery scan (unaffected by this ticket's change; already true
+        before this fix -- this pins that it stays true)."""
+        fake_pid = 53001
+        record = _make_record("wt-no-orphan-scan", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+            ) as mock_find,
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            stop("wt-no-orphan-scan", store=store, kill_orphans=False, timeout=1.0)
+
+        mock_find.assert_not_called()
+
+    def test_kill_blocking_processes_force_kills_unconfirmed_orphan_with_no_budget(
+        self,
+    ):
+        """Driving test (Q2 force-kill fallback): when the graceful signal
+        was refused/not delivered (return value False) AND the zero-budget
+        branch is hit, the orphan must still be force-killed via
+        _wait_or_kill(pid, timeout=0.0) instead of merely being skipped."""
+        target = "/fake/worktree"
+        fake_found = [KilledProcessInfo(pid=54000, name="orphan", cmdline=["orphan"])]
+
+        wait_calls = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+                return_value=fake_found,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=lambda pid, timeout: wait_calls.append((pid, timeout)),
+            ),
+        ):
+            _kill_blocking_processes(target, timeout=0.0)
+
+        assert (54000, 0.0) in wait_calls, (
+            "when the graceful signal was not delivered and the budget is "
+            "exhausted, the force-kill fallback must still call "
+            f"_wait_or_kill(pid, timeout=0.0) -- got {wait_calls}"
+        )
+
+    def test_kill_process_tree_force_kills_unconfirmed_node_with_no_budget(self):
+        """Sibling coverage for the tree-kill loop's identical fallback."""
+        tree = [KilledProcessInfo(pid=54100, name="node", cmdline=["node"])]
+
+        wait_calls = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill",
+                side_effect=lambda pid, timeout: wait_calls.append((pid, timeout)),
+            ),
+        ):
+            _kill_process_tree(tree, timeout=0.0)
+
+        assert (54100, 0.0) in wait_calls, (
+            "when the graceful signal was not delivered and the budget is "
+            "exhausted, _kill_process_tree must force-kill via "
+            f"_wait_or_kill(pid, timeout=0.0) -- got {wait_calls}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestWindowsGracefulSignalGroupLeadership -- ticket #147, AC2
+#
+# Real win32 processes (no mocking of _send_graceful_signal itself): proves
+# that a bare, unconfirmed pid cannot reach a non-leader group member, while
+# a genuinely confirmed leader pid does reach the whole group -- and that a
+# leadership-confirmed break aimed at one group never strikes an unrelated
+# process group sharing the same console.
+# ---------------------------------------------------------------------------
+
+class TestWindowsGracefulSignalGroupLeadership:
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_send_graceful_signal_withholds_break_from_non_leader_group_member(
+        self, tmp_path, caplog
+    ):
+        """W1: a child C spawned by leader L with NO creationflags of its
+        own is a non-leader member of L's process group. Calling
+        _send_graceful_signal(C.pid) (leadership withheld) must issue no
+        CTRL_BREAK_EVENT at all and leave both processes untouched; a
+        leadership-confirmed call against L.pid is then used as a premise
+        check that C really was only reachable via L's group id."""
+        caplog.set_level(
+            logging.DEBUG, logger="lib_python_worktree.core.process_lifecycle"
+        )
+
+        l_marker = tmp_path / "l_break.marker"
+        c_marker = tmp_path / "c_break.marker"
+        pidfile = tmp_path / "child.pid"
+
+        child_code = (
+            "import signal, time\n"
+            "def _on_break(signum, frame):\n"
+            f"    with open({str(c_marker)!r}, 'w') as f:\n"
+            "        f.write('break')\n"
+            "        f.flush()\n"
+            "signal.signal(signal.SIGBREAK, _on_break)\n"
+            "time.sleep(300)\n"
+        )
+        leader_code = (
+            "import signal, subprocess, sys, time\n"
+            "def _on_break(signum, frame):\n"
+            f"    with open({str(l_marker)!r}, 'w') as f:\n"
+            "        f.write('break')\n"
+            "        f.flush()\n"
+            "signal.signal(signal.SIGBREAK, _on_break)\n"
+            "p = subprocess.Popen(\n"
+            f"    [sys.executable, '-c', {child_code!r}],\n"
+            "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            f"with open({str(pidfile)!r}, 'w') as f:\n"
+            "    f.write(str(p.pid))\n"
+            "    f.flush()\n"
+            "time.sleep(300)\n"
+        )
+
+        # stdin/stdout/stderr are redirected to DEVNULL, not inherited --
+        # mirrors _spawn_detached's own rationale (see its docstring): an
+        # inherited stdio handle held open by a long-lived
+        # (time.sleep(300)) grandchild would keep this test's own stdout
+        # pipe from ever reaching EOF, hanging whatever is reading it, even
+        # after the leader/child are force-killed in the finally block
+        # below via a different mechanism (TerminateProcess) that does not
+        # itself close inherited handles held by still-running descendants.
+        leader = subprocess.Popen(
+            [sys.executable, "-c", leader_code],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if pidfile.exists():
+                    content = pidfile.read_text().strip()
+                    if content:
+                        child_pid = int(content)
+                        break
+                time.sleep(0.05)
+            assert child_pid is not None, (
+                "child pid marker file was never written by the leader"
+            )
+            assert _pid_alive(child_pid), "child must be alive before the test"
+
+            # Safety deviation from the plan (documented in the change
+            # report): os.kill is mocked WITHOUT wraps=os.kill here, so the
+            # real GenerateConsoleCtrlEvent syscall is never actually
+            # issued for this leadership-withheld call. A live probe in
+            # this sandbox showed that os.kill(child_pid, CTRL_BREAK_EVENT)
+            # -- a non-leader pid passed as a console process-group id --
+            # does NOT fail with ERROR_INVALID_PARAMETER the way a clearly
+            # bogus id does; it is accepted by the OS and reliably
+            # correlates with the calling shell's own process being
+            # disrupted (repeatedly reproduced, each time crashing the
+            # very shell driving this test session). That is not a test
+            # artifact -- it IS this ticket's bug, demonstrated for real --
+            # but re-triggering it on every CI/dev run of this suite would
+            # be destabilizing the very console the suite runs in. The
+            # premise check below still performs a REAL, safe send
+            # (group_leader=True against the leader's own genuine group
+            # id) to prove the mechanism and the child's reachability only
+            # through that group.
+            with patch.object(os, "kill") as mock_kill:
+                result = _send_graceful_signal(child_pid)
+
+            ctrl_break_calls = [
+                c
+                for c in mock_kill.call_args_list
+                if len(c.args) >= 2 and c.args[1] == signal.CTRL_BREAK_EVENT
+            ]
+            assert ctrl_break_calls == [], (
+                "no CTRL_BREAK_EVENT may be issued for a non-leader group "
+                f"member without leadership confirmation, got {ctrl_break_calls}"
+            )
+            refusal_records = [
+                rec
+                for rec in caplog.records
+                if rec.levelno == logging.DEBUG and str(child_pid) in rec.message
+            ]
+            assert len(refusal_records) == 1, (
+                f"expected a single DEBUG refusal record naming pid "
+                f"{child_pid}, got: {[r.message for r in caplog.records]}"
+            )
+            assert result is False
+
+            time.sleep(2.0)
+            assert not c_marker.exists(), "child must not have received a break"
+            assert not l_marker.exists(), "leader must not have received a break"
+            assert _pid_alive(leader.pid), "leader must still be alive"
+            assert _pid_alive(child_pid), "child must still be alive"
+
+            # Premise check: a leadership-CONFIRMED break aimed at the
+            # LEADER's own pid really does reach the child via the shared
+            # console process group -- proving the child was reachable only
+            # through the leader's group id, never its own.
+            premise_result = _send_graceful_signal(leader.pid, group_leader=True)
+            assert premise_result is True
+            premise_deadline = time.monotonic() + 5.0
+            while time.monotonic() < premise_deadline and not c_marker.exists():
+                time.sleep(0.05)
+            if not c_marker.exists():
+                pytest.skip(
+                    "child never observed the leader-group CTRL_BREAK_EVENT "
+                    "-- cannot prove the premise on this host; skipping"
+                )
+        finally:
+            for leaked_pid in (leader.pid, child_pid):
+                if leaked_pid is not None:
+                    try:
+                        _force_kill(leaked_pid)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_send_graceful_signal_leader_confirmed_break_does_not_strike_bystander(
+        self, tmp_path
+    ):
+        """W2: bystander B and target T are both their own
+        CREATE_NEW_PROCESS_GROUP leaders sharing the same console but
+        belonging to different groups. A leadership-confirmed break aimed
+        at T must reach only T, never B."""
+        t_marker = tmp_path / "t_break.marker"
+        b_heartbeat = tmp_path / "b_heartbeat.txt"
+
+        bystander_code = (
+            "import time\n"
+            f"path = {str(b_heartbeat)!r}\n"
+            "count = 0\n"
+            "while True:\n"
+            "    count += 1\n"
+            "    with open(path, 'w') as f:\n"
+            "        f.write(str(count))\n"
+            "        f.flush()\n"
+            "    time.sleep(0.1)\n"
+        )
+        target_code = (
+            "import signal, time\n"
+            "def _on_break(signum, frame):\n"
+            f"    with open({str(t_marker)!r}, 'w') as f:\n"
+            "        f.write('break')\n"
+            "        f.flush()\n"
+            "signal.signal(signal.SIGBREAK, _on_break)\n"
+            "time.sleep(300)\n"
+        )
+
+        # stdin/stdout/stderr are redirected to DEVNULL, not inherited --
+        # see the matching comment on the leader Popen() call in W1 above
+        # for why this is required (an inherited handle held open by a
+        # long-lived child would hang this test's own stdout pipe).
+        bystander = subprocess.Popen(
+            [sys.executable, "-c", bystander_code],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        target = subprocess.Popen(
+            [sys.executable, "-c", target_code],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not b_heartbeat.exists():
+                time.sleep(0.05)
+            assert b_heartbeat.exists(), "bystander never wrote its first heartbeat"
+            time.sleep(0.35)
+
+            def _read_heartbeat():
+                try:
+                    content = b_heartbeat.read_text().strip()
+                    return int(content) if content else 0
+                except (OSError, ValueError):
+                    return 0
+
+            before = _read_heartbeat()
+
+            result = _send_graceful_signal(target.pid, group_leader=True)
+            assert result is True
+
+            break_deadline = time.monotonic() + 5.0
+            while time.monotonic() < break_deadline and not t_marker.exists():
+                time.sleep(0.05)
+            if not t_marker.exists():
+                pytest.skip(
+                    "target never observed CTRL_BREAK_EVENT -- cannot prove "
+                    "the premise on this host; skipping"
+                )
+
+            time.sleep(0.3)
+            after = _read_heartbeat()
+
+            assert _pid_alive(bystander.pid), (
+                "an unrelated process-group leader sharing the console must "
+                "not be struck by a break aimed at a different group's pid"
+            )
+            assert after > before, (
+                f"bystander heartbeat did not advance ({before} -> {after}) "
+                "-- it may have been killed or frozen by the break"
+            )
+        finally:
+            for leaked_pid in (bystander.pid, target.pid):
+                try:
+                    _force_kill(leaked_pid)
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # stop() tests
 # ---------------------------------------------------------------------------
 
@@ -1196,7 +1809,7 @@ class TestStopKillOrphans:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
@@ -1641,7 +2254,7 @@ class TestKillBlockingProcesses:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
@@ -1737,7 +2350,7 @@ class TestKillBlockingProcesses:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
@@ -1781,7 +2394,7 @@ class TestKillBlockingProcesses:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
@@ -4858,7 +5471,7 @@ class TestKillProcessTree:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
@@ -4888,7 +5501,7 @@ class TestKillProcessTree:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
@@ -5151,7 +5764,7 @@ class TestProcessTreeLineage:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda pid: graceful_calls.append(pid),
+                side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
             ),
             patch("lib_python_worktree.core.process_lifecycle._force_kill"),
             patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
@@ -7910,7 +8523,7 @@ class TestStopKillsProcessGroupSurvivors:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
-                side_effect=lambda p: graceful_calls.append(p),
+                side_effect=lambda p, **_kw: (graceful_calls.append(p), True)[1],
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._wait_or_kill",
