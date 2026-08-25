@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import itertools
 import logging
 import os
 import signal
@@ -95,8 +96,8 @@ def _redirect_start_log_root(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_wedged_object_registry(monkeypatch):
-    """Isolate ``_pl._wedged_object_keys`` (ticket #121) across every test
-    in this module.
+    """Isolate ``_pl._wedged_object_keys`` (ticket #121) and ticket #148's
+    process-wide handle-scan state across every test in this module.
 
     The registry is a module global. Several existing tests
     (``TestDiscoveryCompleteness``'s N2/N3, and this ticket's own new
@@ -111,8 +112,19 @@ def _reset_wedged_object_registry(monkeypatch):
     in the module rather than requiring each test to opt in individually --
     resetting an empty ``OrderedDict`` is cheap and has no effect on tests
     that never touch the registry.
+
+    Ticket #148: also calls ``_pl._reset_handle_scan_state()``, which drops
+    the process-wide persistent-worker reference (``_persistent_query_worker``)
+    and zeroes ``_wedged_worker_count``/``_wedged_object_keys`` -- without
+    this, a persistent worker (or wedged-worker count) left behind by one
+    test would leak into and poison a later test's thread-count or
+    scan-start-gate assertions, exactly the same class of cross-test
+    pollution this fixture already guards against for the #121 registry.
     """
     monkeypatch.setattr(_pl, "_wedged_object_keys", OrderedDict())
+    _pl._reset_handle_scan_state()
+    yield
+    _pl._reset_handle_scan_state()
 
 
 # ---------------------------------------------------------------------------
@@ -4557,68 +4569,83 @@ class TestWinHandleHoldersReal:
     def test_scan_still_runs_and_finds_results_when_wedged_cap_already_full(
         self, tmp_path, monkeypatch
     ):
-        """Reviewer fix pass, ticket #90: a scan-start check that refused to
-        scan at all once ``_wedged_worker_count`` reached
-        ``_MAX_WEDGED_HANDLE_WORKERS`` was tried and rejected -- a wedged
-        worker may, by definition, never return from its NtQueryObject
-        call, so that check would latch permanently once the cap had ever
-        been reached, making every later ``_win_handle_holders`` call
-        silently return ``[]`` forever for the rest of the process's life.
+        """Reviewer fix pass, ticket #90, premise REVERSED by ticket #148:
+        the original version of this test pinned "cap full -> scan still
+        runs unconditionally, via a fresh initial worker every time" -- that
+        unconditional-fresh-initial-worker behaviour is exactly the
+        unbounded per-scan daemon-thread leak ticket #148 closes. Once the
+        new scan-start capacity gate exists, a scan started with the cap
+        already full only proceeds when a HEALTHY PERSISTENT worker already
+        exists to reuse (see ``_acquire_scan_worker``) -- it does not spin
+        up a brand-new initial worker regardless of the cap, as the old
+        contract required. This test now pins the NEW premise directly: cap
+        full, but a persistent worker already present -> the scan still
+        runs (via that persistent worker) and finds real results.
 
-        This pins the corrected contract directly: even with
-        ``_wedged_worker_count`` seeded at the cap (simulating capacity
-        already claimed elsewhere in the process, exactly as the rejected
-        scan-start check would have seen it), a scan must still create its
-        initial worker, actually run, and return genuine findings -- not an
-        empty list.
+        ``_pl._persistent_query_worker`` does not exist yet at RED time
+        (ticket #148's own fix introduces it) -- the ``monkeypatch.setattr``
+        below is expected to raise ``AttributeError``, which is the correct
+        RED failure for this not-yet-implemented module state.
         """
         monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
 
-        target_dir = tmp_path / "target"
-        target_dir.mkdir()
-        target_file = target_dir / "held.txt"
-        target_file.write_text("hold me open")
-
-        code = (
-            "import sys, time\n"
-            f"f = open({str(target_file)!r}, 'r')\n"
-            "sys.stdout.write('ready\\n')\n"
-            "sys.stdout.flush()\n"
-            "time.sleep(10)\n"
-        )
-        proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
+        # A real, healthy persistent worker for the scan-start gate to reuse
+        # once it exists. Constructed unconditionally (before the
+        # AttributeError-raising setattr below) so it is always cleaned up
+        # via the finally block even when the setattr itself fails at RED.
+        _existing_worker = _pl._BoundedQueryWorker()
         try:
-            import psutil
+            monkeypatch.setattr(_pl, "_persistent_query_worker", _existing_worker)
 
-            ready_line = proc.stdout.readline()
-            assert ready_line.strip() == "ready", (
-                f"child process failed to signal readiness: {ready_line!r}"
-            )
+            target_dir = tmp_path / "target"
+            target_dir.mkdir()
+            target_file = target_dir / "held.txt"
+            target_file.write_text("hold me open")
 
-            excluded_pids = set(psutil.pids()) - {proc.pid}
-
-            result = _win_handle_holders(
-                str(target_file),
-                excluded_pids=excluded_pids,
-                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            code = (
+                "import sys, time\n"
+                f"f = open({str(target_file)!r}, 'r')\n"
+                "sys.stdout.write('ready\\n')\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(10)\n"
             )
-            found_pids = {pid for pid, _ in result}
-            assert proc.pid in found_pids, (
-                "a scan started while the process-wide wedged-worker cap was "
-                "already full must still run and find real results, not "
-                f"silently return []; got {result}"
+            proc = subprocess.Popen(
+                [sys.executable, "-c", code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
             )
-        finally:
-            proc.kill()
             try:
-                proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+                import psutil
+
+                ready_line = proc.stdout.readline()
+                assert ready_line.strip() == "ready", (
+                    f"child process failed to signal readiness: {ready_line!r}"
+                )
+
+                excluded_pids = set(psutil.pids()) - {proc.pid}
+
+                result = _win_handle_holders(
+                    str(target_file),
+                    excluded_pids=excluded_pids,
+                    budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+                )
+                found_pids = {pid for pid, _ in result}
+                assert proc.pid in found_pids, (
+                    "a scan started while the process-wide wedged-worker cap "
+                    "was already full, but with a healthy persistent worker "
+                    "already available, must still run (reusing that "
+                    "worker) and find real results, not silently return "
+                    f"[]; got {result}"
+                )
+            finally:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            _existing_worker.close()
 
     @pytest.mark.skipif(
         sys.platform != "win32",
@@ -4828,17 +4855,29 @@ class TestWinHandleHoldersThreadHygiene:
             # before the assertion below.
             deadline = time.monotonic() + 2.0
             delta = threading.active_count() - baseline
-            while delta > 0 and time.monotonic() < deadline:
+            while delta > 1 and time.monotonic() < deadline:
                 time.sleep(0.02)
                 delta = threading.active_count() - baseline
 
-            assert delta <= 0, (
+            # Ticket #148: the bound is now <=1, not <=0. Before #148, a
+            # healthy scan closed its worker on exit, so the delta genuinely
+            # settled back to 0. #148 replaces that per-scan worker with a
+            # single process-wide PERSISTENT worker that deliberately stays
+            # alive (parked on queue.get()) between scans, to be reused by
+            # the next one instead of recreated -- that reused worker's
+            # thread is the intentional "+1" in _HANDLE_SCAN_MAX_LIVE_WORKERS,
+            # not a leak: it does not grow further with additional healthy
+            # scans (still <=1 after 10 scans here), which is what this test
+            # continues to guard against.
+            assert delta <= 1, (
                 f"10 repeated _win_handle_holders scans against a real, healthy "
                 f"(non-wedged) handle table left a thread-count delta of {delta} "
-                f"-- expected it to settle back to 0, not grow with each scan "
-                f"(tickets #90/#121: a healthy scan must never leak a thread at "
-                f"all; #121's wedged-handle registry is only exercised by a "
-                f"handle that actually wedges, see the sibling tests below)"
+                f"-- expected it to settle at <=1 (ticket #148's single "
+                f"reused persistent worker), not grow with each scan "
+                f"(tickets #90/#121/#148: a healthy scan must never leak "
+                f"MORE than the one persistent worker; #121's wedged-handle "
+                f"registry is only exercised by a handle that actually "
+                f"wedges, see the sibling tests below)"
             )
         finally:
             proc.kill()
@@ -5075,6 +5114,678 @@ class TestWinHandleHoldersThreadHygiene:
         )
         assert result == []
         assert result.complete is True
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_repeated_scans_over_distinct_wedging_objects_do_not_grow_thread_count(
+        self, tmp_path, monkeypatch
+    ):
+        """R1 (ticket #148): with the process-wide wedged-worker cap ALREADY
+        full BEFORE the very first scan (simulating a long-lived host that
+        has already accumulated ``_MAX_WEDGED_HANDLE_WORKERS`` legitimately
+        retired workers elsewhere), 20 repeated ``_win_handle_holders``
+        scans -- each against a DISTINCT, never-before-seen wedging object
+        (a unique nonzero ``object_ptr`` every call, so ticket #121's
+        per-object dedup registry can never mask this) -- must still
+        plateau near a small, constant, process-wide bound, not grow by
+        roughly one leaked thread per call.
+
+        Distinguishes this from the existing
+        ``test_repeated_scans_with_a_persistently_wedging_handle_plateau_thread_count``
+        sibling test above: that test reuses ``object_ptr=0`` (the same
+        fallback key) on every one of its 20 calls, so ticket #121's
+        registry already suppresses calls 2-20 outright -- it cannot detect
+        THIS ticket's bug (a fresh, never-suppressed initial worker leaked
+        per scan) at all. Using a distinct object each call is what forces
+        every one of the 20 calls to actually reach a fresh initial worker.
+
+        Today (unfixed): the initial worker is created unconditionally on
+        every call regardless of the cap (see the rejected-scan-start-gate
+        comment above ``_win_handle_holders``) and is never itself counted
+        against any per-scan-start bound, so this leaks roughly one thread
+        per call -- the delta should land near 20, far above the target
+        bound asserted below.
+        """
+        import msvcrt
+
+        held = tmp_path / "held-distinct.txt"
+        held.write_text("hold me open")
+        f = open(held, "r")
+        try:
+            handle_value = msvcrt.get_osfhandle(f.fileno())
+            my_pid = os.getpid()
+            release = threading.Event()
+
+            monkeypatch.setattr(
+                _pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS
+            )
+
+            def _blocking_query_object_raw(ntdll, dup_handle, info_class):
+                release.wait()
+                return None
+
+            monkeypatch.setattr(_pl, "_query_object_raw", _blocking_query_object_raw)
+
+            baseline = threading.active_count()
+            try:
+                for i in range(20):
+                    object_ptr = 0x900000 + i
+                    fake_table = {my_pid: [(handle_value, 646464, object_ptr)]}
+                    monkeypatch.setattr(
+                        _pl,
+                        "_enumerate_handle_table",
+                        lambda ntdll, excluded, _t=fake_table: _t,
+                    )
+                    _win_handle_holders(
+                        str(tmp_path),
+                        excluded_pids=set(),
+                        budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+                    )
+
+                delta = threading.active_count() - baseline
+                # Hardcoded 9 == 1 + _MAX_WEDGED_HANDLE_WORKERS -- the target
+                # bound this ticket introduces as _HANDLE_SCAN_MAX_LIVE_WORKERS.
+                # Switch to referencing that constant directly once it exists.
+                target_bound = 1 + _MAX_WEDGED_HANDLE_WORKERS
+                assert delta <= target_bound, (
+                    f"20 repeated _win_handle_holders scans, each against a "
+                    f"distinct never-before-seen wedging object, with the "
+                    f"process-wide wedged-worker cap already full at entry, "
+                    f"left a thread-count delta of {delta} -- expected it to "
+                    f"plateau at or below 1 + _MAX_WEDGED_HANDLE_WORKERS "
+                    f"(={target_bound}), not grow with each call"
+                )
+            finally:
+                release.set()
+        finally:
+            f.close()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+
+
+# ---------------------------------------------------------------------------
+# TestHandleScanThreadPlateau -- ticket #148 (headline evidence bar: a real
+# create()/remove() lifecycle must not leak a thread per removal)
+# ---------------------------------------------------------------------------
+
+class TestHandleScanThreadPlateau:
+    """R1 (ticket #148): repeated real ``WorktreeManager.create()``/
+    ``remove()`` cycles against a long-lived host process must not leak one
+    daemon thread per removal. Before this ticket's fix,
+    ``_win_handle_holders`` unconditionally created a fresh *initial*
+    ``_BoundedQueryWorker`` on every scan -- if that initial worker's
+    ``NtQueryObject`` call wedges, its thread is never accounted for by
+    ``_MAX_WEDGED_HANDLE_WORKERS`` (which only ever gated *replacement*
+    workers) and is never joined, so it survives forever.
+
+    This proves the regression end-to-end through the real
+    ``WorktreeManager`` lifecycle, mirroring the downstream measurement
+    methodology used by agent-worktree's own
+    ``test_thread_leak_regression.py``: thread OBJECT identity (``id()``),
+    not ``Thread.ident`` (recycled by the OS), diffed against a
+    post-warm-up baseline, survivors filtered to the known leak signature
+    (a daemon thread whose bound target is a ``_BoundedQueryWorker``).
+    """
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_repeated_create_remove_cycles_plateau_thread_count(
+        self, manager_factory, git_repo, tmp_path, monkeypatch
+    ):
+        import msvcrt
+        import psutil
+
+        mgr = manager_factory()
+
+        held = tmp_path / "held-plateau.txt"
+        held.write_text("hold me open")
+        f = open(held, "r")
+        handle_value = msvcrt.get_osfhandle(f.fileno())
+        my_pid = os.getpid()
+
+        release = threading.Event()
+        object_ptr_counter = itertools.count(1)
+
+        def _blocking_query_object_raw(ntdll, dup_handle, info_class):
+            release.wait()
+            return None
+
+        def _fake_enumerate_handle_table(ntdll, excluded):
+            ptr = next(object_ptr_counter)
+            return {my_pid: [(handle_value, 828282, ptr)]}
+
+        monkeypatch.setattr(_pl, "_query_object_raw", _blocking_query_object_raw)
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", _fake_enumerate_handle_table
+        )
+        monkeypatch.setattr(psutil, "process_iter", lambda *a, **kw: iter([]))
+
+        def _is_query_worker_thread(t: "threading.Thread") -> bool:
+            if not t.daemon:
+                return False
+            target = getattr(t, "_target", None)
+            if target is not None:
+                owner = getattr(target, "__self__", None)
+                if owner is not None:
+                    return isinstance(owner, _pl._BoundedQueryWorker)
+            name = t.name
+            return name.startswith("Thread-") and name.endswith("(_run)")
+
+        try:
+            with patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                _pl._find_blocking_processes,
+            ):
+                # Warm-up: once _HANDLE_SCAN_MAX_LIVE_WORKERS exists, this
+                # should read `1 + _pl._HANDLE_SCAN_MAX_LIVE_WORKERS` -- it
+                # does not exist yet at RED time (this ticket's own fix), so
+                # the target value (1 + _MAX_WEDGED_HANDLE_WORKERS == 9) is
+                # hardcoded directly rather than blocking this tests-first
+                # phase on a not-yet-implemented constant.
+                warmup_cycles = 1 + _MAX_WEDGED_HANDLE_WORKERS
+                for _ in range(warmup_cycles):
+                    rec = mgr.create(str(git_repo), "feature/alpha")
+                    mgr.remove(rec.id)
+
+                baseline = {
+                    id(t): t
+                    for t in threading.enumerate()
+                    if _is_query_worker_thread(t)
+                }
+
+                measured_cycles = 10
+                for _ in range(measured_cycles):
+                    rec = mgr.create(str(git_repo), "feature/alpha")
+                    mgr.remove(rec.id)
+
+                after = [
+                    t for t in threading.enumerate() if _is_query_worker_thread(t)
+                ]
+                new_survivors = [t for t in after if id(t) not in baseline]
+
+            assert len(new_survivors) <= 1, (
+                f"{measured_cycles} sequential create()/remove() cycles left "
+                f"{len(new_survivors)} new leaked query-worker daemon "
+                f"thread(s) beyond the post-warm-up baseline of "
+                f"{len(baseline)} -- expected the thread count to plateau "
+                f"(<=1, load-tolerant slack), not grow roughly linearly "
+                f"with the number of remove() calls (ticket #148: "
+                f"_win_handle_holders' unconditional fresh initial worker "
+                f"per scan)"
+            )
+        finally:
+            release.set()
+            f.close()
+
+
+# ---------------------------------------------------------------------------
+# TestHandleScanStartGate -- ticket #148, R2 (loud scan-start capacity gate)
+# ---------------------------------------------------------------------------
+
+class TestHandleScanStartGate:
+    """R2 (ticket #148): once the process-wide wedged-worker cap is already
+    full at scan-start (and no persistent worker is available to reuse),
+    the scan must refuse loudly -- returning ``complete=False`` tagged
+    ``handle_scan:capped`` and logging a warning -- BEFORE ever dumping the
+    system-wide handle table, instead of running the (very heavy) dump and
+    per-handle loop only to have every query immediately re-hit the same
+    cap."""
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_scan_start_gate_returns_capped_without_dumping(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+
+        calls: List[int] = []
+
+        def _spy_enumerate_handle_table(ntdll, excluded):
+            calls.append(1)
+            return {}
+
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", _spy_enumerate_handle_table
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        ):
+            result = _win_handle_holders(
+                str(tmp_path),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+        assert not calls, (
+            "_enumerate_handle_table was invoked despite the process-wide "
+            "wedged-worker cap already being full at scan-start (and no "
+            "persistent worker available) -- the scan-start capacity gate "
+            "must refuse before ever dumping the handle table"
+        )
+        assert result.complete is False
+        assert "handle_scan:capped" in result.skipped_passes
+        assert any(
+            "cap" in rec.message.lower() for rec in caplog.records
+        ), "expected a warning naming the scan-start capacity refusal"
+
+
+# ---------------------------------------------------------------------------
+# TestHandleScanBusyGate -- ticket #148, R3 (handle_scan:busy on lock
+# contention)
+# ---------------------------------------------------------------------------
+
+class TestHandleScanBusyGate:
+    """R3 (ticket #148): a concurrently-running scan holding the new
+    module-level ``_handle_scan_lock`` must not block a second caller
+    forever -- the second scan gives up after a bounded wait and reports
+    ``handle_scan:busy`` rather than dumping the handle table
+    concurrently."""
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_lock_contention_reports_busy_without_scanning(
+        self, tmp_path, monkeypatch
+    ):
+        calls: List[int] = []
+
+        def _spy_enumerate_handle_table(ntdll, excluded):
+            calls.append(1)
+            return {}
+
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", _spy_enumerate_handle_table
+        )
+
+        # _handle_scan_lock does not exist yet at RED time (ticket #148's
+        # own fix introduces it) -- referencing it directly here is
+        # deliberate: an AttributeError is the expected RED failure for
+        # this not-yet-implemented module state, not a fixture bug.
+        _pl._handle_scan_lock.acquire()
+        try:
+            result = _win_handle_holders(
+                str(tmp_path), excluded_pids=set(), budget_sec=0.0
+            )
+        finally:
+            _pl._handle_scan_lock.release()
+
+        assert not calls, (
+            "_enumerate_handle_table was invoked despite the scan-level "
+            "lock being held by another caller -- a contended scan must "
+            "give up and report handle_scan:busy rather than dumping the "
+            "handle table concurrently"
+        )
+        assert result.complete is False
+        assert "handle_scan:busy" in result.skipped_passes
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_lock_contention_reports_busy_with_positive_budget_not_just_zero(
+        self, tmp_path, monkeypatch
+    ):
+        """R3 additional coverage (test-critic finding): the sibling test
+        above only exercises ``budget_sec=0.0`` while ALSO holding the
+        lock -- an implementation that merely short-circuited on
+        ``budget_sec<=0`` (never actually touching ``_handle_scan_lock`` at
+        all) would pass that test too, without the lock being the real
+        mechanism. This case uses a POSITIVE ``budget_sec`` (10.0s,
+        comfortably larger than ``_HANDLE_SCAN_LOCK_WAIT_MAX_SEC`` == 2.0s)
+        -- a "budget<=0 => busy" shortcut would instead proceed straight to
+        the real scan here. The facts that (a) ``_enumerate_handle_table``
+        is still never called and (b) the call still returns well within
+        bounded time (not the full 10s budget) together prove the LOCK
+        itself, not the budget, is what is actually being consulted.
+        """
+        calls: List[int] = []
+
+        def _spy_enumerate_handle_table(ntdll, excluded):
+            calls.append(1)
+            return {}
+
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", _spy_enumerate_handle_table
+        )
+
+        _pl._handle_scan_lock.acquire()
+        try:
+            t0 = time.monotonic()
+            result = _win_handle_holders(
+                str(tmp_path), excluded_pids=set(), budget_sec=10.0
+            )
+            elapsed = time.monotonic() - t0
+        finally:
+            _pl._handle_scan_lock.release()
+
+        assert not calls, (
+            "_enumerate_handle_table was invoked despite the scan-level "
+            "lock being held by another caller with a POSITIVE budget_sec "
+            "-- a 'budget_sec<=0 => busy' shortcut (bypassing the lock "
+            "entirely) would also incorrectly pass the budget_sec=0.0 "
+            "sibling test, but must fail this one"
+        )
+        assert result.complete is False
+        assert "handle_scan:busy" in result.skipped_passes
+        assert elapsed < 5.0, (
+            f"lock-contention busy-gate took {elapsed:.2f}s -- expected it "
+            f"to give up within _HANDLE_SCAN_LOCK_WAIT_MAX_SEC (2.0s) plus "
+            f"slack, not proceed to run the real (10s-budgeted) scan"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGrantedAccessDeferredResolution -- ticket #148, R5 (hang-prone
+# GrantedAccess type-probe pre-filter with deferred resolution)
+# ---------------------------------------------------------------------------
+
+class TestGrantedAccessDeferredResolution:
+    """R5 (ticket #148): a handle whose ``GrantedAccess`` matches the
+    documented hang-prone bitmask (``0x0012019F``) must never itself be the
+    one that triggers the type probe -- its type resolution is deferred to
+    a same-type-index sibling handle instead, and only revisited (for a
+    NAME probe) at end-of-scan once that sibling has resolved the shared
+    type index to ``"File"``."""
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_hang_prone_granted_access_defers_type_probe_to_a_sibling_handle(
+        self, tmp_path, monkeypatch
+    ):
+        """The masked handle's own file lives INSIDE the scan target (so it
+        would match if queried directly); the sibling's file lives OUTSIDE
+        it (so it can never itself cause a match).
+
+        Today (unfixed): ``_enumerate_handle_table`` emits 3-tuples and
+        ``_process_handle`` unpacks exactly 3 values per entry -- the
+        4-tuple fake table below (widened to also carry ``granted_access``,
+        per this ticket) will not even unpack, which is itself the
+        expected RED signal (a direct, genuine demonstration that the
+        widening described by this ticket does not exist yet, not a
+        fixture bug).
+
+        Once the widening AND the GrantedAccess pre-filter both exist: the
+        masked handle (processed first, with an empty per-type-index
+        cache) defers instead of probing (0 calls), the sibling is reached
+        and itself probed (TYPE + NAME, matching neither, since it lives
+        outside the target), and only the end-of-scan revisit finally
+        issues the masked entry's NAME probe (using the type the sibling
+        already resolved) -- 3 total calls. Without the fix, the masked
+        handle's own TYPE+NAME probes fire immediately and the per-handle
+        loop ``break``s on that immediate match before the sibling is EVER
+        reached -- 2 total calls, and the sibling's own probe never fires.
+        """
+        import msvcrt
+
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        masked_file = target_dir / "masked.txt"
+        masked_file.write_text("masked")
+
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        sibling_file = outside_dir / "sibling.txt"
+        sibling_file.write_text("sibling")
+
+        f_masked = open(masked_file, "r")
+        f_sibling = open(sibling_file, "r")
+        try:
+            masked_handle_value = msvcrt.get_osfhandle(f_masked.fileno())
+            sibling_handle_value = msvcrt.get_osfhandle(f_sibling.fileno())
+            my_pid = os.getpid()
+            shared_type_index = 313131
+            _hang_prone_granted_access = 0x0012019F
+
+            fake_table = {
+                my_pid: [
+                    # 4-tuple: (handle_value, type_index, object_ptr,
+                    # granted_access) -- widened by this ticket.
+                    (
+                        masked_handle_value, shared_type_index, 0xAAA001,
+                        _hang_prone_granted_access,
+                    ),
+                    (sibling_handle_value, shared_type_index, 0xAAA002, 0),
+                ]
+            }
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+
+            real_query_object_raw = _pl._query_object_raw
+            calls: List[tuple] = []
+
+            def _recording_query_object_raw(ntdll, dup_handle, info_class):
+                name = real_query_object_raw(ntdll, dup_handle, info_class)
+                calls.append((info_class, name))
+                return name
+
+            monkeypatch.setattr(
+                _pl, "_query_object_raw", _recording_query_object_raw
+            )
+
+            result = _win_handle_holders(
+                str(target_dir),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+            assert my_pid in {pid for pid, _ in result}, (
+                f"expected {my_pid} to be found via the masked handle's "
+                f"deferred revisit; got {result}"
+            )
+            assert len(calls) == 3, (
+                f"expected exactly 3 NtQueryObject-equivalent calls (sibling "
+                f"TYPE + sibling NAME + masked-revisit NAME) -- got "
+                f"{len(calls)}: {calls!r}. A count of 2 means the masked "
+                f"handle's own TYPE+NAME probes fired immediately (today's "
+                f"unfixed behaviour) and the per-handle loop broke on that "
+                f"match before the sibling was ever reached, rather than "
+                f"deferring the masked handle and revisiting it only after "
+                f"the sibling resolved the shared type index."
+            )
+        finally:
+            f_masked.close()
+            f_sibling.close()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_granted_access_requires_exact_equality_not_merely_nonzero(
+        self, tmp_path, monkeypatch
+    ):
+        """R5 additional coverage (test-critic finding): the sibling test
+        above only ever exercises two ``GrantedAccess`` values -- the exact
+        hang-prone mask (``0x0012019F``) and ``0`` -- so a truthy/"any
+        nonzero value" check would pass it too, without ever actually
+        comparing against the named constant. This case uses a THIRD value
+        that is nonzero but does NOT equal ``_HANG_PRONE_GRANTED_ACCESS``
+        (``0x0012019E``, one bit off) on a handle whose file lives INSIDE
+        the scan target -- proving it is queried and matched normally (not
+        deferred): a truthiness-only implementation would incorrectly defer
+        it too, and this handle would never be found via the normal
+        per-handle probe path.
+        """
+        import msvcrt
+
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        held_file = target_dir / "held.txt"
+        held_file.write_text("held")
+
+        f_held = open(held_file, "r")
+        try:
+            handle_value = msvcrt.get_osfhandle(f_held.fileno())
+            my_pid = os.getpid()
+            _not_hang_prone_granted_access = 0x0012019E  # one bit off the mask
+
+            fake_table = {
+                my_pid: [
+                    (handle_value, 424343, 0xCCC001, _not_hang_prone_granted_access),
+                ]
+            }
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+
+            real_query_object_raw = _pl._query_object_raw
+            calls: List[tuple] = []
+
+            def _recording_query_object_raw(ntdll, dup_handle, info_class):
+                name = real_query_object_raw(ntdll, dup_handle, info_class)
+                calls.append((info_class, name))
+                return name
+
+            monkeypatch.setattr(
+                _pl, "_query_object_raw", _recording_query_object_raw
+            )
+
+            result = _win_handle_holders(
+                str(target_dir),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+            assert my_pid in {pid for pid, _ in result}, (
+                f"expected {my_pid} to be found via the normal "
+                f"(non-deferred) per-handle probe path; got {result} -- a "
+                f"GrantedAccess value that is nonzero but does not exactly "
+                f"equal _HANG_PRONE_GRANTED_ACCESS must never be deferred"
+            )
+            assert len(calls) == 2, (
+                f"expected exactly 2 NtQueryObject-equivalent calls (TYPE "
+                f"+ NAME) for a handle whose GrantedAccess is nonzero but "
+                f"does NOT match _HANG_PRONE_GRANTED_ACCESS exactly -- got "
+                f"{len(calls)}: {calls!r}. Zero calls would mean this "
+                f"handle was incorrectly deferred by a truthiness/nonzero "
+                f"check instead of exact equality against the named "
+                f"constant."
+            )
+        finally:
+            f_held.close()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_deferred_masked_handle_overflow_is_loud_and_incomplete(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """R5 additional coverage: the deferred-masked-handle revisit list
+        is itself bounded (``_MAX_DEFERRED_MASKED_HANDLES``) -- hitting
+        that cap is a reportable degradation (``handle_scan:
+        masked_deferred_capped``, ``complete=False``, one warning), not a
+        silent drop. Also pins that this tag is NOT one of teardown's
+        blind-scan tags -- unlike ``handle_scan:capped``, this condition is
+        transient, not a permanent process-wide exhaustion (its stop()
+        mapping is covered separately, in TestStopDetail).
+
+        Neither ``_MAX_DEFERRED_MASKED_HANDLES`` nor
+        ``"handle_scan:masked_deferred_capped"`` exist yet at RED time --
+        the ``monkeypatch.setattr`` below is expected to raise
+        ``AttributeError``, which is the correct RED failure for this
+        not-yet-implemented module state.
+        """
+        monkeypatch.setattr(_pl, "_MAX_DEFERRED_MASKED_HANDLES", 2)
+
+        _hang_prone_granted_access = 0x0012019F
+        my_pid = os.getpid()
+        # More masked entries (all sharing a type index that never resolves
+        # to "File", so none can ever be revisited/resolved) than the
+        # small overflow cap.
+        fake_table = {
+            my_pid: [
+                (10_000 + i, 424242, 0xB00000 + i, _hang_prone_granted_access)
+                for i in range(5)
+            ]
+        }
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        ):
+            result = _win_handle_holders(
+                str(tmp_path),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+        assert result.complete is False
+        assert "handle_scan:masked_deferred_capped" in result.skipped_passes
+        assert any(
+            "deferred" in rec.message.lower() for rec in caplog.records
+        ), "expected a warning naming the deferred-masked-handle overflow"
+
+        from lib_python_worktree.core import teardown as _teardown_mod
+
+        assert (
+            "handle_scan:masked_deferred_capped"
+            not in _teardown_mod._BLIND_SCAN_TAGS
+        )
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_deferred_masked_handles_below_cap_stay_complete_and_untagged(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """R5 additional coverage (test-critic finding): the overflow test
+        above never shows a scan that defers FEWER masked handles than the
+        (patched, small) cap staying untagged/complete -- so on its own it
+        does not prove the cap VALUE itself is load-bearing, only that
+        "some deferral happened" can be flagged. This pins the boundary
+        directly: with the same patched ``_MAX_DEFERRED_MASKED_HANDLES=2``,
+        only 1 masked handle is deferred (and, since it is the scan's only
+        handle, never resolved/revisited either) -- this must leave
+        ``complete=True`` and ``"handle_scan:masked_deferred_capped"``
+        ABSENT, proving the cap boundary itself (not merely "any deferral")
+        is what gates the tag.
+        """
+        monkeypatch.setattr(_pl, "_MAX_DEFERRED_MASKED_HANDLES", 2)
+
+        _hang_prone_granted_access = 0x0012019F
+        my_pid = os.getpid()
+        fake_table = {
+            my_pid: [
+                (20_000, 434343, 0xC00000, _hang_prone_granted_access),
+            ]
+        }
+        monkeypatch.setattr(
+            _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        ):
+            result = _win_handle_holders(
+                str(tmp_path),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+        assert result.complete is True, (
+            f"1 deferred masked handle, below the (patched) cap of 2, must "
+            f"not by itself make the scan incomplete; got complete="
+            f"{result.complete}, skipped_passes={result.skipped_passes}"
+        )
+        assert "handle_scan:masked_deferred_capped" not in result.skipped_passes
+        assert not any(
+            "deferred" in rec.message.lower() for rec in caplog.records
+        ), "no deferred-overflow warning expected below the cap"
 
 
 # ---------------------------------------------------------------------------
@@ -6139,6 +6850,100 @@ class TestStopDetail:
         assert detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
         assert detail.skipped_passes == ("handle_scan:skipped",)
         assert detail.kill_orphans_may_help is False
+
+    def test_handle_scan_capped_maps_to_handle_scan_exhausted_reason(self):
+        """R6 driving test (ticket #148): when the orphan scan reports
+        handle_scan:capped (the process-wide wedged-worker cap was hit --
+        a condition that will not clear itself until the host process
+        restarts), stop() must report the new, more specific
+        STOP_REASON_HANDLE_SCAN_EXHAUSTED reason instead of the generic
+        orphan_scan_incomplete -- with kill_orphans_may_help forced False
+        (retrying kill_orphans cannot help; the process-wide cap will
+        still be full) and a message naming host-restart remediation. Must
+        still set status="stop_incomplete", exactly like every other
+        stop_detail-setting branch (ticket #148's round-3 clarification:
+        the new reason is additive detail, not a different status).
+
+        STOP_REASON_HANDLE_SCAN_EXHAUSTED does not exist yet at RED time --
+        imported directly from state.py below, so this fails with an
+        ImportError, which is the expected RED failure for this
+        not-yet-implemented constant."""
+        from lib_python_worktree.core.state import STOP_REASON_HANDLE_SCAN_EXHAUSTED
+
+        fake_pid = 61200
+        record = _make_record(
+            "wt-handle-scan-exhausted", pids={DEFAULT_ROLE: fake_pid},
+        )
+        store = _make_store(record)
+
+        partial = _pl._PartialList(
+            [], complete=False, skipped_passes=("handle_scan:capped",)
+        )
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=partial,
+            ),
+        ):
+            result = stop(
+                "wt-handle-scan-exhausted",
+                store=store,
+                kill_orphans=True,
+                timeout=5.0,
+            )
+
+        assert result.status == "stop_incomplete"
+        detail = result.stop_detail
+        assert detail is not None
+        assert detail.reason == STOP_REASON_HANDLE_SCAN_EXHAUSTED
+        assert detail.kill_orphans_may_help is False
+        assert "restart" in detail.message.lower()
+
+    def test_handle_scan_busy_and_masked_deferred_capped_keep_generic_reason(self):
+        """R6 negative test (ticket #148): handle_scan:busy and
+        handle_scan:masked_deferred_capped are transient degradations, not
+        the permanent process-wide exhaustion handle_scan:capped signals
+        -- both must keep mapping to the existing generic
+        STOP_REASON_ORPHAN_SCAN_INCOMPLETE, never the new
+        STOP_REASON_HANDLE_SCAN_EXHAUSTED. This is expected to already
+        pass today (no branch currently special-cases either tag) --
+        included as a regression guard against the new branch being made
+        too broad once it exists."""
+        for i, tag in enumerate(
+            ("handle_scan:busy", "handle_scan:masked_deferred_capped")
+        ):
+            fake_pid = 61300 + i
+            wt_id = f"wt-handle-scan-generic-{i}"
+            record = _make_record(wt_id, pids={DEFAULT_ROLE: fake_pid})
+            store = _make_store(record)
+            partial = _pl._PartialList([], complete=False, skipped_passes=(tag,))
+
+            with (
+                patch(
+                    "lib_python_worktree.core.process_lifecycle._pid_alive",
+                    return_value=False,
+                ),
+                patch(
+                    "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                    return_value=partial,
+                ),
+            ):
+                result = stop(
+                    wt_id, store=store, kill_orphans=True, timeout=5.0,
+                )
+
+            assert result.status == "stop_incomplete"
+            detail = result.stop_detail
+            assert detail is not None
+            assert detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE, (
+                f"tag {tag!r} must keep the generic orphan_scan_incomplete "
+                f"reason, got {detail.reason!r}"
+            )
 
     def test_branch_precedence_survivors_wins_over_truncation(self):
         """Edge case: survivors and a truncated tree simultaneously must
@@ -8059,18 +8864,23 @@ class TestDiscoveryCompleteness:
     # cannot slip through.
 
     @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
-    def test_worker_cap_hit_leaves_complete_true(self, monkeypatch):
-        """N2: hitting the process-wide wedged-worker cap mid-scan is an
-        internal degradation (the table was still enumerated up to that
-        point) -- it must NOT be reported as handle_scan:truncated. Forced
-        by patching _BoundedQueryWorker.submit so the very first query this
-        scan issues returns CAPPED, driving _bounded_query straight to its
-        _STOP branch (process_lifecycle.py, _bounded_query).
+    def test_worker_cap_hit_reports_capped_and_incomplete(self, monkeypatch):
+        """N2, REVERSED by ticket #148: hitting the process-wide
+        wedged-worker cap mid-scan used to be reported as an internal
+        degradation with ``complete=True`` (the table was still enumerated
+        up to that point). Ticket #148 reverses this: a cap hit now means
+        this scan gave up early and returned only partial coverage, so it
+        must be reported honestly as ``complete=False`` with
+        ``"handle_scan:capped"`` in ``skipped_passes`` -- never
+        ``"handle_scan:truncated"`` (that tag is reserved for this scan's
+        OWN deadline expiring, a genuinely different condition -- see D5).
+        Forced by patching _BoundedQueryWorker.submit so the very first
+        query this scan issues returns CAPPED, driving _bounded_query
+        straight to its _STOP branch (process_lifecycle.py, _bounded_query).
 
         This test is deliberately integration-level: it pins
-        _win_handle_holders' *reaction* to a _STOP/CAPPED verdict (that it
-        must NOT be folded into handle_scan:truncated), not submit()'s own
-        cap-detection arithmetic (the _wedged_worker_count vs
+        _win_handle_holders' *reaction* to a _STOP/CAPPED verdict, not
+        submit()'s own cap-detection arithmetic (the _wedged_worker_count vs
         _MAX_WEDGED_HANDLE_WORKERS comparison that decides CAPPED vs
         ABANDONED in the first place) -- submit is stubbed here specifically
         to bypass that. The real, unmocked arithmetic is already covered by
@@ -8085,10 +8895,8 @@ class TestDiscoveryCompleteness:
         verdict sets stop_scan=True on the first handle processed,
         deadline_truncated can no longer be set afterwards -- the loop
         breaks on the stop_scan check before it ever reaches the deadline
-        check again. `calls` being non-empty together with
-        `result.complete is True` therefore already proves the CAPPED
-        break-out fired, not the deadline path -- a timing threshold would
-        be redundant and, worse, flaky on a loaded CI runner."""
+        check again. `calls` being non-empty already proves the CAPPED
+        break-out fired, not the deadline path."""
         calls = []
 
         def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
@@ -8102,9 +8910,18 @@ class TestDiscoveryCompleteness:
             "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
         )
 
-        assert result.complete is True
         assert calls, "fake submit was never invoked -- did not exercise the CAPPED path"
         assert list(result) == []
+        assert result.complete is False, (
+            "ticket #148 reverses N2's old rule: a cap hit must now report "
+            "complete=False, not complete=True"
+        )
+        assert "handle_scan:capped" in result.skipped_passes
+        assert "handle_scan:truncated" not in result.skipped_passes, (
+            "a cap hit is a distinct condition from this scan's OWN "
+            "deadline expiring and must not be folded into "
+            "handle_scan:truncated"
+        )
         # The fake submit never touches _wedged_worker_count, so this test
         # itself must leave no process-wide residue behind (compared against
         # the pre-call value, not an absolute 0 -- other tests in the same
@@ -8112,12 +8929,17 @@ class TestDiscoveryCompleteness:
         assert _pl._wedged_worker_count == wedged_before
 
     @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
-    def test_abandoned_with_no_replacement_capacity_leaves_complete_true(self, monkeypatch):
-        """N3: _bounded_query's other _STOP branch -- ABANDONED with no
-        replacement-worker capacity left (_wedged_slot_available() False,
-        process_lifecycle.py lines ~1819-1838) -- is the same internal-
-        degradation class as CAPPED and must likewise leave complete=True,
-        never handle_scan:truncated.
+    def test_abandoned_with_no_replacement_capacity_reports_capped_and_incomplete(
+        self, monkeypatch
+    ):
+        """N3, REVERSED by ticket #148: _bounded_query's other _STOP branch
+        -- ABANDONED with no replacement-worker capacity left
+        (_wedged_slot_available() False, process_lifecycle.py lines
+        ~1819-1838) -- is the same internal-degradation class as CAPPED and
+        must likewise now report complete=False with
+        "handle_scan:capped" (never "handle_scan:truncated"), reversing the
+        old complete=True rule -- see N2's docstring for the full
+        rationale.
 
         Like N2, this test is deliberately integration-level: it pins
         _win_handle_holders' *reaction* to a _STOP/ABANDONED verdict, not
@@ -8127,10 +8949,10 @@ class TestDiscoveryCompleteness:
         and its neighbours.
 
         No wall-clock assertion is used, for the same reason documented in
-        N2 above: `calls` non-empty plus `result.complete is True` already
-        proves the ABANDONED break-out (not the deadline) ended the scan,
-        since stop_scan is always checked before the deadline on every
-        iteration after the first _STOP verdict."""
+        N2 above: `calls` non-empty already proves the ABANDONED break-out
+        (not the deadline) ended the scan, since stop_scan is always
+        checked before the deadline on every iteration after the first
+        _STOP verdict."""
         calls = []
 
         def fake_submit(self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None):
@@ -8144,9 +8966,82 @@ class TestDiscoveryCompleteness:
             "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
         )
 
-        assert result.complete is True
         assert calls, "fake submit was never invoked -- did not exercise the ABANDONED path"
         assert list(result) == []
+        assert result.complete is False, (
+            "ticket #148 reverses N3's old rule: ABANDONED-with-no-capacity "
+            "must now report complete=False, not complete=True"
+        )
+        assert "handle_scan:capped" in result.skipped_passes
+        assert "handle_scan:truncated" not in result.skipped_passes
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
+    def test_handle_scan_propagates_multiple_inner_tags_not_just_truncated(self):
+        """R4 additional coverage (ticket #148): _find_blocking_processes'
+        D5 branch must propagate _win_handle_holders' OWN skipped_passes
+        tags -- including more than one at once -- rather than collapsing
+        every incomplete inner result to the single hardcoded
+        "handle_scan:truncated" string. Simulates a scan reporting both a
+        genuine deadline truncation AND a cap-hit tag simultaneously (even
+        though _win_handle_holders' own single-scan control flow keeps
+        these mutually exclusive in practice today -- see the D5/N2 comment
+        above _win_handle_holders -- the propagation contract at this
+        boundary must not itself assume only one tag is ever possible, and
+        a bare/legacy incomplete list with no tags of its own must still
+        fall back to "handle_scan:truncated", per the plan)."""
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        inner = _pl._PartialList(
+            [], complete=False,
+            skipped_passes=("handle_scan:truncated", "handle_scan:capped"),
+        )
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+            return_value=inner,
+        ):
+            result = _find_blocking_processes(target, host_pid)
+
+        assert "handle_scan:truncated" in result.skipped_passes
+        assert "handle_scan:capped" in result.skipped_passes, (
+            "today's D5 branch only ever appends the literal "
+            "'handle_scan:truncated' string regardless of what tags the "
+            "inner _win_handle_holders result actually carried -- it must "
+            "instead propagate the inner result's own tags"
+        )
+
+    def test_handle_scan_incomplete_with_no_own_tags_falls_back_to_truncated(self):
+        """R4 additional coverage (test-critic finding): the sibling test
+        above only proves tag-FORWARDING (inner tags present -> propagated)
+        -- it never proves the FALLBACK half of the same contract: an inner
+        result that is genuinely incomplete (``complete=False``) but
+        carries NO tags of its own (a bare/legacy incomplete list, e.g. the
+        ``_enumerate_handle_table is None`` path inside
+        ``_win_handle_holders``, which returns
+        ``_PartialList([], complete=False)`` with an empty
+        ``skipped_passes``) must still fall back to the legacy
+        "handle_scan:truncated" string -- proving D5 does not just
+        "forward-or-nothing" but actually falls back when the inner result
+        itself carries nothing to forward."""
+        target = "/fake/worktree"
+        host_pid = os.getpid()
+
+        inner = _pl._PartialList([], complete=False, skipped_passes=())
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+            return_value=inner,
+        ):
+            result = _find_blocking_processes(target, host_pid)
+
+        assert "handle_scan:truncated" in result.skipped_passes, (
+            "a genuinely incomplete inner result with NO tags of its own "
+            "must still fall back to the legacy 'handle_scan:truncated' "
+            "string -- D5 must not silently drop all incompleteness "
+            "signal just because the inner result carried an empty "
+            "skipped_passes"
+        )
 
     # -- D8: lineage-expansion loop truncated by the deadline ---------------
 
@@ -8666,10 +9561,15 @@ class TestWindowsJobObjectContainment:
                 )
                 assert any(
                     "orphan scan discovery was incomplete" in rec.message
+                    or "orphan scan's handle-table pass exhausted" in rec.message
                     for rec in caplog.records
                 ), (
                     "expected the incompleteness to be attributable to the "
-                    "orphan scan's own discovery budget, not anything else"
+                    "orphan scan's own discovery budget (the generic "
+                    "orphan_scan_incomplete message) or, per ticket #148, "
+                    "the more specific handle-table wedged-worker-cap "
+                    "exhaustion message -- both are discovery-completeness "
+                    "limitations, never a real survivor -- not anything else"
                 )
         finally:
             if _pid_alive(grandchild_pid):

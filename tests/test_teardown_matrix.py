@@ -525,6 +525,117 @@ class TestMatrixHistoricalTickets:
         assert record.stop_hook_outcome.status == "completed"
         assert record.stop_hook_outcome.steps_run == 1
 
+    def test_ticket_148_gate_a_blind_confirming_rescan_does_not_clear_capped_hit(
+        self, tmp_path, caplog
+    ):
+        """#148: Gate A's confirming settle-window rescan must not treat a
+        handle_scan:capped-tagged result as proof the pending foreign
+        blocker went away -- that tag means the scan gave up early (the
+        process-wide wedged-worker cap was hit), not that it genuinely
+        looked and found nothing. Before this ticket, only the literal
+        string "open_files:degraded" was special-cased here, so a
+        handle_scan:capped-tagged (empty) rescan result was silently
+        treated as "scan succeeded, foreign hit gone" and removal proceeded
+        instead of being refused.
+
+        Also asserts (test-critic finding) that the confirming-rescan
+        warning actually NAMES the matching tag ("handle_scan:capped"),
+        not just some generic "blind"/"degraded" wording -- an operator
+        reading the log must be able to tell which specific condition
+        fired."""
+        manager = _make_manager(tmp_path)
+        checkout_path = tmp_path / "checkout"
+        checkout_path.mkdir()
+        record = _make_record("wt-t148-capped", path=str(checkout_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        hit = KilledProcessInfo(
+            pid=15148, name="notepad.exe", cmdline=["notepad.exe"],
+            source="orphan_scan",
+        )
+        blind_rescan = _PartialList(
+            [], skipped_passes=("handle_scan:capped",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                side_effect=[_PartialList([hit]), blind_rescan],
+            ),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            caplog.at_level(
+                logging.WARNING, logger="lib_python_worktree.core.manager"
+            ),
+        ):
+            mock_git.return_value = _ok()
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record, force=False, kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert any(
+            "handle_scan:capped" in rec.message for rec in caplog.records
+        ), (
+            "expected the confirming-rescan warning to name the specific "
+            "blind-scan tag (handle_scan:capped), not just a generic "
+            "'degraded'/'blind' message"
+        )
+
+    def test_ticket_148_gate_a_blind_confirming_rescan_does_not_clear_busy_hit(
+        self, tmp_path, caplog
+    ):
+        """#148: same guard as above, for handle_scan:busy (a contended
+        scan-level lock gave up immediately -- it never looked at all, so
+        an empty result from it is no evidence the foreign hit went
+        away). Also asserts the confirming-rescan warning names this tag
+        specifically (test-critic finding, mirrors the capped sibling
+        test above)."""
+        manager = _make_manager(tmp_path)
+        checkout_path = tmp_path / "checkout"
+        checkout_path.mkdir()
+        record = _make_record("wt-t148-busy", path=str(checkout_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        hit = KilledProcessInfo(
+            pid=15149, name="notepad.exe", cmdline=["notepad.exe"],
+            source="orphan_scan",
+        )
+        blind_rescan = _PartialList(
+            [], skipped_passes=("handle_scan:busy",)
+        )
+
+        with (
+            patch("lib_python_worktree.core.teardown._run_git") as mock_git,
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                side_effect=[_PartialList([hit]), blind_rescan],
+            ),
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+            caplog.at_level(
+                logging.WARNING, logger="lib_python_worktree.core.manager"
+            ),
+        ):
+            mock_git.return_value = _ok()
+            mock_sys.platform = "win32"
+            with pytest.raises(WorktreeDirLockedError):
+                manager._teardown(
+                    record, force=False, kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert any(
+            "handle_scan:busy" in rec.message for rec in caplog.records
+        ), (
+            "expected the confirming-rescan warning to name the specific "
+            "blind-scan tag (handle_scan:busy), not just a generic "
+            "'degraded'/'blind' message"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Part 2: boundary-condition rows

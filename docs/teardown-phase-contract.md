@@ -38,7 +38,16 @@ row), not as an ad-hoc test elsewhere -- see that file's own docstring.
    blocker (ticket #117). A degraded/partial scan is never, by itself, a
    blocking condition (ticket #121). Raises `WorktreeDirLockedError` /
    `WorktreeRemovalBlockedError` (ticket #103, when real dirt is also
-   present) when a confirmed blocker cannot be cleared.
+   present) when a confirmed blocker cannot be cleared. A scan result
+   tagged with any of `_BLIND_SCAN_TAGS` (`"open_files:degraded"`,
+   `"handle_scan:capped"`, `"handle_scan:busy"` -- ticket #148) is treated
+   as "never genuinely looked" at both the pre-flight warning and the
+   confirming settle-window rescan: the latter is load-bearing and must
+   not let a blind rescan clear a pending foreign hit. `"handle_scan:
+   truncated"` and `"handle_scan:masked_deferred_capped"` are deliberately
+   excluded -- both mean the scan genuinely looked (just ran out of time,
+   or dropped a bounded few deferred entries), unlike the blind-scan tags
+   above.
 
 5. `_phase_gate_b_early_dirty`
    Early dirty-tree refusal, run BEFORE the `teardown:` steps phase, but

@@ -846,7 +846,7 @@ for a clean, complete scan) on the returned `WorktreeRecord`:
 |---|---|
 | `message` | The same string logged at `WARNING`, naming the worktree id and the hit count (or the degradation reason). |
 | `entries` | A tuple of `OrphanScanEntry(info, owned, killed)` — uncapped, unlike `StopDetail`'s survivor cap. `info` is a `KilledProcessInfo`; `owned` reflects whether the pid was one this environment itself tracked; `killed` is `True` only for a pid the kill call actually confirmed killed. |
-| `skipped_passes` | The scan's (and, if a kill ran, the kill's) degradation tags, e.g. `"open_files:degraded"`, plus the synthetic `"scan:failed"` marker on an unexpected exception. |
+| `skipped_passes` | The scan's (and, if a kill ran, the kill's) degradation tags, e.g. `"open_files:degraded"`, `"handle_scan:truncated"`, `"handle_scan:capped"` (the process-wide wedged-worker cap was hit -- ticket #148), `"handle_scan:busy"` (the scan-level lock was contended -- ticket #148), `"handle_scan:masked_deferred_capped"` (the GrantedAccess deferred-resolution revisit list overflowed -- ticket #148), plus the synthetic `"scan:failed"` marker on an unexpected exception. |
 | `kill_attempted` | `True` iff a kill was actually attempted this invocation (set before the call, so it is `True` even when the call itself raised). |
 
 `kill_blocking_processes=True` makes this phase call the same

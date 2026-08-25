@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Set, Tuple
 
 import portalocker
 
@@ -96,6 +96,45 @@ _POST_KILL_SLEEP: float = 0.5    # seconds to wait between retries
 # the full rationale.
 _PREFLIGHT_SETTLE_SLEEP: float = 1.0     # seconds to wait before the re-scan
 _PREFLIGHT_SETTLE_RETRIES: int = 1       # number of settle re-scans
+
+# Ticket #148: tags a _find_blocking_processes result may carry
+# (result.skipped_passes) that mean "this scan did not genuinely look" --
+# as opposed to "looked and found nothing" -- and must therefore never be
+# treated as proof that a previously observed foreign blocker went away.
+# "open_files:degraded" (ticket #117) was the original, sole member; ticket
+# #148 adds "handle_scan:capped" (the process-wide wedged-worker cap was
+# hit -- the handle-table scan refused before ever dumping the table) and
+# "handle_scan:busy" (the scan-level lock was contended -- another scan was
+# already running, so this one gave up immediately without looking either).
+# Deliberately excludes "handle_scan:truncated" (this scan's own deadline
+# expired mid-enumeration -- it DID genuinely look, just ran out of time,
+# which is a materially weaker signal than never having looked at all) and
+# "handle_scan:masked_deferred_capped" (a transient, per-scan degradation
+# in the GrantedAccess deferred-resolution pre-filter -- the scan still
+# looked at everything else) -- see _scan_coverage_blind's docstring.
+_BLIND_SCAN_TAGS: Tuple[str, ...] = (
+    "open_files:degraded",
+    "handle_scan:capped",
+    "handle_scan:busy",
+)
+
+
+def _scan_coverage_blind(scan) -> Optional[str]:
+    """Return the first tag in *scan*'s ``skipped_passes`` that means "this
+    scan never genuinely looked" (ticket #148), or ``None`` if none apply.
+
+    See ``_BLIND_SCAN_TAGS`` for the exact set and the rationale for what is
+    -- and is deliberately NOT -- included. Used at both Gate A sites: the
+    pre-flight warning (log-only, never a refusal on its own) and the
+    confirming settle-window rescan guard (load-bearing -- a blind rescan
+    must not be allowed to clear a pending, previously observed foreign
+    blocker).
+    """
+    for tag in getattr(scan, "skipped_passes", ()):
+        if tag in _BLIND_SCAN_TAGS:
+            return tag
+    return None
+
 
 # Timeout for the Windows long-path robocopy empty-mirror fallback
 # (ticket #78). Without a bound, robocopy's own defaults (/R:1000000 /W:30)
@@ -760,15 +799,21 @@ def _phase_gate_a_blocking_preflight(ctx: _TeardownContext) -> None:
                 record.id, _scan_exc,
             )
             _preflight_scan = []
-        if "open_files:degraded" in getattr(
-            _preflight_scan, "skipped_passes", ()
-        ):
+        # Ticket #148: log-only pre-flight warning, generalized from the
+        # ticket #117 "open_files:degraded"-only check to any tag in
+        # _BLIND_SCAN_TAGS -- see _scan_coverage_blind's docstring. Never a
+        # refusal on its own (Q2 Option A, unchanged): it can still
+        # contribute to a confirmation via the owned/foreign logic below,
+        # and the Final guard after the destructive git call remains the
+        # backstop for an actually-locked directory this blind scan could
+        # not see coming.
+        _preflight_blind_tag = _scan_coverage_blind(_preflight_scan)
+        if _preflight_blind_tag is not None:
             _logger.warning(
-                "_teardown: worktree '%s' blocking-process scan degraded "
-                "(open_files:degraded) — reduced coverage for this "
-                "attempt; not treated as a blocker on its own (ticket "
-                "#117).",
-                record.id,
+                "_teardown: worktree '%s' blocking-process scan did not "
+                "genuinely look (%s) — reduced coverage for this attempt; "
+                "not treated as a blocker on its own (ticket #117/#148).",
+                record.id, _preflight_blind_tag,
             )
 
         _owned = [info for info in _preflight_scan if info.pid in ctx.owned_pids]
@@ -796,36 +841,42 @@ def _phase_gate_a_blocking_preflight(ctx: _TeardownContext) -> None:
                         record.id, _scan_exc, len(_foreign),
                     )
                     break
-                if "open_files:degraded" in getattr(
-                    _confirm_scan, "skipped_passes", ()
-                ):
-                    # Ticket #117 fix cycle (blocking finding 1): a degraded
-                    # CONFIRMING rescan returns an empty/near-empty result
-                    # because the scan never actually looked at anything --
-                    # not because the foreign blocker went away.
-                    # Intersecting that blind result with the first scan's
-                    # hits would silently clear a real blocker and fall
-                    # straight through to the destructive
+                _confirm_blind_tag = _scan_coverage_blind(_confirm_scan)
+                if _confirm_blind_tag is not None:
+                    # Ticket #117 fix cycle (blocking finding 1), generalized
+                    # by ticket #148 from "open_files:degraded" alone to any
+                    # tag in _BLIND_SCAN_TAGS (see _scan_coverage_blind): a
+                    # BLIND CONFIRMING rescan returns an empty/near-empty
+                    # result because the scan never actually looked at
+                    # anything -- not because the foreign blocker went away.
+                    # This is true whether the scan degraded
+                    # (open_files:degraded), was refused outright by the
+                    # process-wide wedged-worker cap (handle_scan:capped),
+                    # or gave up immediately on scan-lock contention
+                    # (handle_scan:busy) -- none of these are evidence the
+                    # foreign hit cleared. Intersecting a blind result with
+                    # the first scan's hits would silently clear a real
+                    # blocker and fall straight through to the destructive
                     # `git worktree remove` call, reproducing the exact
                     # locked-directory failure this ticket exists to
-                    # prevent. Do NOT let a degraded rescan clear a
-                    # previously observed foreign hit: stop settling and
-                    # conservatively treat the still-pending `_foreign` hits
-                    # from the last real (non-degraded) scan as confirmed,
-                    # rather than as disproven. This is deliberately
-                    # narrower than the pre-#117 blanket degraded-refusal:
-                    # it only fires when a real foreign hit is already
-                    # pending confirmation. A degraded scan with NO prior
-                    # hit never enters this `if _foreign:` branch at all, so
-                    # AC #1's de-escalation (a degraded scan alone must not
-                    # block removal) is unaffected.
+                    # prevent. Do NOT let a blind rescan clear a previously
+                    # observed foreign hit: stop settling and conservatively
+                    # treat the still-pending `_foreign` hits from the last
+                    # real (non-blind) scan as confirmed, rather than as
+                    # disproven. This is deliberately narrower than a
+                    # blanket blind-scan refusal: it only fires when a real
+                    # foreign hit is already pending confirmation. A blind
+                    # scan with NO prior hit never enters this `if
+                    # _foreign:` branch at all, so AC #1's de-escalation (a
+                    # degraded scan alone must not block removal) is
+                    # unaffected.
                     _logger.warning(
-                        "_teardown: worktree '%s' confirming rescan "
-                        "degraded (open_files:degraded) while %d "
-                        "foreign hit(s) were pending confirmation; "
-                        "treating as still-blocking rather than "
-                        "clearing.",
+                        "_teardown: worktree '%s' confirming rescan did not "
+                        "genuinely look (%s) while %d foreign hit(s) were "
+                        "pending confirmation; treating as still-blocking "
+                        "rather than clearing.",
                         record.id,
+                        _confirm_blind_tag,
                         len(_foreign),
                     )
                     break
@@ -893,6 +944,15 @@ def _phase_gate_a_blocking_preflight(ctx: _TeardownContext) -> None:
                 else:
                     _merge_killed_pids(record, killed)
                     if not killed:
+                        # Ticket #148 scope note: this third site -- the
+                        # post-kill check on `_kill_blocking_processes`'s
+                        # own return value -- is deliberately LEFT
+                        # UNCHANGED (still "open_files:degraded" only, not
+                        # `_scan_coverage_blind`/`_BLIND_SCAN_TAGS`). The
+                        # ticket's Gate A scope is the two sites above only
+                        # (pre-flight warning and the confirming-rescan
+                        # guard); widening this site too was considered and
+                        # explicitly deferred, not overlooked.
                         if "open_files:degraded" in getattr(
                             killed, "skipped_passes", ()
                         ):
