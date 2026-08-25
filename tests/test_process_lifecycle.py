@@ -967,14 +967,20 @@ class TestGracefulSignalGroupLeadership:
 
     def test_send_graceful_signal_sends_ctrl_break_for_confirmed_leader(self):
         """group_leader=True is the only way to get a CTRL_BREAK_EVENT."""
+        # signal.CTRL_BREAK_EVENT only exists as a real attribute on win32;
+        # on POSIX CI this simulated-win32 test would otherwise blow up on
+        # attribute lookup before mocking even helps -- patch it into
+        # existence (create=True) the same way TestSignalProcessGroup does
+        # for os.getpgid/os.killpg, which likewise only exist on POSIX.
         with (
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch.object(os, "kill") as mock_kill,
+            patch.object(signal, "CTRL_BREAK_EVENT", 1, create=True),
         ):
             mock_sys.platform = "win32"
             result = _send_graceful_signal(4243, group_leader=True)
 
-        mock_kill.assert_called_once_with(4243, signal.CTRL_BREAK_EVENT)
+            mock_kill.assert_called_once_with(4243, signal.CTRL_BREAK_EVENT)
         assert result is True
 
     def test_send_graceful_signal_confirmed_leader_swallows_oserror(self):
@@ -984,6 +990,7 @@ class TestGracefulSignalGroupLeadership:
         with (
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch.object(os, "kill", side_effect=OSError("no such process")),
+            patch.object(signal, "CTRL_BREAK_EVENT", 1, create=True),
         ):
             mock_sys.platform = "win32"
             result = _send_graceful_signal(4244, group_leader=True)
