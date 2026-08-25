@@ -68,6 +68,21 @@ def test_worktree_record_default_variants():
     assert rec2.variants == {}
 
 
+def test_worktree_record_default_start_variants_is_empty_list():
+    """Ticket #146 (R1): a freshly constructed WorktreeRecord has
+    start_variants == [] -- non-Optional, defaulting to an empty list, never
+    None -- and two independently constructed records do not share the same
+    list instance (default_factory, not a mutable default). Mirrors
+    test_worktree_record_default_variants immediately above."""
+    rec = _make_record()
+    assert rec.start_variants == []
+    assert rec.start_variants is not None
+
+    rec2 = _make_record(id="rec-002")
+    rec.start_variants.append("stale")
+    assert rec2.start_variants == []
+
+
 # ---------------------------------------------------------------------------
 # add + get roundtrip
 # ---------------------------------------------------------------------------

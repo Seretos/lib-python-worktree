@@ -540,7 +540,7 @@ def _build_worktree_env(
     return env
 
 
-def _available_variants(steps: "List[Step]") -> "List[str]":
+def available_variants(steps: "List[Step]") -> "List[str]":
     """Compute the variant strings that WOULD resolve against ``start()``'s
     step-selection block (the tiers at the "Step selection" comment inside
     ``WorktreeManager.start()``, around lines 1601-1622; ticket #131).
@@ -554,6 +554,13 @@ def _available_variants(steps: "List[Step]") -> "List[str]":
     This mirrors the selection tiers for *reporting* purposes only -- it is
     read-only introspection and does not own or alter the real selection
     logic in ``start()``.
+
+    Ticket #146: promoted from the former private ``_available_variants`` to
+    a public, package-exported helper -- ``create()``/``start()`` now call it
+    directly to populate ``WorktreeRecord.start_variants``, and callers other
+    than this module's own ``UnknownVariantError`` raise site need to be able
+    to reach it too. ``_available_variants`` remains as a back-compat module
+    attribute alias below.
     """
     unnamed_steps = [s for s in steps if s.name is None]
     default_reachable = len(unnamed_steps) == 1 or len(steps) == 1
@@ -569,6 +576,11 @@ def _available_variants(steps: "List[Step]") -> "List[str]":
             seen.add(name)
             available.append(name)
     return available
+
+
+# Ticket #146: back-compat alias -- `_available_variants` was the private
+# name before this helper was promoted to the public `available_variants`.
+_available_variants = available_variants
 
 
 class WorktreeManager:
@@ -843,6 +855,7 @@ class WorktreeManager:
                 branch_created_by_us=not branch_exists,
                 ports=port_mapping,
                 base_fetch_fallback=base_fetch_fallback,
+                start_variants=available_variants(contract.start),
             )
             self.state.add(record)
         except Exception:
@@ -1409,6 +1422,7 @@ class WorktreeManager:
             # mark the worktree usable and return without spawning a process.
             record.status = "ready"
             record.shadowed_contract = shadowed_contract
+            record.start_variants = available_variants(contract.start)
             # Ticket #126: this no-op path never reaches _lifecycle_start
             # (where the equivalent reset lives for a real start), so it
             # needs its own reset -- a restarted environment is a new
@@ -1440,7 +1454,7 @@ class WorktreeManager:
             step = contract.start[0]
 
         if step is None:
-            available = _available_variants(contract.start)
+            available = available_variants(contract.start)
             raise UnknownVariantError(variant, available)
 
         from ..setup.runner import _build_step_command, _resolve_shell
@@ -1460,6 +1474,7 @@ class WorktreeManager:
         # transient field -- assign it here, mirroring how killed_pids is
         # propagated explicitly elsewhere for the same reason.
         result.shadowed_contract = shadowed_contract
+        result.start_variants = available_variants(contract.start)
         return result
 
     def stop(
@@ -2092,6 +2107,7 @@ __all__ = (
     "ProcessAlreadyRunningError",
     "ProcessLifecycleError",
     "ProcessNotRunningError",
+    "available_variants",
     "classify_checkout",
     "primary_id_for",
     "untracked_id_for",

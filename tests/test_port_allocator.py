@@ -397,6 +397,7 @@ def test_manager_create_populates_record_ports(tmp_path: Path):
         mock_contract = MagicMock(spec=WorktreeContract)
         mock_contract.ports = [PortSlot(name="web"), PortSlot(name="db")]
         mock_contract.setup = []  # no setup steps — avoids SetupRunner invocation
+        mock_contract.start = []
         mock_load.return_value = mock_contract
 
         # Patch _validate_repo to return the tmp_path (it's "a git repo").
@@ -450,6 +451,7 @@ def test_manager_create_forwards_pinned_ports(tmp_path: Path):
         mock_contract = MagicMock(spec=WorktreeContract)
         mock_contract.ports = [PortSlot(name="web", port=31000), PortSlot(name="db")]
         mock_contract.setup = []
+        mock_contract.start = []
         mock_load.return_value = mock_contract
 
         with patch.object(
@@ -796,6 +798,7 @@ def test_create_releases_ports_when_state_add_fails(tmp_path: Path):
     ):
         mock_contract = MagicMock(spec=WorktreeContract)
         mock_contract.ports = [PortSlot(name="web")]
+        mock_contract.start = []
         mock_load.return_value = mock_contract
 
         with pytest.raises(RuntimeError, match="disk full"):

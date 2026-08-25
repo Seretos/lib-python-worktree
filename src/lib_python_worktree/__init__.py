@@ -61,6 +61,7 @@ from .core.manager import (
     WorktreeManager,
     WorktreeNotFoundError,
     WorktreeRemovalBlockedError,
+    available_variants,
 )
 from .core.process_lifecycle import (
     KilledProcessInfo,
@@ -124,6 +125,7 @@ __all__ = [
     "VariantResolutionError",
     "WorktreeDirLockedError",
     "WorktreeRemovalBlockedError",
+    "available_variants",
     # checkout classification (ticket #84)
     "CheckoutInfo",
     "CheckoutTargetError",

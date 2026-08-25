@@ -654,6 +654,49 @@ def test_orphan_scan_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #146, R4: start_variants is transient -- never persisted to
+# state.yaml, mirroring the orphan_scan precedent directly above.
+# ---------------------------------------------------------------------------
+
+
+def test_start_variants_not_serialised_to_dict():
+    """`_record_to_dict` must never write a `start_variants` key."""
+    from lib_python_worktree.core.yaml_store import _record_to_dict
+
+    rec = _make_record(id="rec-start-variants")
+    # R4 driving assertion: reading the field before it exists is exactly
+    # the RED this test proves -- WorktreeRecord has no `start_variants`
+    # attribute yet (AttributeError), not merely a default of []. Once the
+    # field exists (with default []), execution continues past this line
+    # into the full orphan_scan-style non-default-value check below.
+    assert rec.start_variants == []
+
+    rec.start_variants = ["gui"]
+
+    assert "start_variants" not in _record_to_dict(rec)
+
+
+def test_start_variants_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
+    """A real YamlStateStore add/get cycle must drop `start_variants` rather
+    than persisting a stale copy -- it describes the contract's start:
+    steps as of the most recent create()/start() call, not a stored
+    verdict. No legacy-key deserialization test is added deliberately (the
+    plan's decision): the key never exists on disk in the first place."""
+    rec = _make_record(id="rec-start-variants-roundtrip")
+    # Same RED-driving read as test_start_variants_not_serialised_to_dict
+    # above.
+    assert rec.start_variants == []
+
+    rec.start_variants = ["gui"]
+    yaml_store.add(rec)
+
+    retrieved = yaml_store.get("rec-start-variants-roundtrip")
+
+    assert retrieved is not None
+    assert retrieved.start_variants == []
+
+
+# ---------------------------------------------------------------------------
 # reconcile(): orphaned path
 # ---------------------------------------------------------------------------
 
@@ -3058,3 +3101,46 @@ class TestSetupOutcomeSurvivesLifecycle:
         assert reloaded is not None
         assert reloaded.status == "stopped"
         assert reloaded.setup_outcome == original_outcome
+
+
+# ---------------------------------------------------------------------------
+# Ticket #146, R4: create()'s in-memory return value carries the real
+# start_variants list, while the SAME record read back from a real
+# YamlStateStore-backed manager comes back [] -- the yaml round trip drops
+# the transient field even when create() populated it with real content.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+def test_yaml_backed_list_after_create_yields_empty_start_variants(
+    yaml_manager, git_repo: Path, skip_if_no_git  # noqa: ARG001
+):
+    """create()'s returned record has a non-empty start_variants (a real
+    contract with two named start: steps), but mgr.list() for the same id --
+    which reads back through the real YamlStateStore round trip -- returns a
+    record whose start_variants is []. Proves the transient-field contract
+    holds even when create() itself populated a non-empty value, not just
+    when it stayed at the [] default."""
+    seretos_dir = git_repo / ".seretos"
+    seretos_dir.mkdir()
+    (seretos_dir / "worktree-setup.yml").write_text(
+        "version: 1\n"
+        "isolation: full\n"
+        "start:\n"
+        "  - run: python api.py\n"
+        "    name: api\n"
+        "  - run: python web.py\n"
+        "    name: web\n",
+        encoding="utf-8",
+    )
+
+    mgr = yaml_manager()
+    created = mgr.create(str(git_repo), "feature/yaml-start-variants")
+
+    # R4 driving assertion: reading the field before it exists is exactly
+    # the RED this test proves -- AttributeError, not a value mismatch.
+    assert created.start_variants == ["api", "web"]
+
+    listed = mgr.list()
+    rec = next(r for r in listed if r.id == created.id)
+    assert rec.start_variants == []
