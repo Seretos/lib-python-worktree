@@ -51,4 +51,4 @@ jobs:
 
       - name: Run pytest
         shell: pwsh
-        run: python -m pytest --cov=lib_python_worktree --cov-report=term-missing --cov-fail-under=80
+        run: python -m pytest --cov=lib_python_worktree --cov-report=term-missing --cov-fail-under=80 --durations=25

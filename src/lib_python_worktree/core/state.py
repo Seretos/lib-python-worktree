@@ -31,12 +31,22 @@ STOP_REASON_SURVIVORS = "survivors"
 STOP_REASON_TREE_TRUNCATED = "tree_truncated"
 STOP_REASON_JOB_MEMBER_LIST_TRUNCATED = "job_member_list_truncated"
 STOP_REASON_ORPHAN_SCAN_INCOMPLETE = "orphan_scan_incomplete"
+# Ticket #148: a more specific variant of STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+# for when the orphan scan's own Pass 1c handle-table scan reported
+# "handle_scan:capped" -- the process-wide wedged-worker cap
+# (_MAX_WEDGED_HANDLE_WORKERS in process_lifecycle.py) was hit and no
+# persistent worker was available to reuse. Unlike the generic reason (whose
+# kill_orphans_may_help hint suggests retrying with kill_orphans=True/a
+# larger timeout might help), this condition will not clear itself until the
+# host process restarts -- see process_lifecycle.stop()'s dedicated branch.
+STOP_REASON_HANDLE_SCAN_EXHAUSTED = "handle_scan_exhausted"
 
 STOP_REASONS: Tuple[str, ...] = (
     STOP_REASON_SURVIVORS,
     STOP_REASON_TREE_TRUNCATED,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
+    STOP_REASON_HANDLE_SCAN_EXHAUSTED,
 )
 
 # Outcome vocabulary for ``StopAttempt.outcome`` (ticket #110) -- distinguishes
