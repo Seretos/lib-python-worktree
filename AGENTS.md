@@ -161,6 +161,15 @@ only, not on the workflow.
 `Seretos/agent-worktree` and `Seretos/workboard`. Never hand-bump `version` in
 `pyproject.toml`.
 
+Each bump ticket's body now carries a `### What changed` section populated
+from `gh release view`'s changelog, degrading to a `::warning::` plus a
+release-page link (and truncating at 30000 characters) when the fetch fails
+or returns nothing. The board-add step also resolves the `Status` field's
+`Backlog` option id at runtime and moves the card there instead of leaving it
+in automation's default `Todo` column, degrading to a `::warning::` (card
+left in its default column) if the field/option lookup or the move itself
+fails.
+
 Each consumer has its own dedicated ticket step with `continue-on-error: true`,
 so a broken or missing token for one consumer never blocks the other or the
 release itself.
