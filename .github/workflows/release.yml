@@ -128,24 +128,55 @@ jobs:
             --generate-notes \
             $PRE_FLAG
 
+      - name: Fetch release notes for the bump ticket body
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ inputs.version }}"
+          CHANGELOG_FILE="${RUNNER_TEMP}/bump-changelog.md"
+
+          NOTES=$(gh release view "$TAG" --repo "${{ github.repository }}" \
+            --json body --jq .body 2>/dev/null || true)
+
+          if [ "${#NOTES}" -gt 30000 ]; then
+            NOTES="${NOTES:0:30000}
+
+          _(release notes truncated at 30000 characters; see the full release page.)_"
+          fi
+
+          if [ -z "$NOTES" ]; then
+            echo "::warning::Could not fetch release notes for ${TAG}; falling back to a release link."
+            printf 'See the [release notes for %s](https://github.com/%s/releases/tag/%s).\n' \
+              "$TAG" "${{ github.repository }}" "$TAG" > "$CHANGELOG_FILE"
+          else
+            printf '%s\n' "$NOTES" > "$CHANGELOG_FILE"
+          fi
+
+          echo "CHANGELOG_FILE=${CHANGELOG_FILE}" >> "$GITHUB_ENV"
+
       - name: Open dependency-update ticket in Seretos/agent-worktree
         # continue-on-error: a missing/invalid WORKTREE_TICKET_TOKEN must
         # never fail the release itself.
         id: file_worktree
         continue-on-error: true
         shell: bash
-        # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
-        # column 0 dedents out of the YAML block scalar and breaks the file.
-        # A YAML block scalar holds the markdown verbatim and ${{ }} still
-        # expands. Bash just references "$TITLE"/"$BODY".
+        # TITLE/BODY_HEAD/BODY_TAIL live in env (not a run-block heredoc): a
+        # heredoc body at column 0 dedents out of the YAML block scalar and
+        # breaks the file. A YAML block scalar holds the markdown verbatim
+        # and ${{ }} still expands. Bash just references
+        # "$TITLE"/"$BODY_HEAD"/"$BODY_TAIL". The body is split around the
+        # fetched "### What changed" changelog section, composed at run time
+        # into a temp file and passed via --body-file (a single env string
+        # cannot embed the fetched changelog content read from disk).
         env:
           GH_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
           TITLE: "chore(deps): bump lib-python-worktree to v${{ inputs.version }}"
-          BODY: |
+          BODY_HEAD: |
             ## Dependency update
 
             A new release of **lib-python-worktree** has been published: `v${{ inputs.version }}`.
-
+          BODY_TAIL: |
             ### Action required
 
             1. Update the pin in `pyproject.toml` to:
@@ -157,6 +188,21 @@ jobs:
             4. Commit and open a PR.
         run: |
           CONSUMER="Seretos/agent-worktree"
+          TAG="v${{ inputs.version }}"
+
+          BODY_FILE="$(mktemp)"
+          {
+            printf '%s\n' "$BODY_HEAD"
+            printf '### What changed\n\n'
+            if [ -n "${CHANGELOG_FILE:-}" ] && [ -s "${CHANGELOG_FILE:-}" ]; then
+              cat "$CHANGELOG_FILE"
+            else
+              printf 'See the [release notes for %s](https://github.com/%s/releases/tag/%s).\n' \
+                "$TAG" "${{ github.repository }}" "$TAG"
+            fi
+            printf '\n'
+            printf '%s\n' "$BODY_TAIL"
+          } > "$BODY_FILE"
 
           # Idempotency: skip if an open issue with this exact title already
           # exists — reuse its URL instead of creating a duplicate.
@@ -171,12 +217,12 @@ jobs:
             ISSUE_URL=$(gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY" \
+              --body-file "$BODY_FILE" \
               --label dependencies \
             || gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY")
+              --body-file "$BODY_FILE")
             echo "Ticket opened in ${CONSUMER}: ${ISSUE_URL}"
           fi
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
@@ -193,7 +239,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.WORKTREE_TICKET_TOKEN }}
         run: |
-          gh project item-add 2 --owner Seretos --url "${{ steps.file_worktree.outputs.issue_url }}"
+          ISSUE_URL="${{ steps.file_worktree.outputs.issue_url }}"
+          TOKEN_NAME="WORKTREE_TICKET_TOKEN"
+
+          ITEM_ID=$(gh project item-add 2 --owner Seretos --url "$ISSUE_URL" --format json --jq .id 2>/dev/null || true)
+          if [ -z "$ITEM_ID" ]; then
+            echo "::warning::Could not add ${ISSUE_URL} to project board 2 (check that ${TOKEN_NAME} is a classic PAT with the project scope)."
+          else
+            {
+              PROJECT_ID=$(gh project view 2 --owner Seretos --format json --jq .id)
+              FIELDS=$(gh project field-list 2 --owner Seretos --format json)
+              FIELD_ID=$(printf '%s' "$FIELDS" | jq -r '.fields[] | select(.name=="Status") | .id')
+              OPTION_ID=$(printf '%s' "$FIELDS" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Backlog") | .id')
+              [ -n "$FIELD_ID" ] && [ -n "$OPTION_ID" ] || false
+              gh project item-edit --id "$ITEM_ID" --project-id "$PROJECT_ID" \
+                --field-id "$FIELD_ID" --single-select-option-id "$OPTION_ID"
+            } || echo "::warning::Could not move ${ISSUE_URL} to the Backlog column; card left in its default column."
+          fi
 
       - name: Open dependency-update ticket in Seretos/workboard
         # continue-on-error: a missing/invalid WORKBOARD_TICKET_TOKEN must
@@ -201,18 +263,22 @@ jobs:
         id: file_workboard
         continue-on-error: true
         shell: bash
-        # TITLE/BODY live in env (not a run-block heredoc): a heredoc body at
-        # column 0 dedents out of the YAML block scalar and breaks the file.
-        # A YAML block scalar holds the markdown verbatim and ${{ }} still
-        # expands. Bash just references "$TITLE"/"$BODY".
+        # TITLE/BODY_HEAD/BODY_TAIL live in env (not a run-block heredoc): a
+        # heredoc body at column 0 dedents out of the YAML block scalar and
+        # breaks the file. A YAML block scalar holds the markdown verbatim
+        # and ${{ }} still expands. Bash just references
+        # "$TITLE"/"$BODY_HEAD"/"$BODY_TAIL". The body is split around the
+        # fetched "### What changed" changelog section, composed at run time
+        # into a temp file and passed via --body-file (a single env string
+        # cannot embed the fetched changelog content read from disk).
         env:
           GH_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
           TITLE: "chore(deps): bump lib-python-worktree to v${{ inputs.version }}"
-          BODY: |
+          BODY_HEAD: |
             ## Dependency update
 
             A new release of **lib-python-worktree** has been published: `v${{ inputs.version }}`.
-
+          BODY_TAIL: |
             ### Action required
 
             1. Update the pin in `pyproject.toml` to:
@@ -224,6 +290,21 @@ jobs:
             4. Commit and open a PR.
         run: |
           CONSUMER="Seretos/workboard"
+          TAG="v${{ inputs.version }}"
+
+          BODY_FILE="$(mktemp)"
+          {
+            printf '%s\n' "$BODY_HEAD"
+            printf '### What changed\n\n'
+            if [ -n "${CHANGELOG_FILE:-}" ] && [ -s "${CHANGELOG_FILE:-}" ]; then
+              cat "$CHANGELOG_FILE"
+            else
+              printf 'See the [release notes for %s](https://github.com/%s/releases/tag/%s).\n' \
+                "$TAG" "${{ github.repository }}" "$TAG"
+            fi
+            printf '\n'
+            printf '%s\n' "$BODY_TAIL"
+          } > "$BODY_FILE"
 
           # Idempotency: skip if an open issue with this exact title already
           # exists — reuse its URL instead of creating a duplicate.
@@ -238,12 +319,12 @@ jobs:
             ISSUE_URL=$(gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY" \
+              --body-file "$BODY_FILE" \
               --label dependencies \
             || gh issue create \
               --repo "$CONSUMER" \
               --title "$TITLE" \
-              --body "$BODY")
+              --body-file "$BODY_FILE")
             echo "Ticket opened in ${CONSUMER}: ${ISSUE_URL}"
           fi
           echo "issue_url=${ISSUE_URL}" >> "$GITHUB_OUTPUT"
@@ -257,4 +338,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.WORKBOARD_TICKET_TOKEN }}
         run: |
-          gh project item-add 2 --owner Seretos --url "${{ steps.file_workboard.outputs.issue_url }}"
+          ISSUE_URL="${{ steps.file_workboard.outputs.issue_url }}"
+          TOKEN_NAME="WORKBOARD_TICKET_TOKEN"
+
+          ITEM_ID=$(gh project item-add 2 --owner Seretos --url "$ISSUE_URL" --format json --jq .id 2>/dev/null || true)
+          if [ -z "$ITEM_ID" ]; then
+            echo "::warning::Could not add ${ISSUE_URL} to project board 2 (check that ${TOKEN_NAME} is a classic PAT with the project scope)."
+          else
+            {
+              PROJECT_ID=$(gh project view 2 --owner Seretos --format json --jq .id)
+              FIELDS=$(gh project field-list 2 --owner Seretos --format json)
+              FIELD_ID=$(printf '%s' "$FIELDS" | jq -r '.fields[] | select(.name=="Status") | .id')
+              OPTION_ID=$(printf '%s' "$FIELDS" | jq -r '.fields[] | select(.name=="Status") | .options[] | select(.name=="Backlog") | .id')
+              [ -n "$FIELD_ID" ] && [ -n "$OPTION_ID" ] || false
+              gh project item-edit --id "$ITEM_ID" --project-id "$PROJECT_ID" \
+                --field-id "$FIELD_ID" --single-select-option-id "$OPTION_ID"
+            } || echo "::warning::Could not move ${ISSUE_URL} to the Backlog column; card left in its default column."
+          fi
