@@ -85,8 +85,8 @@ def _is_query_worker_thread(t: "threading.Thread") -> bool:
 
     Module-level (hoisted out of ``TestHandleScanThreadPlateau``, CI-red
     follow-up to ticket #148) so both that test's own measurement AND
-    ``_wait_for_query_worker_threads_to_clear`` below share exactly one
-    identity check. Thread OBJECT identity/target, not ``Thread.ident``
+    ``_stable_query_worker_snapshot`` below share exactly one identity
+    check. Thread OBJECT identity/target, not ``Thread.ident``
     (recycled by the OS): a daemon thread whose bound ``_target`` is the
     ``_run`` method of a live ``_BoundedQueryWorker`` instance, or --
     fallback, for the brief window after a thread starts but before it
@@ -106,52 +106,6 @@ def _is_query_worker_thread(t: "threading.Thread") -> bool:
     return name.startswith("Thread-") and name.endswith("(_run)")
 
 
-def _wait_for_query_worker_threads_to_clear(
-    timeout: float = 5.0, poll: float = 0.02
-) -> None:
-    """Best-effort bounded wait for every query-worker daemon thread to exit.
-
-    CI-red follow-up to ticket #148's own headline test
-    (``TestHandleScanThreadPlateau``): a *wedged* ``_BoundedQueryWorker``'s
-    thread only actually exits once its blocking callable finally returns.
-    Tests in this module that simulate wedging (there are roughly twenty)
-    set their local ``release`` Event in their own ``finally`` block before
-    returning, but most do not additionally join the (possibly several,
-    once-retired-and-replaced) worker threads that unblocks -- those threads
-    exit asynchronously, on their own OS scheduling, sometime after control
-    already returned to pytest.
-
-    That asynchrony is not benign: each exiting worker's ``_run()`` also
-    decrements the *process-wide* ``core.process_lifecycle._wedged_worker_count``
-    global unconditionally, with no notion of which test "owns" that
-    decrement. If such a straggler is still alive when a LATER test's own
-    fixture setup has already reset that counter to 0 and started its own
-    accounting, the straggler's eventual decrement -- landing at an
-    arbitrary later point, more likely the busier/slower the machine --
-    silently frees up capacity the later test's own logic never expected,
-    letting it create genuinely new worker threads it believed were capped.
-    This is exactly the mechanism behind CI observing a small, load-
-    dependent number of "new" leaked query-worker threads in
-    ``TestHandleScanThreadPlateau`` (baseline inflated by many still-
-    unwinding stragglers from earlier tests in this file, a few of which
-    then finish -- and decrement the shared counter -- mid-measurement).
-
-    Called from this module's autouse fixture teardown, once per test, so
-    every worker any test created has already had its blocking ``release``
-    Event set by the time this runs (a test's own ``finally`` always
-    executes before the wrapping fixture's teardown resumes) -- in practice
-    this resolves almost immediately. The bounded timeout is defense against
-    a genuinely wedged case (e.g. an actual bug, or a test that forgets to
-    release its blocking Event) turning into a hung suite rather than a
-    loud, later, easier-to-diagnose failure; never raises on timeout.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not any(_is_query_worker_thread(t) for t in threading.enumerate()):
-            return
-        time.sleep(poll)
-
-
 def _stable_query_worker_snapshot(
     timeout: float = 2.0, poll: float = 0.05, stable_checks: int = 3
 ) -> "List[threading.Thread]":
@@ -159,10 +113,10 @@ def _stable_query_worker_snapshot(
     stopped changing for *stable_checks* consecutive polls (or *timeout*).
 
     Defense-in-depth for ``TestHandleScanThreadPlateau`` (CI-red follow-up,
-    ticket #148): the module-scoped
-    ``_wait_for_query_worker_threads_to_clear()`` fixture teardown above
-    already closes the main window for cross-test contamination, but a
-    snapshot taken at a single fixed instant is still, in principle,
+    ticket #148): the generation guard on ``_wedged_worker_count`` (ticket
+    #148 attempt 2, see ``_reset_wedged_object_registry`` below) already
+    makes a stale straggler's eventual counter decrement a provable no-op,
+    but a snapshot taken at a single fixed instant is still, in principle,
     vulnerable to catching a thread transitioning exactly at that instant
     (e.g. under unusually heavy CI scheduling load). Polling for the count
     to plateau rather than reading it once makes both the baseline and the
@@ -230,27 +184,43 @@ def _reset_wedged_object_registry(monkeypatch):
     scan-start-gate assertions, exactly the same class of cross-test
     pollution this fixture already guards against for the #121 registry.
 
-    CI-red follow-up to ticket #148: the teardown half additionally calls
-    ``_wait_for_query_worker_threads_to_clear()`` AFTER
-    ``_reset_handle_scan_state()``. Resetting the module globals alone does
+    CI-red follow-up to ticket #148, attempt 1, added a bounded settling
+    wait here (``_wait_for_query_worker_threads_to_clear()``) after
+    ``_reset_handle_scan_state()``: resetting the module globals alone does
     not stop an already-retired (wedged) worker's real OS thread from
     running on -- it exits on its own schedule once its blocking call
     returns, and its exit path decrements the very same
     ``_wedged_worker_count`` global this fixture just reset for the NEXT
-    test. Without waiting here, a straggler from THIS test can finish and
-    decrement that counter while a LATER test is already mid-flight,
+    test. Without waiting, a straggler from THIS test could finish and
+    decrement that counter while a LATER test was already mid-flight,
     silently handing it capacity its own accounting never expected to have
     and letting it create genuinely new worker threads it believed were
-    capped (see that helper's docstring for the full mechanism -- this is
-    what produced CI's "3 new leaked threads" in
+    capped -- this is what produced CI's "3 new leaked threads" in
     ``TestHandleScanThreadPlateau`` against a baseline inflated by many such
-    still-unwinding stragglers).
+    still-unwinding stragglers.
+
+    Ticket #148 attempt 2 replaced that timing-dependent wait with a
+    generation guard (see ``_wedged_worker_generation`` in
+    ``core/process_lifecycle.py``): ``submit()`` now records the current
+    generation into each job's state at the moment it increments
+    ``_wedged_worker_count``, and ``_run()`` only applies its matching
+    decrement if that recorded generation still matches the live one.
+    ``_reset_handle_scan_state()`` (called both here and in setup, above)
+    atomically zeroes the counter AND advances the generation under the
+    same lock, so a straggler thread from a prior test that finally exits
+    after this fixture's teardown has already run is holding a now-stale
+    generation -- its decrement is a provable, unconditional no-op against
+    the new test's counter, not something whose timing needs to be waited
+    out. The settling wait is therefore no longer needed for correctness
+    and has been removed; only the (much cheaper, still-useful for reducing
+    incidental thread-listing noise) ``_stable_query_worker_snapshot()``
+    polling helper above remains, for ``TestHandleScanThreadPlateau``'s own
+    measurement.
     """
     monkeypatch.setattr(_pl, "_wedged_object_keys", OrderedDict())
     _pl._reset_handle_scan_state()
     yield
     _pl._reset_handle_scan_state()
-    _wait_for_query_worker_threads_to_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -4091,6 +4061,251 @@ class TestBoundedQueryWorker:
             # in test_grace_skipped_when_scan_deadline_already_passed.
             assert elapsed < 1.0
             assert grace.remaining == 0.0
+        finally:
+            release.set()
+            worker.close()
+
+
+# ---------------------------------------------------------------------------
+# TestWedgedSlotGenerationGuard -- ticket #148, attempt 2: a stale-generation
+# straggler (a wedged worker retired BEFORE _reset_handle_scan_state() last
+# advanced the generation) must not decrement _wedged_worker_count once its
+# blocking callable finally returns -- that decrement now belongs to
+# whichever later test/scan is accounting under the CURRENT generation.
+# Cross-platform, same rationale as TestBoundedQueryWorker above:
+# _BoundedQueryWorker runs an arbitrary zero-arg callable, so none of this
+# needs ctypes/a Windows API.
+# ---------------------------------------------------------------------------
+
+class TestWedgedSlotGenerationGuard:
+    """Unit tests for the generation guard on ``_wedged_worker_count``'s
+    decrement (ticket #148 attempt 2, behavioural requirement 1).
+
+    Today's code (attempt 1) decrements ``_wedged_worker_count`` in
+    ``_BoundedQueryWorker._run()`` unconditionally, the instant a retired
+    worker's wedged callable finally returns -- with no notion of which
+    "generation" of accounting (i.e. which round of
+    ``_reset_handle_scan_state()`` calls) that retirement belongs to. A
+    worker retired BEFORE a reset, whose callable only unblocks AFTER the
+    reset, decrements a counter that a later test/scan has already started
+    accounting fresh against -- corrupting it. These tests drive that race
+    deterministically via ``_pl._reset_handle_scan_state()`` rather than
+    relying on timing, so they are reliable on every platform/load.
+    """
+
+    @staticmethod
+    def _wait_until_thread_gone(thread: threading.Thread, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def test_stale_generation_straggler_does_not_decrement_counter(self, monkeypatch):
+        """Primary driving test (behavioural requirement 1).
+
+        On today's code, ``_run()`` decrements unconditionally: after the
+        straggler is released the counter reads 3 - 1 == 2, so the final
+        ``== 3`` assertion fails with ``2 != 3``. This is the deterministic
+        proof of the straggler race.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert _pl._wedged_worker_count == 1
+
+            # A reset (e.g. this module's autouse fixture, between tests)
+            # advances the generation -- everything retired before this
+            # point is now stale.
+            _pl._reset_handle_scan_state()
+
+            # Stand in for a LATER test's own fresh accounting: it has
+            # already submitted/retired workers of its own under the new
+            # generation and its counter legitimately reads 3.
+            monkeypatch.setattr(_pl, "_wedged_worker_count", 3)
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+            assert not thread.is_alive(), (
+                "the stale-generation straggler's thread must still exit "
+                "once its wedged call finally returns"
+            )
+
+            assert _pl._wedged_worker_count == 3, (
+                "a stale-generation straggler's decrement must be a no-op "
+                "against a later generation's own counter"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    def test_same_generation_straggler_still_decrements(self, monkeypatch):
+        """Regression guard (existing #90 contract, ticket
+        ``test_wedged_worker_count_restored_after_retired_worker_exits``
+        already covers this too): a straggler retired and resolved with NO
+        reset in between must still decrement normally. May already be
+        GREEN on today's code -- that is expected, this guards the fix from
+        over-suppressing decrements outside a genuine generation mismatch.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert _pl._wedged_worker_count == 1
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+            assert not thread.is_alive()
+
+            deadline = time.monotonic() + 2.0
+            while _pl._wedged_worker_count != 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert _pl._wedged_worker_count == 0, (
+                "a same-generation straggler must still decrement back to 0"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    def test_on_abandoned_done_still_fires_for_stale_generation_straggler(self, monkeypatch):
+        """Protects against gating handle cleanup on the generation, which
+        would leak the underlying kernel handle -- only the counter
+        decrement is meant to be generation-scoped, never the callback. May
+        already pass today since the gating does not exist yet; it guards
+        the eventual implementation from breaking this later.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        calls = []
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+                on_abandoned_done=lambda value: calls.append(value),
+            )
+            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+
+            _pl._reset_handle_scan_state()
+            monkeypatch.setattr(_pl, "_wedged_worker_count", 5)
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+            assert not thread.is_alive()
+
+            assert calls == [True], (
+                "on_abandoned_done must still fire for a stale-generation "
+                "straggler -- gating it on the generation would leak the "
+                "underlying kernel handle"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    def test_monotonic_across_repeated_resets(self, monkeypatch):
+        """Two stragglers retired in two different pre-reset generations,
+        both released only after both resets have run, must both be
+        suppressed. Should go RED for the same reason as the primary test.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release_a = threading.Event()
+        release_b = threading.Event()
+
+        worker_a = _BoundedQueryWorker()
+        thread_a = worker_a._thread
+        worker_b = _BoundedQueryWorker()
+        thread_b = worker_b._thread
+        try:
+            outcome_a = worker_a.submit(
+                lambda: release_a.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome_a.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert _pl._wedged_worker_count == 1
+
+            # First reset advances the generation past worker_a's retirement.
+            _pl._reset_handle_scan_state()
+
+            outcome_b = worker_b.submit(
+                lambda: release_b.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome_b.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert _pl._wedged_worker_count == 1
+
+            # Second reset advances the generation again, past worker_b's
+            # retirement too.
+            _pl._reset_handle_scan_state()
+
+            # Stand in for a later test's own fresh accounting under the
+            # newest generation.
+            monkeypatch.setattr(_pl, "_wedged_worker_count", 4)
+
+            release_a.set()
+            release_b.set()
+            self._wait_until_thread_gone(thread_a)
+            self._wait_until_thread_gone(thread_b)
+            assert not thread_a.is_alive()
+            assert not thread_b.is_alive()
+
+            assert _pl._wedged_worker_count == 4, (
+                "both stragglers, retired in two different pre-reset "
+                "generations, must be suppressed once released after both "
+                "resets"
+            )
+        finally:
+            release_a.set()
+            release_b.set()
+            worker_a.close()
+            worker_b.close()
+
+    def test_same_generation_decrement_clamps_at_zero(self, monkeypatch):
+        """Existing/regression guard: a same-generation decrement from 0
+        must still clamp at 0 via ``max(0, ...)``, never go negative. May
+        already pass today.
+        """
+        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert _pl._wedged_worker_count == 1
+
+            # Simulate some other bookkeeping already having driven the
+            # counter down to 0 (e.g. a concurrent scan's own decrement)
+            # before this worker's decrement lands.
+            monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+            assert not thread.is_alive()
+
+            assert _pl._wedged_worker_count == 0, (
+                "decrement must clamp at 0, never go negative"
+            )
         finally:
             release.set()
             worker.close()

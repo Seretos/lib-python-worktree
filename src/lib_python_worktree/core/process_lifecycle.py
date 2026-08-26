@@ -1749,6 +1749,26 @@ class _GraceBudget:
 _wedged_worker_count = 0
 _wedged_worker_lock = threading.Lock()
 
+# Ticket #148 attempt 2 -- generation counter guarding _wedged_worker_count's
+# decrement against a stale straggler. A worker retired (ABANDONED/CAPPED)
+# under one "generation" of accounting may not actually unblock (its wedged
+# callable finally return) until AFTER a later _reset_handle_scan_state()
+# call has already zeroed the counter and moved accounting on to a new
+# generation -- e.g. between two tests in this suite, or, in principle,
+# across any caller that resets this module-level state. If that straggler's
+# _run() still decremented unconditionally, it would corrupt the *new*
+# generation's counter, which it has no relationship to. submit() records
+# the *current* generation (under _wedged_worker_lock, alongside the
+# _wedged_worker_count increment) into the job's state at the moment it
+# retires the worker; _run() then only decrements if the generation it reads
+# back still matches the *live* generation at the moment its wedged callable
+# finally returns -- otherwise the decrement is a deliberate, provable no-op.
+# _reset_handle_scan_state() is the only place that ever advances this
+# counter, and it has no production caller (test-only, see its docstring),
+# so in production this stays permanently 0 and every decrement is always
+# same-generation -- bit-identical behaviour to before this change.
+_wedged_worker_generation = 0
+
 
 def _wedged_slot_available() -> bool:
     """``True`` iff another worker may currently be created without the
@@ -1886,16 +1906,35 @@ def _reset_handle_scan_state() -> None:
     Closes any live persistent worker (bounded join; idempotent and never
     raises even against a wedged thread -- see ``_BoundedQueryWorker.close``)
     before dropping the module reference, then zeroes the wedged-worker
-    accounting. Intended to be called from an autouse test fixture so a
+    accounting and advances ``_wedged_worker_generation`` (ticket #148
+    attempt 2). Intended to be called from an autouse test fixture so a
     worker's daemon thread left behind by one test is actually shut down
     rather than merely orphaned, and never leaks into another test's
     thread-count assertions.
+
+    The generation bump is what makes that safe even when the just-closed
+    worker's wedged callable never actually returns before this call: a
+    straggler retired under the OLD generation will, once its callable
+    finally does return, find ``_wedged_worker_generation`` has moved on and
+    skip its ``_wedged_worker_count`` decrement as a no-op, instead of
+    corrupting whatever a later test/scan has already counted under the new
+    generation. This function has no production caller -- it exists solely
+    for test isolation -- so ``_wedged_worker_generation`` stays permanently
+    0 in production, where every straggler's decrement is always
+    same-generation and behaviour is bit-identical to before this change.
+
+    Both the counter and the generation are written under
+    ``_wedged_worker_lock`` (previously the counter write here was
+    unlocked -- fixed alongside this change since the two must now be
+    updated atomically together).
     """
-    global _persistent_query_worker, _wedged_worker_count
+    global _persistent_query_worker, _wedged_worker_count, _wedged_worker_generation
     if _persistent_query_worker is not None:
         _persistent_query_worker.close()
     _persistent_query_worker = None
-    _wedged_worker_count = 0
+    with _wedged_worker_lock:
+        _wedged_worker_count = 0
+        _wedged_worker_generation += 1
     _wedged_object_keys.clear()
 
 
@@ -2123,8 +2162,13 @@ class _BoundedQueryWorker:
                 was_abandoned = state["abandoned"]
                 callback = state["on_abandoned_done"] if was_abandoned else None
                 slot_acquired = state["slot_acquired"]
+                slot_generation = state["slot_generation"]
             state["done"].set()
             if was_abandoned:
+                # on_abandoned_done fires unconditionally, regardless of
+                # generation -- it closes the duplicated kernel handle this
+                # worker's wedged call was holding; gating it would leak
+                # that handle (ticket #148 attempt 2).
                 if callback is not None:
                     try:
                         callback(value)
@@ -2133,7 +2177,18 @@ class _BoundedQueryWorker:
                 if slot_acquired:
                     global _wedged_worker_count
                     with _wedged_worker_lock:
-                        _wedged_worker_count = max(0, _wedged_worker_count - 1)
+                        # Only decrement if this slot claim's recorded
+                        # generation still matches the live one. A mismatch
+                        # means a _reset_handle_scan_state() call happened
+                        # between this worker's retirement (submit()) and
+                        # its wedged callable finally returning (now) -- the
+                        # counter it was counted against has already been
+                        # zeroed and handed to a new generation's own
+                        # accounting, so decrementing here would corrupt
+                        # that unrelated later count instead of undoing this
+                        # worker's own contribution (ticket #148 attempt 2).
+                        if slot_generation == _wedged_worker_generation:
+                            _wedged_worker_count = max(0, _wedged_worker_count - 1)
 
     def submit(
         self,
@@ -2186,6 +2241,7 @@ class _BoundedQueryWorker:
             "abandoned": False,
             "on_abandoned_done": on_abandoned_done,
             "slot_acquired": False,
+            "slot_generation": None,
         }
         self._job_queue.put((fn, state))
 
@@ -2233,6 +2289,13 @@ class _BoundedQueryWorker:
             with _wedged_worker_lock:
                 _wedged_worker_count += 1
                 at_cap = _wedged_worker_count >= _MAX_WEDGED_HANDLE_WORKERS
+                # Record the generation this slot claim belongs to (ticket
+                # #148 attempt 2), read under the same lock as the count
+                # increment above, so _run() can later tell whether its
+                # eventual decrement still belongs to the same round of
+                # accounting or is a stale straggler against a since-reset
+                # generation.
+                state["slot_generation"] = _wedged_worker_generation
             state["abandoned"] = True
             state["slot_acquired"] = True
 
