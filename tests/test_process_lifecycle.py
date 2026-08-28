@@ -10746,3 +10746,55 @@ class TestDiscoveryPasses:
         assert "open_files:degraded" not in result.skipped_passes
         assert "open_files:truncated" not in result.skipped_passes
         assert "open_files:skipped" not in result.skipped_passes
+
+
+# ---------------------------------------------------------------------------
+# #154 R3 (P3): no psutil call in the failure path runs on the main thread
+# or without a bound -- structural check, one representative call site
+# (Pass 1's proc.cwd()). Full P3 coverage (tier-1 pid_exists, the ancestor
+# walk, the hanging-cwd wall-clock row, the end-to-end matrix row) is NOT
+# covered here -- see the developer's final report for what remains.
+# ---------------------------------------------------------------------------
+
+class TestBoundedPsutilCalls:
+    def test_every_psutil_read_happens_off_the_main_thread(self):
+        """Pass 1's `proc.cwd()` must be dispatched through a bounded
+        worker, never called inline on the calling thread. RED today:
+        `_find_blocking_processes` calls `proc.cwd()` directly at
+        process_lifecycle.py:3363."""
+        import psutil
+        import threading
+
+        target = "/fake/worktree-r3"
+        host_pid = os.getpid()
+
+        threads_seen: list = []
+
+        proc = MagicMock()
+        proc.info = {"pid": 30154, "name": "x", "cmdline": ["x"]}
+
+        def _cwd():
+            threads_seen.append(threading.current_thread())
+            return "/unrelated/path"
+
+        proc.cwd.side_effect = _cwd
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            _find_blocking_processes(
+                target, host_pid, deadline=time.monotonic() + 2.0
+            )
+
+        assert threads_seen, "proc.cwd() was never called"
+        assert threading.main_thread() not in threads_seen, (
+            "proc.cwd() ran on the main thread -- must be dispatched "
+            "through the bounded worker primitive instead"
+        )
