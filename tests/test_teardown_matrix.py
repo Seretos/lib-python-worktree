@@ -23,6 +23,7 @@ import os
 import shutil
 import stat
 import sys
+import time
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,13 @@ from unittest.mock import MagicMock, patch
 # inside a test, would resolve to the patched mock instead of the real
 # function and recurse infinitely.
 _real_rmtree = shutil.rmtree
+# Same idiom as _real_rmtree above: this file's autouse `_no_real_settle_sleep`
+# fixture patches "lib_python_worktree.core.teardown.time.sleep", which -- since
+# teardown.py just does `import time` -- patches the sleep attribute on the SAME
+# global `time` module this test file's own `import time` sees. A test that
+# needs a genuinely real sleep (e.g. to simulate an unbounded hang) must bind
+# the real function now, before any test patches it.
+_real_time_sleep = time.sleep
 
 import pytest
 
@@ -2730,4 +2738,63 @@ class TestMatrixRemovalMechanism:
             f"prune must still run unconditionally even for an "
             f"already-absent target (so a stale git registration is "
             f"cleared); got calls={calls}"
+        )
+
+    # -- R3 end-to-end row: the whole remove() stays under the 10.0s
+    #    ceiling (7.0s failure budget + 3.0s slack) even when a discovery
+    #    target's cwd() hangs -------------------------------------------
+
+    def test_154_rename_failure_diagnosis_returns_within_total_budget_when_cwd_hangs(
+        self, tmp_path
+    ):
+        """A genuinely held/locked worktree's failure-path diagnosis must
+        stay bounded end-to-end, even when the systemwide scan it
+        eventually escalates to hits a process whose discovery call hangs.
+        This is the *held-worktree* population -- explicitly outside AC1's
+        "clean, unheld" population (item 7). RED today: `_find_blocking_
+        processes` is called with no deadline at all from Gate A/the
+        orphan-scan phase, so a hanging discovery call blocks the whole
+        `_teardown()` call for as long as the hang lasts."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r3-e2e"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r3-e2e", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        def _slow_scan(*a, **kw):
+            _real_time_sleep(6.0)
+            return []
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=PermissionError("locked"),
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                side_effect=_slow_scan,
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._run_git", return_value=_ok()
+            ),
+        ):
+            t0 = time.monotonic()
+            try:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=True,
+                    _lifecycle_module=mock_lifecycle,
+                )
+            except Exception:
+                pass  # only the wall-clock budget is pinned by this test
+            elapsed = time.monotonic() - t0
+
+        assert elapsed < 10.0, (
+            f"a held/locked worktree's failure-path diagnosis must "
+            f"complete within the 7.0s failure budget + 3.0s slack, not "
+            f"hang on an unbounded systemwide scan; took {elapsed:.2f}s"
         )
