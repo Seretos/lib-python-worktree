@@ -2047,11 +2047,52 @@ class TestWaitOrKill:
 # ---------------------------------------------------------------------------
 
 def _make_fake_proc(pid: int, name: str, cmdline: list, cwd: str):
-    """Build a fake psutil.Process-like object for _find_blocking_processes tests."""
+    """Build a fake psutil.Process-like object for _find_blocking_processes tests.
+
+    Ticket #154 fix round: Pass 1/1b now construct ``psutil.Process(pid)``
+    themselves (inside a bounded lambda) instead of reading a
+    ``process_iter`` prefetch, and read ``cwd()``/``cmdline()``/``name()``
+    as real method calls -- ``.info`` is kept for callers that still build
+    a ``process_iter`` return list directly (Pass 1c enrichment tests,
+    which are unaffected by this refactor), but the method mocks are what
+    ``psutil.Process(pid)`` dispatch (see
+    ``_make_psutil_process_side_effect`` below) actually reads.
+    """
     proc = MagicMock()
+    proc.pid = pid
     proc.info = {"pid": pid, "name": name, "cmdline": cmdline}
     proc.cwd.return_value = cwd
+    proc.cmdline.return_value = cmdline
+    proc.name.return_value = name
     return proc
+
+
+def _make_psutil_process_side_effect(procs_by_pid: dict, host_pid: int, host_parents=None):
+    """Build a ``psutil.Process`` ``side_effect`` (ticket #154 fix round).
+
+    Pass 1/1b and the ancestor walk now call ``psutil.Process(pid)`` per
+    pid instead of reading a ``process_iter`` prefetch -- a single shared
+    ``mock_proc_cls.return_value`` mock (the pre-fix-round pattern) no
+    longer distinguishes one pid from another. This dispatches
+    ``psutil.Process(pid)`` to *procs_by_pid[pid]* for a known pid,
+    ``host_pid`` to a mock whose ``.parents()`` returns *host_parents*, and
+    raises ``psutil.NoSuchProcess`` for anything else -- swallowed by
+    ``_bounded_call``'s worker, resolving to ``(True, None)``, exactly like
+    a real vanished process.
+    """
+    import psutil
+
+    host_mock = MagicMock()
+    host_mock.parents.return_value = list(host_parents or [])
+
+    def _side_effect(pid):
+        if pid == host_pid:
+            return host_mock
+        if pid in procs_by_pid:
+            return procs_by_pid[pid]
+        raise psutil.NoSuchProcess(pid)
+
+    return _side_effect
 
 
 class TestFindBlockingProcesses:
@@ -2068,13 +2109,15 @@ class TestFindBlockingProcesses:
         proc_other = _make_fake_proc(9002, "python", ["python"], "/other/path")
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_match, proc_other]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[9001, 9002]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {9001: proc_match, 9002: proc_other}, host_pid
+                ),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert len(result) == 1
@@ -2093,13 +2136,13 @@ class TestFindBlockingProcesses:
         proc_sub = _make_fake_proc(9003, "bash", ["bash"], sub_cwd)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_sub]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[9003]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({9003: proc_sub}, host_pid),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert len(result) == 1
@@ -2115,13 +2158,13 @@ class TestFindBlockingProcesses:
         proc_other = _make_fake_proc(9004, "vim", ["vim"], "/home/user")
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_other]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[9004]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({9004: proc_other}, host_pid),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert result == []
@@ -2136,13 +2179,13 @@ class TestFindBlockingProcesses:
         proc_host = _make_fake_proc(host_pid, "python", ["python"], target)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_host]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[host_pid]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({host_pid: proc_host}, host_pid),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert result == []
@@ -2162,13 +2205,17 @@ class TestFindBlockingProcesses:
         ancestor_mock.pid = ancestor_pid
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_ancestor, proc_blocker]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[ancestor_pid, 9005]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {ancestor_pid: proc_ancestor, 9005: proc_blocker},
+                    host_pid,
+                    host_parents=[ancestor_mock],
+                ),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = [ancestor_mock]
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert len(result) == 1
@@ -2186,13 +2233,13 @@ class TestFindBlockingProcesses:
         proc_denied.cwd.side_effect = psutil.AccessDenied(9006)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_denied]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[9006]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({9006: proc_denied}, host_pid),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert result == []
@@ -2205,13 +2252,11 @@ class TestFindBlockingProcesses:
         host_pid = os.getpid()
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert result == []
@@ -2234,17 +2279,15 @@ class TestFindBlockingProcesses:
         proc_sub = _make_fake_proc(9012, "bash", ["bash"], "/fake/worktree/src")
 
         with (
+            patch.object(psutil, "pids", return_value=[9010, 9011, 9012]),
             patch.object(
                 psutil,
-                "process_iter",
-                return_value=[proc_sibling, proc_exact, proc_sub],
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {9010: proc_sibling, 9011: proc_exact, 9012: proc_sub}, host_pid
+                ),
             ),
-            patch.object(psutil, "Process") as mock_proc_cls,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         returned_pids = {r.pid for r in result}
@@ -3174,23 +3217,20 @@ class TestFindBlockingProcessesWindows:
 
         # Simulate a Windows foreign process: cwd() denied, but cmdline contains
         # a path inside the target worktree.
-        proc_win = MagicMock()
-        proc_win.info = {
-            "pid": 8801,
-            "name": "code.exe",
-            "cmdline": ["code.exe", "/fake/worktree/src/main.py"],
-        }
+        proc_win = _make_fake_proc(
+            8801, "code.exe", ["code.exe", "/fake/worktree/src/main.py"], target
+        )
         proc_win.cwd.side_effect = psutil.AccessDenied(8801)
-        proc_win.open_files.side_effect = psutil.AccessDenied(8801)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_win]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[8801]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({8801: proc_win}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)
@@ -3209,23 +3249,20 @@ class TestFindBlockingProcessesWindows:
         target = "C:\\fake\\worktree"
         host_pid = os.getpid()
 
-        proc_unrelated = MagicMock()
-        proc_unrelated.info = {
-            "pid": 8802,
-            "name": "explorer.exe",
-            "cmdline": ["explorer.exe", "C:\\Users\\user\\Documents"],
-        }
+        proc_unrelated = _make_fake_proc(
+            8802, "explorer.exe", ["explorer.exe", "C:\\Users\\user\\Documents"], "C:\\other"
+        )
         proc_unrelated.cwd.side_effect = psutil.AccessDenied(8802)
-        proc_unrelated.open_files.side_effect = psutil.AccessDenied(8802)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_unrelated]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[8802]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({8802: proc_unrelated}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)
@@ -3243,23 +3280,20 @@ class TestFindBlockingProcessesWindows:
         target = "/fake/worktree"
         host_pid = os.getpid()
 
-        proc_posix = MagicMock()
-        proc_posix.info = {
-            "pid": 8803,
-            "name": "bash",
-            "cmdline": ["bash", "/fake/worktree/run.sh"],
-        }
+        proc_posix = _make_fake_proc(
+            8803, "bash", ["bash", "/fake/worktree/run.sh"], "/other/path"
+        )
         proc_posix.cwd.side_effect = psutil.AccessDenied(8803)
-        proc_posix.open_files.side_effect = psutil.AccessDenied(8803)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_posix]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[8803]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({8803: proc_posix}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             result = _find_blocking_processes(target, host_pid)
@@ -3276,23 +3310,20 @@ class TestFindBlockingProcessesWindows:
         target = "C:\\fake\\worktree"
         host_pid = os.getpid()
 
-        proc_exact = MagicMock()
-        proc_exact.info = {
-            "pid": 8804,
-            "name": "tool.exe",
-            "cmdline": ["tool.exe", "--root", "C:\\fake\\worktree"],
-        }
+        proc_exact = _make_fake_proc(
+            8804, "tool.exe", ["tool.exe", "--root", "C:\\fake\\worktree"], "C:\\other"
+        )
         proc_exact.cwd.side_effect = psutil.AccessDenied(8804)
-        proc_exact.open_files.side_effect = psutil.AccessDenied(8804)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_exact]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[8804]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({8804: proc_exact}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)
@@ -3309,23 +3340,22 @@ class TestFindBlockingProcessesWindows:
         host_pid = os.getpid()
 
         # This process: cwd succeeds AND cmdline matches
-        proc_both = MagicMock()
-        proc_both.info = {
-            "pid": 8805,
-            "name": "node.exe",
-            "cmdline": ["node.exe", "C:\\fake\\worktree\\index.js"],
-        }
-        proc_both.cwd.return_value = "C:\\fake\\worktree"
-        proc_both.open_files.return_value = []
+        proc_both = _make_fake_proc(
+            8805,
+            "node.exe",
+            ["node.exe", "C:\\fake\\worktree\\index.js"],
+            "C:\\fake\\worktree",
+        )
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_both]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[8805]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({8805: proc_both}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)
@@ -4224,17 +4254,20 @@ class TestWinHandleHoldersIntegration:
         ancestor_mock.pid = ancestor_pid
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {}, host_pid, host_parents=[ancestor_mock]
+                ),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders",
                 return_value=[(host_pid, "host"), (ancestor_pid, "ancestor")],
             ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = [ancestor_mock]
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)
@@ -4256,17 +4289,18 @@ class TestWinHandleHoldersIntegration:
         proc_cwd_match = _make_fake_proc(9103, "bash", ["bash"], target)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_cwd_match]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[9103]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({9103: proc_cwd_match}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders",
                 side_effect=OSError("simulated ctypes failure"),
             ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)  # must not raise
@@ -4283,16 +4317,15 @@ class TestWinHandleHoldersIntegration:
         host_pid = os.getpid()
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders"
             ) as mock_handle_scan,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             result = _find_blocking_processes(target, host_pid)
@@ -4361,8 +4394,10 @@ class TestHandleScanDeadlineThreading:
         captured_budget: List[float] = []
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders",
@@ -4371,9 +4406,6 @@ class TestHandleScanDeadlineThreading:
                 ),
             ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             deadline = time.monotonic() + 0.2  # far less than the 15.0s ceiling
@@ -4399,16 +4431,15 @@ class TestHandleScanDeadlineThreading:
         host_pid = os.getpid()
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders"
             ) as mock_handle_scan,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             past_deadline = time.monotonic() - 1.0
@@ -4441,8 +4472,10 @@ class TestHandleScanDeadlineThreading:
         captured_budget: List[float] = []
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders",
@@ -4451,9 +4484,6 @@ class TestHandleScanDeadlineThreading:
                 ),
             ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             _find_blocking_processes(target, host_pid)  # no deadline kwarg
@@ -7828,17 +7858,17 @@ class TestDiscoveryBudget:
 
         matching_second.cwd.side_effect = _slow_cwd_second
 
-        def _process_iter_side_effect(*args, **kwargs):
-            return iter([matching_first, matching_second])
-
         with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[40001, 40002]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {40001: matching_first, 40002: matching_second}, host_pid
+                ),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             deadline = time.monotonic() + 0.1
@@ -9564,13 +9594,13 @@ class TestMatchPass:
         proc_match = _make_fake_proc(19001, "node", ["node", "server.js"], target)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_match]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[19001]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({19001: proc_match}, host_pid),
+            ),
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
             result = _find_blocking_processes(target, host_pid)
 
         assert len(result) == 1
@@ -9585,23 +9615,20 @@ class TestMatchPass:
         target = "/fake/worktree"
         host_pid = os.getpid()
 
-        proc_win = MagicMock()
-        proc_win.info = {
-            "pid": 19002,
-            "name": "code.exe",
-            "cmdline": ["code.exe", "/fake/worktree/src/main.py"],
-        }
+        proc_win = _make_fake_proc(
+            19002, "code.exe", ["code.exe", "/fake/worktree/src/main.py"], "/other"
+        )
         proc_win.cwd.side_effect = psutil.AccessDenied(19002)
-        proc_win.open_files.side_effect = psutil.AccessDenied(19002)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_win]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[19002]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({19002: proc_win}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "win32"
 
             result = _find_blocking_processes(target, host_pid)
@@ -9755,7 +9782,7 @@ class TestDiscoveryPasses:
         host_pid = os.getpid()
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "pids", return_value=[]),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
@@ -9800,14 +9827,15 @@ class TestBoundedPsutilCalls:
         proc.cwd.side_effect = _cwd
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[30154]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({30154: proc}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
 
             _find_blocking_processes(
                 target, host_pid, deadline=time.monotonic() + 2.0
@@ -10046,6 +10074,45 @@ class TestSharedWedgePool:
             "counter"
         )
 
+    def test_psutil_wedge_and_handle_wedge_share_the_same_cell(self, monkeypatch):
+        """Real behavioral check (review fix round, R22): a hung psutil
+        call dispatched through _bounded_call and a hung handle-scan probe
+        dispatched through a raw _BoundedQueryWorker.submit(grace=...) must
+        both land on the SAME _wedged_worker_slots cell -- one accounting
+        for every bounded OS call in this module, not a second,
+        psutil-specific pool. Not just hasattr -- both wedges actually run
+        and the cell is read after each."""
+        cell = [0]
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", cell, raising=False)
+
+        release_psutil = threading.Event()
+        release_handle = threading.Event()
+        handle_worker = None
+        try:
+            completed, _ = _pl._bounded_call(
+                lambda: release_psutil.wait(timeout=30), deadline=time.monotonic() + 30
+            )
+            assert completed is False, "a call blocked past its own timeout must not resolve"
+            assert cell[0] == 1, "a hung psutil call must claim a slot on the shared cell"
+
+            handle_worker = _BoundedQueryWorker()
+            outcome = handle_worker.submit(
+                lambda: release_handle.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert cell[0] == 2, (
+                "a hung handle-scan probe must claim a slot on the SAME "
+                "cell a hung psutil call already claimed, not a separate "
+                "psutil-only counter"
+            )
+        finally:
+            release_psutil.set()
+            release_handle.set()
+            if handle_worker is not None:
+                handle_worker.close()
+
 
 class TestBoundedPsutilGraceIsolation:
     def test_bounded_call_never_receives_a_grace_budget(self):
@@ -10060,6 +10127,32 @@ class TestBoundedPsutilGraceIsolation:
             "_bounded_call (the psutil-call wrapper) must not accept a "
             "grace budget at all -- grace is _win_handle_holders-internal "
             "only"
+        )
+
+    def test_bounded_call_submits_with_no_grace_and_the_blocking_call_timeout(self):
+        """Real behavioral check (review fix round): _bounded_call's actual
+        submit() call -- not just its own signature -- passes grace=None
+        and timeout=_BLOCKING_CALL_TIMEOUT_SEC (the generous, ~10^2-10^3
+        per-call psutil timeout), never _HANDLE_QUERY_TIMEOUT_SEC (Pass
+        1c's ~10^5-per-scan per-handle timeout, three orders of magnitude
+        tighter)."""
+        captured: dict = {}
+        real_submit = _BoundedQueryWorker.submit
+
+        def _spy_submit(self, fn, **kwargs):
+            captured.update(kwargs)
+            return real_submit(self, fn, **kwargs)
+
+        with patch.object(_BoundedQueryWorker, "submit", _spy_submit):
+            completed, value = _pl._bounded_call(lambda: 42, deadline=time.monotonic() + 5)
+
+        assert completed is True
+        assert value == 42
+        assert captured.get("grace") is None
+        assert captured.get("timeout") == _pl._BLOCKING_CALL_TIMEOUT_SEC
+        assert _pl._BLOCKING_CALL_TIMEOUT_SEC != _HANDLE_QUERY_TIMEOUT_SEC, (
+            "the two timeouts must remain distinct constants -- this test "
+            "would pass vacuously if they were ever unified"
         )
 
 
@@ -10092,8 +10185,10 @@ class TestDiscoveryBudgetDerivation:
             return _pl._PartialList([], complete=True)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
             patch(
                 "lib_python_worktree.core.process_lifecycle._win_handle_holders",
@@ -10101,9 +10196,6 @@ class TestDiscoveryBudgetDerivation:
             ),
         ):
             mock_sys.platform = "win32"
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
 
             now = time.monotonic()
             _find_blocking_processes(target, host_pid, deadline=now + 1.0)
@@ -10227,16 +10319,17 @@ class TestAncestorWalkAndHangingCwd:
         proc3.cwd.side_effect = _cwd3
 
         with (
+            patch.object(psutil, "pids", return_value=[41001, 41002, 41003]),
             patch.object(
-                psutil, "process_iter", return_value=[proc1, proc2, proc3]
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {41001: proc1, 41002: proc2, 41003: proc3}, host_pid
+                ),
             ),
-            patch.object(psutil, "Process") as mock_proc_cls,
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
             mock_sys.platform = "linux"
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
 
             t0 = time.monotonic()
             result = _find_blocking_processes(

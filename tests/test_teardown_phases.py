@@ -507,22 +507,137 @@ def test_target_is_absent_true_for_truly_absent_target_default_force_false():
 
 
 # ---------------------------------------------------------------------------
-# #154 R3 (tier-1 diagnosis scaffolding, structural existence check only).
-# The full behavioural rows -- tier 1's bounded psutil.pid_exists liveness
-# filter, the skip-on-unconfirmed rule, kill-vs-report-only -- depend on
-# `_retry_bounded`/`_diagnose_and_retry` existing at all, which they do not
-# yet; see the developer's final report for what remains unwritable without
-# this scaffolding.
+# #154 R3/R17: _diagnose_and_retry behavioural coverage (review fix round,
+# reviewer finding 2). The structural existence check
+# (test_tier1_diagnosis_scaffolding_exists) is superseded by these -- the
+# scaffolding it pinned is now exercised directly.
 # ---------------------------------------------------------------------------
 
-def test_tier1_diagnosis_scaffolding_exists():
-    """RED today: neither the shared bounded-retry loop nor the
-    retry-then-diagnose function exists on the teardown module at all."""
-    assert hasattr(teardown, "_retry_bounded"), (
-        "_retry_bounded(op, *, ctx) -- the shared bounded-retry loop used "
-        "by every failure-path entry point -- must exist"
+def test_diagnose_and_retry_tier1_kills_confirmed_live_owned_pid_and_retries():
+    """Tier 1: a pid in ctx.owned_pids that the bounded psutil.pid_exists
+    probe confirms alive is killed via ctx.lifecycle._kill_process_tree
+    and *retry* is attempted exactly once; a successful retry resolves the
+    failure without tier 2 (the systemwide scan) ever running."""
+    record = _make_record(pids={"main": 555})
+    lifecycle = MagicMock()
+    lifecycle._bounded_call.side_effect = lambda fn, deadline=None: (True, fn())
+    ctx = _make_ctx(
+        record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids={555}
     )
-    assert hasattr(teardown, "_diagnose_and_retry"), (
-        "_diagnose_and_retry(ctx, *, trigger, retry) -- tier 1 (bounded "
-        "owned-pid liveness) then tier 2 (systemwide scan) -- must exist"
+
+    retry_calls = []
+
+    def _retry():
+        retry_calls.append(1)
+
+    with (
+        patch("psutil.pid_exists", side_effect=lambda pid: pid == 555),
+        patch.object(teardown, "_find_blocking_processes") as mock_tier2,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="rename", retry=_retry)
+
+    assert resolved is True
+    assert retry_calls == [1]
+    lifecycle._kill_process_tree.assert_called_once()
+    killed_infos = lifecycle._kill_process_tree.call_args[0][0]
+    assert {i.pid for i in killed_infos} == {555}
+    assert ctx.kill_attempted is True
+    assert {b.pid for b in ctx.blockers} == {555}
+    mock_tier2.assert_not_called()
+
+
+def test_diagnose_and_retry_tier1_skips_pid_whose_liveness_probe_did_not_complete():
+    """An owned pid whose bounded liveness probe never completes must
+    never be treated as a confirmed blocker -- not killed, not reported,
+    not retried on. Falls through to tier 2 instead of trusting an
+    unconfirmed pid."""
+    record = _make_record(pids={"main": 777})
+    lifecycle = MagicMock()
+    lifecycle._bounded_call.return_value = (False, None)
+    ctx = _make_ctx(
+        record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids={777}
     )
+
+    with patch.object(teardown, "_find_blocking_processes", return_value=[]) as mock_tier2:
+        resolved = teardown._diagnose_and_retry(ctx, trigger="rename", retry=lambda: None)
+
+    assert resolved is False
+    lifecycle._kill_process_tree.assert_not_called()
+    assert ctx.blockers == []
+    assert ctx.kill_attempted is False
+    mock_tier2.assert_called_once()
+
+
+def test_diagnose_and_retry_tier1_report_only_when_kill_flag_false():
+    """kill_blocking_processes=False: a confirmed-live owned pid is still
+    reported in ctx.blockers (report-only diagnosis), but never killed and
+    never retried on via tier 1 -- falls through to tier 2 for the same
+    report-only treatment."""
+    record = _make_record(pids={"main": 888})
+    lifecycle = MagicMock()
+    lifecycle._bounded_call.side_effect = lambda fn, deadline=None: (True, fn())
+    ctx = _make_ctx(
+        record, lifecycle=lifecycle, kill_blocking_processes=False, owned_pids={888}
+    )
+
+    with (
+        patch("psutil.pid_exists", return_value=True),
+        patch.object(teardown, "_find_blocking_processes", return_value=[]) as mock_tier2,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="rename", retry=lambda: None)
+
+    assert resolved is False
+    lifecycle._kill_process_tree.assert_not_called()
+    assert ctx.kill_attempted is False
+    assert {b.pid for b in ctx.blockers} == {888}
+    mock_tier2.assert_called_once()
+
+
+def test_diagnose_and_retry_tier2_never_kills_when_nothing_found():
+    """Regression (found and fixed during phase=implement, review fix
+    round finding 1 confirmed this fix as correct): _kill_blocking_processes
+    must never be called when tier 2's discovery finds no candidate --
+    calling it anyway would pay its own internal discovery scan for no
+    benefit and could blow the shared per-removal failure budget."""
+    record = _make_record()
+    lifecycle = MagicMock()
+    ctx = _make_ctx(record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids=set())
+
+    with (
+        patch.object(teardown, "_find_blocking_processes", return_value=[]),
+        patch.object(teardown, "_kill_blocking_processes") as mock_kill,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="residual", retry=lambda: None)
+
+    assert resolved is False
+    mock_kill.assert_not_called()
+    assert ctx.kill_attempted is False
+
+
+def test_diagnose_and_retry_tier2_kills_and_retries_when_found():
+    """Tier 2: a systemwide-scan hit is killed via
+    teardown._kill_blocking_processes and *retry* is attempted exactly
+    once; a successful retry resolves the failure."""
+    from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+    record = _make_record()
+    lifecycle = MagicMock()
+    ctx = _make_ctx(record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids=set())
+
+    tier2_hit = KilledProcessInfo(pid=999, name="node", cmdline=["node"], source="orphan_scan")
+    retry_calls = []
+
+    def _retry():
+        retry_calls.append(1)
+
+    with (
+        patch.object(teardown, "_find_blocking_processes", return_value=[tier2_hit]),
+        patch.object(teardown, "_kill_blocking_processes", return_value=[tier2_hit]) as mock_kill,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="residual", retry=_retry)
+
+    assert resolved is True
+    mock_kill.assert_called_once()
+    assert retry_calls == [1]
+    assert ctx.kill_attempted is True
+    assert 999 in {b.pid for b in ctx.blockers}

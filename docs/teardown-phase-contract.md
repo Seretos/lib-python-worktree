@@ -52,6 +52,21 @@ see the "non-empty `.removing` remnant" invariant below.
    #123). Raises `DirtyWorktreeError` when real (non-`.seretos/`-only)
    dirt is present and `force=False`.
 
+   Review fix round (reviewer finding 3, considered and reverted): in the
+   remnant-only/`force=False` case this phase and phase 5 below still run
+   against a nonexistent `record.path` before `_phase_stage_and_delete`
+   raises -- harmless (the probe/step attempt fails or is inconclusive,
+   swallowed) but wasted. A `record.path`-does-not-exist short-circuit was
+   prototyped and reverted: `tests/test_teardown_phases.py`,
+   `tests/test_teardown.py` and `tests/test_teardown_matrix.py` all carry
+   pure-unit-style fixtures that hand-build a `_TeardownContext` over a
+   deliberately nonexistent `record.path` (by design -- these test the
+   phase functions standalone, without touching a real filesystem or
+   `WorktreeManager`), so the short-circuit silently no-ops seven existing
+   tests, including regression pins for tickets #88/#117/#123 -- well past
+   the "a couple lines" bound this fix was scoped to. Left as a named,
+   accepted minor inefficiency.
+
 5. `_phase_run_teardown_steps`
    Run the contract's `teardown:` steps at most once per logical removal
    (ticket #126): gated on `not record.teardown_ran`, and the marker is

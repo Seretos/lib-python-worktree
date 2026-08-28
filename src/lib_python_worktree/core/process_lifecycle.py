@@ -3152,11 +3152,15 @@ def _find_blocking_processes(
         scan budget is governed by *deadline* (see below): capped at
         ``_HANDLE_SCAN_BUDGET_SEC`` and skipped entirely once no budget
         remains.
-    2. Open-file match — processes holding an open file handle inside *path*
-       (via ``psutil.open_files()``). On Windows, a single call can raise a
-       bare ``RuntimeError`` when the OS-wide handle table is too large for
-       psutil's query to succeed (D9) -- this is process-independent, not a
-       per-PID failure; see the Returns section below.
+
+    Ticket #154, item 9: the OS-wide ``psutil.open_files()`` sweep (former
+    Pass 2) is deleted outright, not bounded -- it was the actual hang site
+    (the ticket's own repro stack-dumped inside psutil's ``isfile_strict()``
+    under ``open_files()``). Named consequence: on POSIX, discovery now
+    degrades to cwd-only; a daemon that ``chdir``'d away but still holds an
+    open file handle inside *path* is no longer proactively found by this
+    scan (it can still surface reactively via the removal failure path's
+    bounded diagnosis, if it actually blocks a rename/delete).
 
     All passes exclude the host process and all its OS-level ancestors.
     Results are de-duplicated by PID.
@@ -3178,11 +3182,13 @@ def _find_blocking_processes(
         fixed ``_HANDLE_SCAN_BUDGET_SEC`` ceiling on top of everything else.
         ``None`` (the default, used by direct/test callers) means "use the
         full ``_HANDLE_SCAN_BUDGET_SEC`` ceiling, no external deadline".
-        Passes 1, 1b, and 2 are now ALSO bounded by *deadline* (ticket #87):
-        before this fix they were unbounded linear scans, and against a
-        large/slow ambient process list that measured ~75s of CPU for a
-        single call that found nothing. See ``_DISCOVERY_MAX_SEC`` /
-        ``_DISCOVERY_RESERVE_SEC`` below.
+        Passes 1 and 1b are bounded by *deadline* both between processes
+        (``scan_stop``, ticket #87) and per process (every ``cwd()``/
+        ``cmdline()``/``name()`` read is dispatched through
+        :func:`_bounded_call`, ticket #154 item 11) -- before the #87 fix
+        these were unbounded linear scans that measured ~75s of CPU for a
+        single call finding nothing; before #154 a single wedged process
+        within the scan could still hang the whole call indefinitely.
 
     Returns
     -------
@@ -3190,27 +3196,17 @@ def _find_blocking_processes(
     ``False`` when any pass's entry guard was false (never ran at all -- e.g.
     ``"cwd:skipped"``) or its inner per-process loop broke on ``scan_stop``
     (ran, but did not finish -- e.g. ``"cwd:truncated"``), and likewise for
-    Pass 1b (``"cmdline:..."``), Pass 1c (``"handle_scan:..."``, including
-    ``"handle_scan:failed"`` when :func:`_win_handle_holders` raised and was
-    swallowed -- zero coverage from that pass, not a mere degradation), and
-    Pass 2 (``"open_files:..."``, including ``"open_files:degraded"`` (D9)
-    when ``proc.open_files()`` raised a bare ``RuntimeError`` -- see below).
-    A pass simply not applicable on this OS (Pass 1b/1c off Windows) never
-    contributes a tag. An individual PID raising
-    ``AccessDenied``/``NoSuchProcess`` within a pass is caught and skipped
-    (``continue``) without affecting that pass's completeness -- only a
-    whole pass being skipped/truncated/failed/degraded does. A
-    ``RuntimeError`` from ``proc.open_files()`` on Windows (D9) is different
-    from those: it is *not* per-PID -- it reflects an OS-wide condition (the
-    handle table is too large for a single query) that will recur
-    identically for every remaining process, so Pass 2 stops early
-    (``break``, not ``continue``) and reports ``"open_files:degraded"``
-    rather than either silently continuing to burn the scan budget on
-    guaranteed failures or letting the exception escape and crash the
-    caller (ticket #107). This is distinct from ``"open_files:truncated"``
-    (D7): truncated means the loop ran out of clock (``scan_stop`` was
-    reached); degraded means the OS refused the query outright, independent
-    of remaining budget.
+    Pass 1b (``"cmdline:..."``), and Pass 1c (``"handle_scan:..."``,
+    including ``"handle_scan:failed"`` when :func:`_win_handle_holders`
+    raised and was swallowed -- zero coverage from that pass, not a mere
+    degradation). A pass simply not applicable on this OS (Pass 1b/1c off
+    Windows) never contributes a tag. A bounded call (``cwd()``/``cmdline()``
+    on the primary matching path) that does not complete adds the offending
+    pid to a per-call ``unresponsive_pids`` set (skipped by later passes in
+    the same call) and appends ``"discovery:unresponsive"`` at most once;
+    an enrichment-only bounded call (name()/cmdline() for an already-matched
+    pid) failing to complete does not, since the pid is already a confirmed
+    match and only its display metadata is missing.
     """
     import psutil
 
@@ -3280,85 +3276,122 @@ def _find_blocking_processes(
     # lock, no cap, no eviction, dies with this call.
     unresponsive_pids: set[int] = set()
 
-    # Pass 1: CWD match. proc.cwd() is dispatched through _bounded_call
-    # (item 11) -- a single hung cwd() must not hang the whole scan.
+    # Pass 1: CWD match. Ticket #154 fix round (reviewer finding 1, item 11
+    # "process_iter attribute prefetch is deleted, not bounded"):
+    # psutil.process_iter(["pid", "name", "cmdline"]) eagerly and
+    # synchronously fetches cmdline()/name() for every process before
+    # yielding -- the exact wedge-prone call class this ticket exists to
+    # bound, just moved one call earlier. Iterate the bare pid table
+    # (psutil.pids() reads only the OS pid table, never a per-process
+    # attribute) and construct psutil.Process(pid) INSIDE the bounded
+    # lambda so the wedge-prone read itself runs off the main thread.
+    # name()/cmdline() are fetched only for a pid that already matched via
+    # cwd() -- also bounded, since a matched process is no safer to read
+    # from than an unmatched one.
     pass_unresponsive = False
     if time.monotonic() <= scan_stop:
         pass_truncated = False
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        for pid in psutil.pids():
             if time.monotonic() > scan_stop:
                 pass_truncated = True
                 break
-            try:
-                pid = proc.info["pid"]
-                if pid in excluded_pids:
-                    continue
-                completed, cwd = _bounded_call(proc.cwd, deadline=scan_stop)
-                if not completed:
-                    unresponsive_pids.add(pid)
-                    pass_unresponsive = True
-                    continue
-                if cwd is None:
-                    continue
-                norm_cwd = os.path.normcase(os.path.normpath(cwd))
-                # Match if the process cwd equals the target path or is under it.
-                if norm_cwd == normalized or norm_cwd.startswith(normalized + os.sep):
-                    seen_pids.add(pid)
-                    result.append(
-                        KilledProcessInfo(
-                            pid=pid,
-                            name=proc.info["name"] or "",
-                            cmdline=proc.info["cmdline"] or [],
-                            source="orphan_scan",
-                            match_pass="cwd",
-                        )
-                    )
-            except (psutil.AccessDenied, psutil.NoSuchProcess):
+            if pid in excluded_pids:
                 continue
+            completed, cwd = _bounded_call(
+                lambda pid=pid: psutil.Process(pid).cwd(), deadline=scan_stop
+            )
+            if not completed:
+                unresponsive_pids.add(pid)
+                pass_unresponsive = True
+                continue
+            if cwd is None:
+                continue
+            norm_cwd = os.path.normcase(os.path.normpath(cwd))
+            # Match if the process cwd equals the target path or is under it.
+            if norm_cwd != normalized and not norm_cwd.startswith(normalized + os.sep):
+                continue
+            completed, name_cmdline = _bounded_call(
+                lambda pid=pid: (psutil.Process(pid).name(), psutil.Process(pid).cmdline()),
+                deadline=scan_stop,
+            )
+            if completed and name_cmdline is not None:
+                proc_name, proc_cmdline = name_cmdline
+            else:
+                # Best-effort enrichment only -- a psutil failure or an
+                # unresponsive read here must not prevent the pid from
+                # being reported as a blocker (mirrors Pass 1c's
+                # enrichment below); it is not tagged discovery:unresponsive
+                # since the match itself is already certain.
+                proc_name, proc_cmdline = "", []
+            seen_pids.add(pid)
+            result.append(
+                KilledProcessInfo(
+                    pid=pid,
+                    name=proc_name or "",
+                    cmdline=proc_cmdline or [],
+                    source="orphan_scan",
+                    match_pass="cwd",
+                )
+            )
         if pass_truncated:  # D2
             skipped_passes.append("cwd:truncated")
     else:
         skipped_passes.append("cwd:skipped")  # D1
-    if pass_unresponsive:
-        skipped_passes.append("discovery:unresponsive")
 
     # Pass 1b (Windows only): cmdline token scan.
-    # proc.cwd() raises AccessDenied for almost all foreign processes on Windows.
-    # Scan cmdline tokens as a fallback: if any token resolves to a path under
-    # the worktree directory, treat the process as blocking.
+    # proc.cwd() raises AccessDenied for almost all foreign processes on
+    # Windows. Scan cmdline tokens as a fallback: if any token resolves to
+    # a path under the worktree directory, treat the process as blocking.
+    # Ticket #154 fix round: cmdline() is the call this pass exists to
+    # make, so -- unlike Pass 1's enrichment -- it cannot be skipped for
+    # unmatched pids; it is bounded per pid via _bounded_call instead.
     if sys.platform == "win32":
         if time.monotonic() <= scan_stop:
             pass_truncated = False
-            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            for pid in psutil.pids():
                 if time.monotonic() > scan_stop:
                     pass_truncated = True
                     break
-                try:
-                    pid = proc.info["pid"]
-                    if pid in excluded_pids or pid in seen_pids or pid in unresponsive_pids:
-                        continue
-                    cmdline = proc.info["cmdline"] or []
-                    for token in cmdline:
-                        try:
-                            norm_token = os.path.normcase(os.path.normpath(token))
-                        except (ValueError, TypeError):
-                            continue
-                        if norm_token == normalized or norm_token.startswith(normalized + os.sep):
-                            seen_pids.add(pid)
-                            result.append(KilledProcessInfo(
-                                pid=pid,
-                                name=proc.info["name"] or "",
-                                cmdline=cmdline,
-                                source="orphan_scan",
-                                match_pass="cmdline",
-                            ))
-                            break
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                if pid in excluded_pids or pid in seen_pids or pid in unresponsive_pids:
                     continue
+                completed, cmdline = _bounded_call(
+                    lambda pid=pid: psutil.Process(pid).cmdline(), deadline=scan_stop
+                )
+                if not completed:
+                    unresponsive_pids.add(pid)
+                    pass_unresponsive = True
+                    continue
+                cmdline = cmdline or []
+                matched = False
+                for token in cmdline:
+                    try:
+                        norm_token = os.path.normcase(os.path.normpath(token))
+                    except (ValueError, TypeError):
+                        continue
+                    if norm_token == normalized or norm_token.startswith(normalized + os.sep):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                completed, proc_name = _bounded_call(
+                    lambda pid=pid: psutil.Process(pid).name(), deadline=scan_stop
+                )
+                if not (completed and proc_name is not None):
+                    proc_name = ""
+                seen_pids.add(pid)
+                result.append(KilledProcessInfo(
+                    pid=pid,
+                    name=proc_name or "",
+                    cmdline=cmdline,
+                    source="orphan_scan",
+                    match_pass="cmdline",
+                ))
             if pass_truncated:  # D3
                 skipped_passes.append("cmdline:truncated")
         else:
             skipped_passes.append("cmdline:skipped")  # D3
+    if pass_unresponsive:
+        skipped_passes.append("discovery:unresponsive")
 
     # Pass 1c (Windows only): OS-level handle-table scan (ticket #71). See
     # _win_handle_holders' docstring for the full rationale/mechanism. This
@@ -3417,15 +3450,22 @@ def _find_blocking_processes(
                     continue
                 cmdline: List[str] = []
                 proc_name = name
-                try:
-                    p = psutil.Process(pid)
-                    cmdline = p.cmdline()
+                # Ticket #154 fix round (reviewer finding 1): bounded via
+                # _bounded_call, not a bare psutil.Process(pid) call --
+                # this enrichment is exactly the wedge-prone call class
+                # item 11 exists to bound, with no exemption for Pass 1c.
+                completed, enrichment = _bounded_call(
+                    lambda pid=pid: (psutil.Process(pid).cmdline(), psutil.Process(pid).name()),
+                    deadline=scan_stop,
+                )
+                if completed and enrichment is not None:
+                    fetched_cmdline, fetched_name = enrichment
+                    cmdline = fetched_cmdline or []
                     if not proc_name:
-                        proc_name = p.name()
-                except Exception:  # noqa: BLE001
-                    # Best-effort info gathering only -- a psutil failure here
-                    # must not prevent the PID from being reported as a blocker.
-                    pass
+                        proc_name = fetched_name
+                # Best-effort info gathering only -- a psutil failure or an
+                # unresponsive read here must not prevent the pid from
+                # being reported as a blocker.
                 seen_pids.add(pid)
                 result.append(
                     KilledProcessInfo(
@@ -3501,12 +3541,22 @@ def _kill_blocking_processes(
     *timeout* seconds" guarantee above. Once the deadline passes, expansion
     stops issuing further :func:`_process_tree` calls and degrades
     gracefully to whatever lineage was already expanded so far -- the same
-    pattern :func:`_find_blocking_processes` already uses for its own Pass
-    1/1b/1c/2 discovery loops. Ticket #95, finding 3 (D8): when this happens
-    it is folded into the returned :class:`_PartialList` as
+    pattern :func:`_find_blocking_processes` already uses for its own
+    discovery loops. Ticket #95, finding 3 (D8): when this happens it is
+    folded into the returned :class:`_PartialList` as
     ``"lineage:truncated"`` and ``complete=False`` -- carrying forward
     whatever incompleteness :func:`_find_blocking_processes` itself already
     reported, if any.
+
+    Ticket #154 fix round (reviewer finding 1, item 11): each
+    :func:`_process_tree` call is itself dispatched through
+    :func:`_bounded_call` -- before this fix it was the last unbounded
+    psutil-adjacent call in the removal failure path (its own per-node
+    ``name()``/``cmdline()`` reads are the same wedge class as everything
+    else item 11 bounds). A non-completing walk skips only that blocker's
+    lineage expansion (an enrichment; the blocker itself is still killed
+    below) and sets ``"lineage:truncated"``, the same tag a budget-exhausted
+    walk sets -- the two causes are not distinguished in the tag vocabulary.
     """
     deadline = time.monotonic() + timeout
     found = _find_blocking_processes(path, os.getpid(), deadline=deadline)
@@ -3525,7 +3575,16 @@ def _kill_blocking_processes(
             # whatever lineage was expanded so far is kept, not discarded.
             lineage_truncated = True
             break
-        for descendant in _process_tree(info.pid):
+        completed, descendants = _bounded_call(
+            lambda pid=info.pid: _process_tree(pid), deadline=deadline
+        )
+        if not completed:
+            # This blocker's lineage could not be walked in time -- the
+            # blocker itself is still reported/killed below; only its
+            # descendant expansion is skipped.
+            lineage_truncated = True
+            continue
+        for descendant in descendants or []:
             if descendant.pid in seen_pids:
                 continue
             seen_pids.add(descendant.pid)
