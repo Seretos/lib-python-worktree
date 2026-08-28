@@ -11041,3 +11041,75 @@ class TestBoundedPsutilGraceIsolation:
             "grace budget at all -- grace is _win_handle_holders-internal "
             "only"
         )
+
+
+# ---------------------------------------------------------------------------
+# #154 R3b (item 10): the handle-scan budget is derived from the caller's
+# deadline directly (not from a separately-reserved scan_stop), and the two
+# ceilings _DISCOVERY_MAX_SEC/_DISCOVERY_RESERVE_SEC collapse into one rule
+# while _HANDLE_SCAN_BUDGET_SEC survives as a ceiling.
+# ---------------------------------------------------------------------------
+
+class TestDiscoveryBudgetDerivation:
+    def test_discovery_budget_is_derived_from_the_caller_deadline_under_the_handle_scan_ceiling(
+        self,
+    ):
+        """RED today: Pass 1c's budget is computed straight from `deadline`
+        (`min(_HANDLE_SCAN_BUDGET_SEC, deadline - now)`), not from
+        `scan_stop` (which reserves `min(_DISCOVERY_RESERVE_SEC, 0.2 *
+        remaining)` for the caller's own kill step afterward) -- so on a
+        1.0s deadline today's captured budget is ~1.0s, not the ~0.8s a
+        scan_stop-derived budget would produce."""
+        import psutil
+
+        target = "/fake/worktree-r3b"
+        host_pid = os.getpid()
+
+        captured: list = []
+
+        def _fake_handle_holders(path, excluded_pids, *, budget_sec):
+            captured.append(budget_sec)
+            return _pl._PartialList([], complete=True)
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._win_handle_holders",
+                side_effect=_fake_handle_holders,
+            ),
+        ):
+            mock_sys.platform = "win32"
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            now = time.monotonic()
+            _find_blocking_processes(target, host_pid, deadline=now + 1.0)
+
+        assert len(captured) == 1
+        assert abs(captured[0] - 0.8) < 0.1, (
+            f"expected the 1.0s-deadline case to yield a ~0.8s budget "
+            f"(scan_stop-derived: deadline - 0.2*remaining), got "
+            f"{captured[0]!r}"
+        )
+
+    def test_discovery_ceilings_collapsed_correctly(self):
+        """`_DISCOVERY_MAX_SEC`/`_DISCOVERY_RESERVE_SEC` are deleted, but
+        `_HANDLE_SCAN_BUDGET_SEC` (a genuine, documented ceiling, not a
+        private default) must survive. RED today: both deleted constants
+        still exist."""
+        assert not hasattr(_pl, "_DISCOVERY_MAX_SEC"), (
+            "_DISCOVERY_MAX_SEC must be deleted -- the caller-derived "
+            "deadline is the only budget story now"
+        )
+        assert not hasattr(_pl, "_DISCOVERY_RESERVE_SEC"), (
+            "_DISCOVERY_RESERVE_SEC is replaced by the unconditional "
+            "`0.2 * remaining` rule with no min-of-two"
+        )
+        assert hasattr(_pl, "_HANDLE_SCAN_BUDGET_SEC"), (
+            "_HANDLE_SCAN_BUDGET_SEC must be KEPT as a ceiling (item 10) -- "
+            "deleting it would regress stop(timeout=60, kill_orphans=True) "
+            "from a 15s handle-scan bound to ~47s"
+        )
