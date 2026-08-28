@@ -2449,3 +2449,40 @@ class TestMatrixRemovalMechanism:
             f"worktree '{record.id}' directory is still locked after killing"
             f" 0 blocking process(es)."
         )
+
+    # -- R5 (AC4): a saturated wedge cap cannot block an unheld directory ----
+
+    def test_saturated_wedge_cap_does_not_block_unheld_dir(self, tmp_path):
+        """A `handle_scan:capped`/degraded systemwide scan result must never
+        turn a clean, unheld, successfully-renamed directory's removal into
+        WorktreeDirLockedError -- because on the happy path the scan is
+        never even consulted (AC2/R1). RED today: this fixture reproduces
+        the actual bug this ticket exists to fix -- the confirming rescan
+        can never clear a previously observed foreign hit, so a persistent
+        (always-degraded) scan result keeps the removal permanently
+        blocked."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r5"
+        checkout.mkdir()
+        record = _make_record("wt-r5", path=str(checkout), repo_root=str(tmp_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        degraded = _PartialList([], skipped_passes=("handle_scan:capped",))
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=degraded),
+            ) as mock_scan,
+            patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+        ):
+            # Must succeed -- and, per AC2/R1, must never even call the
+            # (perpetually degraded) scan on a clean, unheld target.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert mock_scan.call_count == 0, (
+            f"a successful rename means the scan is never consulted at all; "
+            f"got {mock_scan.call_count} call(s)"
+        )
+        assert not checkout.exists()

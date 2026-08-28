@@ -487,3 +487,48 @@ def test_git_command_error_identity_after_relocation():
 def test_manager_all_unchanged():
     assert "GitCommandError" in manager_module.__all__
     assert "WorktreeManager" in manager_module.__all__
+
+
+# ---------------------------------------------------------------------------
+# #154 Decision 1 (human override): _target_is_absent() gains one added rule
+# for a non-empty `.removing` remnant -- the lighter fix replacing the
+# rejected _phase_reclaim_staged. See end-to-end coverage in
+# test_teardown_matrix.py::TestMatrixRemovalMechanism::
+# test_staged_dirty_remnant_is_never_silently_destroyed_by_a_later_removal.
+# ---------------------------------------------------------------------------
+
+def test_target_is_absent_false_for_nonempty_remnant_under_no_force(tmp_path):
+    """record.path absent, a non-empty `<path>.removing` remnant present,
+    force=False -> NOT 'target absent' (must surface downstream rather than
+    silently fast-pathing to 'nothing to remove here'). RED today:
+    _target_is_absent() only ever checks `record.path` itself and has no
+    `force` parameter at all."""
+    checkout = tmp_path / "wt-target-absent-remnant"
+    staged = Path(str(checkout) + ".removing")
+    staged.mkdir()
+    (staged / "dirty.txt").write_text("uncommitted")
+    record = _make_record(path=str(checkout))
+
+    assert teardown._target_is_absent(record, force=False) is False
+
+
+def test_target_is_absent_true_for_nonempty_remnant_under_force(tmp_path):
+    """The same remnant under force=True is still 'target absent' for
+    gating purposes -- force=True's pre-clean of a stale remnant is
+    unchanged and happens in _phase_stage_and_delete's opening guard, not
+    here."""
+    checkout = tmp_path / "wt-target-absent-remnant-forced"
+    staged = Path(str(checkout) + ".removing")
+    staged.mkdir()
+    (staged / "dirty.txt").write_text("uncommitted")
+    record = _make_record(path=str(checkout))
+
+    assert teardown._target_is_absent(record, force=True) is True
+
+
+def test_target_is_absent_true_for_truly_absent_target_default_force_false():
+    """Backward-compat: no remnant at all -> unchanged True, with the new
+    `force` parameter defaulting so existing single-arg call sites (e.g.
+    manager.remove()'s own probe) keep working."""
+    record = _make_record(path="/definitely/not/a/real/path/xyz-154")
+    assert teardown._target_is_absent(record) is True
