@@ -2134,8 +2134,18 @@ class _BoundedQueryWorker:
         grace: Optional[_GraceBudget] = None,
         scan_deadline: Optional[float] = None,
         on_abandoned_done=None,
+        timeout: float = _HANDLE_QUERY_TIMEOUT_SEC,
     ) -> _QueryOutcome:
         """Run *fn* (a zero-arg callable) through this worker, bounded.
+
+        *timeout* (ticket #154, item 11) overrides the stage-1 wait,
+        defaulting to ``_HANDLE_QUERY_TIMEOUT_SEC`` (0.01s, tuned for a
+        single NtQueryObject call on an already-duplicated handle) so Pass
+        1c's own callers are unaffected byte-for-byte. A caller bounding a
+        blocking psutil read (via :func:`_bounded_call`) passes
+        ``_BLOCKING_CALL_TIMEOUT_SEC`` instead -- applying the handle-query
+        timeout to a psutil call would misclassify nearly every healthy
+        read as wedged.
 
         Returns a :class:`_QueryOutcome`:
 
@@ -2182,7 +2192,7 @@ class _BoundedQueryWorker:
         }
         self._job_queue.put((fn, state))
 
-        if state["done"].wait(_HANDLE_QUERY_TIMEOUT_SEC):
+        if state["done"].wait(timeout):
             return _QueryOutcome(_QueryStatus.RESOLVED, state["value"])
 
         # Stage 2: a single bounded "second chance", drawn from the shared
@@ -3074,6 +3084,47 @@ def _win_handle_holders(
         _handle_scan_lock.release()
 
 
+def _bounded_call(fn, *, deadline: Optional[float] = None) -> "Tuple[bool, Any]":
+    """Thin, locked wrapper (ticket #154, item 11) for a single blocking
+    psutil read (``proc.cwd()``, ``cmdline()``, ``name()``, the ancestor
+    walk's ``parents()``, tier-1's ``psutil.pid_exists``, ...), dispatched
+    through a short-lived :class:`_BoundedQueryWorker` at
+    ``_BLOCKING_CALL_TIMEOUT_SEC`` -- never ``_HANDLE_QUERY_TIMEOUT_SEC``,
+    which is tuned for a single already-duplicated handle, not a psutil
+    read.
+
+    Returns ``(completed, value)``: ``(True, <fn's return value>)`` if *fn*
+    resolved in time, ``(False, None)`` if it did not (or if a worker
+    could not even be started). Never raises.
+
+    Deliberately never passed a *grace* budget: grace exists for Pass 1c's
+    ~10^5-per-scan ``NtQueryObject`` multiplication problem (see
+    ``_HANDLE_QUERY_GRACE_SEC``'s docstring), not for the ~10^2-10^3-
+    per-call psutil population, where a flat, generous per-call timeout is
+    affordable on its own.
+
+    A non-resolved outcome's thread joins the SAME shared
+    ``_wedged_worker_slots`` cell as a wedged handle-scan worker -- one
+    accounting for every bounded OS call in this module, not two pools
+    (item 14). The worker is intentionally NOT the persistent
+    ``_win_handle_holders`` worker (a separate, freshly-created one per
+    call): sharing that one would serialize ordinary psutil reads behind
+    ``_handle_scan_lock``, which guards a genuinely different resource.
+    """
+    try:
+        worker = _BoundedQueryWorker()
+    except Exception:  # noqa: BLE001 -- never let bounding itself fail
+        return False, None
+    outcome = worker.submit(fn, scan_deadline=deadline, timeout=_BLOCKING_CALL_TIMEOUT_SEC)
+    if outcome.status == _QueryStatus.RESOLVED:
+        worker.close()
+        return True, outcome.value
+    # Not resolved -- submit() already retired this worker's thread and
+    # counted it against the shared _wedged_worker_slots cell; do not
+    # close() it (it may still be genuinely blocked in fn()).
+    return False, None
+
+
 def _find_blocking_processes(
     path: str,
     host_pid: int,
@@ -3164,14 +3215,27 @@ def _find_blocking_processes(
     import psutil
 
     normalized = os.path.normcase(os.path.normpath(path))
+    skipped_passes: List[str] = []
 
-    # Build the set of PIDs to exclude: the host process and all its ancestors.
+    # Ancestor-exclusion walk (ticket #154, item 11): a SAFETY precondition,
+    # not an enrichment -- without it, an ancestor of the calling process
+    # whose cwd lies inside the worktree could be reported as a blocker and
+    # then signalled. Bounded via _bounded_call; if it does not complete,
+    # discovery aborts BEFORE Pass 1 even starts -- an unknown exclusion
+    # set must never become an empty one. `psutil.AccessDenied`/
+    # `NoSuchProcess` are definitive OS answers ("the walk finished as far
+    # as permitted"), not "we never got an answer" -- kept unchanged,
+    # deliberately not routed through the abort rule below.
     excluded_pids: set[int] = {host_pid}
-    try:
-        for ancestor in psutil.Process(host_pid).parents():
+    ancestor_deadline = deadline if deadline is not None else time.monotonic() + _HANDLE_SCAN_BUDGET_SEC
+    completed, ancestors = _bounded_call(
+        lambda: list(psutil.Process(host_pid).parents()), deadline=ancestor_deadline
+    )
+    if not completed:
+        return _PartialList([], complete=False, skipped_passes=("discovery:unresponsive",))
+    if ancestors is not None:
+        for ancestor in ancestors:
             excluded_pids.add(ancestor.pid)
-    except (psutil.AccessDenied, psutil.NoSuchProcess):
-        pass
 
     # Ticket #154 (item 10): `_DISCOVERY_MAX_SEC`/`_DISCOVERY_RESERVE_SEC`
     # are deleted -- the caller-derived *deadline* is the only budget story
@@ -3207,9 +3271,18 @@ def _find_blocking_processes(
     # (raised and was swallowed), or degraded (OS-wide condition made
     # continuing pointless -- Pass 2 only, ticket #107), in the order
     # encountered. See the D1-D9 / N1-N8 rules documented above.
-    skipped_passes: List[str] = []
+    # (skipped_passes was already initialised above the ancestor walk.)
 
-    # Pass 1: CWD match.
+    # Ticket #154 (item 11): a pid whose bounded call did not complete this
+    # call is added here, and later passes skip it -- without this, one
+    # genuinely hung process burns a worker slot in Pass 1, again in Pass
+    # 1b, and again in Pass 1c's enrichment. Local, not a registry: no
+    # lock, no cap, no eviction, dies with this call.
+    unresponsive_pids: set[int] = set()
+
+    # Pass 1: CWD match. proc.cwd() is dispatched through _bounded_call
+    # (item 11) -- a single hung cwd() must not hang the whole scan.
+    pass_unresponsive = False
     if time.monotonic() <= scan_stop:
         pass_truncated = False
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
@@ -3220,9 +3293,12 @@ def _find_blocking_processes(
                 pid = proc.info["pid"]
                 if pid in excluded_pids:
                     continue
-                try:
-                    cwd = proc.cwd()
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                completed, cwd = _bounded_call(proc.cwd, deadline=scan_stop)
+                if not completed:
+                    unresponsive_pids.add(pid)
+                    pass_unresponsive = True
+                    continue
+                if cwd is None:
                     continue
                 norm_cwd = os.path.normcase(os.path.normpath(cwd))
                 # Match if the process cwd equals the target path or is under it.
@@ -3243,6 +3319,8 @@ def _find_blocking_processes(
             skipped_passes.append("cwd:truncated")
     else:
         skipped_passes.append("cwd:skipped")  # D1
+    if pass_unresponsive:
+        skipped_passes.append("discovery:unresponsive")
 
     # Pass 1b (Windows only): cmdline token scan.
     # proc.cwd() raises AccessDenied for almost all foreign processes on Windows.
@@ -3257,7 +3335,7 @@ def _find_blocking_processes(
                     break
                 try:
                     pid = proc.info["pid"]
-                    if pid in excluded_pids or pid in seen_pids:
+                    if pid in excluded_pids or pid in seen_pids or pid in unresponsive_pids:
                         continue
                     cmdline = proc.info["cmdline"] or []
                     for token in cmdline:

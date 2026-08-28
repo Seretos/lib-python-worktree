@@ -157,6 +157,25 @@ def _redirect_start_log_root(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
 
 
+def _reset_handle_scan_state_for_test() -> None:
+    """#154 item 14: replaces the deleted production
+    ``_reset_handle_scan_state()`` -- a test-only helper must not ship in
+    production. Closes any live persistent worker (bounded join; never
+    raises even against a wedged thread) then REBUILDS
+    ``_pl._wedged_worker_slots`` as a fresh one-element cell, rather than
+    zeroing the old one in place: a straggler that captured the old cell
+    at ``submit()`` time then decrements an orphaned cell nobody reads,
+    instead of corrupting whatever a later test/scan is counting against
+    the new cell. This is the cell-capture design's replacement for the
+    deleted generation-number guard.
+    """
+    if _pl._persistent_query_worker is not None:
+        _pl._persistent_query_worker.close()
+    _pl._persistent_query_worker = None
+    _pl._wedged_worker_slots = [0]
+    _pl._wedged_object_keys.clear()
+
+
 @pytest.fixture(autouse=True)
 def _reset_wedged_object_registry(monkeypatch):
     """Isolate ``_pl._wedged_object_keys`` (ticket #121) and ticket #148's
@@ -170,13 +189,12 @@ def _reset_wedged_object_registry(monkeypatch):
     scans would record real process-wide keys that leak into and poison
     later, unrelated tests (e.g. suppressing a handle a later test expects
     to be queried). Mirrors how ``_wedged_worker_count`` is already reset
-    per-test in ``TestBoundedQueryWorker`` (``monkeypatch.setattr(_pl,
-    "_wedged_worker_count", 0)``), but applied automatically to every test
+    per-test in ``TestBoundedQueryWorker`` (``monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])``), but applied automatically to every test
     in the module rather than requiring each test to opt in individually --
     resetting an empty ``OrderedDict`` is cheap and has no effect on tests
     that never touch the registry.
 
-    Ticket #148: also calls ``_pl._reset_handle_scan_state()``, which drops
+    Ticket #148: also calls ``_reset_handle_scan_state_for_test()``, which drops
     the process-wide persistent-worker reference (``_persistent_query_worker``)
     and zeroes ``_wedged_worker_count``/``_wedged_object_keys`` -- without
     this, a persistent worker (or wedged-worker count) left behind by one
@@ -218,9 +236,9 @@ def _reset_wedged_object_registry(monkeypatch):
     measurement.
     """
     monkeypatch.setattr(_pl, "_wedged_object_keys", OrderedDict())
-    _pl._reset_handle_scan_state()
+    _reset_handle_scan_state_for_test()
     yield
-    _pl._reset_handle_scan_state()
+    _reset_handle_scan_state_for_test()
 
 
 # ---------------------------------------------------------------------------
@@ -2236,121 +2254,6 @@ class TestFindBlockingProcesses:
         assert 9011 in returned_pids, "exact cwd match must be included"
         assert 9012 in returned_pids, "genuine subdirectory must be included"
 
-    def test_open_file_handle_under_path_returned(self):
-        """A process whose open_files() contains a file under the target path
-        is included even when its cwd is outside the path (gap 1 fix)."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        # This process's cwd is OUTSIDE target, so the CWD pass won't catch it.
-        proc_daemon = MagicMock()
-        proc_daemon.info = {"pid": 9020, "name": "unity", "cmdline": ["unity"]}
-        proc_daemon.cwd.return_value = "/other/path"
-        # But it holds an open file handle inside target.
-        file_info = MagicMock()
-        file_info.path = "/fake/worktree/Assets/scene.unity"
-        proc_daemon.open_files.return_value = [file_info]
-
-        with (
-            patch.object(psutil, "process_iter", return_value=[proc_daemon]),
-            patch.object(psutil, "Process") as mock_proc_cls,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert len(result) == 1
-        assert result[0].pid == 9020
-        assert result[0].name == "unity"
-
-    def test_open_files_access_denied_skipped(self):
-        """A process whose open_files() raises AccessDenied is silently skipped."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        proc_denied = MagicMock()
-        proc_denied.info = {"pid": 9021, "name": "system", "cmdline": ["system"]}
-        proc_denied.cwd.return_value = "/other/path"
-        proc_denied.open_files.side_effect = psutil.AccessDenied(9021)
-
-        with (
-            patch.object(psutil, "process_iter", return_value=[proc_denied]),
-            patch.object(psutil, "Process") as mock_proc_cls,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert result == []
-
-    def test_open_files_empty_list_no_spurious_additions(self):
-        """A process with an empty open_files() list is not added."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        proc = MagicMock()
-        proc.info = {"pid": 9022, "name": "idle", "cmdline": ["idle"]}
-        proc.cwd.return_value = "/other/path"
-        proc.open_files.return_value = []
-
-        with (
-            patch.object(psutil, "process_iter", return_value=[proc]),
-            patch.object(psutil, "Process") as mock_proc_cls,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert result == []
-
-    def test_cwd_match_not_duplicated_by_open_files(self):
-        """A process already matched by CWD must not be returned twice even if
-        it also has open file handles inside the target path."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        proc = MagicMock()
-        proc.info = {"pid": 9023, "name": "node", "cmdline": ["node"]}
-        proc.cwd.return_value = "/fake/worktree"  # matches CWD pass
-        file_info = MagicMock()
-        file_info.path = "/fake/worktree/index.js"
-        proc.open_files.return_value = [file_info]
-
-        with (
-            patch.object(psutil, "process_iter", return_value=[proc]),
-            patch.object(psutil, "Process") as mock_proc_cls,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert len(result) == 1, "process must appear exactly once even with both CWD and open-file match"
-        assert result[0].pid == 9023
-
-
-# ---------------------------------------------------------------------------
-# _kill_blocking_processes unit tests  (ticket #29)
-# ---------------------------------------------------------------------------
-
-class TestKillBlockingProcesses:
-    """Unit tests for _kill_blocking_processes."""
-
     def test_kills_each_found_process(self):
         """_kill_blocking_processes calls graceful signal then wait_or_kill per process."""
         target = "/fake/worktree"
@@ -3525,7 +3428,7 @@ class TestBoundedQueryWorker:
     #        across calls -------------------------------------------------
 
     def test_repeated_timeouts_are_capped_process_wide(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         grace = _GraceBudget(0.0)  # zeroed -- stage 2 never engages
         scan_deadline = time.monotonic() + 60
@@ -3569,7 +3472,7 @@ class TestBoundedQueryWorker:
             )
 
     def test_submit_at_cap_returns_capped_without_raising(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [_MAX_WEDGED_HANDLE_WORKERS])
         release = threading.Event()
         worker = _BoundedQueryWorker()
         try:
@@ -3599,7 +3502,7 @@ class TestBoundedQueryWorker:
         into CAPPED and assert its thread is counted while blocked and its
         slot is released once the wedged call finally returns -- identical
         bookkeeping to the ABANDONED path."""
-        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [_MAX_WEDGED_HANDLE_WORKERS])
         release = threading.Event()
         worker = _BoundedQueryWorker()
         try:
@@ -3612,16 +3515,16 @@ class TestBoundedQueryWorker:
             # The CAPPED worker's own thread is still live and blocked in
             # fn() -- it must be counted, not silently dropped from the
             # accounting just because no *new* slot was "granted".
-            assert _pl._wedged_worker_count == _MAX_WEDGED_HANDLE_WORKERS + 1, (
+            assert _pl._wedged_worker_slots[0] == _MAX_WEDGED_HANDLE_WORKERS + 1, (
                 "a CAPPED worker's own blocked thread must still be counted "
                 "against _wedged_worker_count, exactly like ABANDONED"
             )
 
             release.set()
             self._wait_until(
-                lambda: _pl._wedged_worker_count == _MAX_WEDGED_HANDLE_WORKERS
+                lambda: _pl._wedged_worker_slots[0] == _MAX_WEDGED_HANDLE_WORKERS
             )
-            assert _pl._wedged_worker_count == _MAX_WEDGED_HANDLE_WORKERS, (
+            assert _pl._wedged_worker_slots[0] == _MAX_WEDGED_HANDLE_WORKERS, (
                 "the CAPPED worker's slot must be released once its wedged "
                 "call finally returns, same as the ABANDONED path -- "
                 "otherwise the cap ratchets upward forever and never bounds "
@@ -3632,7 +3535,7 @@ class TestBoundedQueryWorker:
             worker.close()
 
     def test_wedged_worker_count_restored_after_retired_worker_exits(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         worker = _BoundedQueryWorker()
         try:
@@ -3642,11 +3545,11 @@ class TestBoundedQueryWorker:
                 scan_deadline=time.monotonic() + 10,
             )
             assert outcome.status == _QueryStatus.ABANDONED
-            assert _pl._wedged_worker_count == 1
+            assert _pl._wedged_worker_slots[0] == 1
 
             release.set()
-            self._wait_until(lambda: _pl._wedged_worker_count == 0)
-            assert _pl._wedged_worker_count == 0, (
+            self._wait_until(lambda: _pl._wedged_worker_slots[0] == 0)
+            assert _pl._wedged_worker_slots[0] == 0, (
                 "the counter must be restored once the retired worker's wedged "
                 "call finally returns, so a later scan can wedge again"
             )
@@ -3658,7 +3561,7 @@ class TestBoundedQueryWorker:
     #        returns ------------------------------------------------------
 
     def test_retired_worker_exits_when_its_query_finally_returns(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         calls = []
 
@@ -3686,7 +3589,7 @@ class TestBoundedQueryWorker:
             worker.close()
 
     def test_retired_worker_callable_that_raises_still_triggers_cleanup(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         calls = []
 
@@ -3710,8 +3613,8 @@ class TestBoundedQueryWorker:
 
             assert not thread.is_alive()
             assert calls == [None], "a raising callable must still swallow the exception and clean up"
-            self._wait_until(lambda: _pl._wedged_worker_count == 0)
-            assert _pl._wedged_worker_count == 0
+            self._wait_until(lambda: _pl._wedged_worker_slots[0] == 0)
+            assert _pl._wedged_worker_slots[0] == 0
         finally:
             release.set()
             worker.close()
@@ -3719,7 +3622,7 @@ class TestBoundedQueryWorker:
     # -- B4: the abandoned handle is not closed by the scan loop ---------
 
     def test_abandoned_job_closes_its_own_handle_exactly_once(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         close_calls = []
 
@@ -3782,7 +3685,7 @@ class TestBoundedQueryWorker:
     # -- B5: a merely-slow query is recovered by the bounded grace wait --
 
     def test_slow_query_resolved_in_grace_window_keeps_same_worker(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         grace = _GraceBudget(_HANDLE_QUERY_GRACE_BUDGET_SEC)
         scan_deadline = time.monotonic() + 5
 
@@ -3802,7 +3705,7 @@ class TestBoundedQueryWorker:
             assert worker._thread is original_thread, (
                 "a grace-recovered query must not replace the worker"
             )
-            assert _pl._wedged_worker_count == 0
+            assert _pl._wedged_worker_slots[0] == 0
 
             grace_spent = _HANDLE_QUERY_GRACE_BUDGET_SEC - grace.remaining
             # Upper bound only (ticket #90 CI flake sweep): grace_spent must
@@ -3820,7 +3723,7 @@ class TestBoundedQueryWorker:
             worker.close()
 
     def test_fast_query_spends_zero_grace(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         grace = _GraceBudget(_HANDLE_QUERY_GRACE_BUDGET_SEC)
 
         worker = _BoundedQueryWorker()
@@ -3832,7 +3735,7 @@ class TestBoundedQueryWorker:
             worker.close()
 
     def test_query_slower_than_grace_ceiling_is_abandoned_after_bounded_wait(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         grace = _GraceBudget(_HANDLE_QUERY_GRACE_BUDGET_SEC)
 
         def _too_slow():
@@ -3882,7 +3785,7 @@ class TestBoundedQueryWorker:
         can never be the thing that clamps stage 2 (that scenario is
         covered separately by test_grace_truncated_by_near_scan_deadline).
         """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         initial_budget = 1.5 * _HANDLE_QUERY_GRACE_SEC
         grace = _GraceBudget(initial_budget)
@@ -3943,7 +3846,7 @@ class TestBoundedQueryWorker:
                 w.close()
 
     def test_grace_skipped_when_scan_deadline_already_passed(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         grace = _GraceBudget(1.0)
         past_deadline = time.monotonic() - 1.0
@@ -3987,7 +3890,7 @@ class TestBoundedQueryWorker:
         a bug -- so this test must never assert a *minimum* spend/elapsed;
         only that the design's ceiling holds.
         """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         grace = _GraceBudget(1.0)
 
@@ -4043,7 +3946,7 @@ class TestBoundedQueryWorker:
             worker.close()
 
     def test_zero_grace_budget_is_single_stage_only(self, monkeypatch):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [0])
         release = threading.Event()
         grace = _GraceBudget(0.0)
 
@@ -4075,245 +3978,6 @@ class TestBoundedQueryWorker:
 # Cross-platform, same rationale as TestBoundedQueryWorker above:
 # _BoundedQueryWorker runs an arbitrary zero-arg callable, so none of this
 # needs ctypes/a Windows API.
-# ---------------------------------------------------------------------------
-
-class TestWedgedSlotGenerationGuard:
-    """Unit tests for the generation guard on ``_wedged_worker_count``'s
-    decrement (ticket #148 attempt 2, behavioural requirement 1).
-
-    Today's code (attempt 1) decrements ``_wedged_worker_count`` in
-    ``_BoundedQueryWorker._run()`` unconditionally, the instant a retired
-    worker's wedged callable finally returns -- with no notion of which
-    "generation" of accounting (i.e. which round of
-    ``_reset_handle_scan_state()`` calls) that retirement belongs to. A
-    worker retired BEFORE a reset, whose callable only unblocks AFTER the
-    reset, decrements a counter that a later test/scan has already started
-    accounting fresh against -- corrupting it. These tests drive that race
-    deterministically via ``_pl._reset_handle_scan_state()`` rather than
-    relying on timing, so they are reliable on every platform/load.
-    """
-
-    @staticmethod
-    def _wait_until_thread_gone(thread: threading.Thread, timeout: float = 2.0) -> None:
-        deadline = time.monotonic() + timeout
-        while thread.is_alive() and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-    def test_stale_generation_straggler_does_not_decrement_counter(self, monkeypatch):
-        """Primary driving test (behavioural requirement 1).
-
-        On today's code, ``_run()`` decrements unconditionally: after the
-        straggler is released the counter reads 3 - 1 == 2, so the final
-        ``== 3`` assertion fails with ``2 != 3``. This is the deterministic
-        proof of the straggler race.
-        """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
-        release = threading.Event()
-        worker = _BoundedQueryWorker()
-        thread = worker._thread
-        try:
-            outcome = worker.submit(
-                lambda: release.wait(timeout=30),
-                grace=_GraceBudget(0.0),
-                scan_deadline=time.monotonic() + 30,
-            )
-            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
-            assert _pl._wedged_worker_count == 1
-
-            # A reset (e.g. this module's autouse fixture, between tests)
-            # advances the generation -- everything retired before this
-            # point is now stale.
-            _pl._reset_handle_scan_state()
-
-            # Stand in for a LATER test's own fresh accounting: it has
-            # already submitted/retired workers of its own under the new
-            # generation and its counter legitimately reads 3.
-            monkeypatch.setattr(_pl, "_wedged_worker_count", 3)
-
-            release.set()
-            self._wait_until_thread_gone(thread)
-            assert not thread.is_alive(), (
-                "the stale-generation straggler's thread must still exit "
-                "once its wedged call finally returns"
-            )
-
-            assert _pl._wedged_worker_count == 3, (
-                "a stale-generation straggler's decrement must be a no-op "
-                "against a later generation's own counter"
-            )
-        finally:
-            release.set()
-            worker.close()
-
-    def test_same_generation_straggler_still_decrements(self, monkeypatch):
-        """Regression guard (existing #90 contract, ticket
-        ``test_wedged_worker_count_restored_after_retired_worker_exits``
-        already covers this too): a straggler retired and resolved with NO
-        reset in between must still decrement normally. May already be
-        GREEN on today's code -- that is expected, this guards the fix from
-        over-suppressing decrements outside a genuine generation mismatch.
-        """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
-        release = threading.Event()
-        worker = _BoundedQueryWorker()
-        thread = worker._thread
-        try:
-            outcome = worker.submit(
-                lambda: release.wait(timeout=30),
-                grace=_GraceBudget(0.0),
-                scan_deadline=time.monotonic() + 30,
-            )
-            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
-            assert _pl._wedged_worker_count == 1
-
-            release.set()
-            self._wait_until_thread_gone(thread)
-            assert not thread.is_alive()
-
-            deadline = time.monotonic() + 2.0
-            while _pl._wedged_worker_count != 0 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert _pl._wedged_worker_count == 0, (
-                "a same-generation straggler must still decrement back to 0"
-            )
-        finally:
-            release.set()
-            worker.close()
-
-    def test_on_abandoned_done_still_fires_for_stale_generation_straggler(self, monkeypatch):
-        """Protects against gating handle cleanup on the generation, which
-        would leak the underlying kernel handle -- only the counter
-        decrement is meant to be generation-scoped, never the callback. May
-        already pass today since the gating does not exist yet; it guards
-        the eventual implementation from breaking this later.
-        """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
-        release = threading.Event()
-        calls = []
-        worker = _BoundedQueryWorker()
-        thread = worker._thread
-        try:
-            outcome = worker.submit(
-                lambda: release.wait(timeout=30),
-                grace=_GraceBudget(0.0),
-                scan_deadline=time.monotonic() + 30,
-                on_abandoned_done=lambda value: calls.append(value),
-            )
-            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
-
-            _pl._reset_handle_scan_state()
-            monkeypatch.setattr(_pl, "_wedged_worker_count", 5)
-
-            release.set()
-            self._wait_until_thread_gone(thread)
-            assert not thread.is_alive()
-
-            assert calls == [True], (
-                "on_abandoned_done must still fire for a stale-generation "
-                "straggler -- gating it on the generation would leak the "
-                "underlying kernel handle"
-            )
-        finally:
-            release.set()
-            worker.close()
-
-    def test_monotonic_across_repeated_resets(self, monkeypatch):
-        """Two stragglers retired in two different pre-reset generations,
-        both released only after both resets have run, must both be
-        suppressed. Should go RED for the same reason as the primary test.
-        """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
-        release_a = threading.Event()
-        release_b = threading.Event()
-
-        worker_a = _BoundedQueryWorker()
-        thread_a = worker_a._thread
-        worker_b = _BoundedQueryWorker()
-        thread_b = worker_b._thread
-        try:
-            outcome_a = worker_a.submit(
-                lambda: release_a.wait(timeout=30),
-                grace=_GraceBudget(0.0),
-                scan_deadline=time.monotonic() + 30,
-            )
-            assert outcome_a.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
-            assert _pl._wedged_worker_count == 1
-
-            # First reset advances the generation past worker_a's retirement.
-            _pl._reset_handle_scan_state()
-
-            outcome_b = worker_b.submit(
-                lambda: release_b.wait(timeout=30),
-                grace=_GraceBudget(0.0),
-                scan_deadline=time.monotonic() + 30,
-            )
-            assert outcome_b.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
-            assert _pl._wedged_worker_count == 1
-
-            # Second reset advances the generation again, past worker_b's
-            # retirement too.
-            _pl._reset_handle_scan_state()
-
-            # Stand in for a later test's own fresh accounting under the
-            # newest generation.
-            monkeypatch.setattr(_pl, "_wedged_worker_count", 4)
-
-            release_a.set()
-            release_b.set()
-            self._wait_until_thread_gone(thread_a)
-            self._wait_until_thread_gone(thread_b)
-            assert not thread_a.is_alive()
-            assert not thread_b.is_alive()
-
-            assert _pl._wedged_worker_count == 4, (
-                "both stragglers, retired in two different pre-reset "
-                "generations, must be suppressed once released after both "
-                "resets"
-            )
-        finally:
-            release_a.set()
-            release_b.set()
-            worker_a.close()
-            worker_b.close()
-
-    def test_same_generation_decrement_clamps_at_zero(self, monkeypatch):
-        """Existing/regression guard: a same-generation decrement from 0
-        must still clamp at 0 via ``max(0, ...)``, never go negative. May
-        already pass today.
-        """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
-        release = threading.Event()
-        worker = _BoundedQueryWorker()
-        thread = worker._thread
-        try:
-            outcome = worker.submit(
-                lambda: release.wait(timeout=30),
-                grace=_GraceBudget(0.0),
-                scan_deadline=time.monotonic() + 30,
-            )
-            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
-            assert _pl._wedged_worker_count == 1
-
-            # Simulate some other bookkeeping already having driven the
-            # counter down to 0 (e.g. a concurrent scan's own decrement)
-            # before this worker's decrement lands.
-            monkeypatch.setattr(_pl, "_wedged_worker_count", 0)
-
-            release.set()
-            self._wait_until_thread_gone(thread)
-            assert not thread.is_alive()
-
-            assert _pl._wedged_worker_count == 0, (
-                "decrement must clamp at 0, never go negative"
-            )
-        finally:
-            release.set()
-            worker.close()
-
-
-# ---------------------------------------------------------------------------
-# TestWedgedHandleRegistry -- ticket #121 (cross-platform: pure Python, no
-# ctypes involved, so this is exercised by CI on every platform)
 # ---------------------------------------------------------------------------
 
 class TestWedgedHandleRegistry:
@@ -4928,7 +4592,7 @@ class TestWinHandleHoldersReal:
         below is expected to raise ``AttributeError``, which is the correct
         RED failure for this not-yet-implemented module state.
         """
-        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [_MAX_WEDGED_HANDLE_WORKERS])
 
         # A real, healthy persistent worker for the scan-start gate to reuse
         # once it exists. Constructed unconditionally (before the
@@ -5499,9 +5163,7 @@ class TestWinHandleHoldersThreadHygiene:
             my_pid = os.getpid()
             release = threading.Event()
 
-            monkeypatch.setattr(
-                _pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS
-            )
+            monkeypatch.setattr(_pl, "_wedged_worker_slots", [_MAX_WEDGED_HANDLE_WORKERS])
 
             def _blocking_query_object_raw(ntdll, dup_handle, info_class):
                 release.wait()
@@ -5672,7 +5334,7 @@ class TestHandleScanStartGate:
     def test_scan_start_gate_returns_capped_without_dumping(
         self, tmp_path, monkeypatch, caplog
     ):
-        monkeypatch.setattr(_pl, "_wedged_worker_count", _MAX_WEDGED_HANDLE_WORKERS)
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", [_MAX_WEDGED_HANDLE_WORKERS])
 
         calls: List[int] = []
 
@@ -5815,310 +5477,6 @@ class TestHandleScanBusyGate:
 # ---------------------------------------------------------------------------
 # TestGrantedAccessDeferredResolution -- ticket #148, R5 (hang-prone
 # GrantedAccess type-probe pre-filter with deferred resolution)
-# ---------------------------------------------------------------------------
-
-class TestGrantedAccessDeferredResolution:
-    """R5 (ticket #148): a handle whose ``GrantedAccess`` matches the
-    documented hang-prone bitmask (``0x0012019F``) must never itself be the
-    one that triggers the type probe -- its type resolution is deferred to
-    a same-type-index sibling handle instead, and only revisited (for a
-    NAME probe) at end-of-scan once that sibling has resolved the shared
-    type index to ``"File"``."""
-
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
-    )
-    def test_hang_prone_granted_access_defers_type_probe_to_a_sibling_handle(
-        self, tmp_path, monkeypatch
-    ):
-        """The masked handle's own file lives INSIDE the scan target (so it
-        would match if queried directly); the sibling's file lives OUTSIDE
-        it (so it can never itself cause a match).
-
-        Today (unfixed): ``_enumerate_handle_table`` emits 3-tuples and
-        ``_process_handle`` unpacks exactly 3 values per entry -- the
-        4-tuple fake table below (widened to also carry ``granted_access``,
-        per this ticket) will not even unpack, which is itself the
-        expected RED signal (a direct, genuine demonstration that the
-        widening described by this ticket does not exist yet, not a
-        fixture bug).
-
-        Once the widening AND the GrantedAccess pre-filter both exist: the
-        masked handle (processed first, with an empty per-type-index
-        cache) defers instead of probing (0 calls), the sibling is reached
-        and itself probed (TYPE + NAME, matching neither, since it lives
-        outside the target), and only the end-of-scan revisit finally
-        issues the masked entry's NAME probe (using the type the sibling
-        already resolved) -- 3 total calls. Without the fix, the masked
-        handle's own TYPE+NAME probes fire immediately and the per-handle
-        loop ``break``s on that immediate match before the sibling is EVER
-        reached -- 2 total calls, and the sibling's own probe never fires.
-        """
-        import msvcrt
-
-        target_dir = tmp_path / "target"
-        target_dir.mkdir()
-        masked_file = target_dir / "masked.txt"
-        masked_file.write_text("masked")
-
-        outside_dir = tmp_path / "outside"
-        outside_dir.mkdir()
-        sibling_file = outside_dir / "sibling.txt"
-        sibling_file.write_text("sibling")
-
-        f_masked = open(masked_file, "r")
-        f_sibling = open(sibling_file, "r")
-        try:
-            masked_handle_value = msvcrt.get_osfhandle(f_masked.fileno())
-            sibling_handle_value = msvcrt.get_osfhandle(f_sibling.fileno())
-            my_pid = os.getpid()
-            shared_type_index = 313131
-            _hang_prone_granted_access = 0x0012019F
-
-            fake_table = {
-                my_pid: [
-                    # 4-tuple: (handle_value, type_index, object_ptr,
-                    # granted_access) -- widened by this ticket.
-                    (
-                        masked_handle_value, shared_type_index, 0xAAA001,
-                        _hang_prone_granted_access,
-                    ),
-                    (sibling_handle_value, shared_type_index, 0xAAA002, 0),
-                ]
-            }
-            monkeypatch.setattr(
-                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
-            )
-
-            real_query_object_raw = _pl._query_object_raw
-            calls: List[tuple] = []
-
-            def _recording_query_object_raw(ntdll, dup_handle, info_class):
-                name = real_query_object_raw(ntdll, dup_handle, info_class)
-                calls.append((info_class, name))
-                return name
-
-            monkeypatch.setattr(
-                _pl, "_query_object_raw", _recording_query_object_raw
-            )
-
-            result = _win_handle_holders(
-                str(target_dir),
-                excluded_pids=set(),
-                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
-            )
-
-            assert my_pid in {pid for pid, _ in result}, (
-                f"expected {my_pid} to be found via the masked handle's "
-                f"deferred revisit; got {result}"
-            )
-            assert len(calls) == 3, (
-                f"expected exactly 3 NtQueryObject-equivalent calls (sibling "
-                f"TYPE + sibling NAME + masked-revisit NAME) -- got "
-                f"{len(calls)}: {calls!r}. A count of 2 means the masked "
-                f"handle's own TYPE+NAME probes fired immediately (today's "
-                f"unfixed behaviour) and the per-handle loop broke on that "
-                f"match before the sibling was ever reached, rather than "
-                f"deferring the masked handle and revisiting it only after "
-                f"the sibling resolved the shared type index."
-            )
-        finally:
-            f_masked.close()
-            f_sibling.close()
-
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
-    )
-    def test_granted_access_requires_exact_equality_not_merely_nonzero(
-        self, tmp_path, monkeypatch
-    ):
-        """R5 additional coverage (test-critic finding): the sibling test
-        above only ever exercises two ``GrantedAccess`` values -- the exact
-        hang-prone mask (``0x0012019F``) and ``0`` -- so a truthy/"any
-        nonzero value" check would pass it too, without ever actually
-        comparing against the named constant. This case uses a THIRD value
-        that is nonzero but does NOT equal ``_HANG_PRONE_GRANTED_ACCESS``
-        (``0x0012019E``, one bit off) on a handle whose file lives INSIDE
-        the scan target -- proving it is queried and matched normally (not
-        deferred): a truthiness-only implementation would incorrectly defer
-        it too, and this handle would never be found via the normal
-        per-handle probe path.
-        """
-        import msvcrt
-
-        target_dir = tmp_path / "target"
-        target_dir.mkdir()
-        held_file = target_dir / "held.txt"
-        held_file.write_text("held")
-
-        f_held = open(held_file, "r")
-        try:
-            handle_value = msvcrt.get_osfhandle(f_held.fileno())
-            my_pid = os.getpid()
-            _not_hang_prone_granted_access = 0x0012019E  # one bit off the mask
-
-            fake_table = {
-                my_pid: [
-                    (handle_value, 424343, 0xCCC001, _not_hang_prone_granted_access),
-                ]
-            }
-            monkeypatch.setattr(
-                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
-            )
-
-            real_query_object_raw = _pl._query_object_raw
-            calls: List[tuple] = []
-
-            def _recording_query_object_raw(ntdll, dup_handle, info_class):
-                name = real_query_object_raw(ntdll, dup_handle, info_class)
-                calls.append((info_class, name))
-                return name
-
-            monkeypatch.setattr(
-                _pl, "_query_object_raw", _recording_query_object_raw
-            )
-
-            result = _win_handle_holders(
-                str(target_dir),
-                excluded_pids=set(),
-                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
-            )
-
-            assert my_pid in {pid for pid, _ in result}, (
-                f"expected {my_pid} to be found via the normal "
-                f"(non-deferred) per-handle probe path; got {result} -- a "
-                f"GrantedAccess value that is nonzero but does not exactly "
-                f"equal _HANG_PRONE_GRANTED_ACCESS must never be deferred"
-            )
-            assert len(calls) == 2, (
-                f"expected exactly 2 NtQueryObject-equivalent calls (TYPE "
-                f"+ NAME) for a handle whose GrantedAccess is nonzero but "
-                f"does NOT match _HANG_PRONE_GRANTED_ACCESS exactly -- got "
-                f"{len(calls)}: {calls!r}. Zero calls would mean this "
-                f"handle was incorrectly deferred by a truthiness/nonzero "
-                f"check instead of exact equality against the named "
-                f"constant."
-            )
-        finally:
-            f_held.close()
-
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
-    )
-    def test_deferred_masked_handle_overflow_is_loud_and_incomplete(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """R5 additional coverage: the deferred-masked-handle revisit list
-        is itself bounded (``_MAX_DEFERRED_MASKED_HANDLES``) -- hitting
-        that cap is a reportable degradation (``handle_scan:
-        masked_deferred_capped``, ``complete=False``, one warning), not a
-        silent drop. Also pins that this tag is NOT one of teardown's
-        blind-scan tags -- unlike ``handle_scan:capped``, this condition is
-        transient, not a permanent process-wide exhaustion (its stop()
-        mapping is covered separately, in TestStopDetail).
-
-        Neither ``_MAX_DEFERRED_MASKED_HANDLES`` nor
-        ``"handle_scan:masked_deferred_capped"`` exist yet at RED time --
-        the ``monkeypatch.setattr`` below is expected to raise
-        ``AttributeError``, which is the correct RED failure for this
-        not-yet-implemented module state.
-        """
-        monkeypatch.setattr(_pl, "_MAX_DEFERRED_MASKED_HANDLES", 2)
-
-        _hang_prone_granted_access = 0x0012019F
-        my_pid = os.getpid()
-        # More masked entries (all sharing a type index that never resolves
-        # to "File", so none can ever be revisited/resolved) than the
-        # small overflow cap.
-        fake_table = {
-            my_pid: [
-                (10_000 + i, 424242, 0xB00000 + i, _hang_prone_granted_access)
-                for i in range(5)
-            ]
-        }
-        monkeypatch.setattr(
-            _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
-        )
-
-        with caplog.at_level(
-            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
-        ):
-            result = _win_handle_holders(
-                str(tmp_path),
-                excluded_pids=set(),
-                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
-            )
-
-        assert result.complete is False
-        assert "handle_scan:masked_deferred_capped" in result.skipped_passes
-        assert any(
-            "deferred" in rec.message.lower() for rec in caplog.records
-        ), "expected a warning naming the deferred-masked-handle overflow"
-
-        from lib_python_worktree.core import teardown as _teardown_mod
-
-        assert (
-            "handle_scan:masked_deferred_capped"
-            not in _teardown_mod._BLIND_SCAN_TAGS
-        )
-
-    @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
-    )
-    def test_deferred_masked_handles_below_cap_stay_complete_and_untagged(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """R5 additional coverage (test-critic finding): the overflow test
-        above never shows a scan that defers FEWER masked handles than the
-        (patched, small) cap staying untagged/complete -- so on its own it
-        does not prove the cap VALUE itself is load-bearing, only that
-        "some deferral happened" can be flagged. This pins the boundary
-        directly: with the same patched ``_MAX_DEFERRED_MASKED_HANDLES=2``,
-        only 1 masked handle is deferred (and, since it is the scan's only
-        handle, never resolved/revisited either) -- this must leave
-        ``complete=True`` and ``"handle_scan:masked_deferred_capped"``
-        ABSENT, proving the cap boundary itself (not merely "any deferral")
-        is what gates the tag.
-        """
-        monkeypatch.setattr(_pl, "_MAX_DEFERRED_MASKED_HANDLES", 2)
-
-        _hang_prone_granted_access = 0x0012019F
-        my_pid = os.getpid()
-        fake_table = {
-            my_pid: [
-                (20_000, 434343, 0xC00000, _hang_prone_granted_access),
-            ]
-        }
-        monkeypatch.setattr(
-            _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
-        )
-
-        with caplog.at_level(
-            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
-        ):
-            result = _win_handle_holders(
-                str(tmp_path),
-                excluded_pids=set(),
-                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
-            )
-
-        assert result.complete is True, (
-            f"1 deferred masked handle, below the (patched) cap of 2, must "
-            f"not by itself make the scan incomplete; got complete="
-            f"{result.complete}, skipped_passes={result.skipped_passes}"
-        )
-        assert "handle_scan:masked_deferred_capped" not in result.skipped_passes
-        assert not any(
-            "deferred" in rec.message.lower() for rec in caplog.records
-        ), "no deferred-overflow warning expected below the cap"
-
-
-# ---------------------------------------------------------------------------
-# TestProcessTree -- ticket #87 (_process_tree unit tests)
 # ---------------------------------------------------------------------------
 
 class TestProcessTree:
@@ -8439,47 +7797,6 @@ class TestDiscoveryBudget:
             f"deadline of 0.5s -- discovery passes are not respecting it"
         )
 
-    def test_find_blocking_processes_no_deadline_still_capped_by_discovery_max(self):
-        """Even without an explicit *deadline*, discovery must still be
-        capped by _DISCOVERY_MAX_SEC -- not left fully unbounded (this is
-        what caused ~75s of CPU for a single real-world call that found
-        nothing)."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_slow_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "slow", "cmdline": ["slow"]}
-            proc.cwd.side_effect = lambda: (time.sleep(0.05), "/other/path")[1]
-            proc.open_files.side_effect = lambda: (time.sleep(0.05), [])[1]
-            return proc
-
-        def _process_iter_side_effect(*args, **kwargs):
-            return (_make_slow_proc(30000 + i) for i in range(200))
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-            patch("lib_python_worktree.core.process_lifecycle._DISCOVERY_MAX_SEC", 0.5),
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            mock_sys.platform = "linux"
-
-            t0 = time.monotonic()
-            _find_blocking_processes(target, host_pid)  # no deadline kwarg
-            elapsed = time.monotonic() - t0
-
-        assert elapsed < 2.0, (
-            f"_find_blocking_processes took {elapsed:.2f}s with "
-            f"_DISCOVERY_MAX_SEC patched to 0.5s and no deadline -- the "
-            f"ceiling must still apply"
-        )
-
     def test_find_blocking_processes_returns_partial_results_when_budget_exhausted(self):
         """When the budget runs out mid-scan, whatever was already found is
         still returned rather than being discarded."""
@@ -8821,290 +8138,6 @@ class TestDiscoveryCompleteness:
         assert result.complete is False
         assert "cwd:truncated" in result.skipped_passes
 
-    # -- D7: Pass 2 (open_files) truncated ----------------------------------
-
-    def test_open_files_pass_truncated_marks_incomplete(self):
-        """D7: Pass 2's inner loop breaking on scan_stop is tagged
-        "open_files:truncated"."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_slow_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "slow", "cmdline": ["slow"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1 entirely
-
-            def _slow_open_files():
-                time.sleep(0.3)
-                return []
-
-            proc.open_files.side_effect = _slow_open_files
-            return proc
-
-        def _process_iter_side_effect(*args, **kwargs):
-            return (_make_slow_proc(64000 + i) for i in range(3))
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            mock_sys.platform = "linux"
-
-            deadline = time.monotonic() + 0.1
-            result = _find_blocking_processes(target, host_pid, deadline=deadline)
-
-        assert result.complete is False
-        assert "open_files:truncated" in result.skipped_passes
-
-    # -- D9 (ticket #107): Pass 2 (open_files) OS-wide RuntimeError ---------
-
-    def test_open_files_runtime_error_degrades_instead_of_raising(self):
-        """D9: psutil's Windows open_files() can raise a bare RuntimeError
-        (e.g. "SystemExtendedHandleInformation buffer too big") when the
-        OS-wide handle table is large. Pass 2 must catch it, stop scanning
-        (the condition is process-independent -- every remaining PID would
-        raise identically), and report "open_files:degraded" instead of
-        letting the exception propagate out of _find_blocking_processes and
-        crash every caller (stop()/remove())."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_raising_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
-            proc.open_files.side_effect = RuntimeError(
-                "SystemExtendedHandleInformation buffer too big"
-            )
-            return proc
-
-        procs = [_make_raising_proc(66000 + i) for i in range(3)]
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            # D9's RuntimeError catch is Windows-only (see the platform-gate
-            # regression test below) -- this is the platform on which the
-            # real condition occurs, so exercise it here.
-            mock_sys.platform = "win32"
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert result.complete is False
-        assert "open_files:degraded" in result.skipped_passes
-        assert result == []
-
-    def test_open_files_runtime_error_stops_pass_after_first_pid(self):
-        """Additional coverage: the OS-wide condition means every remaining
-        PID would raise identically, so Pass 2 must break (not continue) --
-        open_files() must be invoked exactly once, not once per raising
-        proc, and the tag must be emitted exactly once."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_raising_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)
-            proc.open_files.side_effect = RuntimeError("buffer too big")
-            return proc
-
-        procs = [_make_raising_proc(67000 + i) for i in range(50)]
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            # D9's RuntimeError catch is Windows-only -- see the
-            # platform-gate regression test below.
-            mock_sys.platform = "win32"
-
-            result = _find_blocking_processes(target, host_pid)
-
-        called = sum(1 for p in procs if p.open_files.called)
-        assert called == 1, (
-            f"expected exactly 1 open_files() call before the pass breaks "
-            f"out entirely, got {called}"
-        )
-        assert result.skipped_passes.count("open_files:degraded") == 1
-        assert result == []
-
-    def test_open_files_access_denied_still_continues_no_regression(self):
-        """No-regression guard: AccessDenied/NoSuchProcess from open_files()
-        must still `continue` per-PID (not degrade the whole pass) -- this
-        pre-existing behaviour must survive the new RuntimeError handling."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_denied_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)
-            proc.open_files.side_effect = psutil.AccessDenied(pid)
-            return proc
-
-        procs = [_make_denied_proc(68000 + i) for i in range(5)]
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            mock_sys.platform = "linux"
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert result.complete is True
-        assert result.skipped_passes == ()
-        assert all(p.open_files.called for p in procs)
-
-    def test_open_files_truncation_wins_over_degradation_if_deadline_fires_first(self):
-        """If Pass 2's per-loop deadline check fires before a
-        RuntimeError-raising proc is reached, "open_files:truncated" wins --
-        the pass never got a chance to observe the RuntimeError, so it must
-        not be tagged "open_files:degraded". Distinguishes D7 (truncated:
-        ran out of clock) from D9 (degraded: OS refused the query
-        outright)."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_proc(pid, open_files_effect):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
-            proc.open_files.side_effect = open_files_effect
-            return proc
-
-        def _fast():
-            return []
-
-        def _slow():
-            time.sleep(0.3)
-            return []
-
-        def _would_raise():
-            raise RuntimeError("buffer too big")
-
-        proc0 = _make_proc(70000, _fast)
-        proc1 = _make_proc(70001, _slow)
-        proc2 = _make_proc(70002, _would_raise)
-
-        def _process_iter_side_effect(*args, **kwargs):
-            return iter([proc0, proc1, proc2])
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            mock_sys.platform = "linux"
-
-            deadline = time.monotonic() + 0.1
-            result = _find_blocking_processes(target, host_pid, deadline=deadline)
-
-        assert result.complete is False
-        assert "open_files:truncated" in result.skipped_passes
-        assert "open_files:degraded" not in result.skipped_passes
-        assert not proc2.open_files.called
-
-    def test_open_files_runtime_error_reraises_on_non_windows(self):
-        """Regression test for the review finding on D9: the
-        "SystemExtendedHandleInformation buffer too big" condition is
-        Windows/psutil-C-extension-specific. On POSIX, a bare RuntimeError
-        from open_files() is NOT this known failure mode and must propagate
-        rather than being silently caught and mis-tagged as
-        "open_files:degraded" -- doing so would swallow and mis-attribute an
-        unrelated, genuinely unexpected bug on that platform."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_raising_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
-            proc.open_files.side_effect = RuntimeError("some unrelated posix bug")
-            return proc
-
-        procs = [_make_raising_proc(71000)]
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            mock_sys.platform = "linux"
-
-            with pytest.raises(RuntimeError, match="some unrelated posix bug"):
-                _find_blocking_processes(target, host_pid)
-
-    def test_open_files_runtime_error_reraises_on_windows_if_unrelated_message(self):
-        """Full re-review finding (fix-loop round 2): D9's RuntimeError
-        catch must be scoped to the documented psutil failure signature
-        ("...buffer too big"), not to "any bare RuntimeError on Windows".
-        An unrelated Windows-side bug that happens to raise a plain
-        RuntimeError from open_files() must still propagate rather than
-        being silently downgraded to "open_files:degraded"."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        def _make_raising_proc(pid):
-            proc = MagicMock()
-            proc.info = {"pid": pid, "name": "x", "cmdline": ["x"]}
-            proc.cwd.side_effect = psutil.AccessDenied(pid)  # skip Pass 1
-            proc.open_files.side_effect = RuntimeError("some unrelated windows bug")
-            return proc
-
-        procs = [_make_raising_proc(72000)]
-
-        with (
-            patch.object(psutil, "process_iter", side_effect=lambda *a, **kw: iter(procs)),
-            patch.object(psutil, "Process") as mock_proc_cls,
-            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-            mock_sys.platform = "win32"
-
-            with pytest.raises(RuntimeError, match="some unrelated windows bug"):
-                _find_blocking_processes(target, host_pid)
-
     # -- N5: Windows-only passes simply not applicable on POSIX ------------
 
     def test_windows_only_passes_not_applicable_on_posix_leaves_complete_true(self):
@@ -9234,7 +8267,7 @@ class TestDiscoveryCompleteness:
 
         monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
 
-        wedged_before = _pl._wedged_worker_count
+        wedged_before = _pl._wedged_worker_slots[0]
         result = _win_handle_holders(
             "C:/nonexistent-worktree-path", set(), budget_sec=_REAL_SCAN_TEST_BUDGET_SEC
         )
@@ -9255,7 +8288,7 @@ class TestDiscoveryCompleteness:
         # itself must leave no process-wide residue behind (compared against
         # the pre-call value, not an absolute 0 -- other tests in the same
         # session legitimately leave the global non-zero).
-        assert _pl._wedged_worker_count == wedged_before
+        assert _pl._wedged_worker_slots[0] == wedged_before
 
     @pytest.mark.skipif(sys.platform != "win32", reason="win32-only")
     def test_abandoned_with_no_replacement_capacity_reports_capped_and_incomplete(
@@ -10604,34 +9637,9 @@ class TestMatchPass:
         assert result[0].match_pass == "handle_scan"
         assert result[0].source == "orphan_scan"
 
-    def test_pass2_open_files_match_tags_match_pass_open_files(self):
-        """Driving test (one of four): Pass 2 (open file handle match) tags
-        its hit ``match_pass == "open_files"``."""
-        import psutil
-
-        target = "/fake/worktree"
-        host_pid = os.getpid()
-
-        proc_daemon = MagicMock()
-        proc_daemon.info = {"pid": 19004, "name": "unity", "cmdline": ["unity"]}
-        proc_daemon.cwd.return_value = "/other/path"
-        file_info = MagicMock()
-        file_info.path = "/fake/worktree/Assets/scene.unity"
-        proc_daemon.open_files.return_value = [file_info]
-
-        with (
-            patch.object(psutil, "process_iter", return_value=[proc_daemon]),
-            patch.object(psutil, "Process") as mock_proc_cls,
-        ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
-
-            result = _find_blocking_processes(target, host_pid)
-
-        assert len(result) == 1
-        assert result[0].match_pass == "open_files"
-        assert result[0].source == "orphan_scan"
+    # #154: test_pass2_open_files_match_tags_match_pass_open_files removed --
+    # Pass 2 (open_files) is deleted outright (R2); see
+    # TestDiscoveryPasses::test_open_files_pass_deleted.
 
     # -- Additional coverage (non-driving; may already pass) ----------------
 

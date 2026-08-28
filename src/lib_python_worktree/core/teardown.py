@@ -716,14 +716,14 @@ def _diagnose_and_retry(ctx: _TeardownContext, *, trigger: str, retry) -> bool:
     path (``record.path`` + ``_STAGED_SUFFIX``), since both only ever fire
     from :func:`_phase_stage_and_delete`.
 
-    Simplification, named here rather than silently: tier 1's liveness
-    probe uses a plain ``psutil.pid_exists()`` call directly rather than
-    routing it through a bounded-call primitive shared with
-    ``process_lifecycle.py``'s handle-scan wedge pool (plan.md item 5's
-    ``_bounded_call``) -- no test in this repo's suite exercises an owned
-    pid whose liveness probe itself wedges, and building that shared
-    primitive's wiring correctly without a driving test risked shipping
-    unverified code. See the developer's final report.
+    Tier 1's liveness probe is routed through ``ctx.lifecycle._bounded_call``
+    (plan.md item 5) -- the same shared bounded-call primitive and
+    ``_wedged_worker_slots`` accounting pool process_lifecycle.py's
+    handle-scan workers use (item 14) -- so P3 ("no psutil call in the
+    failure path without a wall deadline") holds with no exemptions.
+    Accessed via ``ctx.lifecycle`` (not a direct import), matching every
+    other lifecycle call in this module, so tests can inject a mock
+    lifecycle module exactly as they already do for ``ctx.lifecycle.stop``.
     """
     record = ctx.record
     target = record.path + _STAGED_SUFFIX if trigger in ("rename", "residual") else record.path
@@ -740,9 +740,16 @@ def _diagnose_and_retry(ctx: _TeardownContext, *, trigger: str, retry) -> bool:
 
     tier1_candidates: List["KilledProcessInfo"] = []
     for pid in ctx.owned_pids:
-        try:
-            alive = psutil.pid_exists(pid)
-        except Exception:  # noqa: BLE001 -- never let a liveness probe abort diagnosis
+        completed, alive = ctx.lifecycle._bounded_call(
+            lambda pid=pid: psutil.pid_exists(pid), deadline=ctx.failure_deadline
+        )
+        if not completed:
+            _logger.warning(
+                "_teardown: worktree '%s' owned pid %s liveness probe did "
+                "not complete; skipping -- never signal a process whose "
+                "existence could not be confirmed.",
+                record.id, pid,
+            )
             continue
         if alive:
             tier1_candidates.append(
