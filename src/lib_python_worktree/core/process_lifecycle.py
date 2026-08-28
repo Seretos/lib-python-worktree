@@ -306,29 +306,6 @@ _HANDLE_QUERY_GRACE_BUDGET_SEC = 1.0
 # concurrently-running scans.
 _MAX_WEDGED_HANDLE_WORKERS = 8
 
-# Ticket #148 -- GrantedAccess bitmask observed in practice to be hang-prone
-# for the type-probe (ObjectTypeInformation) NtQueryObject call in
-# particular. A handle whose GrantedAccess exactly matches this mask never
-# itself triggers the type probe (see _process_handle's deferred-resolution
-# branch below) -- its type resolution is deferred to a same-type-index
-# sibling handle instead, and only revisited (for the cheaper NAME probe
-# alone) at end-of-scan once that sibling has resolved the shared type
-# index to "File". Exact equality against this constant is deliberate, not
-# a truthiness/bitwise-subset check: GrantedAccess values that are merely
-# nonzero, or that share some bits with this mask without matching it
-# exactly, are not known to exhibit the hang and must not be deferred.
-_HANG_PRONE_GRANTED_ACCESS = 0x0012019F
-
-# Ticket #148 -- bound on how many masked handles a single scan may defer
-# for end-of-scan revisit (see _process_handle/the post-loop revisit in
-# _win_handle_holders). Hitting this cap is a reportable degradation
-# (handle_scan:masked_deferred_capped, complete=False, one warning) rather
-# than a silent drop of further deferrals -- but it is also not unbounded:
-# without a cap, a pathological handle table with very many masked handles
-# sharing a never-resolving type index could grow this list without limit
-# for the life of one scan.
-_MAX_DEFERRED_MASKED_HANDLES = 4096
-
 # Ticket #90 -- bounded join _BoundedQueryWorker.close() waits for a
 # healthy (non-wedged) worker's thread to actually exit after being sent
 # the shutdown sentinel. A worker that is not wedged drains its queue and
@@ -368,25 +345,26 @@ _MAX_TREE_NODES = 256
 # name/cmdline but still carry an accurate `source`.
 _DESCRIBE_MAX_PIDS = 256
 
-# Ticket #87: hard ceiling (seconds) on _find_blocking_processes' own
-# discovery cost -- Pass 1 (cwd), Pass 1b (cmdline tokens), Pass 1c (Windows
-# handle-table scan), and Pass 2 (open files) combined. Before this fix,
-# these passes had no cap of their own beyond Pass 1c's per-call budget --
-# a large/slow ambient process list (observed ~75s of CPU for a single call
-# that found nothing) could make discovery alone blow through whatever
-# timeout the caller (e.g. stop(timeout=...)) requested. _DISCOVERY_MAX_SEC
-# bounds discovery independent of any caller-supplied deadline; when a
-# deadline *is* supplied, discovery is bounded by whichever of the two is
-# tighter (see _find_blocking_processes).
-_DISCOVERY_MAX_SEC = 20.0
+# Ticket #154: `deadline` is now a REQUIRED keyword of _find_blocking_processes
+# (see below) -- every call site (teardown's dirt-gate/tier-2 diagnosis, and
+# _kill_blocking_processes) always supplies a real, caller-derived deadline,
+# so there is no "no deadline at all" case left for a private absolute
+# ceiling to cover. _DISCOVERY_MAX_SEC is deleted outright, not kept as a
+# fallback default.
 
-# Ticket #87: seconds of the caller's deadline reserved (not spent on
-# discovery) so that time remains for the actual signal/kill step once
-# discovery completes. Shrunk to at most 20% of whatever time remains when
-# the caller's deadline itself leaves less than this much room, so the
-# reserve can never itself consume the entire budget on a very tight
-# deadline.
-_DISCOVERY_RESERVE_SEC = 1.0
+# Ticket #154 (item 11): per-call wall-clock bound for a blocking psutil
+# read (proc.cwd()/cmdline()/name()/parents(), tier-1's psutil.pid_exists),
+# dispatched through _bounded_call. Cannot reuse _HANDLE_QUERY_TIMEOUT_SEC
+# (0.01s, tuned for one NtQueryObject on an already-duplicated handle --
+# applying it to a psutil call would misclassify almost every healthy read
+# as wedged). Value composition: generous enough that a healthy psutil read
+# on a loaded host (well under 5ms) is never misclassified; small enough
+# that the worst case (_MAX_WEDGED_HANDLE_WORKERS x this = 2.0s) fits
+# inside the 7s per-removal failure budget (teardown._FAILURE_BUDGET_SEC).
+# Deliberately never combined with a grace budget -- see _bounded_call's
+# docstring: grace exists for Pass 1c's ~10^5-per-scan NtQueryObject
+# multiplication problem, not for the ~10^2-10^3-per-call psutil population.
+_BLOCKING_CALL_TIMEOUT_SEC = 0.25
 
 # Ticket #95, finding 2 (budget starvation): stop() used to hand the primary
 # _wait_or_kill call the ENTIRE remaining timeout budget. On Windows, a
@@ -1732,42 +1710,34 @@ class _GraceBudget:
     remaining: float
 
 
-# Process-wide ceiling accounting (ticket #90): how many _BoundedQueryWorker
-# threads, across every concurrent _win_handle_holders scan in this process,
-# are currently permanently blocked inside a wedged callable. Guarded by
-# _wedged_worker_lock; incremented by submit() unconditionally, for every
-# worker it retires -- ABANDONED or CAPPED alike, since both leave a thread
-# genuinely and permanently blocked in fn() for as long as that real call
-# takes (review finding, ticket #90 fix pass: a CAPPED worker's thread is
-# just as live as an ABANDONED one and must be tracked the same way, or
-# _MAX_WEDGED_HANDLE_WORKERS stops bounding the true number of live blocked
-# threads). Decremented by the retired worker's own thread, in a
-# ``finally``, the moment its wedged callable finally returns. The
-# ABANDONED/CAPPED distinction governs only whether a caller may create a
-# *replacement* worker for the scan's next query -- never whether this
-# worker's own thread is counted.
-_wedged_worker_count = 0
+# Process-wide ceiling accounting (ticket #90, revised #154 item 14): how
+# many _BoundedQueryWorker threads, across every concurrent
+# _win_handle_holders scan AND every bounded psutil call (_bounded_call,
+# including teardown's tier-1 liveness probes) in this process, are
+# currently permanently blocked inside a wedged callable. One shared
+# accounting for every bounded OS call in the module -- not two pools.
+# Guarded by _wedged_worker_lock; incremented by submit() unconditionally,
+# for every worker it retires -- ABANDONED or CAPPED alike, since both
+# leave a thread genuinely and permanently blocked in fn() for as long as
+# that real call takes.
+#
+# A one-element list, not a bare int (ticket #154 item 14, replacing the
+# ticket #148 attempt-2 generation guard): submit() captures the CELL
+# OBJECT ITSELF -- not a version number -- into the job's state at the
+# moment it retires the worker, and _run() decrements THAT captured cell,
+# unconditionally, whenever its wedged callable finally returns. A test
+# fixture that wants isolation from a straggler rebinds
+# `_wedged_worker_slots` to a fresh `[0]` cell (see
+# tests/test_process_lifecycle.py's `_reset_handle_scan_state_for_test()`)
+# rather than zeroing the old one in place -- the straggler's eventual
+# decrement then lands on the cell it captured (now orphaned, read by
+# nobody), never on the new cell a later scan is counting against. This
+# has no production caller of a reset at all: production never replaces
+# the cell, so every decrement always lands where it was counted --
+# bit-identical production behaviour to a bare int, with the isolation
+# problem solved structurally instead of via a version-number comparison.
+_wedged_worker_slots: "List[int]" = [0]
 _wedged_worker_lock = threading.Lock()
-
-# Ticket #148 attempt 2 -- generation counter guarding _wedged_worker_count's
-# decrement against a stale straggler. A worker retired (ABANDONED/CAPPED)
-# under one "generation" of accounting may not actually unblock (its wedged
-# callable finally return) until AFTER a later _reset_handle_scan_state()
-# call has already zeroed the counter and moved accounting on to a new
-# generation -- e.g. between two tests in this suite, or, in principle,
-# across any caller that resets this module-level state. If that straggler's
-# _run() still decremented unconditionally, it would corrupt the *new*
-# generation's counter, which it has no relationship to. submit() records
-# the *current* generation (under _wedged_worker_lock, alongside the
-# _wedged_worker_count increment) into the job's state at the moment it
-# retires the worker; _run() then only decrements if the generation it reads
-# back still matches the *live* generation at the moment its wedged callable
-# finally returns -- otherwise the decrement is a deliberate, provable no-op.
-# _reset_handle_scan_state() is the only place that ever advances this
-# counter, and it has no production caller (test-only, see its docstring),
-# so in production this stays permanently 0 and every decrement is always
-# same-generation -- bit-identical behaviour to before this change.
-_wedged_worker_generation = 0
 
 
 def _wedged_slot_available() -> bool:
@@ -1787,7 +1757,7 @@ def _wedged_slot_available() -> bool:
     ``CAPPED`` for that specific worker.
     """
     with _wedged_worker_lock:
-        return _wedged_worker_count < _MAX_WEDGED_HANDLE_WORKERS
+        return _wedged_worker_slots[0] < _MAX_WEDGED_HANDLE_WORKERS
 
 
 # Ticket #148 -- process-wide persistent query worker + scan lock, closing
@@ -1859,7 +1829,7 @@ def _acquire_scan_worker() -> "Optional[_BoundedQueryWorker]":
     global _persistent_query_worker
     if _persistent_query_worker is not None:
         return _persistent_query_worker
-    if _wedged_worker_count >= _MAX_WEDGED_HANDLE_WORKERS:
+    if _wedged_worker_slots[0] >= _MAX_WEDGED_HANDLE_WORKERS:
         return None
     _persistent_query_worker = _BoundedQueryWorker()
     return _persistent_query_worker
@@ -1900,43 +1870,13 @@ def _clear_scan_worker_slot() -> None:
     _persistent_query_worker = None
 
 
-def _reset_handle_scan_state() -> None:
-    """Test-only: reset ticket #148's process-wide handle-scan state.
-
-    Closes any live persistent worker (bounded join; idempotent and never
-    raises even against a wedged thread -- see ``_BoundedQueryWorker.close``)
-    before dropping the module reference, then zeroes the wedged-worker
-    accounting and advances ``_wedged_worker_generation`` (ticket #148
-    attempt 2). Intended to be called from an autouse test fixture so a
-    worker's daemon thread left behind by one test is actually shut down
-    rather than merely orphaned, and never leaks into another test's
-    thread-count assertions.
-
-    The generation bump is what makes that safe even when the just-closed
-    worker's wedged callable never actually returns before this call: a
-    straggler retired under the OLD generation will, once its callable
-    finally does return, find ``_wedged_worker_generation`` has moved on and
-    skip its ``_wedged_worker_count`` decrement as a no-op, instead of
-    corrupting whatever a later test/scan has already counted under the new
-    generation. This function has no production caller -- it exists solely
-    for test isolation -- so ``_wedged_worker_generation`` stays permanently
-    0 in production, where every straggler's decrement is always
-    same-generation and behaviour is bit-identical to before this change.
-
-    Both the counter and the generation are written under
-    ``_wedged_worker_lock`` (previously the counter write here was
-    unlocked -- fixed alongside this change since the two must now be
-    updated atomically together).
-    """
-    global _persistent_query_worker, _wedged_worker_count, _wedged_worker_generation
-    if _persistent_query_worker is not None:
-        _persistent_query_worker.close()
-    _persistent_query_worker = None
-    with _wedged_worker_lock:
-        _wedged_worker_count = 0
-        _wedged_worker_generation += 1
-    _wedged_object_keys.clear()
-
+# Ticket #154 (item 14): the test-only `_reset_handle_scan_state()` helper
+# that used to live here is deleted outright -- production must not ship a
+# test-only entry point. Its replacement,
+# `_reset_handle_scan_state_for_test()`, lives in
+# tests/test_process_lifecycle.py and rebuilds `_wedged_worker_slots` (a
+# fresh cell) rather than zeroing a shared counter -- see that function and
+# the cell-capture design documented on `_wedged_worker_slots` above.
 
 # Ticket #121 -- process-wide registry of kernel objects whose NtQueryObject
 # call has already wedged at least once, so a *later* scan never re-queries
@@ -2162,33 +2102,30 @@ class _BoundedQueryWorker:
                 was_abandoned = state["abandoned"]
                 callback = state["on_abandoned_done"] if was_abandoned else None
                 slot_acquired = state["slot_acquired"]
-                slot_generation = state["slot_generation"]
+                slot_cell = state["slot_cell"]
             state["done"].set()
             if was_abandoned:
-                # on_abandoned_done fires unconditionally, regardless of
-                # generation -- it closes the duplicated kernel handle this
-                # worker's wedged call was holding; gating it would leak
-                # that handle (ticket #148 attempt 2).
+                # on_abandoned_done fires unconditionally -- it closes the
+                # duplicated kernel handle this worker's wedged call was
+                # holding; gating it would leak that handle.
                 if callback is not None:
                     try:
                         callback(value)
                     except Exception:  # noqa: BLE001 -- best-effort cleanup
                         pass
                 if slot_acquired:
-                    global _wedged_worker_count
+                    # Decrement the CELL this slot claim captured at
+                    # submit() time (ticket #154 item 14) -- not whatever
+                    # `_wedged_worker_slots` currently points at. A test
+                    # fixture that rebinds `_wedged_worker_slots` to a fresh
+                    # cell between tests/scans leaves this straggler
+                    # decrementing the orphaned old cell (read by nobody),
+                    # never corrupting the new cell a later scan is
+                    # counting against -- no version-number comparison
+                    # needed, because object identity already gives the
+                    # same guarantee structurally.
                     with _wedged_worker_lock:
-                        # Only decrement if this slot claim's recorded
-                        # generation still matches the live one. A mismatch
-                        # means a _reset_handle_scan_state() call happened
-                        # between this worker's retirement (submit()) and
-                        # its wedged callable finally returning (now) -- the
-                        # counter it was counted against has already been
-                        # zeroed and handed to a new generation's own
-                        # accounting, so decrementing here would corrupt
-                        # that unrelated later count instead of undoing this
-                        # worker's own contribution (ticket #148 attempt 2).
-                        if slot_generation == _wedged_worker_generation:
-                            _wedged_worker_count = max(0, _wedged_worker_count - 1)
+                        slot_cell[0] = max(0, slot_cell[0] - 1)
 
     def submit(
         self,
@@ -2241,7 +2178,7 @@ class _BoundedQueryWorker:
             "abandoned": False,
             "on_abandoned_done": on_abandoned_done,
             "slot_acquired": False,
-            "slot_generation": None,
+            "slot_cell": None,
         }
         self._job_queue.put((fn, state))
 
@@ -2270,7 +2207,6 @@ class _BoundedQueryWorker:
         # Neither stage resolved it -- this worker's thread is now
         # permanently tied up in *fn*. Decide retirement atomically against
         # _run() possibly completing the job at this exact moment.
-        global _wedged_worker_count
         with state["lock"]:
             if state["completed"]:
                 return _QueryOutcome(_QueryStatus.RESOLVED, state["value"])
@@ -2278,24 +2214,23 @@ class _BoundedQueryWorker:
             # blocked in *fn* for as long as that real call takes --
             # regardless of whether the process-wide cap already had room.
             # It must therefore always be counted in here (and decremented
-            # by _run() once fn() finally returns), or _wedged_worker_count
-            # stops reflecting the true number of live blocked threads and
-            # _MAX_WEDGED_HANDLE_WORKERS stops being a real bound on them
-            # (review finding, ticket #90 fix pass). The cap only ever
-            # governs whether a *replacement* worker may be created for
-            # this scan's next query -- that decision is the CAPPED vs
-            # ABANDONED distinction below, checked *after* this worker's
-            # own slot is already claimed.
+            # by _run() once fn() finally returns), or the cell stops
+            # reflecting the true number of live blocked threads and
+            # _MAX_WEDGED_HANDLE_WORKERS stops being a real bound on them.
+            # The cap only ever governs whether a *replacement* worker may
+            # be created for this scan's next query -- that decision is the
+            # CAPPED vs ABANDONED distinction below, checked *after* this
+            # worker's own slot is already claimed.
             with _wedged_worker_lock:
-                _wedged_worker_count += 1
-                at_cap = _wedged_worker_count >= _MAX_WEDGED_HANDLE_WORKERS
-                # Record the generation this slot claim belongs to (ticket
-                # #148 attempt 2), read under the same lock as the count
-                # increment above, so _run() can later tell whether its
-                # eventual decrement still belongs to the same round of
-                # accounting or is a stale straggler against a since-reset
-                # generation.
-                state["slot_generation"] = _wedged_worker_generation
+                _wedged_worker_slots[0] += 1
+                at_cap = _wedged_worker_slots[0] >= _MAX_WEDGED_HANDLE_WORKERS
+                # Capture the CELL OBJECT itself (ticket #154 item 14) --
+                # not a version number -- read under the same lock as the
+                # count increment above, so _run() later decrements exactly
+                # this cell regardless of whatever `_wedged_worker_slots`
+                # points at by the time this worker's wedged call finally
+                # returns.
+                state["slot_cell"] = _wedged_worker_slots
             state["abandoned"] = True
             state["slot_acquired"] = True
 
@@ -2738,7 +2673,7 @@ def _win_handle_holders(
                 "full and no persistent worker is available to reuse -- "
                 "refusing this scan before dumping the handle table; this "
                 "will not clear until the host process is restarted",
-                _MAX_WEDGED_HANDLE_WORKERS, _wedged_worker_count,
+                _MAX_WEDGED_HANDLE_WORKERS, _wedged_worker_slots[0],
             )
             return _PartialList(
                 [], complete=False, skipped_passes=("handle_scan:capped",)
@@ -2846,7 +2781,6 @@ def _win_handle_holders(
         stop_scan = False
         cap_already_logged = False
         capped_mid_scan = False
-        deferred_overflowed = False
 
         _RESOLVED, _MATCHED, _CONTINUE, _STOP = (
             "resolved", "matched", "continue", "stop",
@@ -2942,25 +2876,23 @@ def _win_handle_holders(
                     "_win_handle_holders: hit the process-wide wedged NtQueryObject "
                     "worker cap (_MAX_WEDGED_HANDLE_WORKERS=%s, live=%s) -- "
                     "stopping this scan early and returning partial results",
-                    _MAX_WEDGED_HANDLE_WORKERS, _wedged_worker_count,
+                    _MAX_WEDGED_HANDLE_WORKERS, _wedged_worker_slots[0],
                 )
                 cap_already_logged = True
             return _STOP, None
 
         found: List[Tuple[int, str]] = []
-        # Ticket #148 (R5): masked handles whose GrantedAccess matched the
-        # hang-prone mask, deferred by _process_handle rather than probed
-        # directly -- revisited once, at end-of-scan, for any whose type
-        # index a sibling handle has since resolved to "File". Bounded by
-        # _MAX_DEFERRED_MASKED_HANDLES; see deferred_overflowed above.
-        deferred_masked: List[Tuple[int, int, int, int]] = []
         current_process = kernel32.GetCurrentProcess()
-        # Per-call cache: object-type-index -> resolved type name (or None if
-        # unresolved). Populated lazily from the first handle seen for each type
-        # index; every later handle of that type index is accepted/skipped from
-        # this cache alone, with no further DuplicateHandle/NtQueryObject call.
+        # Per-call cache: object-type-index -> resolved type name, or None
+        # if a probe against a handle of that type failed to resolve
+        # (ticket #154, the C3 dedup fix: this is deliberately WRITTEN, not
+        # left _UNSET, on a non-resolved outcome too -- see below). Every
+        # later handle sharing that type index is accepted/skipped from
+        # this cache alone, with no further DuplicateHandle/NtQueryObject
+        # call -- including a sibling of a type whose probe wedged.
         _UNSET = object()
         type_name_cache: Dict[int, Optional[str]] = {}
+        type_unresolved = False
 
         def _process_handle(
             proc_handle, pid: int, handle_value: int, type_index: int,
@@ -2979,46 +2911,22 @@ def _win_handle_holders(
             scan's query (``_is_known_wedging_handle``); if so, skips it
             outright via ``_CONTINUE``.
 
-            Ticket #148: when the type index is still unresolved for this
-            scan (``cached_type is _UNSET``) AND *granted_access* exactly
-            equals ``_HANG_PRONE_GRANTED_ACCESS``, this handle must never
-            itself be the one whose type probe runs -- its resolution is
-            deferred to a same-type-index sibling handle instead (or, if
-            none ever resolves the type this scan, dropped silently at
-            end-of-scan -- see the revisit loop below ``_process_handle``'s
-            call site). This check runs BEFORE ``DuplicateHandle`` is ever
-            attempted on this handle -- a masked/deferred handle costs this
-            scan nothing beyond the cheap ``skipped_passes``/registry
-            bookkeeping, and the revisit (which duplicates for real, only
-            for entries whose type index did resolve to ``"File"``) is the
-            sole place a masked handle's own OS handle is ever touched.
+            *granted_access* is accepted for tuple-shape compatibility with
+            ``_enumerate_handle_table``'s 4-tuple entries but is otherwise
+            unused -- ticket #154 deletes the former GrantedAccess-mask
+            deferral special case (a hardcoded workaround for one observed
+            hang-prone mask) in favour of the general per-type-index
+            suppression fix below, which covers a probe that fails to
+            resolve for *any* reason, not just that one mask.
             """
-            nonlocal deferred_overflowed
+            nonlocal type_unresolved
             key = _wedging_handle_key(pid, handle_value, object_ptr, type_index)
             if _is_known_wedging_handle(key):
                 return _CONTINUE  # known-wedging object -- skip without duplicating
 
             cached_type = type_name_cache.get(type_index, _UNSET)
             if cached_type is not _UNSET and cached_type != "File":
-                return _CONTINUE  # known non-file type -- skip without duplicating
-
-            if cached_type is _UNSET and granted_access == _HANG_PRONE_GRANTED_ACCESS:
-                if len(deferred_masked) >= _MAX_DEFERRED_MASKED_HANDLES:
-                    if not deferred_overflowed:
-                        _logger.warning(
-                            "_win_handle_holders: deferred-masked-handle "
-                            "revisit list hit its cap "
-                            "(_MAX_DEFERRED_MASKED_HANDLES=%s) -- further "
-                            "masked handles this scan are dropped rather "
-                            "than deferred",
-                            _MAX_DEFERRED_MASKED_HANDLES,
-                        )
-                        deferred_overflowed = True
-                else:
-                    deferred_masked.append(
-                        (pid, handle_value, type_index, object_ptr)
-                    )
-                return _CONTINUE
+                return _CONTINUE  # known non-file type (or unresolved) -- skip
 
             dup_handle = wintypes.HANDLE()
             ok = kernel32.DuplicateHandle(
@@ -3040,6 +2948,18 @@ def _win_handle_holders(
                     status, type_name = _bounded_query(dup_handle, OBJECT_TYPE_INFORMATION, key)
                     if status != _RESOLVED:
                         owns_handle = False
+                        # Ticket #154 (C3 fix): write the cache even on a
+                        # non-resolved probe -- as `None`, the value this
+                        # cache is already typed and documented for -- so
+                        # no later same-type-index sibling this scan
+                        # re-probes (and re-wedges) the same pathological
+                        # type. Previously this branch returned without
+                        # writing the cache at all, which was the bug: a
+                        # sibling handle of the same type re-triggered a
+                        # fresh DuplicateHandle/NtQueryObject cycle here,
+                        # up to _MAX_WEDGED_HANDLE_WORKERS times per scan.
+                        type_name_cache[type_index] = None
+                        type_unresolved = True
                         return _STOP if status == _STOP else _CONTINUE
                     type_name_cache[type_index] = type_name
                     if type_name != "File":
@@ -3131,81 +3051,24 @@ def _win_handle_holders(
             finally:
                 kernel32.CloseHandle(proc_handle)
 
-        # Ticket #148 (R5): end-of-scan revisit for handles whose type probe
-        # was deferred because their GrantedAccess matched the hang-prone
-        # mask. Only entries whose type index HAS, in the meantime, been
-        # resolved to "File" by some other (sibling) handle sharing that
-        # type index are worth revisiting -- entries whose type never
-        # resolved are dropped silently: that just means "never identified
-        # as file-relevant". Subject to the same scan_deadline/stop_scan
-        # checks as the main loop above -- a scan that is already out of
-        # budget or worker capacity must not silently spend more of either
-        # here.
-        if not stop_scan:
-            for pid, handle_value, type_index, object_ptr in deferred_masked:
-                if stop_scan:
-                    break
-                if time.monotonic() > scan_deadline:
-                    deadline_truncated = True
-                    break
-                if type_name_cache.get(type_index) != "File":
-                    continue
-                key = _wedging_handle_key(pid, handle_value, object_ptr, type_index)
-                if _is_known_wedging_handle(key):
-                    continue
-                proc_handle = kernel32.OpenProcess(PROCESS_DUP_HANDLE, False, pid)
-                if not proc_handle:
-                    continue
-                try:
-                    dup_handle = wintypes.HANDLE()
-                    ok = kernel32.DuplicateHandle(
-                        proc_handle,
-                        wintypes.HANDLE(handle_value),
-                        current_process,
-                        ctypes.byref(dup_handle),
-                        0,
-                        False,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                    if not ok:
-                        continue
-                    owns_handle = True
-                    nt_name: Optional[str] = None
-                    try:
-                        status, nt_name = _bounded_query(
-                            dup_handle, OBJECT_NAME_INFORMATION, key
-                        )
-                        if status != _RESOLVED:
-                            owns_handle = False
-                            if status == _STOP:
-                                stop_scan = True
-                            continue
-                    finally:
-                        if owns_handle:
-                            kernel32.CloseHandle(dup_handle)
-                    if not nt_name:
-                        continue
-                    dos_path = _nt_path_to_dos(nt_name)
-                    if not dos_path:
-                        continue
-                    norm = os.path.normcase(os.path.normpath(dos_path))
-                    if norm == normalized or norm.startswith(normalized + os.sep):
-                        found.append((pid, ""))
-                finally:
-                    kernel32.CloseHandle(proc_handle)
-
-        # Ticket #148 (R2/R4/R5): tag-driven return -- each distinct
-        # degradation this scan may have hit contributes its own tag, and
-        # `complete` is honest: True only when none did. Replaces the old
-        # `complete=not deadline_truncated` rule, which folded a cap hit
-        # into a silent "still complete" (N2/N3, reversed by this ticket).
+        # Ticket #148 (R2/R4), revised #154 (R16b): tag-driven return -- each
+        # distinct degradation this scan may have hit contributes its own
+        # tag, and `complete` is honest: True only when none did.
+        # `handle_scan:type_unresolved` (new, #154) replaces
+        # `handle_scan:masked_deferred_capped`: per-object suppression skips
+        # one kernel object and leaves `complete` alone, but per-*type*
+        # suppression (the C3 fix above) can skip an entire type -- possibly
+        # "File" itself -- so a scan that suppressed a type index must
+        # honestly report `complete=False` rather than silently under-
+        # counting; see #148's own precedent for "a caller can always tell
+        # 'refused to look' from 'looked and found nothing'".
         tags: List[str] = []
         if deadline_truncated:
             tags.append("handle_scan:truncated")
         if capped_mid_scan:
             tags.append("handle_scan:capped")
-        if deferred_overflowed:
-            tags.append("handle_scan:masked_deferred_capped")
+        if type_unresolved:
+            tags.append("handle_scan:type_unresolved")
         return _PartialList(found, complete=not tags, skipped_passes=tuple(tags))
     finally:
         _handle_scan_lock.release()
@@ -3310,22 +3173,21 @@ def _find_blocking_processes(
     except (psutil.AccessDenied, psutil.NoSuchProcess):
         pass
 
-    # Ticket #87: hard-bound the wall-clock cost of discovery as a whole
-    # (Pass 1, 1b, 1c, 2 combined), independent of any per-pass cost of its
-    # own. `scan_stop` is computed once, at entry, from two ceilings:
-    #  - `_DISCOVERY_MAX_SEC`, an absolute cap that applies even with no
-    #    caller-supplied *deadline* at all;
-    #  - when *deadline* IS supplied, `deadline` minus a small reserve, so
-    #    that discovery never eats into the time the caller needs afterward
-    #    for the actual signal/kill step. The reserve shrinks to at most 20%
-    #    of whatever time remains on a very tight deadline, so it can never
-    #    by itself consume the whole budget.
-    # Checked at the top of every pass and inside every per-process loop
-    # below so a slow ambient process list degrades gracefully to "whatever
-    # was found so far" instead of blowing through the caller's budget.
+    # Ticket #154 (item 10): `_DISCOVERY_MAX_SEC`/`_DISCOVERY_RESERVE_SEC`
+    # are deleted -- the caller-derived *deadline* is the only budget story
+    # now (every real call site supplies one). `scan_stop` reserves
+    # `0.2 * remaining` unconditionally (no min-of-two against a deleted
+    # absolute constant) so that discovery never eats into the time the
+    # caller needs afterward for the actual signal/kill step. Checked at
+    # the top of every pass and inside every per-process loop below so a
+    # slow ambient process list degrades gracefully to "whatever was found
+    # so far" instead of blowing through the caller's budget. `deadline is
+    # None` (direct/test callers with no caller-supplied timeout) falls
+    # back to `_HANDLE_SCAN_BUDGET_SEC` -- the one ceiling this module
+    # keeps -- as the overall discovery ceiling too.
     entry_ts = time.monotonic()
     if deadline is None:
-        scan_stop = entry_ts + _DISCOVERY_MAX_SEC
+        scan_stop = entry_ts + _HANDLE_SCAN_BUDGET_SEC
     else:
         # Clamp to 0 (ticket #87 follow-up, finding B4): when *deadline* has
         # already elapsed by entry (remaining < 0), the un-clamped algebra
@@ -3336,8 +3198,7 @@ def _find_blocking_processes(
         # here makes the "no discovery once the deadline is already gone"
         # intent unambiguous without changing behaviour.
         remaining = max(0.0, deadline - entry_ts)
-        reserve = min(_DISCOVERY_RESERVE_SEC, 0.2 * remaining)
-        scan_stop = min(entry_ts + _DISCOVERY_MAX_SEC, deadline - reserve)
+        scan_stop = deadline - 0.2 * remaining
 
     seen_pids: set[int] = set()
     result: List[KilledProcessInfo] = []
@@ -3427,21 +3288,21 @@ def _find_blocking_processes(
     # ctypes/structure failure degrades gracefully to whatever Pass 1/1b
     # already found.
     #
-    # Budget: capped at _HANDLE_SCAN_BUDGET_SEC, but shrunk further to
-    # whatever remains of *deadline* (the caller's overall timeout) when one
-    # was supplied, so this scan can never independently add up to
-    # _HANDLE_SCAN_BUDGET_SEC on top of the caller's own budget. When no
-    # time remains at all, the scan is skipped outright rather than spending
-    # any of the remaining time on a scan that has no chance to report back
-    # before the deadline is needed elsewhere (Pass 2 / the kill/wait step).
+    # Budget (ticket #154, item 10): capped at _HANDLE_SCAN_BUDGET_SEC, but
+    # shrunk further to whatever remains of `scan_stop` -- NOT `deadline`
+    # directly -- so this scan can never independently add up to
+    # _HANDLE_SCAN_BUDGET_SEC on top of the caller's own budget, and never
+    # eats into the reserve `scan_stop` already set aside for the caller's
+    # own kill step afterward (the real inconsistency this fixes: computing
+    # the budget from `deadline` let Pass 1c legally spend time out of that
+    # reserve). When no time remains at all, the scan is skipped outright
+    # rather than spending any of the remaining time on a scan that has no
+    # chance to report back before that time is needed elsewhere.
     if sys.platform == "win32":
         if time.monotonic() <= scan_stop:
-            if deadline is None:
-                handle_scan_budget = _HANDLE_SCAN_BUDGET_SEC
-            else:
-                handle_scan_budget = min(
-                    _HANDLE_SCAN_BUDGET_SEC, max(0.0, deadline - time.monotonic())
-                )
+            handle_scan_budget = min(
+                _HANDLE_SCAN_BUDGET_SEC, max(0.0, scan_stop - time.monotonic())
+            )
             if handle_scan_budget <= 0:
                 handle_holders: "_PartialList" = _PartialList([], complete=True)
                 skipped_passes.append("handle_scan:skipped")  # D4
@@ -3498,74 +3359,12 @@ def _find_blocking_processes(
         else:
             skipped_passes.append("handle_scan:skipped")  # D4
 
-    # Pass 2: open file handles — catches daemons that have changed their cwd
-    # away from the worktree but still hold file locks inside it.
-    if time.monotonic() <= scan_stop:
-        pass_truncated = False
-        pass_degraded = False
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-            if time.monotonic() > scan_stop:
-                pass_truncated = True
-                break
-            try:
-                pid = proc.info["pid"]
-                if pid in excluded_pids or pid in seen_pids:
-                    continue
-                try:
-                    open_files = proc.open_files()
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    continue
-                except RuntimeError as exc:
-                    # D9 (ticket #107): psutil's Windows open_files() can
-                    # raise a bare RuntimeError (e.g.
-                    # "SystemExtendedHandleInformation buffer too big")
-                    # when the OS-wide handle table is large. This is
-                    # process-independent -- it will fail identically for
-                    # every remaining PID -- so continuing the loop would
-                    # just burn the discovery budget on guaranteed
-                    # failures. Stop this pass now and report the
-                    # degradation instead of letting the error escape and
-                    # crash the caller.
-                    #
-                    # Narrowly scoped to this documented psutil failure
-                    # signature (checked case-insensitively, matching this
-                    # module's existing convention for classifying error
-                    # text -- see the lock-signal detection elsewhere in
-                    # this package) -- a bare RuntimeError from
-                    # open_files() with any other message is an unexpected,
-                    # unrelated failure and must not be silently swallowed
-                    # and mis-attributed to "open_files:degraded"; re-raise
-                    # so it surfaces like any other unexpected error. Same
-                    # for POSIX, where this specific Windows C-extension
-                    # condition cannot occur at all.
-                    if sys.platform != "win32" or "buffer too big" not in str(
-                        exc
-                    ).lower():
-                        raise
-                    pass_degraded = True
-                    break
-                for finfo in open_files:
-                    norm_fpath = os.path.normcase(os.path.normpath(finfo.path))
-                    if norm_fpath.startswith(normalized + os.sep) or norm_fpath == normalized:
-                        seen_pids.add(pid)
-                        result.append(
-                            KilledProcessInfo(
-                                pid=pid,
-                                name=proc.info["name"] or "",
-                                cmdline=proc.info["cmdline"] or [],
-                                source="orphan_scan",
-                                match_pass="open_files",
-                            )
-                        )
-                        break
-            except (psutil.AccessDenied, psutil.NoSuchProcess):
-                continue
-        if pass_truncated:  # D7
-            skipped_passes.append("open_files:truncated")
-        elif pass_degraded:  # D9
-            skipped_passes.append("open_files:degraded")
-    else:
-        skipped_passes.append("open_files:skipped")  # D7
+    # Ticket #154 (item 9): Pass 2 (psutil.open_files()) is deleted outright,
+    # not bounded -- it was the actual hang site (the ticket's own repro
+    # stack-dumped inside psutil's isfile_strict() under open_files()).
+    # Named consequence: on POSIX, discovery now degrades to cwd-only, so
+    # stop(kill_orphans=True) no longer finds a daemon that chdir'd away but
+    # still holds an open file inside the worktree.
 
     return _PartialList(
         result, complete=not skipped_passes, skipped_passes=tuple(skipped_passes)

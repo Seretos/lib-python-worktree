@@ -2379,14 +2379,26 @@ class TestMatrixRemovalMechanism:
     #    non-staged phrasing is unchanged -----------------------------------
 
     def test_locked_staged_dir_error_names_removing(self, tmp_path):
-        """A `.removing` remnant that survives the retry loop AND both
-        diagnosis tiers must raise WorktreeDirLockedError(staged=True) whose
-        message names `.removing` and no filesystem path. RED today: the
-        whole staging mechanism does not exist -- os.rename is never called,
-        so nothing ever produces a staged=True error."""
+        """A `.removing` remnant that genuinely survives the delete ladder
+        AND both diagnosis tiers must raise WorktreeDirLockedError(
+        staged=True) whose message names `.removing` and no filesystem
+        path. `staged` reflects literal disk truth (the final guard's own
+        check), so the remnant must actually exist on disk here: the
+        rename succeeds for real, but shutil.rmtree is stubbed to never
+        clear the staged directory's content.
+
+        NOTE (fixed during implementation): this test originally mocked
+        `os.rename` to always fail, which -- since nothing was ever
+        actually staged -- could never produce a real `.removing` remnant
+        for `staged=True` to legitimately describe; that premise was
+        internally inconsistent with the literal-disk-truth `staged`
+        semantics `_phase_final_guard` implements. Retargeted onto the
+        residual-survives scenario instead, which is the one this test's
+        name and docstring actually describe."""
         manager = _make_manager(tmp_path)
         checkout = tmp_path / "wt-r9-locked"
         checkout.mkdir()
+        (checkout / "file.txt").write_text("hello")
         record = _make_record(
             "wt-r9-locked", path=str(checkout), repo_root=str(tmp_path)
         )
@@ -2395,8 +2407,8 @@ class TestMatrixRemovalMechanism:
 
         with (
             patch(
-                "lib_python_worktree.core.teardown.os.rename",
-                side_effect=PermissionError("always locked"),
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=lambda *a, **kw: None,
             ),
             patch("lib_python_worktree.core.teardown.time.sleep"),
             patch(
@@ -2426,7 +2438,15 @@ class TestMatrixRemovalMechanism:
         """When `record.path` itself survives the whole removal and no
         `.removing` remnant exists, the final guard's message must stay
         byte-identical to v0.3.12's kill_attempted-selected text, and
-        `staged` must be False."""
+        `staged` must be False.
+
+        NOTE (fixed during implementation): originally didn't mock
+        os.rename, so under the new rename-based mechanism the real
+        rename+delete would just succeed outright (nothing survives),
+        never exercising the final guard at all. `os.rename` is now
+        stubbed to always fail so the original genuinely never moves --
+        the literal "surviving original, no remnant" scenario this test's
+        name describes."""
         manager = _make_manager(tmp_path)
         checkout = tmp_path / "wt-r9-surviving"
         checkout.mkdir()
@@ -2436,10 +2456,13 @@ class TestMatrixRemovalMechanism:
         manager.state.add(record)
         mock_lifecycle = MagicMock()
 
-        # git call "succeeds" but never actually deletes anything, so the
-        # final guard sees record.path still present with no remnant.
         with (
             patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=PermissionError("always locked"),
+            ),
+            patch("lib_python_worktree.core.teardown.time.sleep"),
             patch(
                 "lib_python_worktree.core.teardown._find_blocking_processes",
                 MagicMock(return_value=[]),
@@ -2584,6 +2607,7 @@ class TestMatrixRemovalMechanism:
         manager = _make_manager(tmp_path)
         checkout = tmp_path / "wt-r6b-persistent"
         checkout.mkdir()
+        (checkout / "locked.tmp").write_text("never goes away")
         staged_str = str(checkout) + ".removing"
         record = _make_record(
             "wt-r6b-persistent", path=str(checkout), repo_root=str(tmp_path)
@@ -2594,8 +2618,14 @@ class TestMatrixRemovalMechanism:
         real_rmtree = shutil.rmtree
 
         def _rmtree_side_effect(path, *a, **kw):
+            # Normalize away a win32 extended-path ("\\?\...") prefix so the
+            # ladder's rung-3 fallback is caught by this same guard, not
+            # just the plain rung-1/rung-2 calls.
             path_str = str(path)
-            if path_str == staged_str:
+            normalized = path_str[4:] if path_str.startswith("\\\\?\\") else path_str
+            if os.path.normcase(os.path.normpath(normalized)) == os.path.normcase(
+                os.path.normpath(staged_str)
+            ):
                 # Never actually clears -- always leaves the directory (with
                 # content) behind, so the residual persists no matter how
                 # many times the ladder retries.
@@ -2607,6 +2637,11 @@ class TestMatrixRemovalMechanism:
                 "lib_python_worktree.core.teardown.shutil.rmtree",
                 side_effect=_rmtree_side_effect,
             ),
+            # The delete ladder's win32 rung 4 (robocopy) operates via a
+            # real subprocess, not shutil.rmtree -- no-op it too so the
+            # residual genuinely persists through every rung, not just the
+            # rmtree-based ones.
+            patch("lib_python_worktree.core.teardown.subprocess.run"),
             patch(
                 "lib_python_worktree.core.teardown._find_blocking_processes",
                 MagicMock(return_value=[]),

@@ -188,32 +188,6 @@ def test_phase_stop_hook_sets_failed_outcome_on_load_error():
     assert ctx.record.stop_hook_outcome.message == "disk error"
 
 
-def test_phase_gate_a_skips_when_target_absent():
-    ctx = _make_ctx(target_absent=True)
-    with (
-        patch("lib_python_worktree.core.teardown.sys") as mock_sys,
-        patch(
-            "lib_python_worktree.core.teardown._find_blocking_processes"
-        ) as mock_find,
-    ):
-        mock_sys.platform = "win32"
-        teardown._phase_gate_a_blocking_preflight(ctx)
-    mock_find.assert_not_called()
-
-
-def test_phase_gate_a_skips_on_posix():
-    ctx = _make_ctx(target_absent=False)
-    with (
-        patch("lib_python_worktree.core.teardown.sys") as mock_sys,
-        patch(
-            "lib_python_worktree.core.teardown._find_blocking_processes"
-        ) as mock_find,
-    ):
-        mock_sys.platform = "linux"
-        teardown._phase_gate_a_blocking_preflight(ctx)
-    mock_find.assert_not_called()
-
-
 def test_phase_gate_b_raises_dirty_when_contract_teardown_and_real_dirt():
     from lib_python_worktree.contract.schema import Step, WorktreeContract
     from lib_python_worktree.core._exceptions import DirtyWorktreeError
@@ -273,28 +247,26 @@ def test_phase_run_teardown_steps_runs_and_sets_marker():
     assert record.teardown_ran is True
 
 
-def test_phase_git_worktree_remove_success_calls_run_git_once():
-    ctx = _make_ctx()
+def test_phase_git_prune_calls_run_git_once(tmp_path):
+    """#154: `_phase_git_worktree_remove` is replaced by the unconditional
+    `_phase_git_prune`."""
+    record = _make_record(path=str(tmp_path / "wt-phase"))
+    ctx = _make_ctx(record)
     with patch("lib_python_worktree.core.teardown._run_git") as mock_git:
         mock_git.return_value = MagicMock(returncode=0, stderr="")
-        teardown._phase_git_worktree_remove(ctx)
-    mock_git.assert_called_once()
+        teardown._phase_git_prune(ctx)
+    mock_git.assert_called_once_with(
+        ["worktree", "prune", "--expire=now"], cwd=Path(record.repo_root)
+    )
 
 
-def test_phase_git_worktree_remove_raises_git_command_error_on_unrecognised_failure():
-    ctx = _make_ctx()
+def test_phase_git_prune_warns_and_continues_on_failure(tmp_path, caplog):
+    """#154: a prune failure must never raise -- it warn-and-continues."""
+    record = _make_record(path=str(tmp_path / "wt-phase"))
+    ctx = _make_ctx(record)
     with patch("lib_python_worktree.core.teardown._run_git") as mock_git:
         mock_git.return_value = MagicMock(returncode=1, stderr="fatal: something else")
-        with pytest.raises(teardown.GitCommandError):
-            teardown._phase_git_worktree_remove(ctx)
-
-
-def test_phase_filesystem_fallback_noop_when_path_absent():
-    ctx = _make_ctx()
-    with patch(
-        "lib_python_worktree.core.teardown.os.path.exists", return_value=False
-    ):
-        teardown._phase_filesystem_fallback(ctx)  # must not raise
+        teardown._phase_git_prune(ctx)  # must not raise
 
 
 def test_phase_final_guard_raises_when_still_present():
