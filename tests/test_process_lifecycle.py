@@ -4422,7 +4422,17 @@ class TestHandleScanDeadlineThreading:
         _find_blocking_processes without it, as pre-existing tests and code
         do) must still get the full _HANDLE_SCAN_BUDGET_SEC ceiling passed
         to _win_handle_holders -- this keeps the new parameter opt-in and
-        backward compatible."""
+        backward compatible.
+
+        Ticket #154 fix (test bug, not a production bug): the `deadline is
+        None` leg computes `scan_stop = entry_ts + _HANDLE_SCAN_BUDGET_SEC`
+        from one `time.monotonic()` read, then derives the budget from a
+        second, slightly later read of `time.monotonic()` -- so the
+        captured value is `_HANDLE_SCAN_BUDGET_SEC` minus whatever real
+        wall-clock time elapsed between those two calls, never bit-identical
+        to the constant. An exact `==` here was always going to be flaky;
+        asserting an upper bound plus a tight tolerance is what the
+        docstring's "full ceiling" claim actually means."""
         import psutil
         from lib_python_worktree.core.process_lifecycle import _HANDLE_SCAN_BUDGET_SEC
 
@@ -4448,7 +4458,9 @@ class TestHandleScanDeadlineThreading:
 
             _find_blocking_processes(target, host_pid)  # no deadline kwarg
 
-        assert captured_budget == [_HANDLE_SCAN_BUDGET_SEC]
+        assert len(captured_budget) == 1
+        assert captured_budget[0] <= _HANDLE_SCAN_BUDGET_SEC
+        assert captured_budget[0] == pytest.approx(_HANDLE_SCAN_BUDGET_SEC, abs=0.5)
 
 
 # ---------------------------------------------------------------------------
