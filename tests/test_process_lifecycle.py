@@ -10683,3 +10683,66 @@ class TestMatchPass:
             "the all(...) assertion below is vacuously true"
         )
         assert all(e.match_pass is None and e.source == "tree" for e in result)
+
+
+# ---------------------------------------------------------------------------
+# #154 R2 (AC3, as reformulated): Pass 2 (psutil.open_files()) is deleted
+# outright, not bounded -- it is the actual hang site (the ticket's own
+# repro stack-dumped inside isfile_strict() under open_files()).
+# ---------------------------------------------------------------------------
+
+class TestDiscoveryPasses:
+    def test_open_files_pass_deleted(self):
+        """A process whose open_files() would blow up (or hang) must never
+        be consulted at all once Pass 2 is deleted. RED today: Pass 2 calls
+        proc.open_files() for every remaining, unmatched pid."""
+        import psutil
+
+        target = "/fake/worktree-r2"
+        host_pid = os.getpid()
+
+        proc = MagicMock()
+        proc.info = {"pid": 20154, "name": "x", "cmdline": ["x"]}
+        proc.cwd.return_value = "/unrelated/path"
+        proc.open_files.side_effect = AssertionError(
+            "Pass 2 (open_files) must be deleted outright -- #154"
+        )
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[proc]),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"  # Pass 1b/1c are win32-only; irrelevant here
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            # Must return normally -- must NOT propagate the AssertionError
+            # from a Pass-2 open_files() call that no longer exists.
+            result = _find_blocking_processes(
+                target, host_pid, deadline=time.monotonic() + 5.0
+            )
+
+        proc.open_files.assert_not_called()
+        assert list(result) == []
+
+    def test_open_files_degraded_tag_never_appears(self):
+        """With Pass 2 deleted, none of its tags can ever be produced."""
+        import psutil
+
+        target = "/fake/worktree-r2b"
+        host_pid = os.getpid()
+
+        with (
+            patch.object(psutil, "process_iter", return_value=[]),
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            result = _find_blocking_processes(
+                target, host_pid, deadline=time.monotonic() + 5.0
+            )
+
+        assert "open_files:degraded" not in result.skipped_passes
+        assert "open_files:truncated" not in result.skipped_passes
+        assert "open_files:skipped" not in result.skipped_passes
