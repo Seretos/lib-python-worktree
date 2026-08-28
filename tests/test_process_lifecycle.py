@@ -10798,3 +10798,124 @@ class TestBoundedPsutilCalls:
             "proc.cwd() ran on the main thread -- must be dispatched "
             "through the bounded worker primitive instead"
         )
+
+
+# ---------------------------------------------------------------------------
+# #154 R16b (item 12): per-type suppression fixes the C3 dedup bug, and the
+# hang-prone-mask deferral/revisit mechanism is deleted outright.
+# ---------------------------------------------------------------------------
+
+class TestPerTypeWedgeSuppression:
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_wedged_type_probe_suppresses_same_type_siblings_in_one_scan(
+        self, tmp_path, monkeypatch
+    ):
+        """Once one handle's type probe fails to resolve (ABANDONED),
+        `type_name_cache[type_index]` must be written (to `None`) so every
+        later sibling handle of that SAME type index is suppressed from the
+        cache alone -- no further DuplicateHandle/submit() at all. RED
+        today: `_process_handle` only ever writes `type_name_cache[type_index]`
+        on the RESOLVED branch (process_lifecycle.py, inside the
+        `if cached_type is _UNSET:` block) -- a non-resolved probe leaves
+        the entry unset, so every sibling re-probes and re-wedges."""
+        import msvcrt
+
+        files = []
+        handles = []
+        try:
+            for i in range(3):
+                p = tmp_path / f"sibling{i}.txt"
+                p.write_text("x")
+                fh = open(p, "r")
+                files.append(fh)
+                handles.append(msvcrt.get_osfhandle(fh.fileno()))
+
+            fake_table = {
+                os.getpid(): [
+                    (handles[0], 500000, 0),
+                    (handles[1], 500000, 0),
+                    (handles[2], 500000, 0),
+                ]
+            }
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+
+            submit_calls: list = []
+
+            def fake_submit(
+                self, fn, *, grace=None, scan_deadline=None, on_abandoned_done=None
+            ):
+                submit_calls.append(1)
+                return _pl._QueryOutcome(_pl._QueryStatus.ABANDONED, None)
+
+            monkeypatch.setattr(_pl._BoundedQueryWorker, "submit", fake_submit)
+
+            result = _win_handle_holders(
+                str(tmp_path),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+            assert len(submit_calls) == 1, (
+                f"once one handle's type probe fails to resolve, no further "
+                f"sibling of the same type index should be probed this "
+                f"scan; got {len(submit_calls)} submit() calls"
+            )
+            assert "handle_scan:type_unresolved" in result.skipped_passes
+            assert result.complete is False
+        finally:
+            for fh in files:
+                fh.close()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows-only: exercises ntdll/ctypes handle enumeration",
+    )
+    def test_hang_prone_mask_is_no_longer_special_cased(self, tmp_path, monkeypatch):
+        """The `_HANG_PRONE_GRANTED_ACCESS` deferral/end-of-scan-revisit
+        mechanism is deleted: a masked handle must be probed directly like
+        any other, and the constants themselves must be gone. RED today:
+        with no sibling of the same type index to resolve the type to
+        "File" first, the masked handle is deferred and never revisited at
+        all -- `_query_object_raw` is never called for it."""
+        import msvcrt
+
+        held = tmp_path / "masked.txt"
+        held.write_text("x")
+        f = open(held, "r")
+        try:
+            handle_value = msvcrt.get_osfhandle(f.fileno())
+            hang_prone_mask = 0x0012019F
+            fake_table = {os.getpid(): [(handle_value, 888888, 0, hang_prone_mask)]}
+            monkeypatch.setattr(
+                _pl, "_enumerate_handle_table", lambda ntdll, excluded: fake_table
+            )
+
+            query_calls: list = []
+            real_query = _pl._query_object_raw
+
+            def _spy_query(ntdll, dup_handle, info_class):
+                query_calls.append(info_class)
+                return real_query(ntdll, dup_handle, info_class)
+
+            monkeypatch.setattr(_pl, "_query_object_raw", _spy_query)
+
+            _win_handle_holders(
+                str(tmp_path),
+                excluded_pids=set(),
+                budget_sec=_REAL_SCAN_TEST_BUDGET_SEC,
+            )
+
+            assert query_calls, (
+                "the masked handle must be probed directly like any other "
+                "-- the hang-prone-mask deferral/revisit mechanism is deleted"
+            )
+        finally:
+            f.close()
+
+        assert not hasattr(_pl, "_HANG_PRONE_GRANTED_ACCESS")
+        assert not hasattr(_pl, "_MAX_DEFERRED_MASKED_HANDLES")
