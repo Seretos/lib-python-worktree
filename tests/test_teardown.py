@@ -22,6 +22,7 @@ import pytest
 
 from lib_python_worktree.core.manager import WorktreeManager, ManagerConfig
 from lib_python_worktree.core.process_lifecycle import (
+    KilledProcessInfo,
     ProcessNotRunningError,
     _PartialList,
 )
@@ -6696,3 +6697,107 @@ class TestCombinedBlockingConditions:
 
         assert hasattr(lib_python_worktree, "WorktreeRemovalBlockedError")
         assert "WorktreeRemovalBlockedError" in lib_python_worktree.__all__
+
+
+# ---------------------------------------------------------------------------
+# #154 (item 8 of plan.md, unchanged by the human override) -- `staged` on
+# DirtyWorktreeError / WorktreeDirLockedError / WorktreeRemovalBlockedError,
+# and `blockers` on WorktreeDirLockedError / WorktreeRemovalBlockedError.
+# ---------------------------------------------------------------------------
+
+class TestStagedAndBlockersAttributes:
+    def test_dirty_worktree_error_staged_default_false_message_unchanged(self):
+        """staged= must default to False and not perturb today's message
+        (R9's byte-identical requirement, extended to DirtyWorktreeError)."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+
+        err = DirtyWorktreeError("wt-staged-default")
+        assert err.staged is False
+        assert str(err) == (
+            "worktree 'wt-staged-default' has uncommitted changes. "
+            "Pass force=True to remove it anyway."
+        )
+
+    def test_dirty_worktree_error_staged_true_names_marker_not_path(self):
+        """#154 item 17 / Decision 1: the dirt-probe undo-failure leg raises
+        DirtyWorktreeError(staged=True) -- the message must name the id and
+        the `.removing` marker suffix, and must NOT contain a filesystem
+        path (per _exceptions.py's documented no-path-leak contract)."""
+        from lib_python_worktree.core.manager import DirtyWorktreeError
+
+        err = DirtyWorktreeError("wt-staged-true", staged=True)
+        assert err.staged is True
+        msg = str(err)
+        assert "wt-staged-true" in msg
+        assert ".removing" in msg
+        assert "/fake/" not in msg and "\fake\\" not in msg
+
+    def test_worktree_dir_locked_error_gains_staged_and_blockers(self):
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        blockers = [
+            KilledProcessInfo(pid=123, name="", cmdline=[], source="tracked")
+        ]
+        err = WorktreeDirLockedError(
+            "wt-locked-staged",
+            killed=[],
+            kill_attempted=False,
+            staged=True,
+            blockers=blockers,
+        )
+        assert err.staged is True
+        assert err.blockers == blockers
+        assert ".removing" in str(err)
+
+    def test_worktree_dir_locked_error_blockers_defaults_to_empty_list_never_none(self):
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        err = WorktreeDirLockedError("wt-locked-default", killed=[])
+        assert err.staged is False
+        assert err.blockers == []
+
+    def test_worktree_dir_locked_error_staged_false_message_byte_identical_to_v0312(self):
+        """R9: the non-staged phrasing, selected by kill_attempted exactly as
+        today, must stay byte-identical."""
+        from lib_python_worktree.core.manager import WorktreeDirLockedError
+
+        killed = [KilledProcessInfo(pid=1, name="a.exe", cmdline=["a"])]
+        err_true = WorktreeDirLockedError("wt-v0312-a", killed=killed, kill_attempted=True)
+        assert str(err_true) == (
+            "worktree 'wt-v0312-a' directory is still locked after killing"
+            " 1 blocking process(es)."
+        )
+        err_false = WorktreeDirLockedError("wt-v0312-b", killed=[], kill_attempted=False)
+        assert str(err_false) == (
+            "worktree 'wt-v0312-b' directory is locked by another process. "
+            "Pass kill_blocking_processes=True to kill the blocking process(es) "
+            "and retry."
+        )
+        assert err_true.staged is False
+        assert err_false.staged is False
+
+    def test_worktree_removal_blocked_error_gains_staged_and_blockers(self):
+        """WorktreeRemovalBlockedError bypasses both parents' __init__ and
+        must set staged/blockers explicitly like its other attributes, or
+        `except WorktreeDirLockedError as e: e.blockers` raises
+        AttributeError on this branch."""
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+
+        blockers = [KilledProcessInfo(pid=9, name="", cmdline=[], source="orphan_scan")]
+        err = WorktreeRemovalBlockedError(
+            "wt-combined-staged",
+            killed=[],
+            kill_attempted=False,
+            dirty_paths=["a.txt"],
+            staged=True,
+            blockers=blockers,
+        )
+        assert err.staged is True
+        assert err.blockers == blockers
+
+    def test_worktree_removal_blocked_error_staged_and_blockers_default(self):
+        from lib_python_worktree.core.manager import WorktreeRemovalBlockedError
+
+        err = WorktreeRemovalBlockedError("wt-combined-default", killed=[])
+        assert err.staged is False
+        assert err.blockers == []

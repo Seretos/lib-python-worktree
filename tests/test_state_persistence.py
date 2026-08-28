@@ -3144,3 +3144,31 @@ def test_yaml_backed_list_after_create_yields_empty_start_variants(
     listed = mgr.list()
     rec = next(r for r in listed if r.id == created.id)
     assert rec.start_variants == []
+
+
+# ---------------------------------------------------------------------------
+# #154 R12 -- the orphan-scan public API break is complete (ticket #140's
+# WorktreeRecord.orphan_scan / OrphanScanReport / OrphanScanEntry surface is
+# removed with no replacement, per the ticket's Q3(c) answer).
+# ---------------------------------------------------------------------------
+
+def test_orphan_scan_surface_removed():
+    """#154 R12: WorktreeRecord no longer carries the transient orphan_scan
+    field, and OrphanScanReport is no longer part of the public API. RED
+    today: both exist (ticket #140)."""
+    import lib_python_worktree
+
+    record = WorktreeRecord(
+        id="wt-154-r12",
+        repo_root="/fake/repo",
+        branch="feature/x",
+        path="/fake/store/wt-154-r12",
+    )
+    assert not hasattr(record, "orphan_scan"), (
+        "WorktreeRecord.orphan_scan must be deleted outright (#154, Q3(c) -- "
+        "no replacement, no always-empty vestige)"
+    )
+    assert "OrphanScanReport" not in lib_python_worktree.__all__
+    assert "OrphanScanEntry" not in lib_python_worktree.__all__
+    assert not hasattr(lib_python_worktree, "OrphanScanReport")
+    assert not hasattr(lib_python_worktree, "OrphanScanEntry")

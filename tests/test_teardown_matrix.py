@@ -51,6 +51,7 @@ from lib_python_worktree.core.process_lifecycle import (
 )
 from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 from lib_python_worktree.contract.schema import Step, WorktreeContract
+from lib_python_worktree.core import teardown
 
 
 # ---------------------------------------------------------------------------
@@ -1838,3 +1839,613 @@ class TestMatrixOrphanScan:
 
         assert record.orphan_scan is not None
         assert any(e.info.pid == 16501 for e in record.orphan_scan.entries)
+
+
+# ---------------------------------------------------------------------------
+# #154 -- rename-is-the-oracle removal mechanism (generation-2 plan.md,
+# amended by the human override note: no _phase_reclaim_staged; the
+# undo-failure leg hard-raises and leaves the remnant; ctx.failure_deadline
+# stays None on every DirtyWorktreeError leg, staged=True included).
+# ---------------------------------------------------------------------------
+
+def _git_side_effect_deletes_on_worktree_remove(checkout: Path, calls: list):
+    """A ``_run_git`` stand-in that also mirrors real git's destructive
+    effect for a ``worktree remove`` call, so the final-guard's real
+    ``os.path.exists`` check sees an accurate post-removal filesystem state
+    against TODAY'S code path (mocked git normally leaves the directory
+    behind, which would make an unrelated WorktreeDirLockedError mask the
+    assertion this test actually cares about)."""
+
+    def _side_effect(args, cwd=None, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["worktree", "remove"]:
+            shutil.rmtree(str(checkout), ignore_errors=True)
+        return _ok()
+
+    return _side_effect
+
+
+class TestMatrixRemovalMechanism:
+    """New scenarios for #154. Supersedes v0.3.12's Gate A / orphan-scan /
+    `git worktree remove` / filesystem-fallback mechanism with rename ->
+    rmtree -> `git worktree prune --expire=now`, per the human override note
+    (`.adev/154-1/plan-final-human-override.md`) amending generation-2
+    plan.md (`.adev/154-1/plan.md`)."""
+
+    # -- R1 (AC2): the happy path never scans -------------------------------
+
+    def test_happy_path_never_scans(self, tmp_path):
+        """A clean, unheld worktree's removal performs zero systemwide
+        process/handle scans and spawns no non-git subprocess. RED today:
+        Gate A (win32) and the orphan-scan phase (both platforms) each call
+        `_find_blocking_processes` unconditionally."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r1"
+        checkout.mkdir()
+        record = _make_record("wt-r1", path=str(checkout), repo_root=str(tmp_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        git_calls: list = []
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown._run_git",
+                side_effect=_git_side_effect_deletes_on_worktree_remove(
+                    checkout, git_calls
+                ),
+            ) as mock_git,
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=[]),
+            ) as mock_scan,
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+                MagicMock(return_value=[]),
+            ) as mock_kill,
+            patch("lib_python_worktree.core.teardown.subprocess.run") as mock_run,
+            patch("lib_python_worktree.core.teardown.sys") as mock_sys,
+        ):
+            mock_sys.platform = "win32"
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert mock_scan.call_count == 0, (
+            f"_find_blocking_processes must never be called on the happy "
+            f"path (AC2); was called {mock_scan.call_count} time(s)"
+        )
+        assert mock_kill.call_count == 0
+        assert mock_run.call_count == 0, "no robocopy (no non-git subprocess)"
+        assert not checkout.exists()
+
+    # -- R4: removal is rename-based; git is only pruned ---------------------
+
+    def test_rename_then_rmtree_then_prune(self, tmp_path):
+        """Removal never calls `git worktree remove`; it stages via
+        `os.rename`, deletes the staged tree, then prunes with
+        `--expire=now`. RED today: `worktree remove` is called and no
+        `worktree prune --expire=now` call is ever made on the happy path."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r4"
+        checkout.mkdir()
+        (checkout / "file.txt").write_text("hello")
+        record = _make_record("wt-r4", path=str(checkout), repo_root=str(tmp_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        git_calls: list = []
+        with patch(
+            "lib_python_worktree.core.teardown._run_git",
+            side_effect=_git_side_effect_deletes_on_worktree_remove(
+                checkout, git_calls
+            ),
+        ):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert not checkout.exists()
+        assert not Path(str(checkout) + ".removing").exists()
+        assert ["worktree", "remove", str(checkout)] not in git_calls
+        assert ["worktree", "remove", "--force", str(checkout)] not in git_calls
+        assert ["worktree", "prune", "--expire=now"] in git_calls, (
+            f"expected an unconditional `git worktree prune --expire=now` "
+            f"call; got calls={git_calls}"
+        )
+
+    def test_prune_failure_still_reports_removed(self, tmp_path):
+        """A failed prune (stale git bookkeeping) must not turn an
+        otherwise-complete filesystem removal into a raised exception --
+        `_phase_git_prune` warn-and-continues. RED today: prune is never
+        called on this path at all, so there is nothing to make fail this
+        way -- the checkout is deleted via `git worktree remove` instead."""
+        from lib_python_worktree.core._exceptions import GitTimeoutError
+
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r4-prune-fail"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r4-prune-fail", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        calls: list = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            calls.append(list(args))
+            if args[:2] == ["worktree", "prune"]:
+                raise GitTimeoutError(args, elapsed=5.0)
+            if args[:2] == ["worktree", "remove"]:
+                shutil.rmtree(str(checkout), ignore_errors=True)
+            return _ok()
+
+        with patch(
+            "lib_python_worktree.core.teardown._run_git",
+            side_effect=_side_effect,
+        ):
+            # Must NOT raise despite the prune call failing.
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert any(c[:2] == ["worktree", "prune"] for c in calls), (
+            f"expected an unconditional `worktree prune` call that could "
+            f"then be made to fail; got calls={calls}"
+        )
+        assert not checkout.exists()
+
+    # -- R6: bounded rename retry replaces the settle rescan (P1) ------------
+
+    def test_rename_retries_within_budget(self, tmp_path):
+        """A transient rename failure (AV/indexer holding a handle for a
+        moment) must be absorbed by a short bounded retry loop -- never by
+        going straight to a systemwide scan. RED today: `os.rename` is never
+        called at all (removal goes through `git worktree remove`), so the
+        retry can never be observed."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r6"
+        checkout.mkdir()
+        record = _make_record("wt-r6", path=str(checkout), repo_root=str(tmp_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        real_rename = os.rename
+        attempts = {"n": 0}
+
+        def _flaky_rename(src, dst, *a, **kw):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise PermissionError("simulated transient AV lock")
+            return real_rename(src, dst, *a, **kw)
+
+        with (
+            patch("lib_python_worktree.core.teardown.os.rename", side_effect=_flaky_rename),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=[]),
+            ) as mock_scan,
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+                MagicMock(return_value=[]),
+            ) as mock_kill,
+            patch(
+                "lib_python_worktree.core.teardown._run_git",
+                return_value=_ok(),
+            ),
+        ):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        assert attempts["n"] == 3, (
+            f"expected exactly 3 rename attempts (2 transient failures + 1 "
+            f"success); got {attempts['n']}"
+        )
+        assert mock_scan.call_count == 0, "a transient rename failure must never escalate to a scan"
+        assert mock_kill.call_count == 0
+
+    def test_transient_retry_budget_is_exhausted_in_exact_steps(self, tmp_path):
+        """Budget pinning: a rename that never succeeds burns exactly the
+        transient-retry budget (2.0s / 0.1s steps = 20 sleeps, 21 attempts)
+        before entering diagnosis -- not an unbounded loop, not zero
+        retries. RED today: `os.rename` is never called at all."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r6-exhaust"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r6-exhaust", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        clock = {"t": 0.0}
+        sleeps: list = []
+
+        def _fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock["t"] += seconds
+
+        def _fake_monotonic():
+            return clock["t"]
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=PermissionError("always locked"),
+            ) as mock_rename,
+            patch("lib_python_worktree.core.teardown.time.sleep", side_effect=_fake_sleep),
+            patch("lib_python_worktree.core.teardown.time.monotonic", side_effect=_fake_monotonic),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=[]),
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+                MagicMock(return_value=[]),
+            ),
+            patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+        ):
+            try:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+            except Exception:
+                pass  # the eventual raise isn't what this test pins
+
+        assert mock_rename.call_count == 21, (
+            f"expected exactly 21 rename attempts (1 initial + 20 retries "
+            f"at the 2.0s/0.1s budget); got {mock_rename.call_count}"
+        )
+        assert len(sleeps) == 20
+        assert all(s == 0.1 for s in sleeps)
+
+
+    # -- R10: the dirt gate runs without teardown steps; git is no longer
+    #    the mechanism ----------------------------------------------------
+
+    def test_dirt_gate_runs_without_teardown_steps(self, tmp_path):
+        """A contract with NO `teardown:` steps must still refuse a dirty,
+        force=False removal -- via the new unconditional dirt gate, not via
+        git's own exit-128 refusal. RED today: without `teardown:` steps,
+        Gate B is skipped entirely (it only runs `if ... ctx.contract.teardown`),
+        so nothing probes dirt before the (mocked, always-succeeding)
+        `git worktree remove` call, and removal succeeds instead of
+        raising."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r10"
+        checkout.mkdir()
+        record = _make_record("wt-r10", path=str(checkout), repo_root=str(tmp_path))
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["status", "--porcelain"]:
+                return MagicMock(returncode=0, stdout="M  dirty.txt\x00")
+            return _ok()
+
+        with patch(
+            "lib_python_worktree.core.teardown._run_git",
+            side_effect=_git_side_effect,
+        ):
+            with pytest.raises(DirtyWorktreeError) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+        assert excinfo.value.staged is False
+        assert checkout.exists(), "a refused removal must not touch the checkout"
+
+    # -- R11 (amended by Decision 1 + Decision 2): combined verdict, probe
+    #    cost, and the undo-failure leg -------------------------------------
+
+    def test_dirty_and_locked_raises_removal_blocked(self, tmp_path):
+        """Real dirt + a forward rename-probe that fails -> the combined
+        WorktreeRemovalBlockedError verdict (#103), carrying `.blockers`
+        (default []) and `staged=False`. RED today: no rename probe exists
+        at all -- a dirty tree with no teardown: steps and a mocked-success
+        git call proceeds to raise nothing (see test_dirt_gate_runs_without_
+        teardown_steps) or, once #103's existing exit-128 codepath is hit,
+        raises via a completely different (git-stderr-based) mechanism."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r11-blocked"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r11-blocked", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["status", "--porcelain"]:
+                return MagicMock(returncode=0, stdout="M  dirty.txt\x00")
+            return _ok()
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=PermissionError("locked"),
+            ),
+        ):
+            with pytest.raises(WorktreeRemovalBlockedError) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+        assert excinfo.value.dirty_paths
+        assert excinfo.value.blockers == []
+        assert excinfo.value.staged is False
+
+    def test_dirt_gate_probe_is_a_bare_rename_pair_not_the_retry_loop(self, tmp_path):
+        """The dirt gate's forward-then-undo probe must be a bare rename
+        pair -- no sleep, no retry budget -- so a dirty, held worktree is
+        diagnosed in microseconds, not ~2s. RED today: neither the probe nor
+        `os.rename` exists on this path at all, so `os.rename` is never
+        called and this assertion fails on that alone."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r11-probe-cost"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r11-probe-cost", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["status", "--porcelain"]:
+                return MagicMock(returncode=0, stdout="M  dirty.txt\x00")
+            return _ok()
+
+        rename_calls: list = []
+        real_rename = os.rename
+
+        def _tracked_rename(src, dst, *a, **kw):
+            rename_calls.append((src, dst))
+            return real_rename(src, dst, *a, **kw)
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=_tracked_rename,
+            ),
+            patch("lib_python_worktree.core.teardown.time.sleep") as mock_sleep,
+        ):
+            with pytest.raises(DirtyWorktreeError) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+
+        assert excinfo.value.staged is False
+        assert len(rename_calls) == 2, (
+            f"expected exactly one forward rename and one undo rename; "
+            f"got {rename_calls}"
+        )
+        mock_sleep.assert_not_called()
+        assert checkout.exists(), "the undo must put the tree back exactly where it was"
+
+    def test_dirt_probe_undo_failure_raises_dirty_with_staged_not_blocked(
+        self, tmp_path
+    ):
+        """#154 Decision 1 + Decision 2 (human override): when the forward
+        probe succeeds but the undo rename cannot be undone (even after a
+        bounded retry), the phase must hard-raise plain DirtyWorktreeError
+        with staged=True -- NOT WorktreeRemovalBlockedError (the forward
+        probe succeeding already proves the directory was not locked) -- and
+        leave the `.removing` remnant on disk with no restore attempt.
+        Decision 2: ctx.failure_deadline stays None on this leg even though
+        a bounded retry ran, because the undo-retry must not share the
+        `_retry_bounded` helper's `ctx.failure_deadline`-opening contract.
+        RED today: neither the probe nor the undo mechanism exists."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r11-undo-fail"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r11-undo-fail", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        def _git_side_effect(args, cwd=None, **kwargs):
+            if args[:2] == ["status", "--porcelain"]:
+                return MagicMock(returncode=0, stdout="M  dirty.txt\x00")
+            return _ok()
+
+        real_rename = os.rename
+        state = {"forward_done": False}
+
+        def _rename_side_effect(src, dst, *a, **kw):
+            staged = str(checkout) + ".removing"
+            if not state["forward_done"] and dst == staged:
+                state["forward_done"] = True
+                return real_rename(src, dst, *a, **kw)
+            if state["forward_done"] and src == staged:
+                raise PermissionError("undo refused (AV opened the staged dir)")
+            return real_rename(src, dst, *a, **kw)
+
+        ctx_holder: list = []
+        real_build_context = teardown.build_context
+
+        def _capturing_build_context(*a, **kw):
+            ctx = real_build_context(*a, **kw)
+            ctx_holder.append(ctx)
+            return ctx
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown._run_git",
+                side_effect=_git_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=_rename_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+            ) as mock_kill_tree,
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+            ) as mock_kill_blocking,
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+            ) as mock_find,
+            patch(
+                "lib_python_worktree.core.teardown.build_context",
+                side_effect=_capturing_build_context,
+            ),
+        ):
+            with pytest.raises(DirtyWorktreeError) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+
+        assert type(excinfo.value) is DirtyWorktreeError, (
+            "must be plain DirtyWorktreeError, never the combined "
+            "WorktreeRemovalBlockedError -- the forward probe succeeding "
+            "already proves the directory was not locked"
+        )
+        assert excinfo.value.staged is True
+        mock_kill_tree.assert_not_called()
+        mock_kill_blocking.assert_not_called()
+        mock_find.assert_not_called()
+        assert ctx_holder, "build_context must have been called via manager._teardown"
+        assert ctx_holder[0].failure_deadline is None, (
+            "Decision 2: ctx.failure_deadline must stay None on every "
+            "DirtyWorktreeError leg, staged=True included"
+        )
+
+    def test_staged_dirty_remnant_is_never_silently_destroyed_by_a_later_removal(
+        self, tmp_path
+    ):
+        """#154 Decision 1 (human override, rejecting generation-2 plan.md's
+        _phase_reclaim_staged): once a `.removing` remnant is left behind by
+        the undo-failure leg above, a LATER force=False remove() of the same
+        record must NOT silently restore-then-re-raise (that was generation-2's
+        rejected design) and must NOT silently destroy the remnant either --
+        it must raise (reusing the existing DirtyWorktreeError(staged=True) /
+        WorktreeDirLockedError vocabulary) with the remnant's content
+        untouched. Only force=True may destroy it. RED today: none of this
+        mechanism exists -- a plain removal of a record whose `record.path`
+        is absent takes today's target-absent fast path and reports success
+        with the `.removing` directory's content silently left as garbage
+        (and, moreover, `_target_is_absent` doesn't even know `.removing`
+        exists, so it never surfaces to the caller at all)."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r11-datasafety"
+        staged = Path(str(checkout) + ".removing")
+        # Simulate the post-undo-failure state directly: record.path absent,
+        # non-empty remnant present with recognisable, uncommitted content.
+        staged.mkdir()
+        (staged / "uncommitted.txt").write_text("precious work")
+        record = _make_record(
+            "wt-r11-datasafety", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        with patch(
+            "lib_python_worktree.core.teardown._run_git", return_value=_ok()
+        ):
+            with pytest.raises((DirtyWorktreeError, WorktreeDirLockedError)) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+
+        assert getattr(excinfo.value, "staged", None) is True
+        assert not checkout.exists(), "must not silently restore the remnant either"
+        assert staged.exists() and (staged / "uncommitted.txt").read_text() == (
+            "precious work"
+        ), "the remnant's uncommitted content must never be silently destroyed"
+
+        # force=True clears it, per the override's unchanged force=True rule.
+        with patch(
+            "lib_python_worktree.core.teardown._run_git", return_value=_ok()
+        ):
+            manager._teardown(record, force=True, _lifecycle_module=mock_lifecycle)
+        assert not staged.exists()
+
+    # -- R9: a remnant that cannot be cleared names `.removing`, and the
+    #    non-staged phrasing is unchanged -----------------------------------
+
+    def test_locked_staged_dir_error_names_removing(self, tmp_path):
+        """A `.removing` remnant that survives the retry loop AND both
+        diagnosis tiers must raise WorktreeDirLockedError(staged=True) whose
+        message names `.removing` and no filesystem path. RED today: the
+        whole staging mechanism does not exist -- os.rename is never called,
+        so nothing ever produces a staged=True error."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r9-locked"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r9-locked", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown.os.rename",
+                side_effect=PermissionError("always locked"),
+            ),
+            patch("lib_python_worktree.core.teardown.time.sleep"),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=[]),
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+                MagicMock(return_value=[]),
+            ),
+            patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+        ):
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+
+        assert excinfo.value.staged is True
+        msg = str(excinfo.value)
+        assert ".removing" in msg
+        assert str(checkout) not in msg
+        assert excinfo.value.blockers is not None
+
+    def test_final_guard_on_a_surviving_original_keeps_the_v0312_message(
+        self, tmp_path
+    ):
+        """When `record.path` itself survives the whole removal and no
+        `.removing` remnant exists, the final guard's message must stay
+        byte-identical to v0.3.12's kill_attempted-selected text, and
+        `staged` must be False."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r9-surviving"
+        checkout.mkdir()
+        record = _make_record(
+            "wt-r9-surviving", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        # git call "succeeds" but never actually deletes anything, so the
+        # final guard sees record.path still present with no remnant.
+        with (
+            patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=[]),
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+                MagicMock(return_value=[]),
+            ),
+        ):
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+
+        assert excinfo.value.staged is False
+        assert str(excinfo.value) == (
+            f"worktree '{record.id}' directory is still locked after killing"
+            f" 0 blocking process(es)."
+        )

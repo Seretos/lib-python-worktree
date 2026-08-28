@@ -69,27 +69,44 @@ def _make_ctx(record=None, **overrides) -> teardown._TeardownContext:
 # R1: phase tuple shape + run_teardown ordering/abort semantics
 # ---------------------------------------------------------------------------
 
-def test_teardown_phases_is_tuple_of_eleven_callables():
+def test_teardown_phases_is_tuple_of_ten_callables():
+    """#154 (human override, Decision 1): the rename/rmtree/prune rework
+    deletes four phases (_phase_gate_a_blocking_preflight, _phase_orphan_scan,
+    _phase_git_worktree_remove, _phase_filesystem_fallback) and adds three
+    (_phase_dirt_gate, _phase_stage_and_delete, _phase_git_prune) --
+    NOT four, because the override explicitly rejects _phase_reclaim_staged
+    (generation-2 plan.md item 2a) in favour of the lighter fix (no new
+    phase; _target_is_absent() gains one added rule instead). Net: 11 -> 10.
+    """
     assert isinstance(teardown._TEARDOWN_PHASES, tuple)
-    assert len(teardown._TEARDOWN_PHASES) == 11
+    assert len(teardown._TEARDOWN_PHASES) == 10
     assert all(callable(p) for p in teardown._TEARDOWN_PHASES)
 
 
 def test_teardown_phases_documented_order():
+    """#154 (human override, Decision 1): the amended order. Gate A and the
+    orphan scan are gone (replaced by the rename-is-the-oracle mechanism);
+    `git worktree remove` + the filesystem fallback are replaced by the
+    unconditional dirt gate, the merged stage+delete phase and the
+    unconditional prune. `_phase_reclaim_staged` is deliberately ABSENT --
+    see the override note, Decision 1.
+    """
     names = [f.__name__ for f in teardown._TEARDOWN_PHASES]
     assert names == [
         "_phase_guard_primary",
         "_phase_stop_processes",
         "_phase_stop_hook",
-        "_phase_gate_a_blocking_preflight",
         "_phase_gate_b_early_dirty",
         "_phase_run_teardown_steps",
-        "_phase_orphan_scan",
-        "_phase_git_worktree_remove",
-        "_phase_filesystem_fallback",
+        "_phase_dirt_gate",
+        "_phase_stage_and_delete",
+        "_phase_git_prune",
         "_phase_final_guard",
         "_phase_release_ports",
     ]
+    assert "_phase_reclaim_staged" not in names, (
+        "Decision 1 rejects the reclaim phase entirely -- do not reintroduce it"
+    )
 
 
 def test_run_teardown_executes_phases_in_order():
