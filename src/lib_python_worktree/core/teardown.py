@@ -784,7 +784,10 @@ def _diagnose_and_retry(ctx: _TeardownContext, *, trigger: str, retry) -> bool:
     if tier2:
         ctx.blockers.extend(tier2)
 
-    if ctx.kill_blocking_processes:
+    if ctx.kill_blocking_processes and tier2:
+        # Only attempt a kill when tier 2 actually found a confirmed
+        # holder -- calling _kill_blocking_processes with nothing to kill
+        # would still pay its own internal discovery scan for no benefit.
         ctx.kill_attempted = True
         try:
             killed = _kill_blocking_processes(
