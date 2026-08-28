@@ -11234,3 +11234,41 @@ class TestAncestorWalkAndHangingCwd:
             "the third pid must still be inspected after the hung one is "
             "abandoned"
         )
+
+
+# ---------------------------------------------------------------------------
+# #154 R15 (item 14, test fixture rework): _reset_handle_scan_state() -- a
+# test-only helper shipped in production -- is deleted; its body relocates
+# into THIS test file as _reset_handle_scan_state_for_test(), which rebinds
+# _wedged_worker_slots to a fresh cell rather than zeroing a shared one.
+# ---------------------------------------------------------------------------
+
+class TestResetHandleScanStateForTest:
+    def test_reset_helper_rebuilds_the_counter_cell(self):
+        """RED today: `_reset_handle_scan_state_for_test` does not exist in
+        this test module at all -- the production `_reset_handle_scan_state`
+        it is meant to replace is a different symbol, on a different
+        object (the module), with different semantics (zeroes a shared int
+        rather than rebuilding a cell)."""
+        old_cell = getattr(_pl, "_wedged_worker_slots", None)
+
+        _reset_handle_scan_state_for_test()
+
+        assert _pl._persistent_query_worker is None
+        assert _pl._wedged_worker_slots == [0]
+        if old_cell is not None:
+            assert _pl._wedged_worker_slots is not old_cell, (
+                "the cell must be REBUILT (a fresh list object), not "
+                "zeroed in place -- zeroing in place is exactly what the "
+                "generation guard existed to make safe, and the cell "
+                "design replaces that need entirely"
+            )
+
+    def test_production_module_ships_no_test_only_reset_function(self):
+        """The production module must stop shipping a test-only entry
+        point. RED today: `_reset_handle_scan_state` still exists on `_pl`."""
+        assert not hasattr(_pl, "_reset_handle_scan_state"), (
+            "_reset_handle_scan_state must be deleted from production -- "
+            "its body relocates into this test file as "
+            "_reset_handle_scan_state_for_test()"
+        )
