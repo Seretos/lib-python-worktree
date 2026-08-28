@@ -10995,3 +10995,49 @@ class TestWedgedSlotCellIsolation:
             "_wedged_worker_generation must be deleted -- replaced by "
             "object-identity cell capture, not a version number"
         )
+
+
+# ---------------------------------------------------------------------------
+# #154 R20/R22 (item 11, item 14): one bounded-call primitive for every
+# blocking psutil read, drawing from the SAME wedge pool as the handle-scan
+# workers -- no second, psutil-specific pool, no grace budget leaking into
+# a psutil call. These are structural existence/shape checks: the full
+# call-volume and one-slot-per-hung-pid behavioural rows depend on
+# `_bounded_call`/`unresponsive_pids` machinery that does not exist yet at
+# all, so a call-by-call behavioural test cannot be written meaningfully
+# against today's tree -- see the developer's final report.
+# ---------------------------------------------------------------------------
+
+class TestSharedWedgePool:
+    def test_bounded_call_primitive_and_shared_pool_exist(self):
+        """RED today: neither the shared counter cell nor the bounded-call
+        primitive for psutil reads exists at all."""
+        assert hasattr(_pl, "_wedged_worker_slots"), (
+            "the shared, one-element wedge-count cell must exist"
+        )
+        assert hasattr(_pl, "_bounded_call"), (
+            "the thin locked wrapper letting callers outside "
+            "_win_handle_holders (including teardown's tier 1) share the "
+            "handle-scan wedge pool must exist"
+        )
+        assert not hasattr(_pl, "_wedged_worker_count"), (
+            "_wedged_worker_count (bare int) must be replaced by the "
+            "_wedged_worker_slots cell, not kept alongside it as a second "
+            "counter"
+        )
+
+
+class TestBoundedPsutilGraceIsolation:
+    def test_bounded_call_never_receives_a_grace_budget(self):
+        """Deviation 1 (kept, unchanged): grace exists only for Pass 1c's
+        ~10^5-per-scan NtQueryObject multiplication problem and must never
+        be threaded into a psutil call. RED today: `_bounded_call` does not
+        exist, so its signature cannot be inspected at all."""
+        import inspect
+
+        sig = inspect.signature(_pl._bounded_call)
+        assert "grace" not in sig.parameters, (
+            "_bounded_call (the psutil-call wrapper) must not accept a "
+            "grace budget at all -- grace is _win_handle_holders-internal "
+            "only"
+        )
