@@ -10919,3 +10919,79 @@ class TestPerTypeWedgeSuppression:
 
         assert not hasattr(_pl, "_HANG_PRONE_GRANTED_ACCESS")
         assert not hasattr(_pl, "_MAX_DEFERRED_MASKED_HANDLES")
+
+
+# ---------------------------------------------------------------------------
+# #154 R15 (item 14): cross-test isolation without _reset_handle_scan_state()
+# and without the generation guard -- _wedged_worker_count becomes a
+# one-element counter cell (_wedged_worker_slots), captured by reference at
+# submit() time so a straggler's later decrement lands on the cell it
+# claimed, never on whatever cell a test/scan has since rebound to.
+# ---------------------------------------------------------------------------
+
+class TestWedgedSlotCellIsolation:
+    """Re-expression of TestWedgedSlotGenerationGuard for the cell-capture
+    design (item 14, revision 3) -- no generation number, no comparison, no
+    reset-side bump. See that class (above) for the non-cell baseline this
+    supersedes."""
+
+    @staticmethod
+    def _wait_until_thread_gone(thread: threading.Thread, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def test_straggler_decrements_only_the_pool_it_claimed(self, monkeypatch):
+        """RED today: `_wedged_worker_slots` does not exist -- production
+        code still writes to the bare module int `_wedged_worker_count`, so
+        a monkeypatched cell is never touched by a real submit()/straggler
+        cycle."""
+        cell_a = [0]
+        monkeypatch.setattr(_pl, "_wedged_worker_slots", cell_a, raising=False)
+
+        release = threading.Event()
+        worker = _BoundedQueryWorker()
+        thread = worker._thread
+        try:
+            outcome = worker.submit(
+                lambda: release.wait(timeout=30),
+                grace=_GraceBudget(0.0),
+                scan_deadline=time.monotonic() + 30,
+            )
+            assert outcome.status in (_QueryStatus.ABANDONED, _QueryStatus.CAPPED)
+            assert cell_a[0] == 1, (
+                "the slot claim must land on the current _wedged_worker_slots "
+                "cell, not a bare module int"
+            )
+
+            # Stand in for the test fixture rebinding to a fresh cell
+            # between tests/scans -- the replacement for
+            # _reset_handle_scan_state()'s generation bump.
+            cell_b = [0]
+            monkeypatch.setattr(_pl, "_wedged_worker_slots", cell_b, raising=False)
+
+            release.set()
+            self._wait_until_thread_gone(thread)
+            assert not thread.is_alive(), (
+                "the stale-cell straggler's thread must still exit once its "
+                "wedged call finally returns"
+            )
+
+            assert cell_b[0] == 0, "a straggler must never touch a cell it never claimed"
+            assert cell_a[0] == 0, (
+                "the decrement must land on the cell this worker claimed at "
+                "submit() time"
+            )
+        finally:
+            release.set()
+            worker.close()
+
+    def test_generation_guard_is_deleted(self):
+        """Z4's deletion list names the Generation-Guard explicitly; the
+        cell-capture design replaces it structurally rather than keeping it
+        as a deviation. RED today: `_wedged_worker_generation` still exists
+        as a module global."""
+        assert not hasattr(_pl, "_wedged_worker_generation"), (
+            "_wedged_worker_generation must be deleted -- replaced by "
+            "object-identity cell capture, not a version number"
+        )
