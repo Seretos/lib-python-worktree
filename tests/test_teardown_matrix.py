@@ -2486,3 +2486,133 @@ class TestMatrixRemovalMechanism:
             f"got {mock_scan.call_count} call(s)"
         )
         assert not checkout.exists()
+
+    # -- R6b: the residual trigger gets the same bounded retry first, then
+    #    the same diagnosis ---------------------------------------------
+
+    def test_transient_residual_is_resolved_by_bounded_retry_without_diagnosis(
+        self, tmp_path
+    ):
+        """A residual left behind by the delete ladder's first attempt (a
+        transient AV/indexer lock on one file) must be absorbed by the same
+        bounded retry loop as a failed rename -- never escalated to
+        diagnosis. RED today: there is no staged path at all (`shutil.rmtree`
+        is never invoked against `<path>.removing`), so the staged-path
+        retry-count assertion below is unreachable at 0."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r6b-transient"
+        checkout.mkdir()
+        staged_str = str(checkout) + ".removing"
+        record = _make_record(
+            "wt-r6b-transient", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        real_rmtree = shutil.rmtree
+        staged_rmtree_calls = {"n": 0}
+
+        def _rmtree_side_effect(path, *a, **kw):
+            path_str = str(path)
+            if path_str == staged_str or path_str.startswith("\\?\\" + staged_str):
+                staged_rmtree_calls["n"] += 1
+                if staged_rmtree_calls["n"] == 1:
+                    # Simulate a transient locked file surviving the first
+                    # delete attempt: remove everything else, but leave the
+                    # staged directory (with one file) in place.
+                    for child in Path(path_str.replace("\\?\\", "")).glob("*"):
+                        if child.name != "locked.tmp":
+                            if child.is_dir():
+                                real_rmtree(str(child), *a, **kw)
+                            else:
+                                child.unlink()
+                    return
+                real_rmtree(path_str.replace("\\?\\", ""), *a, **kw)
+                return
+            real_rmtree(path_str, *a, **kw)
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_rmtree_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+            ) as mock_find,
+            patch(
+                "lib_python_worktree.core.teardown._kill_blocking_processes",
+            ) as mock_kill,
+            patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+        ):
+            manager._teardown(
+                record,
+                force=False,
+                kill_blocking_processes=False,
+                _lifecycle_module=mock_lifecycle,
+            )
+
+        mock_find.assert_not_called()
+        mock_kill.assert_not_called()
+        assert staged_rmtree_calls["n"] >= 2, (
+            f"expected the delete ladder to retry against the staged path "
+            f"at least once after a transient residual; got "
+            f"{staged_rmtree_calls['n']} call(s) against {staged_str!r}"
+        )
+        assert not checkout.exists()
+        assert not Path(staged_str).exists()
+
+    def test_persistent_residual_enters_diagnosis_only_after_the_retry_budget(
+        self, tmp_path
+    ):
+        """A residual that never clears on its own must still go through the
+        bounded retry loop FIRST -- only once that budget is exhausted does
+        the residual trigger enter tier-1/tier-2 diagnosis. RED today: the
+        staged path is never created at all, so `_find_blocking_processes`
+        is never invoked against it via a residual trigger (it may still be
+        invoked via today's unrelated Gate A/orphan-scan mechanics, but
+        never for the reason this test pins)."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r6b-persistent"
+        checkout.mkdir()
+        staged_str = str(checkout) + ".removing"
+        record = _make_record(
+            "wt-r6b-persistent", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        real_rmtree = shutil.rmtree
+
+        def _rmtree_side_effect(path, *a, **kw):
+            path_str = str(path)
+            if path_str == staged_str:
+                # Never actually clears -- always leaves the directory (with
+                # content) behind, so the residual persists no matter how
+                # many times the ladder retries.
+                return
+            real_rmtree(path_str, *a, **kw)
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown.shutil.rmtree",
+                side_effect=_rmtree_side_effect,
+            ),
+            patch(
+                "lib_python_worktree.core.teardown._find_blocking_processes",
+                MagicMock(return_value=[]),
+            ) as mock_find,
+            patch("lib_python_worktree.core.teardown._run_git", return_value=_ok()),
+        ):
+            with pytest.raises(WorktreeDirLockedError) as excinfo:
+                manager._teardown(
+                    record,
+                    force=False,
+                    kill_blocking_processes=False,
+                    _lifecycle_module=mock_lifecycle,
+                )
+
+        assert excinfo.value.staged is True
+        assert mock_find.call_count >= 1, (
+            "a persistent residual must eventually escalate to tier-2 "
+            "diagnosis (systemwide scan) once the retry budget is spent"
+        )
