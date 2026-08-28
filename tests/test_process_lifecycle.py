@@ -11113,3 +11113,124 @@ class TestDiscoveryBudgetDerivation:
             "deleting it would regress stop(timeout=60, kill_orphans=True) "
             "from a 15s handle-scan bound to ~47s"
         )
+
+
+# ---------------------------------------------------------------------------
+# #154 R3 (remaining rows): the ancestor-exclusion walk's abandonment
+# behaviour, and the hanging-cwd() wall-clock guarantee. Both exercise
+# TODAY's real _find_blocking_processes structure directly -- no
+# not-yet-existing scaffolding required -- so these are genuine behavioural
+# rows, not structural existence checks. Each takes ~2s to run (a real,
+# bounded sleep proving today's code is NOT bounded), not an infinite hang.
+# ---------------------------------------------------------------------------
+
+class TestAncestorWalkAndHangingCwd:
+    def test_incomplete_ancestor_walk_aborts_discovery_and_reports_nothing(self):
+        """If the bounded ancestor walk does not complete, discovery must
+        abort BEFORE Pass 1 -- no pass runs, nothing is reported, and
+        therefore nothing can be killed (a safety rule, not a cost rule: an
+        unknown exclusion set must never become an empty one). RED today:
+        `psutil.Process(host_pid).parents()` is called directly with no
+        bound at all -- a hanging ancestor walk blocks the whole call."""
+        import psutil
+
+        target = "/fake/worktree-r3-ancestor"
+        host_pid = os.getpid()
+
+        def _slow_parents():
+            time.sleep(2.0)
+            return []
+
+        process_iter_calls: list = []
+
+        def _process_iter_spy(*a, **kw):
+            process_iter_calls.append(1)
+            return []
+
+        with (
+            patch.object(psutil, "process_iter", side_effect=_process_iter_spy),
+            patch.object(psutil, "Process") as mock_proc_cls,
+        ):
+            mock_host = MagicMock()
+            mock_host.parents.side_effect = _slow_parents
+            mock_proc_cls.return_value = mock_host
+
+            t0 = time.monotonic()
+            result = _find_blocking_processes(
+                target, host_pid, deadline=time.monotonic() + 1.0
+            )
+            elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.5, (
+            f"the ancestor walk must be abandoned within its bound; took "
+            f"{elapsed:.2f}s against a 1.0s deadline"
+        )
+        assert list(result) == []
+        assert result.complete is False
+        assert "discovery:unresponsive" in result.skipped_passes
+        assert not process_iter_calls, (
+            "no pass may run once the ancestor walk is abandoned -- "
+            "psutil.pids()/process_iter must never be called"
+        )
+
+    def test_hanging_cwd_is_abandoned_within_per_call_bound(self):
+        """A single hung `proc.cwd()` must not hang the whole scan: it is
+        abandoned within its own per-call bound, tagged, and the NEXT pid
+        is still inspected. RED today: `proc.cwd()` is called directly with
+        no bound at all."""
+        import psutil
+
+        target = "/fake/worktree-r3-hang"
+        host_pid = os.getpid()
+
+        proc1 = MagicMock()
+        proc1.info = {"pid": 41001, "name": "a", "cmdline": ["a"]}
+        proc1.cwd.return_value = "/unrelated/1"
+
+        proc2 = MagicMock()
+        proc2.info = {"pid": 41002, "name": "hung", "cmdline": ["hung"]}
+
+        def _hang():
+            time.sleep(2.0)
+            return "/unrelated/2"
+
+        proc2.cwd.side_effect = _hang
+
+        proc3_calls: list = []
+        proc3 = MagicMock()
+        proc3.info = {"pid": 41003, "name": "c", "cmdline": ["c"]}
+
+        def _cwd3():
+            proc3_calls.append(1)
+            return "/unrelated/3"
+
+        proc3.cwd.side_effect = _cwd3
+
+        with (
+            patch.object(
+                psutil, "process_iter", return_value=[proc1, proc2, proc3]
+            ),
+            patch.object(psutil, "Process") as mock_proc_cls,
+            patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            mock_host = MagicMock()
+            mock_host.parents.return_value = []
+            mock_proc_cls.return_value = mock_host
+
+            t0 = time.monotonic()
+            result = _find_blocking_processes(
+                target, host_pid, deadline=time.monotonic() + 1.0
+            )
+            elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.5, (
+            f"a hanging cwd() must be abandoned within its per-call bound; "
+            f"took {elapsed:.2f}s against a 1.0s deadline"
+        )
+        assert result.complete is False
+        assert "discovery:unresponsive" in result.skipped_passes
+        assert proc3_calls, (
+            "the third pid must still be inspected after the hung one is "
+            "abandoned"
+        )
