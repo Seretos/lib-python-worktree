@@ -69,27 +69,44 @@ def _make_ctx(record=None, **overrides) -> teardown._TeardownContext:
 # R1: phase tuple shape + run_teardown ordering/abort semantics
 # ---------------------------------------------------------------------------
 
-def test_teardown_phases_is_tuple_of_eleven_callables():
+def test_teardown_phases_is_tuple_of_ten_callables():
+    """#154 (human override, Decision 1): the rename/rmtree/prune rework
+    deletes four phases (_phase_gate_a_blocking_preflight, _phase_orphan_scan,
+    _phase_git_worktree_remove, _phase_filesystem_fallback) and adds three
+    (_phase_dirt_gate, _phase_stage_and_delete, _phase_git_prune) --
+    NOT four, because the override explicitly rejects _phase_reclaim_staged
+    (generation-2 plan.md item 2a) in favour of the lighter fix (no new
+    phase; _target_is_absent() gains one added rule instead). Net: 11 -> 10.
+    """
     assert isinstance(teardown._TEARDOWN_PHASES, tuple)
-    assert len(teardown._TEARDOWN_PHASES) == 11
+    assert len(teardown._TEARDOWN_PHASES) == 10
     assert all(callable(p) for p in teardown._TEARDOWN_PHASES)
 
 
 def test_teardown_phases_documented_order():
+    """#154 (human override, Decision 1): the amended order. Gate A and the
+    orphan scan are gone (replaced by the rename-is-the-oracle mechanism);
+    `git worktree remove` + the filesystem fallback are replaced by the
+    unconditional dirt gate, the merged stage+delete phase and the
+    unconditional prune. `_phase_reclaim_staged` is deliberately ABSENT --
+    see the override note, Decision 1.
+    """
     names = [f.__name__ for f in teardown._TEARDOWN_PHASES]
     assert names == [
         "_phase_guard_primary",
         "_phase_stop_processes",
         "_phase_stop_hook",
-        "_phase_gate_a_blocking_preflight",
         "_phase_gate_b_early_dirty",
         "_phase_run_teardown_steps",
-        "_phase_orphan_scan",
-        "_phase_git_worktree_remove",
-        "_phase_filesystem_fallback",
+        "_phase_dirt_gate",
+        "_phase_stage_and_delete",
+        "_phase_git_prune",
         "_phase_final_guard",
         "_phase_release_ports",
     ]
+    assert "_phase_reclaim_staged" not in names, (
+        "Decision 1 rejects the reclaim phase entirely -- do not reintroduce it"
+    )
 
 
 def test_run_teardown_executes_phases_in_order():
@@ -171,32 +188,6 @@ def test_phase_stop_hook_sets_failed_outcome_on_load_error():
     assert ctx.record.stop_hook_outcome.message == "disk error"
 
 
-def test_phase_gate_a_skips_when_target_absent():
-    ctx = _make_ctx(target_absent=True)
-    with (
-        patch("lib_python_worktree.core.teardown.sys") as mock_sys,
-        patch(
-            "lib_python_worktree.core.teardown._find_blocking_processes"
-        ) as mock_find,
-    ):
-        mock_sys.platform = "win32"
-        teardown._phase_gate_a_blocking_preflight(ctx)
-    mock_find.assert_not_called()
-
-
-def test_phase_gate_a_skips_on_posix():
-    ctx = _make_ctx(target_absent=False)
-    with (
-        patch("lib_python_worktree.core.teardown.sys") as mock_sys,
-        patch(
-            "lib_python_worktree.core.teardown._find_blocking_processes"
-        ) as mock_find,
-    ):
-        mock_sys.platform = "linux"
-        teardown._phase_gate_a_blocking_preflight(ctx)
-    mock_find.assert_not_called()
-
-
 def test_phase_gate_b_raises_dirty_when_contract_teardown_and_real_dirt():
     from lib_python_worktree.contract.schema import Step, WorktreeContract
     from lib_python_worktree.core._exceptions import DirtyWorktreeError
@@ -256,28 +247,26 @@ def test_phase_run_teardown_steps_runs_and_sets_marker():
     assert record.teardown_ran is True
 
 
-def test_phase_git_worktree_remove_success_calls_run_git_once():
-    ctx = _make_ctx()
+def test_phase_git_prune_calls_run_git_once(tmp_path):
+    """#154: `_phase_git_worktree_remove` is replaced by the unconditional
+    `_phase_git_prune`."""
+    record = _make_record(path=str(tmp_path / "wt-phase"))
+    ctx = _make_ctx(record)
     with patch("lib_python_worktree.core.teardown._run_git") as mock_git:
         mock_git.return_value = MagicMock(returncode=0, stderr="")
-        teardown._phase_git_worktree_remove(ctx)
-    mock_git.assert_called_once()
+        teardown._phase_git_prune(ctx)
+    mock_git.assert_called_once_with(
+        ["worktree", "prune", "--expire=now"], cwd=Path(record.repo_root)
+    )
 
 
-def test_phase_git_worktree_remove_raises_git_command_error_on_unrecognised_failure():
-    ctx = _make_ctx()
+def test_phase_git_prune_warns_and_continues_on_failure(tmp_path, caplog):
+    """#154: a prune failure must never raise -- it warn-and-continues."""
+    record = _make_record(path=str(tmp_path / "wt-phase"))
+    ctx = _make_ctx(record)
     with patch("lib_python_worktree.core.teardown._run_git") as mock_git:
         mock_git.return_value = MagicMock(returncode=1, stderr="fatal: something else")
-        with pytest.raises(teardown.GitCommandError):
-            teardown._phase_git_worktree_remove(ctx)
-
-
-def test_phase_filesystem_fallback_noop_when_path_absent():
-    ctx = _make_ctx()
-    with patch(
-        "lib_python_worktree.core.teardown.os.path.exists", return_value=False
-    ):
-        teardown._phase_filesystem_fallback(ctx)  # must not raise
+        teardown._phase_git_prune(ctx)  # must not raise
 
 
 def test_phase_final_guard_raises_when_still_present():
@@ -470,3 +459,185 @@ def test_git_command_error_identity_after_relocation():
 def test_manager_all_unchanged():
     assert "GitCommandError" in manager_module.__all__
     assert "WorktreeManager" in manager_module.__all__
+
+
+# ---------------------------------------------------------------------------
+# #154 Decision 1 (human override): _target_is_absent() gains one added rule
+# for a non-empty `.removing` remnant -- the lighter fix replacing the
+# rejected _phase_reclaim_staged. See end-to-end coverage in
+# test_teardown_matrix.py::TestMatrixRemovalMechanism::
+# test_staged_dirty_remnant_is_never_silently_destroyed_by_a_later_removal.
+# ---------------------------------------------------------------------------
+
+def test_target_is_absent_false_for_nonempty_remnant_under_no_force(tmp_path):
+    """record.path absent, a non-empty `<path>.removing` remnant present,
+    force=False -> NOT 'target absent' (must surface downstream rather than
+    silently fast-pathing to 'nothing to remove here'). RED today:
+    _target_is_absent() only ever checks `record.path` itself and has no
+    `force` parameter at all."""
+    checkout = tmp_path / "wt-target-absent-remnant"
+    staged = Path(str(checkout) + ".removing")
+    staged.mkdir()
+    (staged / "dirty.txt").write_text("uncommitted")
+    record = _make_record(path=str(checkout))
+
+    assert teardown._target_is_absent(record, force=False) is False
+
+
+def test_target_is_absent_true_for_nonempty_remnant_under_force(tmp_path):
+    """The same remnant under force=True is still 'target absent' for
+    gating purposes -- force=True's pre-clean of a stale remnant is
+    unchanged and happens in _phase_stage_and_delete's opening guard, not
+    here."""
+    checkout = tmp_path / "wt-target-absent-remnant-forced"
+    staged = Path(str(checkout) + ".removing")
+    staged.mkdir()
+    (staged / "dirty.txt").write_text("uncommitted")
+    record = _make_record(path=str(checkout))
+
+    assert teardown._target_is_absent(record, force=True) is True
+
+
+def test_target_is_absent_true_for_truly_absent_target_default_force_false():
+    """Backward-compat: no remnant at all -> unchanged True, with the new
+    `force` parameter defaulting so existing single-arg call sites (e.g.
+    manager.remove()'s own probe) keep working."""
+    record = _make_record(path="/definitely/not/a/real/path/xyz-154")
+    assert teardown._target_is_absent(record) is True
+
+
+# ---------------------------------------------------------------------------
+# #154 R3/R17: _diagnose_and_retry behavioural coverage (review fix round,
+# reviewer finding 2). The structural existence check
+# (test_tier1_diagnosis_scaffolding_exists) is superseded by these -- the
+# scaffolding it pinned is now exercised directly.
+# ---------------------------------------------------------------------------
+
+def test_diagnose_and_retry_tier1_kills_confirmed_live_owned_pid_and_retries():
+    """Tier 1: a pid in ctx.owned_pids that the bounded psutil.pid_exists
+    probe confirms alive is killed via ctx.lifecycle._kill_process_tree
+    and *retry* is attempted exactly once; a successful retry resolves the
+    failure without tier 2 (the systemwide scan) ever running."""
+    record = _make_record(pids={"main": 555})
+    lifecycle = MagicMock()
+    lifecycle._bounded_call.side_effect = lambda fn, deadline=None: (True, fn())
+    ctx = _make_ctx(
+        record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids={555}
+    )
+
+    retry_calls = []
+
+    def _retry():
+        retry_calls.append(1)
+
+    with (
+        patch("psutil.pid_exists", side_effect=lambda pid: pid == 555),
+        patch.object(teardown, "_find_blocking_processes") as mock_tier2,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="rename", retry=_retry)
+
+    assert resolved is True
+    assert retry_calls == [1]
+    lifecycle._kill_process_tree.assert_called_once()
+    killed_infos = lifecycle._kill_process_tree.call_args[0][0]
+    assert {i.pid for i in killed_infos} == {555}
+    assert ctx.kill_attempted is True
+    assert {b.pid for b in ctx.blockers} == {555}
+    mock_tier2.assert_not_called()
+
+
+def test_diagnose_and_retry_tier1_skips_pid_whose_liveness_probe_did_not_complete():
+    """An owned pid whose bounded liveness probe never completes must
+    never be treated as a confirmed blocker -- not killed, not reported,
+    not retried on. Falls through to tier 2 instead of trusting an
+    unconfirmed pid."""
+    record = _make_record(pids={"main": 777})
+    lifecycle = MagicMock()
+    lifecycle._bounded_call.return_value = (False, None)
+    ctx = _make_ctx(
+        record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids={777}
+    )
+
+    with patch.object(teardown, "_find_blocking_processes", return_value=[]) as mock_tier2:
+        resolved = teardown._diagnose_and_retry(ctx, trigger="rename", retry=lambda: None)
+
+    assert resolved is False
+    lifecycle._kill_process_tree.assert_not_called()
+    assert ctx.blockers == []
+    assert ctx.kill_attempted is False
+    mock_tier2.assert_called_once()
+
+
+def test_diagnose_and_retry_tier1_report_only_when_kill_flag_false():
+    """kill_blocking_processes=False: a confirmed-live owned pid is still
+    reported in ctx.blockers (report-only diagnosis), but never killed and
+    never retried on via tier 1 -- falls through to tier 2 for the same
+    report-only treatment."""
+    record = _make_record(pids={"main": 888})
+    lifecycle = MagicMock()
+    lifecycle._bounded_call.side_effect = lambda fn, deadline=None: (True, fn())
+    ctx = _make_ctx(
+        record, lifecycle=lifecycle, kill_blocking_processes=False, owned_pids={888}
+    )
+
+    with (
+        patch("psutil.pid_exists", return_value=True),
+        patch.object(teardown, "_find_blocking_processes", return_value=[]) as mock_tier2,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="rename", retry=lambda: None)
+
+    assert resolved is False
+    lifecycle._kill_process_tree.assert_not_called()
+    assert ctx.kill_attempted is False
+    assert {b.pid for b in ctx.blockers} == {888}
+    mock_tier2.assert_called_once()
+
+
+def test_diagnose_and_retry_tier2_never_kills_when_nothing_found():
+    """Regression (found and fixed during phase=implement, review fix
+    round finding 1 confirmed this fix as correct): _kill_blocking_processes
+    must never be called when tier 2's discovery finds no candidate --
+    calling it anyway would pay its own internal discovery scan for no
+    benefit and could blow the shared per-removal failure budget."""
+    record = _make_record()
+    lifecycle = MagicMock()
+    ctx = _make_ctx(record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids=set())
+
+    with (
+        patch.object(teardown, "_find_blocking_processes", return_value=[]),
+        patch.object(teardown, "_kill_blocking_processes") as mock_kill,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="residual", retry=lambda: None)
+
+    assert resolved is False
+    mock_kill.assert_not_called()
+    assert ctx.kill_attempted is False
+
+
+def test_diagnose_and_retry_tier2_kills_and_retries_when_found():
+    """Tier 2: a systemwide-scan hit is killed via
+    teardown._kill_blocking_processes and *retry* is attempted exactly
+    once; a successful retry resolves the failure."""
+    from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
+
+    record = _make_record()
+    lifecycle = MagicMock()
+    ctx = _make_ctx(record, lifecycle=lifecycle, kill_blocking_processes=True, owned_pids=set())
+
+    tier2_hit = KilledProcessInfo(pid=999, name="node", cmdline=["node"], source="orphan_scan")
+    retry_calls = []
+
+    def _retry():
+        retry_calls.append(1)
+
+    with (
+        patch.object(teardown, "_find_blocking_processes", return_value=[tier2_hit]),
+        patch.object(teardown, "_kill_blocking_processes", return_value=[tier2_hit]) as mock_kill,
+    ):
+        resolved = teardown._diagnose_and_retry(ctx, trigger="residual", retry=_retry)
+
+    assert resolved is True
+    mock_kill.assert_called_once()
+    assert retry_calls == [1]
+    assert ctx.kill_attempted is True
+    assert 999 in {b.pid for b in ctx.blockers}

@@ -367,9 +367,9 @@ Exception
 ├── RuntimeError
 │   ├── WorktreeError                    (base for all engine errors)
 │   │   ├── GitTimeoutError              (git subprocess exceeded WORKTREE_GIT_TIMEOUT_SEC; carries .network, .subcommand)
-│   │   ├── DirtyWorktreeError           (remove refused; pass force=True -- an untracked-only `.seretos/` copy is exempt, see below)
+│   │   ├── DirtyWorktreeError           (remove refused; pass force=True -- an untracked-only `.seretos/` copy is exempt, see below; carries .staged -- True iff the checkout is currently parked under `<id>.removing`, see "Removal mechanism" below)
 │   │   │   └── WorktreeRemovalBlockedError  (ALSO a WorktreeDirLockedError, see below -- multiple inheritance)
-│   │   ├── WorktreeDirLockedError       (remove refused; directory locked by another process -- carries .worktree_id, .killed, .kill_attempted)
+│   │   ├── WorktreeDirLockedError       (remove refused; directory locked by another process -- carries .worktree_id, .killed, .kill_attempted, .staged, .blockers -- the full tier-1 (inferred)/tier-2 (confirmed) candidate list, distinct from .killed)
 │   │   │   └── WorktreeRemovalBlockedError  (lock AND real dirt both blocking at once; carries .dirty_paths too -- see "Reporting every blocking condition at once" below)
 │   │   ├── BranchNotFoundError
 │   │   ├── BranchAlreadyCheckedOutError (carries .branch, .path, .prunable)
@@ -389,6 +389,25 @@ Exception
 
 All public exception classes are re-exported from `lib_python_worktree`.
 
+### Removal mechanism
+
+`remove()` no longer runs `git worktree remove`. It renames the checkout to
+`<path>.removing` (this alone proves, on Windows, that nothing still holds a
+handle inside it -- `os.rename` fails with a sharing violation if so), deletes
+the staged tree, then unconditionally runs `git worktree prune --expire=now`
+so the git registration is cleared even if the deletion had already happened
+some other way. A clean, unheld worktree's removal performs **zero**
+systemwide process/handle scans -- scanning only ever happens as bounded
+diagnosis after a rename or delete failure, and only escalates to actually
+killing anything when `kill_blocking_processes=True`. A `.removing` remnant
+left behind by a failure surfaces via `WorktreeDirLockedError`/
+`DirtyWorktreeError`'s `.staged` attribute (see above) -- the message names
+the marker suffix and the worktree id, never a filesystem path. A stale
+`.removing` remnant found on a *later* `remove()` attempt is never silently
+restored or destroyed: under `force=False` it raises again (clear it by hand
+or pass `force=True`); under `force=True` it is cleared before the fresh
+removal proceeds.
+
 ### `DirtyWorktreeError` and the `.seretos/` convenience copy
 
 The `agent-worktree` plugin copies the whole `.seretos/` directory into every
@@ -396,12 +415,12 @@ new checkout right after `create()` returns, purely as a convenience so the
 checkout has its own readable copy of the contract that created it. That copy
 is untracked, and `remove(force=False)` no longer treats its mere presence as
 "uncommitted changes": if the checkout's **only** dirt (per `git status`) is
-untracked content under `.seretos/`, `_teardown` auto-escalates to
-`git worktree remove --force` on the caller's behalf, so a plain
-`create()` -> `remove()` cycle with zero real edits succeeds without ever
-passing `force=True`. Any other dirt -- an untracked file elsewhere, or a
-**modified** (tracked) file anywhere including inside `.seretos/` -- still
-raises `DirtyWorktreeError` exactly as before.
+untracked content under `.seretos/`, the dirt gate treats the tree as clean
+and the removal proceeds normally, so a plain `create()` -> `remove()` cycle
+with zero real edits succeeds without ever passing `force=True`. Any other
+dirt -- an untracked file elsewhere, or a **modified** (tracked) file
+anywhere including inside `.seretos/` -- still raises `DirtyWorktreeError`
+exactly as before.
 
 This is a deliberate, documented trade-off, and the exemption covers **any**
 untracked content under `.seretos/`, not merely the copied contract file --
@@ -444,24 +463,24 @@ reads `.dirty_paths` directly.
 
 This is raised only when the removal genuinely cannot succeed on the current
 attempt for **two or more** reasons at once; a single blocking condition
-still raises the corresponding single-condition exception unchanged. On
-Windows, the combined check runs as part of the Step 2b pre-flight (before
-any process is killed) and at both of `_teardown`'s lock-signal raise sites;
-detecting real dirt never kills a blocking process or attempts the
-destructive `git worktree remove` for a removal that cannot succeed anyway.
-The dirt probe itself is gated on `force=False` (a forced removal can never
-be blocked by dirt, so there is nothing to probe or report) and is
-memoised per removal attempt, so it never issues more than one extra
-`git status` call.
+still raises the corresponding single-condition exception unchanged. It is
+detected by the unconditional dirt gate's own rename probe (before the
+checkout is ever renamed for real): real dirt is present, *and* a cheap
+forward `os.rename` immediately fails, meaning the directory is also
+genuinely locked. Detecting real dirt never kills a blocking process by
+itself. The dirt probe is gated on `force=False` (a forced removal can never
+be blocked by dirt, so there is nothing to probe or report) and is memoised
+per removal attempt, so it never issues more than one extra `git status`
+call.
 
-`force` and `kill_blocking_processes` guard two different refusal gates, and
-neither substitutes for the other (ticket #140): the Windows-only confirmed-
-blocker pre-flight (`WorktreeDirLockedError`) is bypassed only by
-`kill_blocking_processes=True` -- `force=True` alone still raises it -- and
-the real-dirt refusal (`DirtyWorktreeError`) is bypassed only by
-`force=True` -- `kill_blocking_processes=True` alone still raises it.
-Neither gate runs on POSIX at all; see "Orphan process scan and
-`orphan_scan`" below for what surfaces a blocking process there instead.
+`force` and `kill_blocking_processes` guard two different refusal
+conditions, and neither substitutes for the other: a directory lock
+(`WorktreeDirLockedError`) is bypassed only by `kill_blocking_processes=True`
+-- `force=True` alone still raises it -- and the real-dirt refusal
+(`DirtyWorktreeError`) is bypassed only by `force=True` --
+`kill_blocking_processes=True` alone still raises it. Both run identically
+on Windows and POSIX now -- the removal mechanism itself (see "Removal
+mechanism" above) is platform-uniform.
 
 ## Cross-platform notes
 
@@ -827,41 +846,22 @@ tracked-PID-only question of what `stop()` found at the tracked PID itself).
 `stop_attempt`: recomputed on every `stop()` call and **not** persisted to
 `state.yaml`.
 
-### Orphan process scan and `orphan_scan`
+### Removed: the orphan-scan phase and `orphan_scan` (ticket #154)
 
-Every `remove()` call runs an all-platform, **warn-only** scan (ticket #140)
-for a process holding the checkout -- as cwd, a cmdline token, a Windows
-handle, or an open file -- that this engine never tracked. Before this,
-such a process was silently orphaned once `git worktree remove` succeeded
-around it; there was no signal at all, especially on POSIX, where the
-Windows-only pre-flight gate above never ran. This new phase runs on
-**every** platform, after the contract's `teardown:` steps but before the
-destructive `git worktree remove` call, and it never turns a working
-removal into a failure -- it only ever warns.
-
-The result is a transient `orphan_scan` (an `OrphanScanReport`, or `None`
-for a clean, complete scan) on the returned `WorktreeRecord`:
-
-| Field | Meaning |
-|---|---|
-| `message` | The same string logged at `WARNING`, naming the worktree id and the hit count (or the degradation reason). |
-| `entries` | A tuple of `OrphanScanEntry(info, owned, killed)` — uncapped, unlike `StopDetail`'s survivor cap. `info` is a `KilledProcessInfo`; `owned` reflects whether the pid was one this environment itself tracked; `killed` is `True` only for a pid the kill call actually confirmed killed. |
-| `skipped_passes` | The scan's (and, if a kill ran, the kill's) degradation tags, e.g. `"open_files:degraded"`, `"handle_scan:truncated"`, `"handle_scan:capped"` (the process-wide wedged-worker cap was hit -- ticket #148), `"handle_scan:busy"` (the scan-level lock was contended -- ticket #148), `"handle_scan:masked_deferred_capped"` (the GrantedAccess deferred-resolution revisit list overflowed -- ticket #148), plus the synthetic `"scan:failed"` marker on an unexpected exception. |
-| `kill_attempted` | `True` iff a kill was actually attempted this invocation (set before the call, so it is `True` even when the call itself raised). |
-
-`kill_blocking_processes=True` makes this phase call the same
-`_kill_blocking_processes` remedy the Windows pre-flight gate uses -- and
-only when the scan found at least one hit, so a clean scan never pays the
-~5s kill call. This is what makes `kill_blocking_processes=True` meaningful
-on POSIX for the first time. **Kill-target caveat:** a heuristic hit --
-matched via cmdline, a Windows handle scan, or an open file, not only an
-exact cwd match -- becomes a kill target too when the flag is set: an
-editor or an AV scanner that merely holds a handle or an open file under
-the checkout can be terminated by an opt-in caller.
-
-`orphan_scan` is deliberately **transient**, like `stop_hook_outcome` above:
-it describes one live removal attempt's scan, not a stored verdict, and is
-never persisted to `state.yaml`.
+Prior versions ran an all-platform, warn-only scan (ticket #140) on every
+`remove()` call for a process holding the checkout that this engine never
+tracked, surfacing hits on a transient `WorktreeRecord.orphan_scan`
+(`OrphanScanReport`/`OrphanScanEntry`). Ticket #154 removes this phase and
+that public field **with no replacement**: a clean, unheld worktree's
+removal no longer performs any systemwide scan at all (see "Removal
+mechanism" above), so there is no longer a natural point in the happy path
+to run an always-on warn-only scan without reintroducing the cost this
+ticket exists to remove. A process that still holds the checkout is now
+only ever discovered as bounded diagnosis after a rename/delete failure,
+and reported via `WorktreeDirLockedError`/`WorktreeRemovalBlockedError`'s
+`.blockers`, not via a separate scan report. `stop(kill_orphans=True)`'s
+own, unrelated orphan-scan mechanism (`STOP_REASON_ORPHAN_SCAN_INCOMPLETE`
+etc. -- see "`StopDetail`" below) is untouched by this change.
 
 ## Release
 

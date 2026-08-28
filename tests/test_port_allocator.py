@@ -682,21 +682,27 @@ def test_create_rolls_back_worktree_on_allocation_failure(tmp_path: Path):
 # Regression: _teardown() keeps ports when git remove fails (blocking #2)
 # ---------------------------------------------------------------------------
 
-def test_teardown_keeps_ports_when_git_remove_fails(tmp_path: Path):
-    """Regression: if git worktree remove fails, ports must NOT be freed.
+def test_teardown_keeps_ports_when_removal_fails(tmp_path: Path):
+    """Regression: if the checkout genuinely can't be removed, ports must
+    NOT be freed.
 
-    Asserts that when _run_git raises GitCommandError inside _teardown():
-    - allocator.release() is NOT called.
+    Ticket #154 replaced ``git worktree remove`` with a rename-then-delete
+    mechanism (see docs/teardown-phase-contract.md); there is no more
+    ``git worktree remove`` call whose failure to simulate. The equivalent
+    failure mode now is the rename in ``_phase_stage_and_delete`` never
+    succeeding, so the original checkout directory survives every phase
+    and ``_phase_final_guard`` raises ``WorktreeDirLockedError`` before the
+    port-release phase ever runs.
+
+    Asserts that when ``os.rename`` never succeeds:
+    - allocator.release() is NOT called (phase engine aborts on the raise).
     - The state record is left untouched (remove() re-raises before state ops).
-    - GitCommandError propagates to the caller.
+    - WorktreeDirLockedError propagates to the caller.
     """
     from unittest.mock import MagicMock, patch
 
-    from lib_python_worktree.core.manager import (
-        GitCommandError,
-        ManagerConfig,
-        WorktreeManager,
-    )
+    from lib_python_worktree.core._exceptions import WorktreeDirLockedError
+    from lib_python_worktree.core.manager import ManagerConfig, WorktreeManager
     from lib_python_worktree.core.state import InMemoryStateStore, WorktreeRecord
 
     store = InMemoryStateStore()
@@ -707,33 +713,40 @@ def test_teardown_keeps_ports_when_git_remove_fails(tmp_path: Path):
     mock_allocator.release.return_value = None
     mgr._allocator = mock_allocator
 
-    # Pre-populate a record with allocated ports.
+    checkout_path = tmp_path / "wt"
+    checkout_path.mkdir()
+
+    # Pre-populate a record with allocated ports, backed by a real checkout
+    # directory so `_target_is_absent`/the dirt gate see a genuine target.
     record = WorktreeRecord(
         id="wt-keep-ports-abc",
         repo_root=str(tmp_path),
         branch="feature/keep-ports",
-        path=str(tmp_path / "wt"),
+        path=str(checkout_path),
         ports={"web": 31500},
     )
     store.add(record)
 
-    # Make git worktree remove fail.
-    def _fail_git(args, cwd=None, **kwargs):
-        if "remove" in args:
-            return MagicMock(returncode=1, stdout="", stderr="error: cannot remove")
-        return MagicMock(returncode=0, stdout="", stderr="")
-
-    with patch("lib_python_worktree.core.teardown._run_git", side_effect=_fail_git):
-        with pytest.raises(GitCommandError):
+    # The rename never succeeds -- the checkout stays exactly where it is,
+    # so the final guard finds the original still present and raises.
+    with (
+        patch("lib_python_worktree.core.teardown.os.rename", side_effect=OSError("locked")),
+        patch("lib_python_worktree.core.teardown._run_git") as mock_run_git,
+    ):
+        mock_run_git.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        with pytest.raises(WorktreeDirLockedError):
             mgr._teardown(record, force=False)
 
-    # Ports must NOT have been released — git remove failed, worktree still alive.
+    # Ports must NOT have been released — the checkout is still alive.
     mock_allocator.release.assert_not_called()
 
     # State record must still be present (teardown raised before state.remove).
     assert store.get("wt-keep-ports-abc") is not None, (
-        "State record was removed despite git worktree remove failing"
+        "State record was removed despite the checkout failing to be removed"
     )
+
+    # The checkout directory itself must genuinely still exist.
+    assert checkout_path.exists()
 
 
 # ---------------------------------------------------------------------------

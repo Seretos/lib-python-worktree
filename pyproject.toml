@@ -31,7 +31,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m \"not loaded_host\""
 # Per-test timeout (#90, #114): several tests spawn real OS
 # processes/threads (process_lifecycle.py's _query_object_bounded /
 # NtQueryObject on Windows) that are documented to wedge indefinitely
@@ -43,4 +43,5 @@ timeout = 90
 timeout_method = "thread"
 markers = [
   "requires_git: marks tests that invoke real git subprocesses (skipped if git is absent)",
+  "loaded_host: marks tests that must run on a loaded developer machine to be meaningful (#154 AC1 duration measurement) -- opt-in only, excluded from the default addopts selection and never run by CI",
 ]

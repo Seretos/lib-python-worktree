@@ -1471,36 +1471,35 @@ def test_remove_untracked_contract_copy_no_force_succeeds(
     assert manager.state.get(rec.id) is None
 
 
-def test_dirty_worktree_error_message_no_git_internals(monkeypatch):
+def test_dirty_worktree_error_message_no_git_internals(monkeypatch, tmp_path):
     """DirtyWorktreeError message must contain 'force=True' and must not
     contain '--force' or '128' (no git internals leaked).
 
-    Uses a fake _run_git that returns returncode=128 with a realistic git
-    stderr so the test does not need a real git binary.
+    #154: re-expressed against the unconditional dirt gate's own
+    ``git status`` probe -- the ``git worktree remove``-exit-128 mechanism
+    this test originally exercised no longer exists, and its fake
+    (nonexistent) ``record.path`` is now ``target_absent``, which skips
+    the dirt gate entirely and could never raise DirtyWorktreeError under
+    the new mechanism at all. Uses a real checkout directory and a dirty
+    ``git status --porcelain`` response instead.
     """
     from lib_python_worktree.core.state import WorktreeRecord
 
+    checkout = tmp_path / "test-wt-deadbeef"
+    checkout.mkdir()
     fake_record = WorktreeRecord(
         id="test-wt-deadbeef",
-        repo_root="/fake/repo",
+        repo_root=str(tmp_path),
         branch="feature/test",
-        path="/fake/repo-store/test-wt-deadbeef",
-    )
-
-    real_git_stderr = (
-        "fatal: '/fake/repo-store/test-wt-deadbeef' contains modified or "
-        "untracked files, use --force to delete it"
+        path=str(checkout),
     )
 
     def _fake_run_git(args, cwd=None, **kwargs):
-        if args[:2] == ["worktree", "remove"]:
+        if args[:2] == ["status", "--porcelain"]:
             return subprocess.CompletedProcess(
-                args=["git", *args],
-                returncode=128,
-                stdout="",
-                stderr=real_git_stderr,
+                args=["git", *args], returncode=0, stdout="M  dirty.txt\x00",
+                stderr="",
             )
-        # Any other git call (e.g. lifecycle stop) returns success.
         return subprocess.CompletedProcess(
             args=["git", *args], returncode=0, stdout="", stderr=""
         )

@@ -584,78 +584,8 @@ def test_stop_hook_outcome_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore)
 
 
 # ---------------------------------------------------------------------------
-# Ticket #140, R9: orphan_scan is transient -- never persisted to
-# state.yaml, mirroring the stop_hook_outcome precedent directly above.
-# ---------------------------------------------------------------------------
-
-
-def test_orphan_scan_not_serialised_to_dict():
-    """`_record_to_dict` must never write an `orphan_scan` key."""
-    from lib_python_worktree.core.yaml_store import _record_to_dict
-
-    rec = _make_record(id="rec-orphan-scan")
-    # R9 driving assertion: reading the field before it exists is exactly
-    # the RED this test proves -- WorktreeRecord has no `orphan_scan`
-    # attribute yet (AttributeError), not merely a default of None. Once
-    # the field exists (with default None), execution continues past this
-    # line into the full stop_hook_outcome-style non-None-value check below.
-    assert rec.orphan_scan is None
-
-    from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
-    from lib_python_worktree.core.state import OrphanScanEntry, OrphanScanReport
-
-    rec.orphan_scan = OrphanScanReport(
-        message="worktree 'rec-orphan-scan' orphan scan found 1 process",
-        entries=(
-            OrphanScanEntry(
-                info=KilledProcessInfo(
-                    pid=42, name="vim", cmdline=["vim"], source="orphan_scan"
-                ),
-                owned=False,
-                killed=False,
-            ),
-        ),
-    )
-
-    assert "orphan_scan" not in _record_to_dict(rec)
-
-
-def test_orphan_scan_dropped_on_yaml_roundtrip(yaml_store: YamlStateStore):
-    """A real YamlStateStore add/get cycle must drop `orphan_scan` rather
-    than persisting a stale copy -- it describes a single remove()/
-    _teardown() call's live scan, not a stored verdict. No legacy-key
-    deserialization test is added deliberately (the plan's decision): the
-    key never exists on disk in the first place."""
-    rec = _make_record(id="rec-orphan-scan-roundtrip")
-    # Same RED-driving read as test_orphan_scan_not_serialised_to_dict above.
-    assert rec.orphan_scan is None
-
-    from lib_python_worktree.core.process_lifecycle import KilledProcessInfo
-    from lib_python_worktree.core.state import OrphanScanEntry, OrphanScanReport
-
-    rec.orphan_scan = OrphanScanReport(
-        message="worktree 'rec-orphan-scan-roundtrip' orphan scan found 1 process",
-        entries=(
-            OrphanScanEntry(
-                info=KilledProcessInfo(
-                    pid=43, name="vim", cmdline=["vim"], source="orphan_scan"
-                ),
-                owned=False,
-                killed=False,
-            ),
-        ),
-    )
-    yaml_store.add(rec)
-
-    retrieved = yaml_store.get("rec-orphan-scan-roundtrip")
-
-    assert retrieved is not None
-    assert retrieved.orphan_scan is None
-
-
-# ---------------------------------------------------------------------------
 # Ticket #146, R4: start_variants is transient -- never persisted to
-# state.yaml, mirroring the orphan_scan precedent directly above.
+# state.yaml, mirroring the stop_hook_outcome precedent directly above.
 # ---------------------------------------------------------------------------
 
 
@@ -3144,3 +3074,31 @@ def test_yaml_backed_list_after_create_yields_empty_start_variants(
     listed = mgr.list()
     rec = next(r for r in listed if r.id == created.id)
     assert rec.start_variants == []
+
+
+# ---------------------------------------------------------------------------
+# #154 R12 -- the orphan-scan public API break is complete (ticket #140's
+# WorktreeRecord.orphan_scan / OrphanScanReport / OrphanScanEntry surface is
+# removed with no replacement, per the ticket's Q3(c) answer).
+# ---------------------------------------------------------------------------
+
+def test_orphan_scan_surface_removed():
+    """#154 R12: WorktreeRecord no longer carries the transient orphan_scan
+    field, and OrphanScanReport is no longer part of the public API. RED
+    today: both exist (ticket #140)."""
+    import lib_python_worktree
+
+    record = WorktreeRecord(
+        id="wt-154-r12",
+        repo_root="/fake/repo",
+        branch="feature/x",
+        path="/fake/store/wt-154-r12",
+    )
+    assert not hasattr(record, "orphan_scan"), (
+        "WorktreeRecord.orphan_scan must be deleted outright (#154, Q3(c) -- "
+        "no replacement, no always-empty vestige)"
+    )
+    assert "OrphanScanReport" not in lib_python_worktree.__all__
+    assert "OrphanScanEntry" not in lib_python_worktree.__all__
+    assert not hasattr(lib_python_worktree, "OrphanScanReport")
+    assert not hasattr(lib_python_worktree, "OrphanScanEntry")

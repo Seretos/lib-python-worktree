@@ -537,73 +537,6 @@ class BaseFetchFallback:
     elapsed_sec: Optional[float] = None
 
 
-@dataclass(frozen=True)
-class OrphanScanEntry:
-    """One process hit reported by the new all-platform, warn-only
-    orphan-detection teardown phase (``_phase_orphan_scan``, ticket #140).
-
-    ``info`` is the underlying :class:`~.process_lifecycle.KilledProcessInfo`
-    (carrying its own ``source``/``match_pass`` provenance). ``owned`` is
-    ``True`` iff ``info.pid`` was one of the pids ``record.pids`` tracked at
-    context-build time (mirrors Gate A's own owned/foreign distinction --
-    see ``teardown._phase_gate_a_blocking_preflight``). ``killed`` is
-    ``True`` only for a pid the reused ``_kill_blocking_processes`` remedy
-    actually confirmed killed on this attempt -- a pid seen only by the
-    warn scan (no kill attempted, or attempted but not confirmed by the
-    kill's own tighter rescan) is reported with ``killed=False``.
-    """
-
-    info: "KilledProcessInfo"
-    owned: bool
-    killed: bool
-
-
-@dataclass(frozen=True)
-class OrphanScanReport:
-    """Machine-readable result of one ``_phase_orphan_scan`` invocation
-    (ticket #140), attached to :attr:`WorktreeRecord.orphan_scan`.
-
-    Unlike :class:`StopDetail`'s ``survivor_pids``, ``entries`` is
-    deliberately **uncapped** -- a deliberate, documented divergence: the
-    phase is warn-only and never blocks removal, so there is no bounded
-    "how many can I afford to list before giving up and refusing" trade-off
-    to make; every hit found is worth reporting.
-
-    ``entries`` is the **union** of the initial full-budget warn scan and
-    (when ``kill_blocking_processes=True`` and the scan produced at least
-    one hit) the reused ``_kill_blocking_processes`` remedy's own result,
-    first-wins pid-deduped, preserving scan order then kill order -- see
-    ``teardown._phase_orphan_scan``'s docstring for the full merge
-    rationale.
-
-    ``skipped_passes`` carries forward the scan's own incompleteness tags
-    (``"cwd:truncated"``, ``"handle_scan:skipped"``, ...) plus any the kill
-    result added, deduped, order-preserving, plus the synthetic
-    ``"scan:failed"`` marker (ticket #107) when an unexpected exception
-    anywhere in the phase's body -- scan OR kill -- was caught rather than
-    left to propagate and turn a working removal into a failure.
-
-    ``kill_attempted`` is ``True`` whenever the kill was actually attempted
-    on this invocation, **including when it raised** -- an honest record of
-    intent, not of success (mirrors ``WorktreeDirLockedError``'s own
-    ``kill_attempted`` semantics elsewhere in this package).
-
-    ``message`` is the exact human-readable string also passed to the one
-    ``_logger.warning(...)`` call the phase emits for an abnormal outcome
-    (message parity, matching ``StopDetail``/``BaseFetchFallback``).
-
-    Like ``killed_pids``/``stop_hook_outcome``, this is deliberately
-    **transient**: ``yaml_store._record_to_dict`` is never taught about
-    ``orphan_scan`` -- it describes one live removal attempt's scan, not a
-    stored verdict, so no legacy-key deserialization path exists for it.
-    """
-
-    message: str
-    entries: Tuple[OrphanScanEntry, ...] = ()
-    skipped_passes: Tuple[str, ...] = ()
-    kill_attempted: bool = False
-
-
 @dataclass
 class WorktreeRecord:
     """A single tracked worktree (or, since ticket #84, a primary checkout).
@@ -826,21 +759,6 @@ class WorktreeRecord:
     fallback happened" (fetch succeeded, or no fetch was attempted at all --
     ``fetch=False``, or a defaulted rather than explicit ``base``)."""
 
-    orphan_scan: Optional[OrphanScanReport] = None
-    """Ticket #140: machine-readable result of the most recent
-    ``_phase_orphan_scan`` invocation (the new all-platform, warn-only
-    teardown phase, index 6), or ``None``. See :class:`OrphanScanReport`'s
-    own docstring for the full rationale -- in short: written ONLY by
-    ``teardown._phase_orphan_scan``; never touched by ``start``/``stop``/
-    ``reconcile``/``adopt``/``list_repo``. Deliberately **transient**,
-    exactly like ``killed_pids``/``stop_hook_outcome``: never persisted to
-    ``state.yaml``, and subject to the same in-memory-store-by-reference
-    caveat documented on ``killed_pids`` for ``InMemoryStateStore``-backed
-    managers. ``None`` means either the phase has not yet run for this
-    record, or its most recent run found a clean, complete scan (no hits,
-    no incompleteness to report) -- both indistinguishable and both
-    correctly "nothing to warn about"."""
-
     start_variants: List[str] = field(default_factory=list)
     """Ticket #146: the full list of variant strings that WOULD resolve
     against ``start()``'s step-selection tiers for the contract ``create()``
@@ -859,9 +777,9 @@ class WorktreeRecord:
     unconditionally, with no ``is None`` guard.
 
     Deliberately **transient**, exactly like ``killed_pids``/
-    ``shadowed_contract``/``stop_attempt``/``stop_hook_outcome``/
-    ``orphan_scan``: never persisted to ``state.yaml`` (``yaml_store
-    ._record_to_dict`` never serialises it) -- it is a live recomputation
+    ``shadowed_contract``/``stop_attempt``/``stop_hook_outcome``: never
+    persisted to ``state.yaml`` (``yaml_store._record_to_dict`` never
+    serialises it) -- it is a live recomputation
     from the contract, not a stored verdict, so a legacy record round-tripped
     through ``YamlStateStore`` always comes back with ``start_variants ==
     []``. Subject to the same in-memory-store-by-reference caveat documented
@@ -935,8 +853,6 @@ __all__: Iterable[str] = (
     "BASE_FETCH_FALLBACK_REASON_FETCH_FAILED",
     "BASE_FETCH_FALLBACK_REASON_FETCH_TIMEOUT",
     "InMemoryStateStore",
-    "OrphanScanEntry",
-    "OrphanScanReport",
     "SetupOutcome",
     "SETUP_STATUSES",
     "SETUP_STATUS_COMPLETED",

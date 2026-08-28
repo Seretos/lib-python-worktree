@@ -1107,23 +1107,19 @@ class WorktreeManager:
         blocking process there was previously silently orphaned rather than
         refused or reported).
 
-        New in this ticket: an additional, all-platform, **warn-only**
-        teardown phase now scans for exactly that previously-silent POSIX
-        case (and, on any platform, any process this engine never tracked
-        that still holds the checkout) after the contract's ``teardown:``
-        steps run but before the destructive ``git worktree remove``. It
-        never refuses the removal and never turns a working removal into a
-        failure -- every hit is reported on the returned record's
-        ``orphan_scan`` (a ``state.OrphanScanReport``, or ``None`` when the
-        scan was clean). Only when the caller ALSO opts into
-        ``kill_blocking_processes=True``, and the scan found at least one
-        hit, is the reused kill-and-retry remedy invoked -- making that flag
-        meaningful on POSIX for the first time. **Caveat:** with
-        ``kill_blocking_processes=True``, a heuristic hit (a cmdline-token
-        match, a Windows handle-table match, or an open-file match -- not
-        only an exact cwd match) becomes a KILL TARGET, not merely a
-        warning: an editor or AV scanner that merely holds a handle or an
-        open file under the checkout can be terminated by an opt-in caller.
+        Ticket #154: replaces the previous ``git worktree remove`` +
+        Windows-only pre-flight-scan + all-platform warn-only orphan-scan
+        mechanism with a single, identical-on-both-platforms sequence:
+        ``os.rename(record.path, "<path>.removing")`` proves unheldness
+        (Windows) and stages the checkout (both platforms), then the staged
+        tree is deleted and ``git worktree prune --expire=now`` clears the
+        registration. A clean, unheld worktree's removal performs zero
+        systemwide process/handle scans; scanning happens only as bounded
+        diagnosis after a rename or delete failure. The all-platform
+        warn-only orphan-scan phase (and the transient
+        ``WorktreeRecord.orphan_scan``/``state.OrphanScanReport``/
+        ``state.OrphanScanEntry`` surface it populated) is removed with no
+        replacement.
         """
         record, tracked = self._resolve_removal_target(worktree_id, checkout_path)
         # Guard 1 (ticket #84): refuse a primary checkout before any
@@ -1143,8 +1139,10 @@ class WorktreeManager:
         # in, not whatever _teardown() leaves behind afterwards.
         # Ticket #135: routed through the shared teardown._target_is_absent
         # seam so both this probe and _teardown()'s own probe are covered
-        # by a single patch target in tests.
-        target_absent = _teardown_mod._target_is_absent(record)
+        # by a single patch target in tests. Ticket #154: passes force=
+        # through -- a non-empty `.removing` remnant under force=False is
+        # not "target absent" (see _target_is_absent's docstring).
+        target_absent = _teardown_mod._target_is_absent(record, force=force)
         # Phase 1: remove the git worktree checkout.  If this raises the
         # directory still exists, so we keep the state record and propagate.
         self._teardown(record, force=force, kill_blocking_processes=kill_blocking_processes)
@@ -1169,10 +1167,6 @@ class WorktreeManager:
             # verdict _teardown() computed and assigned onto the in-memory
             # `record` a moment ago. Copy it forward explicitly.
             removed.stop_hook_outcome = record.stop_hook_outcome
-            # Ticket #140: same transient-field rationale as killed_pids/
-            # stop_hook_outcome above -- orphan_scan is not serialised to
-            # state.yaml either, so copy it forward explicitly.
-            removed.orphan_scan = record.orphan_scan
         else:
             removed = record
             removed.status = "removed"
@@ -2002,12 +1996,12 @@ class WorktreeManager:
         parameters, then runs the ordered phase sequence in
         ``teardown.run_teardown``. See ``docs/teardown-phase-contract.md``
         for the full phase-by-phase contract (Stop, ``stop:`` hook, Gate A,
-        Gate B, ``teardown:``, orphan scan (ticket #140), ``git worktree
-        remove``, FS fallback, final guard, port release) and
-        ``tests/test_teardown_matrix.py`` for the
-        consolidated regression matrix covering the eleven historical
-        scenarios (#76, #84, #88, #103, #107, #117, #121, #123, #126, #127,
-        #130) this delegation must keep reproducing bit-for-bit.
+        Gate B, ``teardown:``, dirt gate, stage-and-delete rename-based
+        removal, ``git worktree prune``, final guard, port release --
+        ticket #154 replaced the ``git worktree remove``/orphan-scan/FS-
+        fallback trio with this rename-then-delete mechanism) and
+        ``tests/test_teardown_matrix.py`` for the consolidated regression
+        matrix this delegation must keep reproducing bit-for-bit.
 
         ``_lifecycle_module`` is an injection seam for tests; callers should
         leave it as ``None`` (the real ``process_lifecycle`` module is used).

@@ -1,4 +1,4 @@
-# Teardown phase contract (ticket #135)
+# Teardown phase contract (ticket #135, rewritten for #154)
 
 This document is the central contract for `core/teardown.py`'s removal
 sequence. It names every phase in `teardown._TEARDOWN_PHASES`, in order,
@@ -10,6 +10,22 @@ and that tuple in sync.
 Any new teardown/remove scenario belongs in
 `tests/test_teardown_matrix.py` first (as a characterization/regression
 row), not as an ad-hoc test elsewhere -- see that file's own docstring.
+
+**Ticket #154 rewrite, in one sentence:** the mechanism changed from "ask
+the whole system who holds this directory" (a Windows-only pre-flight scan,
+a `git worktree remove` call with its own dirty/lock triage, an
+all-platform warn-only orphan scan, and a long-path filesystem fallback) to
+"try to get rid of it, and only diagnose when that fails" -- `os.rename`
+proves unheldness on Windows and stages the checkout on both platforms; a
+scan (`_find_blocking_processes`) is now only ever consulted as bounded
+diagnosis after a rename or delete failure, never on the happy path. The
+phase count is **11 -> 10**: four phases deleted
+(`_phase_gate_a_blocking_preflight`, `_phase_orphan_scan`,
+`_phase_git_worktree_remove`, `_phase_filesystem_fallback`), three added
+(`_phase_dirt_gate`, `_phase_stage_and_delete`, `_phase_git_prune`).
+`_phase_reclaim_staged` (a phase generation-2 planning considered and a
+later human-override decision explicitly rejected) does **not** exist --
+see the "non-empty `.removing` remnant" invariant below.
 
 ## Phases, in order
 
@@ -29,125 +45,124 @@ row), not as an ad-hoc test elsewhere -- see that file's own docstring.
    (ticket #130) -- a hook failure is warn-logged but never blocks
    teardown.
 
-4. `_phase_gate_a_blocking_preflight`
-   Windows-only pre-flight check for a confirmed blocking process, run
-   BEFORE the destructive `git worktree remove` call. Skipped entirely
-   when the target directory is already absent (ticket #127). A pid this
-   environment owns is trusted immediately; a foreign pid must survive a
-   bounded settle-and-rescan window before being treated as a confirmed
-   blocker (ticket #117). A degraded/partial scan is never, by itself, a
-   blocking condition (ticket #121). Raises `WorktreeDirLockedError` /
-   `WorktreeRemovalBlockedError` (ticket #103, when real dirt is also
-   present) when a confirmed blocker cannot be cleared. A scan result
-   tagged with any of `_BLIND_SCAN_TAGS` (`"open_files:degraded"`,
-   `"handle_scan:capped"`, `"handle_scan:busy"` -- ticket #148) is treated
-   as "never genuinely looked" at both the pre-flight warning and the
-   confirming settle-window rescan: the latter is load-bearing and must
-   not let a blind rescan clear a pending foreign hit. `"handle_scan:
-   truncated"` and `"handle_scan:masked_deferred_capped"` are deliberately
-   excluded -- both mean the scan genuinely looked (just ran out of time,
-   or dropped a bounded few deferred entries), unlike the blind-scan tags
-   above.
+4. `_phase_gate_b_early_dirty`
+   Unchanged from before #154. Early dirty-tree refusal, run BEFORE the
+   `teardown:` steps phase, but only when the contract actually has
+   `teardown:` steps to protect (ticket #117, AC #3; pinned for ticket
+   #123). Raises `DirtyWorktreeError` when real (non-`.seretos/`-only)
+   dirt is present and `force=False`.
 
-5. `_phase_gate_b_early_dirty`
-   Early dirty-tree refusal, run BEFORE the `teardown:` steps phase, but
-   only when the contract actually has `teardown:` steps to protect
-   (ticket #117, AC #3; pinned for ticket #123). Raises
-   `DirtyWorktreeError` when real (non-`.seretos/`-only) dirt is present
-   and `force=False`.
+   Review fix round (reviewer finding 3, considered and reverted): in the
+   remnant-only/`force=False` case this phase and phase 5 below still run
+   against a nonexistent `record.path` before `_phase_stage_and_delete`
+   raises -- harmless (the probe/step attempt fails or is inconclusive,
+   swallowed) but wasted. A `record.path`-does-not-exist short-circuit was
+   prototyped and reverted: `tests/test_teardown_phases.py`,
+   `tests/test_teardown.py` and `tests/test_teardown_matrix.py` all carry
+   pure-unit-style fixtures that hand-build a `_TeardownContext` over a
+   deliberately nonexistent `record.path` (by design -- these test the
+   phase functions standalone, without touching a real filesystem or
+   `WorktreeManager`), so the short-circuit silently no-ops seven existing
+   tests, including regression pins for tickets #88/#117/#123 -- well past
+   the "a couple lines" bound this fix was scoped to. Left as a named,
+   accepted minor inefficiency.
 
-6. `_phase_run_teardown_steps`
+5. `_phase_run_teardown_steps`
    Run the contract's `teardown:` steps at most once per logical removal
    (ticket #126): gated on `not record.teardown_ran`, and the marker is
-   persisted immediately after the steps complete, before the git-remove
-   phase is attempted, so a later `force=True` retry after a
-   *post*-teardown `DirtyWorktreeError` never re-runs these steps. A step
-   failure never blocks the rest of teardown. Invalidates the memoised
-   dirt-probe snapshot afterward so later phases see fresh disk state.
+   persisted immediately after the steps complete, before the dirt-gate/
+   stage-and-delete phases below are attempted, so a later `force=True`
+   retry after a *post*-teardown `DirtyWorktreeError` never re-runs these
+   steps. A step failure never blocks the rest of teardown. Invalidates
+   the memoised dirt-probe snapshot afterward so the dirt gate sees fresh
+   disk state.
 
-7. `_phase_orphan_scan`
-   All-platform (not just Windows), **warn-only** scan for a process
-   holding the checkout (as cwd, cmdline token, Windows handle, or open
-   file) that this engine never tracked -- previously silently orphaned
-   once `git worktree remove` succeeded around it (ticket #140). Runs
-   AFTER the `teardown:` steps phase but BEFORE the destructive
-   `git worktree remove` call, with a fresh, full-budget
-   `_find_blocking_processes(record.path, os.getpid())` call (no
-   `deadline`) -- deliberately not a reuse of Gate A's own result, since
-   Gate A never runs on POSIX or against an absent target, and the
-   `teardown:` steps that just ran may have changed the picture. On
-   win32 with a present target this means a removal now pays TWO full
-   scans (Gate A's own pre-flight plus this phase's) -- an accepted,
-   documented cost. Skipped entirely (`record.orphan_scan` stays `None`)
-   when the target is already absent (mirrors Gate A's own ticket #127
-   skip).
+6. `_phase_dirt_gate`
+   New in #154 (item 16-17). The unconditional second dirt verdict,
+   immediately before staging. Skipped entirely -- probe included -- when
+   `force=True` or `ctx.target_absent`. Reuses the memoised `ctx.dirt()`;
+   the `teardown:` steps phase above already invalidated it when it ran,
+   so the happy path (no real dirt) pays at most one `git status` call,
+   never two.
 
-   `_kill_blocking_processes(record.path)` (the SAME reused remedy Gate A
-   and `_resolve_lock_or_raise` use) is invoked only when
-   `kill_blocking_processes=True` **and** the scan found at least one hit
-   -- a clean scan skips the ~5s kill call entirely even with the flag
-   set. This is what makes `kill_blocking_processes=True` meaningful on
-   POSIX for the first time. `ctx.kill_attempted` is set immediately
-   before that call, so an attempt that raises mid-way is still recorded
-   honestly. Only entries the kill call actually confirms killed are
-   merged into `record.killed_pids` (via `_merge_killed_pids` -- see the
-   cross-phase invariant below).
+   Real dirt found: a **bare rename pair** (forward, then immediately
+   back) -- deliberately NOT the transient-retry loop, no sleep -- decides
+   between three outcomes:
+   - forward rename fails: the directory is genuinely locked too ->
+     `WorktreeRemovalBlockedError` (#103's combined verdict), `blockers`
+     populated, `staged=False`.
+   - forward succeeds, undo succeeds: plain `DirtyWorktreeError`,
+     `staged=False`, tree exactly where it was.
+   - forward succeeds, undo fails: a bounded but **budget-isolated**
+     retry on the undo (`_bare_retry_bounded` -- reuses
+     `_TRANSIENT_RETRY_BUDGET_SEC`/`_TRANSIENT_RETRY_STEP_SEC` but never
+     opens `ctx.failure_deadline`, human override Decision 2). Still
+     unresolved: `DirtyWorktreeError(staged=True)` -- never the combined
+     error, since the forward probe succeeding already proved the
+     directory was not locked (human override Decision 1+2).
 
-   `record.orphan_scan` (a `state.OrphanScanReport`) is the **union** of
-   the warn scan and the kill result, first-wins pid-deduped, preserving
-   scan order then kill-only order: a pid the scan found but the kill's
-   own tighter rescan did not confirm is reported `killed=False`; a pid
-   both the scan and the kill confirmed is reported `killed=True`; a
-   lineage-only pid the kill's `_process_tree` expansion added (never
-   seen by the scan itself) is reported `killed=True` too. Unlike
-   `StopDetail`'s `survivor_pids`, the hit list is deliberately
-   **uncapped**.
+7. `_phase_stage_and_delete`
+   New in #154 (item 2), replacing `_phase_git_worktree_remove` and
+   `_phase_filesystem_fallback` together. Rename is the oracle on both
+   platforms -- `os.rename(record.path, record.path + ".removing")`
+   proves unheldness on Windows and moves the checkout out of the way on
+   both; the staged tree is then deleted via the 4-rung
+   `_delete_tree_ladder` (plain `shutil.rmtree`; a chmod sweep + retry for
+   a read-only file, ticket #78's P4; win32 extended-path `rmtree`; win32
+   robocopy empty-mirror, bounded by `WORKTREE_ROBOCOPY_TIMEOUT_SEC`).
 
-   **Warn-only, hard invariant:** this phase never raises and never adds
-   a new refusal condition or a new `force` requirement. The entire body
-   (scan AND kill) is wrapped in a single `except Exception` that logs
-   once, appends the synthetic `"scan:failed"` marker to
-   `skipped_passes`, and proceeds with whatever partial results were
-   already collected -- this is what protects against
-   `_find_blocking_processes` (or the kill call) re-raising a bare
-   `RuntimeError` (ticket #107) and turning a working removal into a
-   failure. Exactly one `_logger.warning(...)` is emitted for an abnormal
-   outcome (no hits, or `skipped_passes` non-empty, or the failure case),
-   with the identical string also stored as the report's `message`.
+   Opening guard (human override, Decision 1 -- the lighter fix that
+   replaces generation-2 planning's rejected `_phase_reclaim_staged`):
+   - neither the original tree nor a `.removing` remnant present: true
+     no-op, `os.rename` is never called.
+   - remnant only, `force=False`: `_target_is_absent` already refused to
+     fast-path this as "target absent" -- raise here too
+     (`DirtyWorktreeError(staged=True)`), reusing the existing
+     vocabulary rather than silently restoring or destroying it.
+   - remnant only, `force=True`: force authorises destroying it -- clear
+     it via the delete ladder and return.
+   - original present, remnant also present (a same-path recreation
+     collision): pre-clean the stale remnant via the delete ladder before
+     staging again.
+   - original present, no remnant: the ordinary case.
 
-   **Kill-target caveat:** with `kill_blocking_processes=True`, a
-   heuristic hit from Pass 1b (`cmdline`), Pass 1c (`handle_scan`), or
-   Pass 2 (`open_files`) -- not only an exact Pass 1 cwd match -- becomes
-   a KILL TARGET, not merely a warning: an editor or AV scanner that
-   merely holds a handle or an open file under the checkout can be
-   terminated by an opt-in caller.
+   A failed rename, or a residual left behind after the delete ladder,
+   goes through `_retry_bounded` (opens `ctx.failure_deadline` if not
+   already open, shared by every failure-path leg of this removal
+   attempt) and then, if still unresolved, `_diagnose_and_retry` (tier 1:
+   bounded owned-pid liveness via `psutil.pid_exists`, kill + one retry
+   if `kill_blocking_processes=True`; tier 2: systemwide
+   `_find_blocking_processes`/`_kill_blocking_processes`, kill + one
+   retry, only ever attempted when tier 2 actually found a candidate).
+   **Neither this phase nor `_diagnose_and_retry` raises on an
+   unresolved failure** -- `_phase_final_guard` is the sole raise site,
+   using the literal on-disk truth at the end of the removal attempt.
 
-8. `_phase_git_worktree_remove`
-   Run `git worktree remove` (with `--force` iff `force=True`). On
-   failure, triages via `_triage_remove_failure`: phantom-state
-   deregistration (`is not a working tree`) is treated as already-gone;
-   the exit-128 fallback widens to fire without `force=True` when the
-   target was already absent (ticket #127); a directory-lock signal routes
-   through the shared kill-and-retry remedy (`_resolve_lock_or_raise`,
-   ticket #72); dirt that is *only* the benign `.seretos/` convenience
-   copy auto-escalates to a forced retry via `_seretos_exemption_retry`
-   (ticket #100); anything else raises `DirtyWorktreeError` or a bare
-   `GitCommandError`.
+8. `_phase_git_prune`
+   New in #154 (item 1). Unconditional `git worktree prune --expire=now`
+   -- runs even on the target-absent fast path, so a stale git
+   registration is always cleared. Warn-and-continue on failure: by this
+   phase the checkout is genuinely gone from disk (or never existed),
+   only git's bookkeeping may be stale, and that staleness is self-healing
+   via `WorktreeManager.prune()`.
 
-9. `_phase_filesystem_fallback`
-   Long-path (Windows `MAX_PATH`) fallback: extended-path `rmtree`, then a
-   bounded robocopy empty-mirror trick (ticket #78). Plain `shutil.rmtree`
-   on POSIX. Best-effort; never raises.
+9. `_phase_final_guard`
+   Rewritten for #154. The sole raise site for a `_phase_stage_and_delete`
+   failure `_diagnose_and_retry` could not resolve, using the literal
+   on-disk truth: `staged = os.path.exists(record.path + ".removing")`
+   (true whenever the remnant exists, including when `record.path` also
+   exists -- the remnant is the more surprising fact). Remnant absent,
+   `record.path` present -> `staged=False` -> byte-identical to v0.3.12's
+   `kill_attempted`-selected message. Remnant present (either sub-case)
+   -> `staged=True` -> a phrasing naming the `.removing` marker suffix and
+   the worktree id, never a filesystem path. Either case: ERROR log +
+   `WorktreeDirLockedError(..., blockers=list(ctx.blockers))`. `status` is
+   never `"removed"` on this branch and ports are not released.
 
-10. `_phase_final_guard`
-    If the checkout directory is still present after every deletion
-    attempt, raise `WorktreeDirLockedError` rather than silently reporting
-    `"removed"`.
-
-11. `_phase_release_ports`
-    Release the record's allocated ports -- only reached once the git
-    remove (and fallback/final-guard) phases above have succeeded, so a
-    concurrent `allocate()` can never reissue a port that is still bound.
+10. `_phase_release_ports`
+    Release the record's allocated ports -- only reached once every phase
+    above has succeeded, so a concurrent `allocate()` can never reissue a
+    port that is still bound.
 
 ## Cross-phase invariants
 
@@ -157,32 +172,45 @@ row), not as an ad-hoc test elsewhere -- see that file's own docstring.
   removed, so a branch-delete failure never leaves a stale orphaned
   record.
 - **Dirt memoisation is two-phase**, not one snapshot for the whole
-  removal: Gate A/Gate B consume the pre-teardown probe; every phase-6+
-  consumer must see a fresh, post-teardown probe (`_TeardownContext.dirt`
-  docstring has the full rationale). Collapsing this back into a single
-  snapshot reintroduces the ticket #117 regression.
-- **`teardown._target_is_absent(record)`** is the single seam for "is the
-  checkout directory already gone?", shared by `WorktreeManager.remove()`
-  and `build_context()`. The long-path-fallback and Final-guard
-  `os.path.exists` checks are deliberately NOT routed through this seam --
-  they must always see the real filesystem.
+  removal: Gate B consumes the pre-teardown probe; the dirt gate must see
+  a fresh, post-teardown probe (`_TeardownContext.dirt` docstring has the
+  full rationale). Collapsing this back into a single snapshot
+  reintroduces the ticket #117 regression.
+- **`teardown._target_is_absent(record, force=...)`** is the single seam
+  for "is the checkout directory already gone?", shared by
+  `WorktreeManager.remove()` and `build_context()`. Ticket #154 adds one
+  rule: a non-empty `<path>.removing` remnant under `force=False` is NOT
+  "target absent", even when `record.path` itself is gone -- it must
+  surface as an error on the next removal attempt (the dirt gate /
+  stage-and-delete phase raises, reusing the existing
+  `DirtyWorktreeError(staged=True)`/`WorktreeDirLockedError` vocabulary)
+  rather than being silently fast-pathed as "nothing to remove here".
+  This is a **named, accepted limitation** (human override, Decision 1):
+  the self-healing generation-2 planning wanted (auto-restore a clean
+  crash remnant) is not delivered by this lighter fix -- an operator who
+  hits it must clear the stale `.removing` directory by hand or pass
+  `force=True`. Under `force=True` the remnant is still treated as
+  "target absent" here; the pre-clean happens in
+  `_phase_stage_and_delete`'s opening guard, not in this seam.
 - **No `WorktreeManager` reference crosses into this module.** `store`/
   `allocator` are plain fields on `_TeardownContext`, read once at
   `build_context()` time.
-- **The Gate A / Gate B trigger split (ticket #140).** `force` and
-  `kill_blocking_processes` guard TWO DIFFERENT gates, and neither
-  substitutes for the other. Gate A (win32-only) refuses on a confirmed
-  blocking process and is bypassed only by `kill_blocking_processes=True`
-  -- `force=True` alone still raises `WorktreeDirLockedError`. Gate B
-  refuses on real uncommitted dirt and is bypassed only by `force=True`
-  -- `kill_blocking_processes=True` alone still raises
-  `DirtyWorktreeError`. Neither gate runs on POSIX; phase 7
-  (`_phase_orphan_scan`) is what surfaces a blocking process there
-  instead, warn-only rather than as a refusal.
-- **`record.killed_pids` merges, never overwrites (ticket #140).** Every
-  call site that assigns to `record.killed_pids` -- `_resolve_lock_or_raise`,
-  Gate A's confirmed-blocker kill, and `_phase_orphan_scan`'s own kill --
-  goes through `_merge_killed_pids` (first-wins, pid-deduped, in-place
-  append), never a plain `record.killed_pids = killed` assignment. A pid
-  an earlier phase (or an earlier `stop()` call) already recorded is
-  preserved, not clobbered by a later phase's own kill result.
+- **The two trigger kinds and the retry-then-diagnose call sites.** A
+  failed rename and a residual-after-delete are the only two triggers
+  `_diagnose_and_retry` ever sees, both from `_phase_stage_and_delete`.
+  `_retry_bounded` has two call sites (the rename, the residual check);
+  the dirt gate's undo retry is a third, **bespoke** bounded-retry call
+  site (`_bare_retry_bounded`) that deliberately does NOT share
+  `_retry_bounded`'s `ctx.failure_deadline`-opening contract (human
+  override, Decision 2) -- `ctx.failure_deadline` stays `None` on every
+  `DirtyWorktreeError` leg, `staged=True` included.
+- **One failure budget per removal (`_FAILURE_BUDGET_SEC = 7.0`).**
+  Opened the first time `_retry_bounded` is entered for a given removal
+  attempt; every later failure-path leg of the SAME attempt shares it.
+  Disjoint from AC1's `<2s`/`<5s` ceiling by construction: a clean,
+  unheld worktree's rename succeeds on the first attempt, so the failure
+  budget is never opened at all for that population.
+- **`record.killed_pids`/`ctx.blockers` merge, never overwrite.** Every
+  call site that records a kill goes through `_merge_killed_pids`
+  (first-wins, pid-deduped, in-place append), never a plain
+  `record.killed_pids = killed` assignment.
