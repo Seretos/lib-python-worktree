@@ -7787,11 +7787,12 @@ class TestDiscoveryBudget:
     observed for a single call that found nothing)."""
 
     def test_find_blocking_processes_respects_deadline_across_all_passes(self):
-        """Driving test (R4): Pass 1 (cwd) and Pass 2 (open_files) -- the two
-        passes that run on every platform -- must each bail out once the
-        deadline-derived scan budget is exhausted, instead of grinding
-        through the full (here: artificially slow) process list. Simulated
-        on a non-Windows platform so Pass 1b/1c (Windows-only) never run,
+        """Driving test (R4): Pass 1 (cwd) -- the one pass that runs on
+        every platform, now that Pass 2 is deleted (ticket #154) -- must
+        bail out once the deadline-derived scan budget is exhausted,
+        instead of grinding through the full (here: artificially slow)
+        process list. Simulated on a non-Windows platform so Pass 1b/1c
+        (Windows-only) never run,
         keeping this test deterministic and independent of real Windows
         ctypes internals."""
         import psutil
@@ -7807,27 +7808,21 @@ class TestDiscoveryBudget:
                 time.sleep(0.05)
                 return "/other/path"
 
-            def _slow_open_files():
-                time.sleep(0.05)
-                return []
-
             proc.cwd.side_effect = _slow_cwd
-            proc.open_files.side_effect = _slow_open_files
             return proc
 
-        def _process_iter_side_effect(*args, **kwargs):
-            # Fresh generator each call -- Pass 1 and Pass 2 each iterate
-            # process_iter independently.
-            return (_make_slow_proc(20000 + i) for i in range(200))
+        slow_pids = list(range(20000, 20200))
+        slow_procs = {pid: _make_slow_proc(pid) for pid in slow_pids}
 
         with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=slow_pids),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(slow_procs, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             t0 = time.monotonic()
@@ -8092,16 +8087,16 @@ class TestDiscoveryCompleteness:
         proc_denied = MagicMock()
         proc_denied.info = {"pid": 62000, "name": "x", "cmdline": []}
         proc_denied.cwd.side_effect = psutil.AccessDenied(62000)
-        proc_denied.open_files.side_effect = psutil.AccessDenied(62000)
 
         with (
-            patch.object(psutil, "process_iter", return_value=[proc_denied]),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[62000]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect({62000: proc_denied}, host_pid),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             result = _find_blocking_processes(target, host_pid)
@@ -8120,13 +8115,12 @@ class TestDiscoveryCompleteness:
         host_pid = os.getpid()
 
         with (
-            patch.object(psutil, "process_iter", return_value=iter([])),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             past_deadline = time.monotonic() - 5.0
@@ -8161,17 +8155,17 @@ class TestDiscoveryCompleteness:
         # iterator would simply exhaust naturally instead.
         third = _make_fake_proc(63003, "node3", ["node3"], "/other/path")
 
-        def _process_iter_side_effect(*args, **kwargs):
-            return iter([matching_first, matching_second, third])
-
         with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_side_effect),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[63001, 63002, 63003]),
+            patch.object(
+                psutil,
+                "Process",
+                side_effect=_make_psutil_process_side_effect(
+                    {63001: matching_first, 63002: matching_second, 63003: third}, host_pid
+                ),
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             deadline = time.monotonic() + 0.1
@@ -8191,13 +8185,12 @@ class TestDiscoveryCompleteness:
         host_pid = os.getpid()
 
         with (
-            patch.object(psutil, "process_iter", return_value=iter([])),
-            patch.object(psutil, "Process") as mock_proc_cls,
+            patch.object(psutil, "pids", return_value=[]),
+            patch.object(
+                psutil, "Process", side_effect=_make_psutil_process_side_effect({}, host_pid)
+            ),
             patch("lib_python_worktree.core.process_lifecycle.sys") as mock_sys,
         ):
-            mock_host = MagicMock()
-            mock_host.parents.return_value = []
-            mock_proc_cls.return_value = mock_host
             mock_sys.platform = "linux"
 
             result = _find_blocking_processes(target, host_pid)
@@ -10253,14 +10246,14 @@ class TestAncestorWalkAndHangingCwd:
             time.sleep(2.0)
             return []
 
-        process_iter_calls: list = []
+        pids_calls: list = []
 
-        def _process_iter_spy(*a, **kw):
-            process_iter_calls.append(1)
+        def _pids_spy():
+            pids_calls.append(1)
             return []
 
         with (
-            patch.object(psutil, "process_iter", side_effect=_process_iter_spy),
+            patch.object(psutil, "pids", side_effect=_pids_spy),
             patch.object(psutil, "Process") as mock_proc_cls,
         ):
             mock_host = MagicMock()
@@ -10280,9 +10273,9 @@ class TestAncestorWalkAndHangingCwd:
         assert list(result) == []
         assert result.complete is False
         assert "discovery:unresponsive" in result.skipped_passes
-        assert not process_iter_calls, (
+        assert not pids_calls, (
             "no pass may run once the ancestor walk is abandoned -- "
-            "psutil.pids()/process_iter must never be called"
+            "psutil.pids() must never be called"
         )
 
     def test_hanging_cwd_is_abandoned_within_per_call_bound(self):
