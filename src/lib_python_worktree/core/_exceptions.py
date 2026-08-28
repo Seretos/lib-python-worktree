@@ -134,21 +134,41 @@ class GitCommandError(WorktreeError):
 
 
 class DirtyWorktreeError(WorktreeError):
-    """Raised when ``git worktree remove`` refuses because the worktree has
-    uncommitted changes and ``force=False`` was passed.
+    """Raised when a removal refuses because the worktree has uncommitted
+    changes and ``force=False`` was passed.
 
     The message names only the engine-level parameter (``force=True``) and
     the worktree id — no raw git command text, absolute paths, or exit codes
     are surfaced so that callers can react programmatically without parsing
     implementation details.
+
+    ``staged`` (ticket #154, item 17): ``True`` iff the checkout currently
+    sits at ``<path>.removing`` -- the dirt-gate rename probe's forward leg
+    succeeded (proving the directory was not locked) but the undo rename
+    failed even after a bounded retry. The remnant is left in place; a
+    later ``remove()`` attempt raises again rather than silently restoring
+    or destroying it (see ``teardown.py``'s dirt-gate phase). ``False`` in
+    every other case, including the ordinary dirty-tree refusal where the
+    tree is exactly where it was.
     """
 
-    def __init__(self, worktree_id: str) -> None:
-        super().__init__(
-            f"worktree '{worktree_id}' has uncommitted changes. "
-            f"Pass force=True to remove it anyway."
-        )
+    def __init__(self, worktree_id: str, *, staged: bool = False) -> None:
+        if staged:
+            message = (
+                f"worktree '{worktree_id}' has uncommitted changes and "
+                f"could not be un-staged: its checkout is staged under the "
+                f"'{worktree_id}.removing' marker and the marker directory "
+                f"is still held. A later remove() will retry it "
+                f"automatically, or pass force=True to discard it."
+            )
+        else:
+            message = (
+                f"worktree '{worktree_id}' has uncommitted changes. "
+                f"Pass force=True to remove it anyway."
+            )
+        super().__init__(message)
         self.worktree_id = worktree_id
+        self.staged = staged
 
 
 class InvalidRepoError(WorktreeError):
@@ -191,6 +211,18 @@ class WorktreeDirLockedError(WorktreeError):
     applicable) how many processes were killed — no raw paths, exit codes,
     or git command text are surfaced so that callers can react
     programmatically without parsing implementation details.
+
+    ``staged`` (ticket #154): ``True`` iff a ``<path>.removing`` remnant
+    exists on disk -- true whenever the remnant exists, including when the
+    original ``record.path`` also exists (the remnant is the more
+    surprising fact and the one the operator needs named). Selects a third
+    message phrasing that names the marker suffix and the worktree id, and
+    -- like the other two phrasings -- no filesystem path. ``blockers``
+    (ticket #154): the full list of tier-1 (inferred, ``source="tracked"``)
+    and tier-2 (path-confirmed, ``source="orphan_scan"``) candidates
+    gathered while diagnosing this failure -- distinct from ``killed``,
+    which is only ever populated with processes this call actually
+    terminated. Defaults to ``[]``, never ``None``.
     """
 
     def __init__(
@@ -199,8 +231,17 @@ class WorktreeDirLockedError(WorktreeError):
         killed: "List[KilledProcessInfo]",
         *,
         kill_attempted: bool = True,
+        staged: bool = False,
+        blockers: "Optional[List[KilledProcessInfo]]" = None,
     ) -> None:
-        if kill_attempted:
+        if staged:
+            message = (
+                f"worktree '{worktree_id}' could not be removed: its "
+                f"checkout is staged under the '{worktree_id}.removing' "
+                f"marker and the marker directory is still held. A later "
+                f"remove() will retry it automatically."
+            )
+        elif kill_attempted:
             n = len(killed)
             message = (
                 f"worktree '{worktree_id}' directory is still locked after killing"
@@ -216,6 +257,8 @@ class WorktreeDirLockedError(WorktreeError):
         self.worktree_id = worktree_id
         self.killed = killed
         self.kill_attempted = kill_attempted
+        self.staged = staged
+        self.blockers = list(blockers or [])
 
 
 class WorktreeRemovalBlockedError(WorktreeDirLockedError, DirtyWorktreeError):
@@ -265,6 +308,8 @@ class WorktreeRemovalBlockedError(WorktreeDirLockedError, DirtyWorktreeError):
         *,
         kill_attempted: bool = False,
         dirty_paths: "Optional[List[str]]" = None,
+        staged: bool = False,
+        blockers: "Optional[List[KilledProcessInfo]]" = None,
     ) -> None:
         if kill_attempted:
             n = len(killed)
@@ -288,6 +333,8 @@ class WorktreeRemovalBlockedError(WorktreeDirLockedError, DirtyWorktreeError):
         self.killed = list(killed)
         self.kill_attempted = kill_attempted
         self.dirty_paths = list(dirty_paths or [])
+        self.staged = staged
+        self.blockers = list(blockers or [])
 
 
 class UnknownVariantError(WorktreeError, ValueError):
