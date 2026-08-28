@@ -1996,12 +1996,12 @@ class WorktreeManager:
         parameters, then runs the ordered phase sequence in
         ``teardown.run_teardown``. See ``docs/teardown-phase-contract.md``
         for the full phase-by-phase contract (Stop, ``stop:`` hook, Gate A,
-        Gate B, ``teardown:``, orphan scan (ticket #140), ``git worktree
-        remove``, FS fallback, final guard, port release) and
-        ``tests/test_teardown_matrix.py`` for the
-        consolidated regression matrix covering the eleven historical
-        scenarios (#76, #84, #88, #103, #107, #117, #121, #123, #126, #127,
-        #130) this delegation must keep reproducing bit-for-bit.
+        Gate B, ``teardown:``, dirt gate, stage-and-delete rename-based
+        removal, ``git worktree prune``, final guard, port release --
+        ticket #154 replaced the ``git worktree remove``/orphan-scan/FS-
+        fallback trio with this rename-then-delete mechanism) and
+        ``tests/test_teardown_matrix.py`` for the consolidated regression
+        matrix this delegation must keep reproducing bit-for-bit.
 
         ``_lifecycle_module`` is an injection seam for tests; callers should
         leave it as ``None`` (the real ``process_lifecycle`` module is used).
