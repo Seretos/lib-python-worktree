@@ -532,3 +532,25 @@ def test_target_is_absent_true_for_truly_absent_target_default_force_false():
     manager.remove()'s own probe) keep working."""
     record = _make_record(path="/definitely/not/a/real/path/xyz-154")
     assert teardown._target_is_absent(record) is True
+
+
+# ---------------------------------------------------------------------------
+# #154 R3 (tier-1 diagnosis scaffolding, structural existence check only).
+# The full behavioural rows -- tier 1's bounded psutil.pid_exists liveness
+# filter, the skip-on-unconfirmed rule, kill-vs-report-only -- depend on
+# `_retry_bounded`/`_diagnose_and_retry` existing at all, which they do not
+# yet; see the developer's final report for what remains unwritable without
+# this scaffolding.
+# ---------------------------------------------------------------------------
+
+def test_tier1_diagnosis_scaffolding_exists():
+    """RED today: neither the shared bounded-retry loop nor the
+    retry-then-diagnose function exists on the teardown module at all."""
+    assert hasattr(teardown, "_retry_bounded"), (
+        "_retry_bounded(op, *, ctx) -- the shared bounded-retry loop used "
+        "by every failure-path entry point -- must exist"
+    )
+    assert hasattr(teardown, "_diagnose_and_retry"), (
+        "_diagnose_and_retry(ctx, *, trigger, retry) -- tier 1 (bounded "
+        "owned-pid liveness) then tier 2 (systemwide scan) -- must exist"
+    )
