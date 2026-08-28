@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
+import sys
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2616,3 +2618,67 @@ class TestMatrixRemovalMechanism:
             "a persistent residual must eventually escalate to tier-2 "
             "diagnosis (systemwide scan) once the retry budget is spent"
         )
+
+    # -- R7: Windows read-only files no longer defeat the delete (P4) -------
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="win32-only: NTFS read-only semantics"
+    )
+    def test_readonly_file_is_removed(self, tmp_path):
+        """`git worktree remove` used to absorb a PermissionError on a
+        read-only file for us; the new merged delete ladder needs its own
+        chmod-and-retry rung, exercised against the STAGED path. Real
+        filesystem, real read-only file.
+
+        NOTE: v0.3.12's existing `_phase_filesystem_fallback` already
+        recovers this specific case today (its robocopy rung clears
+        read-only attributes), so the plain end-to-end "did it get
+        deleted" outcome is NOT RED by itself -- confirmed by first running
+        this assertion alone and observing it already passes. The
+        RED-worthy assertion is therefore the mechanism this ticket
+        actually changes: deletion must go through the rename-staged path
+        (`os.rename` to `<path>.removing`), not `git worktree remove` +
+        the old fallback. RED today: `os.rename` is never called at all."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r7-readonly"
+        checkout.mkdir()
+        ro_file = checkout / "readonly.txt"
+        ro_file.write_text("cannot touch this")
+        os.chmod(str(ro_file), stat.S_IREAD)
+        record = _make_record(
+            "wt-r7-readonly", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        staged_str = str(checkout) + ".removing"
+        real_rename = os.rename
+        rename_to_staged_calls = []
+
+        def _tracked_rename(src, dst, *a, **kw):
+            if str(dst) == staged_str:
+                rename_to_staged_calls.append((src, dst))
+            return real_rename(src, dst, *a, **kw)
+
+        try:
+            with (
+                patch(
+                    "lib_python_worktree.core.teardown._run_git",
+                    return_value=_ok(),
+                ),
+                patch(
+                    "lib_python_worktree.core.teardown.os.rename",
+                    side_effect=_tracked_rename,
+                ),
+            ):
+                manager._teardown(
+                    record, force=False, _lifecycle_module=mock_lifecycle
+                )
+            assert rename_to_staged_calls, (
+                "deletion must go through the rename-staged path -- "
+                "os.rename to '<path>.removing' was never called"
+            )
+            assert not checkout.exists()
+        finally:
+            if ro_file.exists():
+                os.chmod(str(ro_file), stat.S_IWRITE)
