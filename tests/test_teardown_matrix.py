@@ -2682,3 +2682,52 @@ class TestMatrixRemovalMechanism:
         finally:
             if ro_file.exists():
                 os.chmod(str(ro_file), stat.S_IWRITE)
+
+    # -- R8 (remaining sub-cases not superseded by Decision 1's rejection
+    #    of _phase_reclaim_staged): the merged stage+delete phase's own
+    #    guard for "nothing to do here" ---------------------------------
+
+    def test_absent_tree_and_no_remnant_attempts_no_rename_and_no_delete(
+        self, tmp_path
+    ):
+        """record.path absent, no `.removing` remnant either -> zero
+        os.rename calls, zero shutil.rmtree calls, zero subprocess.run
+        calls (no robocopy) -- but the removal still completes (prune runs,
+        ports released). RED today: an absent target already short-circuits
+        most phases via `ctx.target_absent`, but the specific claim that
+        `git worktree prune --expire=now` still runs unconditionally is new
+        -- today's target-absent path never prunes at all."""
+        manager = _make_manager(tmp_path)
+        checkout = tmp_path / "wt-r8-absent"
+        # Deliberately never created -- record.path does not exist.
+        record = _make_record(
+            "wt-r8-absent", path=str(checkout), repo_root=str(tmp_path)
+        )
+        manager.state.add(record)
+        mock_lifecycle = MagicMock()
+
+        calls: list = []
+
+        def _side_effect(args, cwd=None, **kwargs):
+            calls.append(list(args))
+            return _ok()
+
+        with (
+            patch(
+                "lib_python_worktree.core.teardown._run_git",
+                side_effect=_side_effect,
+            ),
+            patch("lib_python_worktree.core.teardown.os.rename") as mock_rename,
+            patch("lib_python_worktree.core.teardown.shutil.rmtree") as mock_rmtree,
+            patch("lib_python_worktree.core.teardown.subprocess.run") as mock_run,
+        ):
+            manager._teardown(record, force=False, _lifecycle_module=mock_lifecycle)
+
+        mock_rename.assert_not_called()
+        mock_rmtree.assert_not_called()
+        mock_run.assert_not_called()
+        assert any(c[:2] == ["worktree", "prune"] for c in calls), (
+            f"prune must still run unconditionally even for an "
+            f"already-absent target (so a stale git registration is "
+            f"cleared); got calls={calls}"
+        )
