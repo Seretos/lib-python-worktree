@@ -25,6 +25,7 @@ Each inconsistency is logged at WARNING level.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import socket
@@ -185,6 +186,41 @@ def _pid_alive_windows(pid: int) -> bool:
         return False
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _pid_status(pid: int, expected_start_time: Optional[float]) -> Optional[bool]:
+    """Tri-state identity-verified liveness check (ticket #157).
+
+    - ``False``: *pid* is dead, or alive but demonstrably not the process
+      *expected_start_time* names (a real, mismatching ``create_time()``).
+    - ``True``: *pid* is alive and its ``create_time()`` matches
+      *expected_start_time* bit-exactly.
+    - ``None``: *pid* is alive but identity could not be verified (e.g.
+      ``expected_start_time is None`` -- a legacy/unverifiable record -- or
+      ``psutil`` itself could not be queried, e.g. ``AccessDenied``).
+
+    Liveness (via :func:`_pid_alive`) is always checked first: a dead pid
+    is unconditionally ``False``, regardless of *expected_start_time* --
+    there is no "dead but unverifiable" state. Only once a pid is confirmed
+    alive does identity verification (or the lack of an
+    *expected_start_time* to verify against) come into play. The
+    ``create_time()`` comparison is exact -- no tolerance window -- so a
+    stranger spawned within any window of the expected time is never
+    mistaken for the tracked process; see the module docstring on
+    ``process_lifecycle`` for why a tolerance window is deliberately not
+    used.
+    """
+    if not _pid_alive(pid):
+        return False
+    if expected_start_time is None:
+        return None
+    import psutil
+
+    try:
+        real_start_time = psutil.Process(pid).create_time()
+    except Exception:  # noqa: BLE001 -- e.g. NoSuchProcess/AccessDenied
+        return None
+    return real_start_time == expected_start_time
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +409,43 @@ def _start_log_paths_from_dict(d: Any) -> Dict[str, str]:
     }
 
 
+def _start_times_from_dict(d: Any) -> Dict[str, float]:
+    """Reconstruct the ``start_times`` per-role mapping (ticket #157) from
+    its serialised form, mirroring :func:`_start_log_paths_from_dict`'s
+    tolerate-anything convention.
+
+    Never raises: a missing key, ``None``, or any non-``dict`` value yields
+    ``{}``. Within a dict, a non-``str`` key is skipped; a value that
+    cannot be coerced to ``float`` (e.g. the literal string ``"not-a-
+    number"``) is dropped rather than raising or corrupting the whole
+    record load -- ``bool`` is explicitly excluded even though
+    ``float(True) == 1.0`` would otherwise silently coerce, since a stray
+    boolean here can only be a corrupt/hand-edited value, never a genuine
+    ``create_time()`` reading. A non-finite float (``NaN``/``inf``/``-inf``
+    -- e.g. a hand-edited ``state.yaml`` carrying ``.nan``/``.inf``) is
+    dropped the same way (ticket #157 fix cycle, R2 finding 3, blocking):
+    ``_pid_status``'s identity comparison is an exact ``==`` against this
+    value, and ``NaN`` never equals anything, even another ``NaN`` -- so a
+    kept ``NaN`` would permanently and silently misreport a genuinely
+    running, correctly-started process as an identity mismatch, with no way
+    for ``reconcile()``/``stop()``/``start()`` to ever self-correct.
+    """
+    if not isinstance(d, dict):
+        return {}
+    result: Dict[str, float] = {}
+    for key, value in d.items():
+        if not isinstance(key, str) or isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(parsed):
+            continue
+        result[key] = parsed
+    return result
+
+
 def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
     return {
         "id": rec.id,
@@ -388,6 +461,7 @@ def _record_to_dict(rec: WorktreeRecord) -> Dict[str, Any]:
         "backing": rec.backing,
         "job_names": dict(rec.job_names),
         "variants": dict(rec.variants),
+        "start_times": dict(rec.start_times),
         "stop_detail": _stop_detail_to_dict(rec.stop_detail),
         "setup_outcome": _setup_outcome_to_dict(rec.setup_outcome),
         "teardown_ran": rec.teardown_ran,
@@ -418,6 +492,7 @@ def _record_from_dict(d: Dict[str, Any]) -> WorktreeRecord:
         backing=d.get("backing", "worktree"),
         job_names=dict(d.get("job_names") or {}),
         variants=dict(d.get("variants") or {}),
+        start_times=_start_times_from_dict(d.get("start_times")),
         stop_detail=_stop_detail_from_dict(d.get("stop_detail")),
         setup_outcome=_setup_outcome_from_dict(d.get("setup_outcome")),
         teardown_ran=bool(d.get("teardown_ran", False)),
@@ -771,9 +846,17 @@ def reconcile(
                     changed = True
                 report.orphaned.append(wt_id)
 
+            # Ticket #157: a role whose live pid's real create_time no
+            # longer matches record.start_times[role] (the OS recycled the
+            # pid onto an unrelated process) must be swept exactly like a
+            # genuinely dead one -- _pid_status(pid, expected) is False for
+            # BOTH cases. A role that is alive but unverifiable (no
+            # start_times entry -- a legacy record, or psutil could not be
+            # queried) is verdict None and is deliberately NOT swept here;
+            # only a demonstrated mismatch or genuine death counts.
             dead_roles = [
                 role for role, pid in rec.pids.items()
-                if not _pid_alive(pid)
+                if _pid_status(pid, rec.start_times.get(role)) is False
             ]
             for role in dead_roles:
                 pid = rec.pids.pop(role)
@@ -783,6 +866,12 @@ def reconcile(
                 # phantom / ambiguous stop(variant=...) match against a role
                 # that no longer has a live pid.
                 rec.variants.pop(role, None)
+                # Ticket #157: mirrors the variants pop immediately above --
+                # a role with no surviving pid must not keep a stale
+                # start_times entry either, or a later start() of the same
+                # role could compare a freshly-spawned pid's identity
+                # against an unrelated, long-gone process' start time.
+                rec.start_times.pop(role, None)
                 # Ticket #119 -- start_log_paths[role] is intentionally NOT
                 # popped here; the log file outlives its process and callers
                 # read it off the stop/list response, so this field

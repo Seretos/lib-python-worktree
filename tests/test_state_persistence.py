@@ -50,6 +50,7 @@ from lib_python_worktree.core.yaml_store import (
     YamlStateStore,
     _pid_alive,
     _pid_alive_windows,
+    _pid_status,
     adopt,
     reconcile,
 )
@@ -807,6 +808,78 @@ def test_reconcile_live_pid_unchanged(state_dir: Path, tmp_path: Path):
     assert updated is not None
     assert updated.pids == {"self": live_pid}
     assert updated.status == "created"
+
+
+# ---------------------------------------------------------------------------
+# reconcile(): PID-reuse identity verification (ticket #157, R5)
+# ---------------------------------------------------------------------------
+
+def test_reconcile_sweeps_role_with_mismatched_identity(state_dir: Path, tmp_path: Path):
+    """Driving test (R5): a role whose live pid's real create_time does not
+    match record.start_times[role] must be swept as dead, exactly like an
+    actually-dead pid -- today reconcile() keys off bare _pid_alive() only
+    (yaml_store.py's dead_roles list comprehension), so a live-but-
+    mismatched pid is kept. Genuine RED."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-mismatch-reconcile"
+    wt_path.mkdir()
+
+    sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        import psutil
+
+        real_start = psutil.Process(sentinel.pid).create_time()
+
+        rec = _make_record(
+            id="wt-mismatch-reconcile", path=str(wt_path), pids={"main": sentinel.pid}
+        )
+        rec.start_times = {"main": real_start - 5000.0}
+        rec.variants = {"main": "default"}
+        store.add(rec)
+
+        report = reconcile(store)
+
+        assert "wt-mismatch-reconcile" in report.stopped, (
+            "a mismatched-identity role must be swept, exactly like a dead one"
+        )
+        updated = store.get("wt-mismatch-reconcile")
+        assert updated is not None
+        assert "main" not in updated.pids
+        # Test-critic F7: variants[role] and start_times[role] must be
+        # popped alongside pids[role] -- else a later start() of the same
+        # role could compare the new pid's identity against this stale,
+        # unrelated recorded start time, or a stop(variant=...) could
+        # phantom-match a role with no live pid.
+        assert "main" not in updated.variants
+        assert "main" not in updated.start_times
+    finally:
+        _force_kill(sentinel.pid)
+        try:
+            sentinel.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_reconcile_keeps_role_when_identity_unverifiable(state_dir: Path, tmp_path: Path):
+    """Also: a live-but-unverifiable role (no recorded start_times entry --
+    a legacy record) must not be over-swept. Expected to already pass --
+    matches today's default (kept) behaviour."""
+    store = YamlStateStore(state_dir=state_dir)
+    wt_path = tmp_path / "wt-unverifiable-reconcile"
+    wt_path.mkdir()
+    live_pid = os.getpid()
+
+    rec = _make_record(
+        id="wt-unverifiable-reconcile", path=str(wt_path), pids={"main": live_pid}
+    )
+    # No start_times entry recorded -- legacy/unverifiable.
+    store.add(rec)
+
+    reconcile(store)
+
+    updated = store.get("wt-unverifiable-reconcile")
+    assert updated is not None
+    assert "main" in updated.pids
 
 
 # ---------------------------------------------------------------------------
@@ -2438,6 +2511,140 @@ class TestVariantsRoundTrip:
         legacy = store.get("legacy-wt-variants")
         assert legacy is not None
         assert legacy.variants == {}
+
+
+# ---------------------------------------------------------------------------
+# TestStartTimesRoundTrip -- ticket #157, R7(iii)
+# ---------------------------------------------------------------------------
+
+class TestStartTimesRoundTrip:
+    """R7(iii): ``WorktreeRecord.start_times`` (per-role mapping of role ->
+    the recorded process ``create_time()``) must persist through
+    ``state.yaml`` bit-exactly, and a legacy record with no ``start_times``
+    key must still deserialise (defaulting to ``{}``). Today
+    ``_record_to_dict``/``_record_from_dict`` do not touch this field at
+    all -- it round-trips to ``{}`` regardless of what was set, which is
+    the genuine RED for the driving test below."""
+
+    def test_start_times_round_trip_full_precision(self, state_dir: Path):
+        """Driving test: a record with a full-precision start_times value
+        round-trips through a fresh YamlStateStore load."""
+        store = YamlStateStore(state_dir=state_dir)
+        record = _make_record(id="wt-start-times")
+        record.start_times = {"main": 1735689600.123456}
+        store.add(record)
+
+        reloaded_store = YamlStateStore(state_dir=state_dir)
+        reloaded = reloaded_store.get("wt-start-times")
+        assert reloaded is not None
+        assert reloaded.start_times == {"main": 1735689600.123456}, (
+            "start_times must round-trip bit-exactly -- nothing is "
+            "serialised yet"
+        )
+
+    def test_legacy_record_without_start_times_key_defaults_to_empty(
+        self, state_dir: Path
+    ):
+        """A pre-#157 state.yaml entry with no ``start_times`` key at all
+        must still deserialise, defaulting to an empty dict. Expected to
+        already pass -- the field's own default is {}."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "legacy-wt-start-times": {
+                    "id": "legacy-wt-start-times",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/legacy-wt-start-times",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    # no "start_times" key at all -- simulates a pre-#157
+                    # state.yaml.
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        legacy = store.get("legacy-wt-start-times")
+        assert legacy is not None
+        assert legacy.start_times == {}
+
+    def test_start_times_junk_value_degrades_to_dropped_entry(self, state_dir: Path):
+        """Also: a non-numeric junk value in the YAML degrades to a dropped
+        entry rather than raising -- genuine RED, since the key is not read
+        at all today so the valid "worker" entry is lost too, not just the
+        junk one."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw = {
+            "version": 1,
+            "worktrees": {
+                "wt-junk-start-times": {
+                    "id": "wt-junk-start-times",
+                    "repo_root": "/repos/myrepo",
+                    "branch": "main",
+                    "path": "/store/myrepo/wt-junk-start-times",
+                    "status": "created",
+                    "ports": {},
+                    "pids": {},
+                    "branch_created_by_us": False,
+                    "backing": "worktree",
+                    "start_times": {"main": "not-a-number", "worker": 123.5},
+                },
+            },
+        }
+        (state_dir / "state.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        rec = store.get("wt-junk-start-times")
+        assert rec is not None
+        assert rec.start_times == {"worker": 123.5}
+
+    def test_start_times_non_finite_value_degrades_to_dropped_entry(
+        self, state_dir: Path
+    ):
+        """R2 fix cycle (finding 3, blocking, codex): a non-finite float
+        (``NaN``/``inf`` -- what a hand-edited/corrupt ``state.yaml``'s
+        ``.nan``/``.inf`` YAML scalars deserialise to) must degrade to a
+        dropped entry, the same as any other junk value, not be kept as-is.
+        ``_pid_status``'s identity comparison is an exact ``==`` against
+        this value, and ``NaN`` never equals anything (even another
+        ``NaN``) -- keeping it would permanently misreport a genuinely
+        running, correctly-started process as an identity mismatch, with no
+        way for a later reconcile()/stop()/start() call to self-correct."""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        raw_text = (
+            "version: 1\n"
+            "worktrees:\n"
+            "  wt-nonfinite-start-times:\n"
+            "    id: wt-nonfinite-start-times\n"
+            "    repo_root: /repos/myrepo\n"
+            "    branch: main\n"
+            "    path: /store/myrepo/wt-nonfinite-start-times\n"
+            "    status: created\n"
+            "    ports: {}\n"
+            "    pids: {}\n"
+            "    branch_created_by_us: false\n"
+            "    backing: worktree\n"
+            "    start_times:\n"
+            "      main: .nan\n"
+            "      worker: 123.5\n"
+        )
+        (state_dir / "state.yaml").write_text(raw_text, encoding="utf-8")
+
+        store = YamlStateStore(state_dir=state_dir)
+        rec = store.get("wt-nonfinite-start-times")
+        assert rec is not None
+        assert rec.start_times == {"worker": 123.5}, (
+            "a NaN start_times entry must be dropped, not kept -- an "
+            "exact-equality identity comparison against NaN can never "
+            "succeed, permanently misreporting a live, correctly-started "
+            "process as a stranger"
+        )
 
 
 # ---------------------------------------------------------------------------

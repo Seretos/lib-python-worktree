@@ -58,7 +58,16 @@ Platform differences
   ``SIGKILL`` for force-kill.
 
 The ``_pid_alive`` helper is imported from ``yaml_store`` so there is a
-single, tested implementation.
+single, tested implementation. Ticket #157: ``yaml_store`` also exposes
+``_pid_status(pid, expected_start_time) -> Optional[bool]``, a tri-state,
+identity-verified liveness check comparing a live process' real
+``psutil.Process(pid).create_time()`` against ``record.start_times[role]``
+bit-exactly. ``start()`` captures this identity right after spawning (before
+the early-exit wait); ``start()``'s already-running guard, ``stop()``, and
+``_wait_or_kill`` all consult it before acting on a tracked pid, so a PID
+the OS has recycled onto an unrelated process is never signalled, killed,
+or reported as a survivor -- see each function's own docstring for the
+exact contract.
 
 No ``mcp`` imports; returns plain dataclasses (``WorktreeRecord``).
 """
@@ -85,7 +94,9 @@ from .state import (
     STOP_ATTEMPT_ALREADY_EXITED,
     STOP_ATTEMPT_KILLED,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
+    STOP_ATTEMPT_UNCONFIRMED_ALIVE,
     STOP_REASON_HANDLE_SCAN_EXHAUSTED,
+    STOP_REASON_IDENTITY_UNVERIFIED,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
     STOP_REASON_SURVIVORS,
@@ -96,7 +107,7 @@ from .state import (
     WorktreeRecord,
     _STOP_DETAIL_MAX_PIDS,
 )
-from .yaml_store import _pid_alive
+from .yaml_store import _pid_alive, _pid_status
 
 _logger = logging.getLogger(__name__)
 
@@ -963,7 +974,45 @@ def _reap_until_gone(pid: int, attempts: int = 50) -> None:
         time.sleep(0.01)
 
 
-def _wait_or_kill(pid: int, timeout: float) -> None:
+def _capture_start_time(pid: int) -> Optional[float]:
+    """Best-effort, bounded-retry capture of *pid*'s real
+    ``psutil.Process(pid).create_time()`` (ticket #157).
+
+    Called by :func:`start` immediately after :func:`_spawn_detached`
+    returns, before anything else runs (in particular, before the
+    early-exit wait) -- capturing later would risk reading a create_time
+    for a pid that has already exited and been recycled onto an unrelated
+    process, recording a wrong identity instead of no identity at all.
+
+    Retries until it succeeds or the ``_EARLY_EXIT_WAIT_SEC`` budget
+    passes -- deliberately reusing that existing window rather than adding
+    a new one: it is the same wait ``start()`` already pays in the common
+    (successful) case to detect an early exit, so a healthy capture adds no
+    extra latency. ``psutil.NoSuchProcess`` breaks out immediately
+    (retrying a pid that is confirmed gone is pointless -- there is nothing
+    left to become readable); any other error (``AccessDenied``, a
+    transient ``OSError``, etc.) retries until the budget is exhausted.
+
+    Returns ``None`` when no identity could be captured -- callers must
+    treat that as "no identity recorded", never a fabricated ``0.0``.
+    """
+    import psutil
+
+    deadline = time.monotonic() + _EARLY_EXIT_WAIT_SEC
+    while True:
+        try:
+            return psutil.Process(pid).create_time()
+        except psutil.NoSuchProcess:
+            return None
+        except Exception:  # noqa: BLE001 -- e.g. AccessDenied/OSError
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
+
+
+def _wait_or_kill(
+    pid: int, timeout: float, *, expected_start_time: Optional[float] = None
+) -> None:
     """Wait up to *timeout* seconds for *pid* to die; force-kill if it doesn't.
 
     Uses a polling loop (0.1 s sleep) so there is no hard dependency on
@@ -971,23 +1020,39 @@ def _wait_or_kill(pid: int, timeout: float) -> None:
     a zombie child of ours, so a graceful exit is detected promptly instead
     of reading as "alive" indefinitely.  ``timeout <= 0`` goes straight to
     force-kill.
+
+    ``expected_start_time`` (ticket #157): when supplied, every escalation
+    point -- the ``timeout <= 0`` immediate path, the mid-poll check, and
+    the post-timeout escalation -- re-verifies identity via
+    ``yaml_store._pid_status(pid, expected_start_time)`` immediately before
+    calling :func:`_force_kill`, and the poll loop additionally exits
+    early, without escalating, the moment that verdict stops being
+    ``True`` -- i.e. the tracked process died and the OS recycled *pid*
+    onto an unrelated process mid-wait. Omitting *expected_start_time* (the
+    two-arg call form) preserves today's plain ``_pid_alive``-only
+    behaviour unchanged -- see :func:`_kill_process_tree` and the orphan
+    scan, which call this without an identity on purpose.
     """
     if timeout <= 0:
-        _force_kill(pid)
-        _reap_until_gone(pid)
+        if expected_start_time is None or _pid_status(pid, expected_start_time) is True:
+            _force_kill(pid)
+            _reap_until_gone(pid)
         return
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _reap(pid) or not _pid_alive(pid):
             return
+        if expected_start_time is not None and _pid_status(pid, expected_start_time) is not True:
+            return
         time.sleep(0.1)
 
     # Still alive after the timeout — escalate to force-kill, then reap so
     # the killed child does not linger as a zombie.
     if not _reap(pid) and _pid_alive(pid):
-        _force_kill(pid)
-        _reap_until_gone(pid)
+        if expected_start_time is None or _pid_status(pid, expected_start_time) is True:
+            _force_kill(pid)
+            _reap_until_gone(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -3691,7 +3756,14 @@ def start(
     WorktreeNotFoundError
         If *worktree_id* is not in *store*.
     ProcessAlreadyRunningError
-        If ``record.pids[role]`` already exists AND the process is alive.
+        If ``record.pids[role]`` already exists AND the process is alive AND
+        its identity is confirmed (ticket #157: ``yaml_store._pid_status(
+        existing_pid, record.start_times.get(role)) is True``). A live pid
+        whose identity is mismatched or unverifiable is abandoned instead
+        of blocking the restart -- a ``WARNING`` names the abandoned pid,
+        role, and both the recorded and observed start times (or notes that
+        no prior identity was recorded, for a legacy record) -- see
+        ``_pid_status``'s docstring for the tri-state contract.
     ValueError
         If *cmd* is empty.
     """
@@ -3714,14 +3786,53 @@ def start(
         )
 
     existing_pid = record.pids.get(role, 0)
-    if existing_pid and _pid_alive(existing_pid):
-        raise ProcessAlreadyRunningError(worktree_id, role, existing_pid)
+    if existing_pid:
+        existing_start_time = record.start_times.get(role)
+        existing_verdict = _pid_status(existing_pid, existing_start_time)
+        if existing_verdict is True:
+            raise ProcessAlreadyRunningError(worktree_id, role, existing_pid)
+        if existing_verdict is not True and _pid_alive(existing_pid):
+            # Ticket #157: the pid is alive (confirmed via the raw liveness
+            # check, since _pid_status's own False covers BOTH "dead" and
+            # "alive but mismatched" -- they must be told apart here), but
+            # its identity is either demonstrably mismatched (verdict
+            # False) or unverifiable (verdict None). Either way: abandon
+            # rather than block. A genuinely dead pid (verdict False AND
+            # NOT alive) falls straight through this whole block with no
+            # log at all, exactly like today's behaviour for an
+            # already-gone process.
+            import psutil  # noqa: PLC0415
+
+            if existing_start_time is None:
+                _logger.warning(
+                    "start(worktree_id=%s, role=%s): abandoning existing "
+                    "pid %s -- no prior identity recorded for this role "
+                    "(legacy record); restarting instead of blocking",
+                    worktree_id, role, existing_pid,
+                )
+            else:
+                try:
+                    observed_start_time = psutil.Process(existing_pid).create_time()
+                except Exception:  # noqa: BLE001 -- best-effort, log-only
+                    observed_start_time = None
+                _logger.warning(
+                    "start(worktree_id=%s, role=%s): abandoning existing "
+                    "pid %s -- recorded start_time %s does not match "
+                    "observed %s; restarting instead of blocking",
+                    worktree_id, role, existing_pid,
+                    existing_start_time, observed_start_time,
+                )
 
     log_dir = log_dir_for(worktree_id, env=env)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"start-{_role_log_slug(role)}.log"
 
     proc = _spawn_detached(cmd, env=env, cwd=cwd, log_path=log_path)
+
+    # Ticket #157: capture identity immediately after spawn returns, before
+    # anything else runs (in particular before the early-exit wait below) --
+    # see _capture_start_time's docstring for why placement matters.
+    captured_start_time = _capture_start_time(proc.pid)
 
     try:
         proc.wait(timeout=_EARLY_EXIT_WAIT_SEC)
@@ -3778,6 +3889,18 @@ def start(
         record.variants[role] = variant
     else:
         record.variants.pop(role, None)
+    # Ticket #157: mirrors job_names'/variants' role-keyed, no-None-value
+    # convention -- a real float or no key at all, never None. Overwrites
+    # any stale entry from a previous start() of this same role (including
+    # one left over from an abandoned, identity-mismatched pid this call
+    # just restarted over). Absent when capture could not complete (e.g.
+    # the process died before it could be read) -- a role with no captured
+    # identity is simply unverifiable at the next stop()/start() guard, not
+    # a wrong identity.
+    if captured_start_time is not None:
+        record.start_times[role] = captured_start_time
+    else:
+        record.start_times.pop(role, None)
     store.update(record)
 
     return record
@@ -4003,16 +4126,78 @@ def stop(
     capped snapshot would reintroduce exactly the false-positive class this
     ticket exists to eliminate.
 
-    Known limitation -- PID reuse (out of scope for this ticket): the
-    tracked PID is trusted as-is, with no identity check against the
-    process it originally belonged to. If the OS has recycled that PID
-    number for an unrelated process by the time ``stop()`` runs, this call
-    will signal/kill *that* process's tree/group instead, believing it to
-    be the one it started. A ``psutil.Process(pid).create_time()`` comparison
-    against a start-time recorded by :func:`start` would close this gap; it
-    is a known, pre-existing follow-up, not introduced by this ticket, and
-    intentionally not implemented here (it would touch the record schema and
-    :func:`start`).
+    PID-reuse identity verification (ticket #157)
+    -----------------------------------------------
+    The tracked PID's identity is verified before anything is signalled:
+    ``yaml_store._pid_status(pid, record.start_times.get(role))`` is
+    computed once, right after ``pid`` is resolved. That verdict alone
+    cannot distinguish "genuinely dead" from "alive but demonstrably a
+    different process" -- both read ``False`` -- so a plain ``_pid_alive``
+    re-check disambiguates them, because the two cases are handled very
+    differently:
+
+    - **Dead** (``_pid_alive`` is ``False``, regardless of the identity
+      verdict): everything below runs exactly as it did before this
+      ticket -- tree/process-group snapshot included. A dead tracked pid
+      poses no "signal a stranger's tree" risk (there is no live process
+      at that pid for ``_process_tree``/``_process_group_members`` to find
+      anything real for), and this snapshot is what the pre-existing
+      ``STOP_ATTEMPT_TRACKED_PID_MISSING`` case (ticket #87/#110: a
+      composite/chained shell command whose wrapper died while a real
+      backgrounded child it spawned kept running) depends on -- this
+      ticket must not, and does not, break that. This branch also carries
+      its own fresh re-check immediately before its group signal fires
+      (round 2's finding-2 fix); round 5 extended that re-check's effect
+      to the snapshot too (`recycled_dead_at_entry`, below): if the pid was
+      dead at entry but the OS has recycled its number onto a live
+      stranger by the time this branch is about to act, the ALREADY-
+      COLLECTED `tree`/`group_member_pids` snapshot -- taken even earlier,
+      before either re-check ran -- is discarded exactly like the sibling
+      `pid_was_alive` case just below, not just the direct group signal.
+    - **Alive and identity confirmed** (``_pid_status`` is ``True``,
+      which implies alive): also runs exactly as before -- tree/group
+      snapshot, graceful signal, ``_wait_or_kill``, force-kill escalation.
+      A fresh ``_pid_status`` re-check immediately precedes the signal
+      (round 1's R3 fix, below) *and* the tree/group snapshots' own
+      consumption (round 4's fix, this paragraph): if that re-check no
+      longer confirms identity -- the tracked pid exited and the OS
+      recycled its number onto an unrelated live process in the
+      non-zero time the snapshot work took -- both the signal AND the
+      already-collected ``tree``/``group_member_pids`` snapshots are
+      discarded (`recycled_after_confirm`, combined with the sibling
+      `recycled_dead_at_entry` gate above into `discard_stale_snapshot`,
+      below), not just the signal.
+      Without this, `_process_tree`/`_process_group_members` would have
+      walked the STRANGER now occupying that pid, and the unconditional
+      `_kill_process_tree` call at the end would force-kill its
+      descendants regardless of the signal-side gate -- the same
+      PID-reuse bug this ticket exists to close, reached through the
+      snapshot-consumption path instead. The Job Object snapshot is
+      exempt from this discard (see below): it is keyed by name, not by
+      the recycled pid.
+    - **Alive but identity NOT confirmed** (alive, but ``_pid_status`` is
+      ``False`` -- a demonstrated mismatch -- or ``None`` -- unverifiable):
+      this is the one new gate ticket #157 adds. The tree/process-group
+      snapshot, ``_signal_process_group``, ``_send_graceful_signal``, and
+      ``_wait_or_kill`` are all skipped entirely for the tracked pid --
+      nothing is ever signalled or force-killed against a pid that is
+      alive but might belong to someone else. A verdict of ``None`` here
+      additionally sets ``status="stop_incomplete"`` with
+      ``stop_detail.reason == "identity_unverified"`` (checked first in
+      the if/elif chain below, before any kill-attempt-derived reason); a
+      verdict of ``False`` (the alive-but-mismatched case) is reported as
+      a clean "our process is already gone", exactly like the genuinely
+      dead case -- it is not itself a ``stop_incomplete`` trigger.
+
+    The Windows Job Object path is **not** gated on this verdict: it is
+    keyed by ``record.job_names[role]`` (a UUID-based name, not the PID
+    number), so it is immune to PID reuse by construction and still runs
+    for every verdict -- see "Process-tree kill" above for what it covers.
+    The final survivor re-probe also special-cases the tracked pid: its own
+    liveness is re-checked via ``_pid_status(pid, ...) is True`` rather than
+    the plain ``_pid_alive`` used for every other candidate, so a pid this
+    call never touched (verdict not ``True``) can never be reported as a
+    "survivor" of a kill attempt that was never made against it.
 
     Parameters
     ----------
@@ -4053,6 +4238,29 @@ def stop(
 
     pid = record.pids[role]
 
+    # Ticket #157: verify identity BEFORE any snapshot/signal is taken --
+    # see "PID-reuse identity verification" above for the full contract.
+    #
+    # `identity_verdict` alone cannot distinguish "genuinely dead" from
+    # "alive but demonstrably a different process" -- _pid_status returns
+    # False for both. That distinction matters here: a dead tracked pid
+    # must still get the FULL original tree/group snapshot (ticket #87/
+    # #110's orphaned-child detection -- a composite/chained shell command
+    # whose wrapper died while a real backgrounded child kept running --
+    # depends on it and predates this ticket), while a pid that IS alive
+    # but not confirmed ours must never have its tree/group touched at all
+    # (it could belong to an unrelated stranger process). `raw_alive`
+    # disambiguates; `unconfirmed_alive` is the one new gate this ticket
+    # adds, and it is the ONLY thing that skips the tree/group snapshot,
+    # `_signal_process_group`, `_send_graceful_signal`, and `_wait_or_kill`
+    # below -- a dead tracked pid (raw_alive=False) never hits that gate,
+    # exactly preserving pre-#157 behaviour for it.
+    existing_start_time = record.start_times.get(role)
+    identity_verdict = _pid_status(pid, existing_start_time)
+    raw_alive = _pid_alive(pid)
+    identity_confirmed = identity_verdict is True
+    unconfirmed_alive = raw_alive and not identity_confirmed
+
     # Compute a shared deadline so that the primary kill step, the tree kill,
     # and the optional orphan scan together never exceed the caller-supplied
     # timeout.
@@ -4069,31 +4277,40 @@ def stop(
     # reintroducing a narrower version of this ticket's own original bug.
     primary_cap, tree_floor, orphan_floor = _compute_stop_budget(timeout, kill_orphans)
 
-    # Snapshot the descendant tree BEFORE any signal is sent (ticket #87):
-    # once the root dies, a reparented grandchild becomes invisible to
-    # anything that only looks at the tracked PID.
-    tree = _process_tree(pid)
+    if not unconfirmed_alive:
+        # Snapshot the descendant tree BEFORE any signal is sent (ticket #87):
+        # once the root dies, a reparented grandchild becomes invisible to
+        # anything that only looks at the tracked PID.
+        tree = _process_tree(pid)
 
-    # Ticket #110, finding #110-3: describe the tracked pid itself BEFORE any
-    # signal is sent -- once it is killed, psutil can no longer answer
-    # name()/cmdline() for it. Used below to enrich the tracked-pid
-    # KilledProcessInfo entry instead of constructing it with an empty
-    # name/cmdline (the root cause of "killed_pids" entries that look like
-    # anonymous bare PIDs).
-    tracked_pid_name, tracked_pid_cmdline = _describe_pid(pid)
+        # Ticket #110, finding #110-3: describe the tracked pid itself BEFORE any
+        # signal is sent -- once it is killed, psutil can no longer answer
+        # name()/cmdline() for it. Used below to enrich the tracked-pid
+        # KilledProcessInfo entry instead of constructing it with an empty
+        # name/cmdline (the root cause of "killed_pids" entries that look like
+        # anonymous bare PIDs).
+        tracked_pid_name, tracked_pid_cmdline = _describe_pid(pid)
 
-    # Ticket #87 follow-up, finding F2: _process_tree's _MAX_TREE_NODES cap
-    # truncates silently -- a tree with more descendants than the cap allows
-    # leaves the excess neither collected, killed, nor checked below. This
-    # snapshot alone does not distinguish "truncated" from "the caller's
-    # own list" (that would require widening _process_tree's return type --
-    # see its docstring); instead, treat "collected exactly the cap" as
-    # "cannot guarantee completeness": a genuinely smaller real tree would
-    # never have produced this many entries. The only false positive this
-    # can produce is the rare boundary case of a real tree that happens to
-    # be exactly cap-sized with no more descendants -- accepted as the
-    # conservative, cheap trade-off documented on _process_tree.
-    tree_possibly_truncated = len(tree) >= _MAX_TREE_NODES
+        # Ticket #87 follow-up, finding F2: _process_tree's _MAX_TREE_NODES cap
+        # truncates silently -- a tree with more descendants than the cap allows
+        # leaves the excess neither collected, killed, nor checked below. This
+        # snapshot alone does not distinguish "truncated" from "the caller's
+        # own list" (that would require widening _process_tree's return type --
+        # see its docstring); instead, treat "collected exactly the cap" as
+        # "cannot guarantee completeness": a genuinely smaller real tree would
+        # never have produced this many entries. The only false positive this
+        # can produce is the rare boundary case of a real tree that happens to
+        # be exactly cap-sized with no more descendants -- accepted as the
+        # conservative, cheap trade-off documented on _process_tree.
+        tree_possibly_truncated = len(tree) >= _MAX_TREE_NODES
+    else:
+        # Ticket #157: pid is alive but its identity is not confirmed
+        # (mismatched or unverifiable) -- never snapshot a tree/description
+        # for a pid that might not be ours; see the "PID-reuse identity
+        # verification" docstring above.
+        tree = []
+        tracked_pid_name, tracked_pid_cmdline = "", []
+        tree_possibly_truncated = False
 
     # Ticket #95, R5: Windows Job Object containment -- a ppid-independent
     # mechanism that closes the gap _process_tree's ppid-walk cannot by
@@ -4134,36 +4351,180 @@ def stop(
         # ppid-tree/process-group path, never itself a stop_incomplete
         # trigger.
 
-    # POSIX only, also snapshotted BEFORE any signal (ticket #87 follow-up,
-    # finding B3): the PIDs of any OTHER process sharing *pid*'s process
-    # group. _signal_process_group below fires a single SIGTERM at the whole
-    # group -- this snapshot is what lets a same-group descendant that
-    # ignores that SIGTERM (and is not also reachable via the ppid-tree
-    # snapshot above, e.g. because it already detached out of *pid*'s
-    # lineage) still get force-killed and checked by the survivor re-probe,
-    # instead of silently surviving while stop() still reports "stopped".
-    group_member_pids = _process_group_members(pid)
-    # Ticket #110, finding #110-3: describe each member BEFORE the graceful
-    # signal below -- same snapshot-time rationale as tracked_pid_name/
-    # tracked_pid_cmdline and job_pid_descriptions above. Bounded by
-    # _DESCRIBE_MAX_PIDS: beyond the cap, an entry keeps empty metadata but
-    # still carries source="process_group".
-    group_pid_descriptions: Dict[int, Tuple[str, List[str]]] = {}
-    for _gidx, _gpid in enumerate(group_member_pids):
-        if _gidx >= _DESCRIBE_MAX_PIDS:
-            break
-        group_pid_descriptions[_gpid] = _describe_pid(_gpid)
+    # Ticket #157 fix cycle (R5, blocking): shared with the dead-at-entry
+    # branch below (`elif not identity_confirmed:`) -- set True there when
+    # that branch's OWN fresh re-check finds the pid has become alive
+    # (recycled) since entry. Declared here, ahead of the branch, so it is
+    # always defined regardless of which arm executes; consumed by the
+    # unified discard gate below, alongside the sibling
+    # `recycled_after_confirm` case.
+    recycled_dead_at_entry = False
 
-    # POSIX only: if *pid* is itself the leader of its own process group (as
-    # start_new_session=True guarantees for processes we spawned), signal
-    # the whole group in one shot. No-op on Windows, when *pid* is not a
-    # group leader, or when doing so would signal our own group.
-    _signal_process_group(pid, force=False)
+    if not unconfirmed_alive:
+        # POSIX only, also snapshotted BEFORE any signal (ticket #87
+        # follow-up, finding B3): the PIDs of any OTHER process sharing
+        # *pid*'s process group. _signal_process_group below fires a single
+        # SIGTERM at the whole group -- this snapshot is what lets a
+        # same-group descendant that ignores that SIGTERM (and is not also
+        # reachable via the ppid-tree snapshot above, e.g. because it
+        # already detached out of *pid*'s lineage) still get force-killed
+        # and checked by the survivor re-probe, instead of silently
+        # surviving while stop() still reports "stopped".
+        group_member_pids = _process_group_members(pid)
+        # Ticket #110, finding #110-3: describe each member BEFORE the graceful
+        # signal below -- same snapshot-time rationale as tracked_pid_name/
+        # tracked_pid_cmdline and job_pid_descriptions above. Bounded by
+        # _DESCRIBE_MAX_PIDS: beyond the cap, an entry keeps empty metadata but
+        # still carries source="process_group".
+        group_pid_descriptions: Dict[int, Tuple[str, List[str]]] = {}
+        for _gidx, _gpid in enumerate(group_member_pids):
+            if _gidx >= _DESCRIBE_MAX_PIDS:
+                break
+            group_pid_descriptions[_gpid] = _describe_pid(_gpid)
 
-    pid_was_alive = _pid_alive(pid)
-    if pid_was_alive:
-        _send_graceful_signal(pid, group_leader=True)
-        _wait_or_kill(pid, max(0.0, min(deadline - time.monotonic(), primary_cap)))
+        # Ticket #157 fix cycle (R3, blocking, TOCTOU): the snapshot/describe
+        # work above (tree walk, tracked-pid/job/group description lookups)
+        # takes real, non-zero time. If the tracked pid was confirmed
+        # alive-and-ours at the TOP of this function (`identity_confirmed`)
+        # but has since exited and the OS recycled its number for an
+        # unrelated process in that window, signalling now would act on
+        # that stranger -- exactly the bug this ticket exists to close,
+        # just narrowed to this smaller window. Re-verify identity with a
+        # FRESH `_pid_status` call immediately before any signal fires,
+        # rather than trusting the entry-time `identity_confirmed` alone. A
+        # pid that was already dead at entry (`not identity_confirmed`
+        # here, since this branch is only reached when `not
+        # unconfirmed_alive`) was never going to be signalled either way,
+        # so it never needs this re-check.
+        pid_was_alive = identity_confirmed and (
+            _pid_status(pid, existing_start_time) is True
+        )
+
+        if pid_was_alive:
+            # POSIX only: if *pid* is itself the leader of its own process
+            # group (as start_new_session=True guarantees for processes we
+            # spawned), signal the whole group in one shot. No-op on
+            # Windows, when *pid* is not a group leader, or when doing so
+            # would signal our own group.
+            _signal_process_group(pid, force=False)
+            _send_graceful_signal(pid, group_leader=True)
+            _wait_or_kill(
+                pid,
+                max(0.0, min(deadline - time.monotonic(), primary_cap)),
+                expected_start_time=existing_start_time,
+            )
+        elif not identity_confirmed:
+            # Tracked pid was already dead at entry -- still fire the group
+            # signal (the TOCTOU re-check above only ever applies to the
+            # identity_confirmed-at-entry case, since only that case was
+            # ever going to signal the tracked pid itself):
+            # _signal_process_group targets pid's process GROUP, not pid
+            # itself, and is what reaches a same-group descendant of an
+            # already-dead tracked pid -- the composite/chained shell
+            # command case -- see _process_group_members' docstring for why
+            # the pgid can remain valid even after the leader has been
+            # reaped.
+            #
+            # Ticket #157 fix cycle (R2 finding 2, blocking, codex): the
+            # snapshot/describe work above (tree walk, tracked-pid/job/group
+            # description lookups) takes real, non-zero time. *pid* was
+            # dead at entry (not identity_confirmed), but a dead process
+            # never comes back to life -- if it is alive NOW, the OS must
+            # have recycled that pid number onto an unrelated live process
+            # in the meantime. `_signal_process_group`'s own
+            # `os.getpgid(pid) != pid` guard cannot by itself distinguish
+            # "our leader, reaped, group survivors still alive" (the
+            # legitimate case this branch exists for) from "a brand-new,
+            # unrelated process that happens to already be its own
+            # session/group leader" (extremely common for anything spawned
+            # with start_new_session/setsid) -- it would signal that
+            # stranger's group. Re-check immediately before signalling:
+            # only fire when *pid* is still not alive.
+            if not _pid_alive(pid):
+                _signal_process_group(pid, force=False)
+            else:
+                # Ticket #157 fix cycle (R5, blocking): mirror-image of the
+                # `recycled_after_confirm` gate below, for THIS branch. The
+                # pid was dead at entry, but the fresh re-check immediately
+                # above just found it alive -- a dead process cannot come
+                # back to life on its own, so the OS must have recycled the
+                # pid number onto an unrelated live process in the
+                # (non-zero-time) tree/group snapshot work above. The group
+                # SIGNAL is already correctly withheld by the `if` above,
+                # but the already-collected `tree`/`group_member_pids`
+                # snapshots (taken earlier, before this re-check, at the
+                # top of this function) still describe that STRANGER, not
+                # our own already-dead tracked process. Flag it here so the
+                # shared discard gate right below (which already handles
+                # the sibling `pid_was_alive` case via
+                # `recycled_after_confirm`) also drops both snapshots
+                # before `_kill_process_tree` runs -- otherwise the
+                # snapshot would still reach it unconditionally, force-
+                # killing the stranger's descendants despite the direct
+                # signal having been correctly skipped.
+                recycled_dead_at_entry = True
+        # else: identity_confirmed was True at entry, but the fresh
+        # re-check just above failed -- the pid's identity no longer
+        # verifies as ours. Skip the group signal too: unlike the
+        # already-dead-at-entry case above, we cannot tell here whether
+        # *pid* is now a recycled stranger (in which case its "process
+        # group" is that stranger's, not ours) or genuinely gone, so
+        # treating this exactly like the initial non-True verdict (no
+        # signal at all) is the only safe choice.
+    else:
+        # Ticket #157: identity not confirmed -- never snapshot this pid's
+        # process group or signal it; see the "PID-reuse identity
+        # verification" docstring above.
+        group_member_pids = []
+        group_pid_descriptions: Dict[int, Tuple[str, List[str]]] = {}
+        pid_was_alive = False
+
+    # Ticket #157 fix cycle (R4, blocking, codex): the fresh `pid_was_alive`
+    # re-check above only ever gated whether the ROOT pid and its process
+    # group got SIGNALLED -- it did nothing to the already-collected
+    # `tree`/`group_member_pids` snapshots, which were taken BEFORE that
+    # re-check ran and are unconditionally folded into `killed_tree` below
+    # for `_kill_process_tree` to force-kill. If the tracked pid was
+    # confirmed alive-and-ours at entry (`identity_confirmed`) but has since
+    # exited and the OS recycled its number onto an unrelated live process
+    # in the time the snapshot work took, `tree` (a ppid-descendant walk of
+    # whatever now occupies `pid`) and `group_member_pids` (that stranger's
+    # process-group members) describe the WRONG process's descendants --
+    # exactly the PID-reuse bug this ticket exists to close, just reached
+    # through the snapshot-consumption path instead of the direct-signal
+    # path. Discard both entirely in that case, mirroring the signal-side
+    # gate: `recycled_after_confirm` is True only when identity WAS
+    # confirmed at entry but the fresh re-check just failed -- it is
+    # deliberately False for the already-dead-at-entry case (`not
+    # identity_confirmed`), which must keep its full original snapshot (see
+    # the "PID-reuse identity verification" docstring above: a dead tracked
+    # pid's tree/group is what the pre-existing
+    # STOP_ATTEMPT_TRACKED_PID_MISSING case, ticket #87/#110, depends on).
+    # The Job Object snapshot (`job_member_pids`) is NOT touched here: it is
+    # keyed by `record.job_names[role]` (a UUID-based name), not by `pid`,
+    # so it is immune to PID reuse by construction and must stay
+    # unconditional in every verdict -- see the docstring's "Windows Job
+    # Object path is not gated on this verdict" paragraph.
+    #
+    # Ticket #157 fix cycle (R5, blocking): `recycled_after_confirm` alone
+    # only covered the `pid_was_alive` sibling case (confirmed-alive-at-
+    # entry, then recycled away before the fresh re-check). It left the
+    # mirror-image gap open: `recycled_dead_at_entry` (set above, in the
+    # `elif not identity_confirmed:` branch) covers the pid-was-dead-at-
+    # entry case where the fresh re-check in THAT branch instead finds the
+    # pid has become alive (recycled onto a stranger) by the time it is
+    # about to act. Both describe the same underlying fact -- "the pid this
+    # snapshot was taken for is no longer the same pid we are now reasoning
+    # about" -- so they share one discard gate: whichever branch's own
+    # re-check detects the mismatch, the ENTIRE pid-derived tree/group
+    # snapshot must be discarded before `_kill_process_tree` runs, not just
+    # the directly-gated signal call.
+    recycled_after_confirm = identity_confirmed and not pid_was_alive
+    discard_stale_snapshot = recycled_after_confirm or recycled_dead_at_entry
+    if discard_stale_snapshot:
+        tree = []
+        group_member_pids = []
+        tree_possibly_truncated = False
 
     # Kill the snapshotted descendant tree, plus any process-group members
     # not already covered by it (finding B3) -- both get the identical
@@ -4259,8 +4620,18 @@ def stop(
     # everything this call attempted to kill. Any survivor means the
     # environment is not actually torn down, even though the tracked pid
     # entry is about to be cleared below.
-    candidate_pids = [pid] + [info.pid for info in killed_tree] + [info.pid for info in orphan_found]
-    survivor_pids = [p for p in candidate_pids if _pid_alive(p)]
+    #
+    # Ticket #157: the tracked pid itself is special-cased to
+    # ``_pid_status(pid, existing_start_time) is True`` rather than the
+    # plain ``_pid_alive`` every other candidate uses -- a pid whose
+    # identity was never confirmed (verdict not True) was never signalled
+    # or killed by this call, so it must never be reported as a "survivor"
+    # of an attempt that was never made against it, no matter how alive the
+    # OS says it currently is.
+    other_candidate_pids = [info.pid for info in killed_tree] + [info.pid for info in orphan_found]
+    survivor_pids = (
+        [pid] if _pid_status(pid, existing_start_time) is True else []
+    ) + [p for p in other_candidate_pids if _pid_alive(p)]
 
     # Ticket #95, finding 1: killed_pids was never populated by stop() --
     # only ever written by manager.py's separate _kill_blocking_processes
@@ -4333,13 +4704,74 @@ def stop(
     # longer meaningful and would otherwise leave the
     # set(variants) <= set(pids) invariant violated.
     record.variants.pop(role, None)
+    # Ticket #157 fix cycle (R2, blocking): mirror the variants[role] clear
+    # immediately above -- once this role's pid entry is gone, the identity
+    # (start_time) recorded for it is no longer meaningful either, for
+    # EVERY verdict (True, False, or None), matching the plan's explicit
+    # requirement that stop() always clears pids[role]/variants[role]/
+    # start_times[role] together once it has made its verdict-based
+    # decision. Leaving a stale start_times[role] entry behind would let a
+    # future start() for this role (or a future stop() reusing this
+    # dict, e.g. via InMemoryStateStore's by-reference semantics) compare a
+    # brand-new pid's real create_time() against an identity that no
+    # longer describes anything this record tracks.
+    record.start_times.pop(role, None)
     # Ticket #119 -- start_log_paths[role] is intentionally NOT popped here
     # (contrast job_names/variants immediately above): the log file outlives
     # its process and callers read it off this very stop() response, so this
     # field deliberately does not honour the set(x) <= set(pids) invariant
     # that job_names/variants do.
 
-    if survivor_pids:
+    # Ticket #157 fix cycle (R4, blocking): `identity_verdict` was computed
+    # once, near the TOP of this function, before the job-terminate/orphan-
+    # scan work above (which can take real, non-zero time -- up to
+    # `orphan_floor` seconds when kill_orphans=True) ran. A verdict of None
+    # means the tracked pid was alive-but-unverifiable at entry, and this
+    # call never signalled or killed it (see `unconfirmed_alive` above) --
+    # so it remains free to exit entirely on its own during that window. A
+    # stale verdict=None must not still drive a stop_incomplete/
+    # identity_unverified report once the pid has since, genuinely, gone
+    # away: that would misreport a clean exit as an unresolved identity
+    # case. Re-probe with a FRESH, cheap `_pid_alive` call right here,
+    # immediately before it decides the report -- this is deliberately the
+    # freshest available liveness information, not a repeat of the
+    # `identity_verdict` computation itself (which would just re-ask the
+    # same now-answered "is it still unverifiable" question).
+    # Ticket #157 fix cycle (R6, blocking): capture this fresh reading once
+    # and share it with the `_stop_attempt_outcome` selection below (see
+    # its `unconfirmed_alive` branch) -- both must agree on the same
+    # freshest-available liveness fact, or `record.status`/`stop_detail`
+    # can resolve "stopped" while `record.stop_attempt` simultaneously
+    # claims "alive but unconfirmed", contradicting each other on the same
+    # record.
+    _fresh_pid_alive_for_finalization = _pid_alive(pid)
+    identity_unverified_and_still_alive = (
+        identity_verdict is None and _fresh_pid_alive_for_finalization
+    )
+
+    if identity_unverified_and_still_alive:
+        # Ticket #157: alive but identity could not be verified -- placed
+        # FIRST, ahead of every kill-attempt-derived reason below, since no
+        # signal/kill was ever attempted against the tracked pid in this
+        # case at all. A verdict of False (dead, or alive-but-mismatched)
+        # deliberately does NOT reach this branch -- see the "PID-reuse
+        # identity verification" docstring above for why that is reported
+        # as a clean "our process is gone" instead.
+        message = (
+            f"stop(worktree_id={worktree_id}, role={role}): tracked pid "
+            f"{pid} is alive but its identity could not be verified "
+            f"against start_times[{role!r}] -- withholding signal/kill to "
+            f"avoid acting on a possibly-recycled pid"
+        )
+        _logger.warning(message)
+        record.status = "stop_incomplete"
+        record.stop_detail = StopDetail(
+            reason=STOP_REASON_IDENTITY_UNVERIFIED,
+            message=message,
+            role=role,
+            kill_orphans_may_help=False,
+        )
+    elif survivor_pids:
         message = (
             f"stop(worktree_id={worktree_id}, role={role}): process(es) "
             f"survived termination: {survivor_pids}"
@@ -4511,6 +4943,41 @@ def stop(
             f"stop(worktree_id={worktree_id}, role={role}): tracked pid "
             f"{pid} was alive at entry; termination attempted"
         )
+    elif unconfirmed_alive and _fresh_pid_alive_for_finalization:
+        # Ticket #157 fix cycle (R1, blocking): the tracked pid was alive
+        # at entry but its identity could not be confirmed as ours --
+        # either a mismatched start_times[role] or no recorded start_time
+        # at all (a legacy record; per the "PID-reuse identity
+        # verification" docstring above, most such records still describe
+        # the original tracked process, not a recycled stranger). No
+        # signal/kill was ever attempted against it (the unconfirmed_alive
+        # gate above skips the tree/group/signal sequence entirely for this
+        # case). Placed AHEAD of both branches below: neither
+        # "already_exited" nor "tracked_pid_missing" is honest here -- both
+        # claim the tracked pid "had already exited at entry", which is
+        # verifiably false while it is still alive, regardless of whether
+        # an unrelated job-object member happened to be found and killed
+        # alongside it.
+        #
+        # Ticket #157 fix cycle (R6, blocking): `unconfirmed_alive` alone is
+        # the STALE entry-time reading (captured before the job-terminate/
+        # orphan-scan work above, which can take real time, ran) -- reusing
+        # it bare here let a pid that was alive-but-unverifiable at entry
+        # and has since genuinely exited still report
+        # STOP_ATTEMPT_UNCONFIRMED_ALIVE (claiming "is alive ... left
+        # untouched") in direct contradiction of `record.status`/
+        # `stop_detail`, which already resolve off the fresh
+        # `_fresh_pid_alive_for_finalization` reading above and would
+        # correctly show a clean "stopped" in that same case. Gating on the
+        # SAME fresh reading keeps both fields honest together.
+        _stop_attempt_outcome = STOP_ATTEMPT_UNCONFIRMED_ALIVE
+        _stop_attempt_message = (
+            f"stop(worktree_id={worktree_id}, role={role}): tracked pid "
+            f"{pid} is alive but its identity could not be confirmed as "
+            f"ours -- left untouched, no signal or kill was attempted "
+            f"against it"
+        )
+        _logger.debug(_stop_attempt_message)
     elif _something_else_found:
         _stop_attempt_outcome = STOP_ATTEMPT_TRACKED_PID_MISSING
         _stop_attempt_message = (

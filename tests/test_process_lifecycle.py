@@ -46,6 +46,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _kill_blocking_processes,
     _kill_process_tree,
     _pid_alive,
+    _pid_status,
     _process_group_members,
     _process_tree,
     _send_graceful_signal,
@@ -63,6 +64,8 @@ from lib_python_worktree.core.state import (
     STOP_ATTEMPT_ALREADY_EXITED,
     STOP_ATTEMPT_KILLED,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
+    STOP_ATTEMPT_UNCONFIRMED_ALIVE,
+    STOP_REASON_IDENTITY_UNVERIFIED,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
     STOP_REASON_SURVIVORS,
@@ -353,9 +356,16 @@ class TestStart:
             pass
 
     def test_start_idempotent_raises_already_running(self):
-        """start raises ProcessAlreadyRunningError when the role's PID is alive."""
+        """start raises ProcessAlreadyRunningError when the role's PID is
+        alive AND its identity is confirmed (ticket #157) -- start_times is
+        set to the live pid's own real create_time so the identity guard
+        passes, matching this test's original "still alive, still ours"
+        intent."""
+        import psutil
+
         live_pid = os.getpid()  # current process is definitely alive
         record = _make_record("wt-2", pids={DEFAULT_ROLE: live_pid})
+        record.start_times[DEFAULT_ROLE] = psutil.Process(live_pid).create_time()
         store = _make_store(record)
 
         with pytest.raises(ProcessAlreadyRunningError) as exc_info:
@@ -1202,6 +1212,15 @@ class TestGracefulSignalGroupLeadership:
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
                 return_value=True,
             ),
+            # Ticket #157 mock migration: stop()'s identity gate now
+            # consults _pid_status, not _pid_alive, for the tracked pid --
+            # this record has no start_times entry, so without this patch
+            # the verdict would be None (unverifiable) and stop() would
+            # never signal fake_pid at all.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=True,
+            ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._process_tree",
                 return_value=descendants,
@@ -1283,6 +1302,13 @@ class TestGracefulSignalGroupLeadership:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see the sibling leadership test
+            # above for why this is needed now that stop()'s identity gate
+            # consults _pid_status rather than bare _pid_alive.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -1761,10 +1787,18 @@ class TestStop:
             kill_called.append(pid)
 
         # _pid_alive: always True (process never dies)
+        # _pid_status: always True (ticket #157 -- this record carries no
+        # start_times entry, so without this patch the identity verdict
+        # would be None/unverifiable and stop() would never act on fake_pid
+        # at all)
         # _force_kill: captured
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -1795,6 +1829,11 @@ class TestStop:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -1872,6 +1911,572 @@ class TestStop:
 
 
 # ---------------------------------------------------------------------------
+# Ticket #157: PID-reuse identity verification -- stop() (R1)
+# ---------------------------------------------------------------------------
+
+class TestStopPidReuseIdentity:
+    """R1: a recycled PID must never be signalled or reported killed.
+
+    ``stop()`` currently trusts a tracked PID as-is (no identity check
+    against the process it originally belonged to -- the "PID reuse is out
+    of scope" limitation documented on ``stop()``'s own docstring). These
+    tests plant a ``record.start_times[role]`` that does not match a real,
+    live sentinel process' actual ``create_time()`` and expect that
+    mismatch to prevent any signal/kill -- today's code has no such check,
+    so the sentinel is killed and this is a genuine RED.
+    """
+
+    @pytest.mark.parametrize("offset_sec", [-5000.0, -0.5, -0.05])
+    def test_stop_never_kills_pid_with_mismatched_start_time(self, offset_sec):
+        """Driving test: a live sentinel whose recorded start_time does not
+        match its real create_time must survive stop() untouched and must
+        never appear in killed_pids. Parametrized near-boundary offsets
+        (down to 0.05s) prove a same-second stranger cannot pass either."""
+        import psutil
+
+        # _spawn_detached (not a raw subprocess.Popen) -- on Windows it
+        # creates the sentinel in its OWN new process group
+        # (CREATE_NEW_PROCESS_GROUP), which is what makes it safe for stop()
+        # to target with CTRL_BREAK_EVENT without also breaking the pytest
+        # process itself (which shares this test's own console group).
+        sentinel = _spawn_detached([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            real_start = psutil.Process(sentinel.pid).create_time()
+            record = _make_record("wt-pid-reuse", pids={DEFAULT_ROLE: sentinel.pid})
+            record.start_times[DEFAULT_ROLE] = real_start + offset_sec
+            store = _make_store(record)
+
+            result = stop("wt-pid-reuse", store=store, timeout=1.0)
+
+            assert _pid_alive(sentinel.pid), (
+                "a PID whose recorded start_time does not match the live "
+                "process' real create_time must never be signalled/killed"
+            )
+            assert sentinel.pid not in [i.pid for i in result.killed_pids], (
+                "a mismatched-identity pid must never be reported as killed"
+            )
+            # Test-critic F1: a demonstrated mismatch (verdict False) must
+            # be reported as a clean "already gone" -- never
+            # identity_unverified, which is reserved for verdict None
+            # (unverifiable, not mismatched).
+            assert (
+                result.stop_detail is None
+                or result.stop_detail.reason != STOP_REASON_IDENTITY_UNVERIFIED
+            ), (
+                "a mismatched (not unverifiable) identity must never set "
+                "stop_detail.reason == identity_unverified"
+            )
+            # Test-critic F2: the record must never accumulate an
+            # unkillable entry -- pids[role] is cleared regardless of
+            # verdict, even though nothing was signalled/killed here.
+            assert DEFAULT_ROLE not in result.pids, (
+                "pids[role] must be cleared even for a non-True verdict"
+            )
+        finally:
+            _force_kill(sentinel.pid)
+            try:
+                sentinel.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_stop_never_kills_mismatched_pids_snapshotted_children(self, tmp_path):
+        """Also: guards the snapshot-ordering move -- a mismatched tracked
+        pid's real child (reachable via today's pre-signal tree/group
+        snapshot) must also survive untouched, not just the tracked pid
+        itself."""
+        import psutil
+
+        pid_file = tmp_path / "child_pid.txt"
+        parent_code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(60)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(60)\n"
+        )
+        # _spawn_detached, not a raw subprocess.Popen -- see the comment on
+        # the sentinel spawn in the test above for why this matters.
+        parent = _spawn_detached([sys.executable, "-c", parent_code])
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not pid_file.exists():
+                time.sleep(0.05)
+            assert pid_file.exists(), "parent never reported its child's pid"
+            child_pid = int(pid_file.read_text().strip())
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not _pid_alive(child_pid):
+                time.sleep(0.05)
+            assert _pid_alive(child_pid)
+
+            real_start = psutil.Process(parent.pid).create_time()
+            record = _make_record(
+                "wt-pid-reuse-children", pids={DEFAULT_ROLE: parent.pid}
+            )
+            record.start_times[DEFAULT_ROLE] = real_start - 5000.0
+            store = _make_store(record)
+
+            stop("wt-pid-reuse-children", store=store, timeout=1.0)
+
+            assert _pid_alive(parent.pid), "mismatched tracked pid must survive"
+            assert _pid_alive(child_pid), (
+                "the mismatched tracked pid's snapshotted child must also "
+                "survive -- it must never be reached at all"
+            )
+        finally:
+            for leaked_pid in (child_pid, parent.pid):
+                if leaked_pid is None:
+                    continue
+                try:
+                    _force_kill(leaked_pid)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                parent.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Ticket #157: PID-reuse identity verification -- start() (R2)
+# ---------------------------------------------------------------------------
+
+class TestStartPidReuseIdentity:
+    """R2: an unverifiable or mismatched PID must never block a restart,
+    and abandoning it must be logged. ``start()``'s guard today raises
+    ``ProcessAlreadyRunningError`` purely off ``_pid_alive`` -- with no
+    identity check, a mismatched or legacy (no-start-times) record still
+    raises, which is exactly the behaviour these driving tests demonstrate
+    as wrong (genuine RED: the uncaught ``ProcessAlreadyRunningError``
+    propagates out of the test)."""
+
+    def test_mismatched_identity_does_not_block_restart(self, caplog):
+        """Driving test (a): a live pid whose recorded start_time does not
+        match its real create_time must not block start() -- start()
+        restarts and leaves the abandoned pid alone, logging a WARNING that
+        names the abandoned pid/role and both start times."""
+        caplog.set_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        )
+        import psutil
+
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            real_start = psutil.Process(sentinel.pid).create_time()
+            mismatched = real_start - 5000.0
+            record = _make_record(
+                "wt-restart-mismatch", pids={DEFAULT_ROLE: sentinel.pid}
+            )
+            record.start_times[DEFAULT_ROLE] = mismatched
+            store = _make_store(record)
+
+            result = start(
+                "wt-restart-mismatch",
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                store=store,
+            )
+
+            new_pid = result.pids[DEFAULT_ROLE]
+            try:
+                assert new_pid != sentinel.pid
+                assert _pid_alive(sentinel.pid), (
+                    "the abandoned, identity-mismatched pid must be left "
+                    "alone, never killed"
+                )
+                assert any(
+                    str(sentinel.pid) in rec.message and DEFAULT_ROLE in rec.message
+                    for rec in caplog.records
+                ), "expected a WARNING naming the abandoned pid and role"
+                assert any(
+                    str(mismatched) in rec.message and str(real_start) in rec.message
+                    for rec in caplog.records
+                ), "expected both the recorded and observed start times in the message"
+            finally:
+                _force_kill(new_pid)
+        finally:
+            _force_kill(sentinel.pid)
+            try:
+                sentinel.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_legacy_no_identity_does_not_block_restart(self, caplog):
+        """Driving test (b): a live pid with NO recorded start_times entry
+        at all (a legacy record) must not block start() either -- and the
+        WARNING must note that no prior identity was recorded, not claim a
+        "both start times" comparison that does not exist for this row."""
+        caplog.set_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        )
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            record = _make_record(
+                "wt-restart-legacy", pids={DEFAULT_ROLE: sentinel.pid}
+            )
+            # No record.start_times entry -- simulates a legacy record.
+            store = _make_store(record)
+
+            result = start(
+                "wt-restart-legacy",
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                store=store,
+            )
+
+            new_pid = result.pids[DEFAULT_ROLE]
+            try:
+                assert new_pid != sentinel.pid
+                assert _pid_alive(sentinel.pid)
+                assert any(
+                    str(sentinel.pid) in rec.message and DEFAULT_ROLE in rec.message
+                    for rec in caplog.records
+                ), "expected a WARNING naming the abandoned pid and role"
+                assert any(
+                    "no prior identity" in rec.message.lower()
+                    or "no recorded identity" in rec.message.lower()
+                    or "no recorded start" in rec.message.lower()
+                    for rec in caplog.records
+                ), "expected the message to note no prior identity was recorded"
+            finally:
+                _force_kill(new_pid)
+        finally:
+            _force_kill(sentinel.pid)
+            try:
+                sentinel.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_matching_identity_still_raises(self):
+        """Also (c): an exact identity match still raises -- unaffected,
+        already-passing behaviour (the guard already checks liveness; an
+        exact match is meant to keep raising once identity is wired in)."""
+        import psutil
+
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            real_start = psutil.Process(sentinel.pid).create_time()
+            record = _make_record(
+                "wt-restart-match", pids={DEFAULT_ROLE: sentinel.pid}
+            )
+            record.start_times[DEFAULT_ROLE] = real_start
+            store = _make_store(record)
+
+            with pytest.raises(ProcessAlreadyRunningError):
+                start(
+                    "wt-restart-match",
+                    [sys.executable, "-c", "pass"],
+                    store=store,
+                )
+        finally:
+            _force_kill(sentinel.pid)
+            try:
+                sentinel.wait(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def test_restart_records_new_real_start_time(self):
+        """Also: after a successful restart, start_times[role] equals the
+        new child's real create_time."""
+        import psutil
+
+        record = _make_record("wt-restart-record-time")
+        store = _make_store(record)
+
+        result = start(
+            "wt-restart-record-time",
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            store=store,
+        )
+        try:
+            new_pid = result.pids[DEFAULT_ROLE]
+            real_start = psutil.Process(new_pid).create_time()
+            # Test-critic F3: the design is a bit-exact create_time()
+            # comparison (no tolerance window at all -- see _pid_status's
+            # docstring), so this assertion must be tight enough to catch a
+            # regression to that comparison, not just "roughly the same
+            # process". A tiny epsilon is still allowed for float repr
+            # round-trip through the record, not for genuine drift.
+            assert result.start_times.get(DEFAULT_ROLE) == pytest.approx(
+                real_start, abs=1e-6
+            )
+        finally:
+            _force_kill(result.pids[DEFAULT_ROLE])
+
+
+# ---------------------------------------------------------------------------
+# Ticket #157: an alive-but-unverifiable tracked pid is reported, not
+# killed -- stop() (R3)
+# ---------------------------------------------------------------------------
+
+class TestStopUnverifiableIdentity:
+    """R3: verdict None (identity alive but unverifiable) must never signal
+    the tracked pid, and must report status='stop_incomplete' with
+    stop_detail.reason == STOP_REASON_IDENTITY_UNVERIFIED. stop() today has
+    no such branch at all -- it signals whenever _pid_alive is true,
+    regardless of identity verifiability -- so this is a genuine RED."""
+
+    def test_stop_reports_identity_unverified_and_never_signals(self, caplog):
+        """Driving test: patching _pid_status to None must prevent any
+        signal/force-kill/wait attempt against the tracked pid, and must
+        set the new identity_unverified stop_detail reason. Test-critic F9:
+        deliberately uses a non-default role ("worker", not DEFAULT_ROLE)
+        so a hardcoded-default bug in stop_detail.role would be caught."""
+        caplog.set_level(
+            logging.WARNING, logger="lib_python_worktree.core.process_lifecycle"
+        )
+        custom_role = "worker"
+        fake_pid = 424242
+        record = _make_record("wt-unverifiable", pids={custom_role: fake_pid})
+        record.start_times[custom_role] = 123456.0
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=None,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._force_kill"
+            ) as mock_force,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill"
+            ) as mock_wait,
+        ):
+            result = stop(
+                "wt-unverifiable", store=store, role=custom_role, timeout=0.3,
+            )
+
+        mock_signal.assert_not_called()
+        mock_force.assert_not_called()
+        mock_wait.assert_not_called()
+        assert result.status == "stop_incomplete"
+        assert result.stop_detail is not None
+        assert result.stop_detail.reason == STOP_REASON_IDENTITY_UNVERIFIED
+        assert result.stop_detail.role == custom_role
+        assert str(fake_pid) in result.stop_detail.message
+
+    def test_stop_unverifiable_still_terminates_recorded_job_object(self):
+        """Also: with a recorded job_names[role], _terminate_job_object is
+        still called even under verdict None -- job containment is keyed by
+        job name, not by pid identity, and is expected to remain
+        unaffected by the identity check. May already pass."""
+        fake_pid = 555555
+        record = _make_record("wt-unverifiable-job", pids={DEFAULT_ROLE: fake_pid})
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        record.job_names[DEFAULT_ROLE] = "fake-job-name"
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=None,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._open_job_object",
+                return_value=999,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._job_object_member_pids",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._terminate_job_object"
+            ) as mock_terminate,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._close_job_object_handle"
+            ),
+        ):
+            stop("wt-unverifiable-job", store=store, timeout=0.3)
+
+        mock_terminate.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Ticket #157: the graceful-wait window cannot escalate onto a recycled
+# PID -- _wait_or_kill (R4)
+# ---------------------------------------------------------------------------
+
+class TestWaitOrKillIdentity:
+    """R4: with an identity supplied, _wait_or_kill must stop polling
+    (and never force-kill) once the identity no longer matches -- today's
+    _wait_or_kill has no expected_start_time parameter at all wired into
+    its loop, so this is a genuine RED (it ignores the parameter and
+    escalates regardless)."""
+
+    def test_stops_polling_when_identity_no_longer_matches(self):
+        """Driving test: an identity sequence that goes True -> False mid-
+        wait must produce an early return and never call _force_kill."""
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                side_effect=[True, False, False, False, False, False, False],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._force_kill"
+            ) as mock_kill,
+            patch("time.sleep"),
+        ):
+            _wait_or_kill(99999, timeout=0.3, expected_start_time=123.0)
+
+        mock_kill.assert_not_called()
+
+    def test_still_escalates_when_identity_holds_through_timeout(self):
+        """Also: identity stays True through the timeout => _force_kill IS
+        still called -- expected to already pass, matching today's
+        unconditional-escalation behaviour when the pid never dies."""
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._force_kill"
+            ) as mock_kill,
+            patch("time.sleep"),
+        ):
+            _wait_or_kill(99999, timeout=0.1, expected_start_time=123.0)
+
+        mock_kill.assert_called_once_with(99999)
+
+    def test_identity_less_call_sites_still_escalate_unchanged(self):
+        """Also: the existing two-arg call form (no expected_start_time)
+        must keep today's _pid_alive-only escalation behaviour unchanged --
+        must already pass (regression guard for :1358-1407's call sites)."""
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._force_kill"
+            ) as mock_kill,
+            patch("time.sleep"),
+        ):
+            _wait_or_kill(99999, timeout=0.1)
+
+        mock_kill.assert_called_once_with(99999)
+
+
+# ---------------------------------------------------------------------------
+# Ticket #157: identity capture resilience -- start() (R7 i/ii)
+# ---------------------------------------------------------------------------
+
+class TestStartCapturesIdentity:
+    """R7(i)/(ii): identity capture at start() must be resilient to a
+    transient psutil failure, and a process that dies before capture
+    completes must record no start_times entry. start() today never
+    captures an identity at all -- (i) is a genuine RED; (ii)'s "records
+    nothing" half is trivially true today (nothing is ever recorded) and
+    may already pass -- see the class docstring on TestStopPidReuseIdentity
+    for the parallel convention."""
+
+    def test_transient_psutil_failure_still_records_identity(self):
+        """Driving test (i): a create_time() read that raises AccessDenied
+        once then succeeds must still end up recording start_times[role]."""
+        import psutil
+
+        record = _make_record("wt-capture-retry")
+        store = _make_store(record)
+
+        call_state = {"count": 0}
+
+        def _flaky_process(pid):
+            call_state["count"] += 1
+            if call_state["count"] == 1:
+                raise psutil.AccessDenied(pid)
+            stub = MagicMock()
+            stub.create_time.return_value = time.time()
+            return stub
+
+        with patch("psutil.Process", side_effect=_flaky_process):
+            result = start(
+                "wt-capture-retry",
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                store=store,
+            )
+        try:
+            assert DEFAULT_ROLE in result.start_times, (
+                "start() must retry a transient psutil failure and still "
+                "record start_times[role] -- no capture is implemented yet"
+            )
+        finally:
+            _force_kill(result.pids[DEFAULT_ROLE])
+
+    def test_process_dies_before_capture_records_nothing_for_unrecycled_dead_pid(self):
+        """(ii): when the create_time() capture itself fails with
+        NoSuchProcess (the process vanished between spawn and capture),
+        start() must record no start_times entry for that role -- never a
+        wrong/stale identity. Test-critic F5: forced deterministically via
+        a psutil.Process patch scoped to the start() call, rather than
+        racing a real process's exit timing against the capture call --
+        capturing immediately after spawn (the correct placement) means a
+        real short-lived process is normally still alive at capture time,
+        which would make an un-mocked version of this test pass for the
+        wrong reason (or fail outright) depending on machine speed."""
+        import psutil
+
+        record = _make_record("wt-capture-dead")
+        store = _make_store(record)
+
+        def _gone(pid):
+            raise psutil.NoSuchProcess(pid)
+
+        with patch("psutil.Process", side_effect=_gone):
+            result = start(
+                "wt-capture-dead",
+                [sys.executable, "-c", "pass"],
+                store=store,
+            )
+        new_pid = result.pids[DEFAULT_ROLE]
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _pid_alive(new_pid):
+            time.sleep(0.05)
+        assert not _pid_alive(new_pid), "process should have exited by now"
+
+        assert DEFAULT_ROLE not in result.start_times, (
+            "a capture that fails with NoSuchProcess must record no "
+            "start_times entry (never a wrong identity)"
+        )
+        assert _pid_status(new_pid, None) is False
+
+
+# ---------------------------------------------------------------------------
 # stop() kill_orphans tests  (ticket #36)
 # ---------------------------------------------------------------------------
 
@@ -1938,6 +2543,11 @@ class TestStopKillOrphans:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -2731,7 +3341,7 @@ class TestStopBudgetReallocation:
         captured_primary_timeout: List[float] = []
         captured_orphan_timeout: List[float] = []
 
-        def fake_wait_or_kill(pid, timeout):
+        def fake_wait_or_kill(pid, timeout, **_kw):
             captured_primary_timeout.append(timeout)
             # Simulate the pathological case: _wait_or_kill burns its whole
             # granted budget (e.g. CTRL_BREAK_EVENT was a no-op).
@@ -2740,6 +3350,11 @@ class TestStopBudgetReallocation:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -2908,7 +3523,7 @@ class TestStopBudgetReallocation:
             timeout, False
         )
 
-        def fake_wait_or_kill(pid, timeout_arg):
+        def fake_wait_or_kill(pid, timeout_arg, **_kw):
             # Simulate _wait_or_kill overrunning its granted primary_cap --
             # e.g. a polling tick landing just past the deadline -- so that
             # by the time the tree-kill budget is computed, the shared
@@ -2918,6 +3533,16 @@ class TestStopBudgetReallocation:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: without this, the identity
+            # verdict for this record (no start_times entry, and fake_pid
+            # is not a real OS process) would be False, stop() would skip
+            # the pid_was_alive branch entirely, and _wait_or_kill's fake
+            # overrun-simulating side effect above would never run --
+            # silently defeating the whole point of this test.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -2979,7 +3604,7 @@ class TestStopBudgetReallocation:
             timeout, True
         )
 
-        def fake_wait_or_kill(pid, timeout_arg):
+        def fake_wait_or_kill(pid, timeout_arg, **_kw):
             # Simulate _wait_or_kill overrunning its granted primary_cap --
             # e.g. a polling tick landing just past the deadline.
             time.sleep(timeout_arg + 0.3)
@@ -2995,6 +3620,13 @@ class TestStopBudgetReallocation:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see the sibling tree-floor test
+            # above -- without this, _wait_or_kill's overrun simulation
+            # would never run at all.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
@@ -3109,6 +3741,11 @@ class TestStopReportsKilledPids:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
@@ -6209,6 +6846,14 @@ class TestProcessTreeLineage:
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
                 return_value=True,
             ),
+            # Ticket #157 mock migration: this record has no start_times
+            # entry, so without this patch the identity verdict would be
+            # False (yaml_store's own, unpatched _pid_alive says fake_pid
+            # is dead) and stop() would skip the tree snapshot entirely.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=True,
+            ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._send_graceful_signal",
                 side_effect=lambda pid, **_kw: (graceful_calls.append(pid), True)[1],
@@ -6251,6 +6896,11 @@ class TestStopStatusHonesty:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch("lib_python_worktree.core.process_lifecycle._force_kill"),
@@ -6446,6 +7096,11 @@ class TestStopDetail:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch("lib_python_worktree.core.process_lifecycle._force_kill"),
@@ -6697,6 +7352,11 @@ class TestStopDetail:
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
                 return_value=True,
             ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=True,
+            ),
             patch("lib_python_worktree.core.process_lifecycle._force_kill"),
             patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
             patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
@@ -6799,6 +7459,11 @@ class TestStopDetail:
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
                 return_value=True,
             ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=True,
+            ),
             patch("lib_python_worktree.core.process_lifecycle._force_kill"),
             patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
         ):
@@ -6824,6 +7489,11 @@ class TestStopDetail:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch("lib_python_worktree.core.process_lifecycle._force_kill"),
@@ -6867,6 +7537,11 @@ class TestStopAttemptOutcome:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
@@ -7069,6 +7744,716 @@ class TestStopAttemptOutcome:
 
 
 # ---------------------------------------------------------------------------
+# Ticket #157 fix cycle -- reviewer round 1 (R1-R4)
+# ---------------------------------------------------------------------------
+
+class TestStopClearsStartTimes:
+    """R2 (blocking): stop() must pop record.start_times[role], exactly as
+    it already pops pids[role]/variants[role] -- for BOTH a True-verdict
+    clean stop and a non-True-verdict decline-to-kill. Before this fix,
+    only pids/variants were cleared; start_times[role] was left behind."""
+
+    def test_start_times_popped_on_true_verdict_clean_stop(self):
+        """Driving test (a): identity confirmed (verdict True) -> the kill
+        path runs, and start_times[role] must still be gone afterwards."""
+        fake_pid = 94000
+        record = _make_record("wt-clear-start-times-true", pids={DEFAULT_ROLE: fake_pid})
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=True,
+            ),
+            patch("lib_python_worktree.core.process_lifecycle._signal_process_group"),
+            patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
+            patch("lib_python_worktree.core.process_lifecycle._wait_or_kill"),
+        ):
+            result = stop("wt-clear-start-times-true", store=store, timeout=0.3)
+
+        assert DEFAULT_ROLE not in result.start_times
+        assert DEFAULT_ROLE not in store.get("wt-clear-start-times-true").start_times
+
+    @pytest.mark.parametrize("verdict", [False, None])
+    def test_start_times_popped_on_non_true_verdict_decline_to_kill(self, verdict):
+        """Driving test (b): identity NOT confirmed (verdict False --
+        mismatched -- or None -- unverifiable) -> stop() declines to
+        signal/kill anything, but must still pop start_times[role] --
+        pids[role] and variants[role] are unconditionally cleared
+        regardless of verdict, and start_times[role] must follow the same
+        rule."""
+        fake_pid = 94100
+        record = _make_record(
+            "wt-clear-start-times-nontrue", pids={DEFAULT_ROLE: fake_pid}
+        )
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=verdict,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+        ):
+            result = stop("wt-clear-start-times-nontrue", store=store, timeout=0.3)
+
+        mock_signal.assert_not_called()
+        assert DEFAULT_ROLE not in result.start_times
+        assert DEFAULT_ROLE not in store.get("wt-clear-start-times-nontrue").start_times
+
+
+class TestStopAttemptUnconfirmedAlive:
+    """R1 (blocking): stop_attempt.outcome/.message must never claim
+    "already exited" for a tracked pid that is verifiably alive but whose
+    identity could not be confirmed -- neither for a demonstrated mismatch
+    (verdict False) nor for a legacy record with no recorded identity at
+    all (verdict None). Before this fix, both cases forced
+    tracked_pid_alive (renamed pid_was_alive) to False purely because no
+    action was taken, and the outcome-selection logic then read that as
+    "was never alive", producing outcome=="already_exited" and a message
+    claiming "had already exited at entry" -- actively false while the pid
+    is alive throughout."""
+
+    @pytest.mark.parametrize("verdict", [False, None])
+    def test_outcome_and_message_never_claim_already_exited(self, verdict):
+        fake_pid = 94200
+        record = _make_record(
+            "wt-unconfirmed-alive-outcome", pids={DEFAULT_ROLE: fake_pid}
+        )
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=verdict,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+        ):
+            result = stop("wt-unconfirmed-alive-outcome", store=store, timeout=0.3)
+
+        mock_signal.assert_not_called()
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome != STOP_ATTEMPT_ALREADY_EXITED
+        assert result.stop_attempt.outcome != STOP_ATTEMPT_TRACKED_PID_MISSING
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_UNCONFIRMED_ALIVE
+        assert "already exited" not in result.stop_attempt.message.lower()
+        assert "already_exited" not in result.stop_attempt.message.lower()
+
+
+class TestStopSignalReverificationTOCTOU:
+    """R3 (blocking, Codex): identity must be re-verified with a FRESH
+    check immediately before any signal fires against the tracked pid --
+    not just once at the top of stop(). Before this fix, the confirmed-at-
+    entry verdict alone gated the signal, so a pid that exited and was
+    recycled by the OS for an unrelated process in the window between the
+    entry check and the (potentially slow) tree/group snapshot could still
+    be signalled."""
+
+    def test_no_signal_sent_when_identity_flips_before_signal_point(self):
+        """Driving test: _pid_status confirms identity (True) at the top of
+        stop(), then returns False on the very next call -- the fresh
+        re-check taken immediately before the signal fires. No signal of
+        any kind (group or direct) may be sent in that case."""
+        fake_pid = 94300
+        record = _make_record("wt-toctou", pids={DEFAULT_ROLE: fake_pid})
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                # 1st call: entry-time identity_verdict/identity_confirmed
+                # -> True. 2nd call: the fresh re-check immediately before
+                # the signal fires -> False (identity no longer verifies).
+                # Remaining entries cover the later survivor re-probe.
+                side_effect=[True, False, False, False, False, False],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group"
+            ) as mock_group_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill"
+            ) as mock_wait,
+        ):
+            result = stop("wt-toctou", store=store, timeout=0.3)
+
+        mock_group_signal.assert_not_called()
+        mock_signal.assert_not_called()
+        mock_wait.assert_not_called()
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome != STOP_ATTEMPT_KILLED
+
+
+class TestStopTreeSnapshotReverificationTOCTOU:
+    """Round-4 fix (blocking, Codex): R3's fresh re-check above only ever
+    gated whether the ROOT pid and its process group got SIGNALLED. It did
+    nothing to the already-collected `tree`/`group_member_pids` snapshots,
+    which are taken BEFORE that re-check runs and were previously folded
+    into `killed_tree` UNCONDITIONALLY for `_kill_process_tree` to
+    force-kill. If the tracked pid exits and the OS recycles its number
+    onto an unrelated live process in the window between the entry-time
+    identity check and the (potentially slow) tree/group snapshot work,
+    `_process_tree`/`_process_group_members` walk the FOREIGN process now
+    occupying that pid -- the fresh re-check correctly withholds the
+    signal from the root pid, but the already-snapshotted foreign
+    descendants were still passed to `_kill_process_tree` and force-killed.
+    This is the same PID-reuse bug class ticket #157 exists to close,
+    reached through the snapshot-consumption path instead of the
+    direct-signal path."""
+
+    def test_foreign_tree_and_group_snapshot_not_killed_when_identity_flips(self):
+        """Driving test: identity confirmed True at the entry check, then
+        the tracked pid dies and the OS recycles it onto a foreign live
+        process before the tree/group snapshot's fresh re-verification
+        point. The foreign process's descendant-tree and process-group
+        snapshot entries must NOT be passed on to `_kill_process_tree`."""
+        fake_pid = 96100
+        foreign_tree = [
+            KilledProcessInfo(pid=96101, name="foreign-child", cmdline=["foreign-child"]),
+        ]
+        foreign_group_pid = 96103
+        record = _make_record("wt-tree-toctou", pids={DEFAULT_ROLE: fake_pid})
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        store = _make_store(record)
+
+        captured_killed_trees: List[List[KilledProcessInfo]] = []
+
+        def fake_kill_process_tree(killed_tree, **kw):
+            captured_killed_trees.append(list(killed_tree))
+            return killed_tree
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=foreign_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[foreign_group_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                # 1st call: entry-time identity_verdict/identity_confirmed
+                # -> True (ours, confirmed alive at entry). 2nd call: the
+                # fresh re-check taken immediately before the signal fires
+                # (R3) -> False (identity no longer verifies -- the pid was
+                # recycled). Remaining calls (survivor re-probe, etc.) also
+                # read False -- the foreign process was never touched by
+                # this call.
+                side_effect=[True] + [False] * 10,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=fake_kill_process_tree,
+            ),
+        ):
+            result = stop("wt-tree-toctou", store=store, timeout=0.3)
+
+        assert len(captured_killed_trees) == 1
+        killed_pids_passed = {info.pid for info in captured_killed_trees[0]}
+        assert 96101 not in killed_pids_passed, (
+            "the foreign process's descendant-tree snapshot must be "
+            "discarded once identity no longer verifies, not force-killed"
+        )
+        assert foreign_group_pid not in killed_pids_passed, (
+            "the foreign process's process-group snapshot must be "
+            "discarded once identity no longer verifies, not force-killed"
+        )
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome != STOP_ATTEMPT_KILLED
+
+    def test_confirmed_tree_and_group_still_killed_on_green_path(self):
+        """Regression guard for the main GREEN path (R1): when identity
+        stays confirmed throughout (no recycle), the full tree/group
+        snapshot must still reach `_kill_process_tree` exactly as before --
+        this fix must not introduce a false negative on the ticket's
+        primary success path."""
+        fake_pid = 96200
+        real_tree = [
+            KilledProcessInfo(pid=96201, name="child", cmdline=["child"]),
+        ]
+        real_group_pid = 96203
+        record = _make_record("wt-tree-toctou-green", pids={DEFAULT_ROLE: fake_pid})
+        record.start_times[DEFAULT_ROLE] = 123456.0
+        store = _make_store(record)
+
+        captured_killed_trees: List[List[KilledProcessInfo]] = []
+
+        def fake_kill_process_tree(killed_tree, **kw):
+            captured_killed_trees.append(list(killed_tree))
+            return killed_tree
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=real_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[real_group_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                # Identity confirmed True at entry AND at the fresh
+                # re-check -- no recycle. All later calls (survivor
+                # re-probe) also read True since nothing here mocks the
+                # tracked pid as having exited.
+                return_value=True,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._wait_or_kill"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=fake_kill_process_tree,
+            ),
+        ):
+            result = stop("wt-tree-toctou-green", store=store, timeout=0.3)
+
+        assert len(captured_killed_trees) == 1
+        killed_pids_passed = {info.pid for info in captured_killed_trees[0]}
+        assert 96201 in killed_pids_passed, (
+            "the confirmed-ours descendant tree must still be killed on "
+            "the main GREEN path"
+        )
+        assert real_group_pid in killed_pids_passed, (
+            "the confirmed-ours process-group snapshot must still be "
+            "killed on the main GREEN path"
+        )
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_KILLED
+
+
+class TestStopDeadAtEntryTreeSnapshotReverificationTOCTOU:
+    """Round-5 fix (blocking): mirror-image of
+    TestStopTreeSnapshotReverificationTOCTOU (round 4), for the sibling
+    dead-at-entry branch. Round 2's finding-2 fix added a fresh
+    `_pid_alive(pid)` re-check in the `elif not identity_confirmed:` branch
+    (reached when the tracked pid was DEAD at the entry probe) immediately
+    before `_signal_process_group(pid, force=False)` fires -- if the pid has
+    since become alive (recycled onto a stranger), the group SIGNAL is
+    correctly skipped. But that branch's own tree/group snapshot (`tree =
+    _process_tree(pid)`, `group_member_pids = _process_group_members(pid)`
+    -- collected once, early, before either branch's re-check runs at all)
+    was never discarded when THIS branch's own re-check found the pid had
+    become alive/recycled -- only the direct group SIGNAL was withheld;
+    the already-collected snapshot still flowed unconditionally into
+    `killed_tree` -> `_kill_process_tree`, force-killing the stranger's
+    descendants regardless."""
+
+    def test_foreign_tree_and_group_snapshot_not_killed_when_dead_pid_recycled(self):
+        """Driving test: the tracked pid reads dead at the entry probe (so
+        the dead-at-entry / composite-orphan-child branch is reached and
+        its own foreign tree/group snapshot is collected), but by the time
+        that branch's fresh re-check runs (immediately before it would fire
+        `_signal_process_group`), the pid has become alive again -- which
+        can only mean the OS recycled it onto an unrelated live process.
+        The foreign process's descendant-tree and process-group snapshot
+        entries must NOT be passed on to `_kill_process_tree`, mirroring
+        the discard already proven for the sibling `pid_was_alive` case."""
+        fake_pid = 96300
+        foreign_tree = [
+            KilledProcessInfo(pid=96301, name="foreign-child", cmdline=["foreign-child"]),
+        ]
+        foreign_group_pid = 96303
+        record = _make_record("wt-dead-tree-toctou", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_killed_trees: List[List[KilledProcessInfo]] = []
+
+        def fake_kill_process_tree(killed_tree, **kw):
+            captured_killed_trees.append(list(killed_tree))
+            return killed_tree
+
+        # 1st call: raw_alive at the top of stop() -> False (dead at entry,
+        # reaching the dead-at-entry branch). Every call after that -> True
+        # (the pid has been recycled onto a live stranger by the time the
+        # dead-at-entry branch's own re-check, and everything after, runs).
+        _alive_calls = {"n": 0}
+
+        def _fake_pid_alive(_p):
+            _alive_calls["n"] += 1
+            return _alive_calls["n"] > 1
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=foreign_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[foreign_group_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                side_effect=_fake_pid_alive,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                # Identity never confirmed -- dead-at-entry branch throughout.
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group"
+            ) as mock_group_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=fake_kill_process_tree,
+            ),
+        ):
+            result = stop("wt-dead-tree-toctou", store=store, timeout=0.3)
+
+        mock_group_signal.assert_not_called(), (
+            "a dead-at-entry tracked pid recycled onto a live stranger "
+            "must never have its process group signalled"
+        )
+        mock_signal.assert_not_called()
+        assert len(captured_killed_trees) == 1
+        killed_pids_passed = {info.pid for info in captured_killed_trees[0]}
+        assert 96301 not in killed_pids_passed, (
+            "the foreign process's descendant-tree snapshot must be "
+            "discarded once the dead-at-entry pid is found recycled, not "
+            "force-killed"
+        )
+        assert foreign_group_pid not in killed_pids_passed, (
+            "the foreign process's process-group snapshot must be "
+            "discarded once the dead-at-entry pid is found recycled, not "
+            "force-killed"
+        )
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome != STOP_ATTEMPT_KILLED
+
+    def test_tree_and_group_still_killed_when_dead_pid_stays_dead(self):
+        """Regression guard for the pre-existing orphan-child-detection path
+        (ticket #87/#110): when the tracked pid is dead at entry AND stays
+        dead throughout (no recycle), its tree/process-group snapshot must
+        still reach `_kill_process_tree` exactly as before -- a composite/
+        chained shell command whose wrapper died while a real backgrounded
+        child it spawned kept running depends on this. This fix must not
+        introduce a false negative on that pre-existing success path."""
+        fake_pid = 96400
+        real_tree = [
+            KilledProcessInfo(pid=96401, name="child", cmdline=["child"]),
+        ]
+        real_group_pid = 96403
+        record = _make_record("wt-dead-tree-toctou-green", pids={DEFAULT_ROLE: fake_pid})
+        store = _make_store(record)
+
+        captured_killed_trees: List[List[KilledProcessInfo]] = []
+
+        def fake_kill_process_tree(killed_tree, **kw):
+            captured_killed_trees.append(list(killed_tree))
+            return killed_tree
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=real_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[real_group_pid],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group"
+            ) as mock_group_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_process_tree",
+                side_effect=fake_kill_process_tree,
+            ),
+        ):
+            result = stop("wt-dead-tree-toctou-green", store=store, timeout=0.3)
+
+        mock_group_signal.assert_called_once_with(fake_pid, force=False)
+        assert len(captured_killed_trees) == 1
+        killed_pids_passed = {info.pid for info in captured_killed_trees[0]}
+        assert 96401 in killed_pids_passed, (
+            "the dead-at-entry tracked pid's descendant tree must still be "
+            "killed when it genuinely stays dead (ticket #87/#110)"
+        )
+        assert real_group_pid in killed_pids_passed, (
+            "the dead-at-entry tracked pid's process-group snapshot must "
+            "still be killed when it genuinely stays dead (ticket #87/#110)"
+        )
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == STOP_ATTEMPT_TRACKED_PID_MISSING
+
+
+class TestStopIdentityUnverifiedFreshnessReconciliation:
+    """R4 (blocking, Codex): the identity_verdict is None branch must
+    reconcile with a FRESH raw-liveness reading taken immediately before
+    the stop_detail/status report is finalized, not the raw_alive reading
+    captured near the top of stop() (before the job-terminate/orphan-scan
+    work, which can take real time, ran). Before this fix, a pid that was
+    alive-but-unconfirmed at entry and had genuinely died by the time this
+    report was written was still reported as stop_incomplete/
+    identity_unverified -- a stale verdict misreporting a clean exit."""
+
+    def test_outcome_does_not_claim_identity_unverified_when_pid_now_dead(self):
+        """Driving test: identity_verdict is None (unverifiable) throughout
+        -- the pid was alive at the initial _pid_alive probe (entry) but is
+        dead by the time the finalization logic re-probes it."""
+        fake_pid = 94400
+        record = _make_record(
+            "wt-identity-unverified-freshness", pids={DEFAULT_ROLE: fake_pid}
+        )
+        # Deliberately no record.start_times[DEFAULT_ROLE] entry -- a
+        # legacy record, matching one of the two verdict=None scenarios.
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                # 1st call: raw_alive at the top of stop() -> True (alive
+                # at entry). 2nd call: the fresh re-probe immediately before
+                # the identity_verdict-is-None report is finalized -> False
+                # (the pid has since genuinely exited).
+                side_effect=[True, False],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=None,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+        ):
+            result = stop(
+                "wt-identity-unverified-freshness", store=store, timeout=0.3,
+            )
+
+        mock_signal.assert_not_called()
+        assert (
+            result.stop_detail is None
+            or result.stop_detail.reason != STOP_REASON_IDENTITY_UNVERIFIED
+        ), "a pid that has since genuinely died must not be reported identity_unverified"
+        assert result.status != "stop_incomplete", (
+            "the freshest liveness reading shows the pid is gone -- this "
+            "must resolve as a clean exit, not stop_incomplete"
+        )
+
+
+class TestStopAttemptOutcomeFreshnessReconciliation:
+    """R2 fix cycle, finding 1 (blocking): `record.stop_attempt.outcome`/
+    `.message` must not contradict `record.status`/`stop_detail` on the same
+    record. Before this fix, `_stop_attempt_outcome`'s `unconfirmed_alive`
+    branch keyed off the STALE entry-time `unconfirmed_alive` flag, never
+    reconciled against the fresh liveness reading `identity_unverified_and_
+    still_alive` already uses for `status`/`stop_detail` -- so a pid that
+    was alive-but-unverifiable at entry and has since genuinely exited got
+    `status="stopped"` (correct) while `stop_attempt.outcome` still claimed
+    STOP_ATTEMPT_UNCONFIRMED_ALIVE with a message literally asserting the
+    pid "is alive ... left untouched", directly contradicting `status`."""
+
+    def test_outcome_not_unconfirmed_alive_when_pid_died_before_finalization(self):
+        """Driving test: mirrors
+        TestStopIdentityUnverifiedFreshnessReconciliation's setup (identity
+        verdict None throughout, pid alive at the entry probe, dead by the
+        fresh re-probe taken immediately before finalization) but asserts
+        on `stop_attempt` instead of `status`/`stop_detail`."""
+        fake_pid = 94500
+        record = _make_record(
+            "wt-stop-attempt-freshness", pids={DEFAULT_ROLE: fake_pid}
+        )
+        # Deliberately no record.start_times[DEFAULT_ROLE] entry -- a
+        # legacy record, matching one of the two verdict=None scenarios.
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                # 1st call: raw_alive at the top of stop() -> True (alive
+                # at entry). 2nd call: the fresh re-probe immediately before
+                # the identity_verdict-is-None report is finalized -> False
+                # (the pid has since genuinely exited).
+                side_effect=[True, False],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=None,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+        ):
+            result = stop(
+                "wt-stop-attempt-freshness", store=store, timeout=0.3,
+            )
+
+        mock_signal.assert_not_called()
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome != STOP_ATTEMPT_UNCONFIRMED_ALIVE, (
+            "stop_attempt must not claim the pid is alive-but-unconfirmed "
+            "once the freshest reading shows it has genuinely exited -- "
+            "that would contradict status/stop_detail, which already "
+            "resolve off the same fresh reading"
+        )
+        assert "is alive" not in result.stop_attempt.message.lower()
+
+
+class TestStopGroupSignalRecycledPidGuard:
+    """R2 fix cycle, finding 2 (blocking, codex): the dead-at-entry
+    `_signal_process_group` branch (reached when the tracked pid was
+    already dead at the top of stop()) must re-verify liveness immediately
+    before signalling. Before this fix it fired unconditionally, so if the
+    OS recycled the tracked pid number onto an unrelated live process
+    during the (non-zero-time) tree/job/group snapshot work above, that
+    live stranger's process group could be signalled -- exactly the
+    PID-reuse bug this ticket exists to close, reopened on this one path."""
+
+    def test_group_signal_skipped_when_dead_pid_becomes_alive_and_foreign(self):
+        """Driving test: the tracked pid is dead at the entry probe (so the
+        dead-at-entry / composite-orphan-child branch is reached), but by
+        the time this branch is about to fire `_signal_process_group`, the
+        pid has become alive again -- which can only mean the OS recycled
+        it onto an unrelated live process, since a dead process cannot come
+        back to life on its own. The group signal must be withheld."""
+        fake_pid = 94600
+        record = _make_record(
+            "wt-group-signal-recycled", pids={DEFAULT_ROLE: fake_pid}
+        )
+        store = _make_store(record)
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_group_members",
+                return_value=[],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
+                return_value=False,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                # 1st call: raw_alive at the top of stop() -> False (dead
+                # at entry, reaching the "already dead" branch). 2nd call:
+                # the fresh re-check immediately before
+                # _signal_process_group fires -> True (recycled onto a
+                # live foreign process in the interim). 3rd call: the
+                # identity_unverified_and_still_alive fresh reading further
+                # down (short-circuited to False regardless, since
+                # identity_verdict is False here, not None, but the
+                # variable assignment still runs unconditionally).
+                side_effect=[False, True, True],
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._signal_process_group"
+            ) as mock_group_signal,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._send_graceful_signal"
+            ) as mock_signal,
+        ):
+            result = stop("wt-group-signal-recycled", store=store, timeout=0.3)
+
+        mock_group_signal.assert_not_called(), (
+            "a dead-at-entry tracked pid that has since become alive again "
+            "can only be a recycled stranger -- its process group must "
+            "never be signalled"
+        )
+        mock_signal.assert_not_called()
+        assert result.stop_attempt is not None
+
+
+# ---------------------------------------------------------------------------
 # TestKilledPidsIdentifiability -- ticket #110
 # ---------------------------------------------------------------------------
 
@@ -7115,6 +8500,11 @@ class TestKilledPidsIdentifiability:
             ),
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch("lib_python_worktree.core.process_lifecycle._send_graceful_signal"),
@@ -7566,6 +8956,11 @@ class TestEncodedCommandDecoding:
         with (
             patch(
                 "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+            # Ticket #157 mock migration: see test_stop_timeout_fallback_kills.
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_status",
                 return_value=True,
             ),
             patch(
