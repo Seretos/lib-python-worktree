@@ -113,6 +113,13 @@ jobs:
           git push origin "$TAG"
 
       - name: Create GitHub Release
+        # PREV_TAG: each release branch is force-pushed fresh off main and
+        # the stamp commit is never merged back, so no prior vX.Y.Z tag is
+        # ever an ancestor of the newly created tag -- `gh`'s ancestor-walk
+        # auto-detect for --generate-notes therefore finds nothing and
+        # would otherwise generate notes from the beginning of history.
+        # prev_release_tag.py computes the actual previous released tag by
+        # real semver precedence so it can be passed explicitly.
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -122,10 +129,22 @@ jobs:
           if [[ "${{ inputs.version }}" == *-* ]]; then
             PRE_FLAG="--prerelease"
           fi
+
+          # `git tag --list` sees all historical tags here because
+          # "Checkout main" above already ran with fetch-depth: 0.
+          PREV_TAG=$(git tag --list 'v*' | python3 .github/scripts/prev_release_tag.py "${{ inputs.version }}")
+          NOTES_START=""
+          if [ -z "$PREV_TAG" ]; then
+            echo "::warning::No previous release tag found; notes will span full history."
+          else
+            NOTES_START="--notes-start-tag $PREV_TAG"
+          fi
+
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
             --title "$TAG" \
             --generate-notes \
+            $NOTES_START \
             $PRE_FLAG
 
       - name: Fetch release notes for the bump ticket body
