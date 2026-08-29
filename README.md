@@ -377,7 +377,8 @@ Exception
 │   │   ├── WorktreeNotFoundError
 │   │   ├── GitCommandError              (carries .command, .returncode, .stderr)
 │   │   ├── UnknownVariantError          (ALSO a ValueError; start(variant=...) matched no start: step -- carries .variant, .available -- .available includes the implicit "default" fallback when reachable, ticket #131)
-│   │   └── VariantResolutionError       (ALSO a ValueError; stop(variant=...) could not resolve to one role -- carries .variant, .roles, .requested_role)
+│   │   ├── VariantResolutionError       (ALSO a ValueError; stop(variant=...) could not resolve to one role -- carries .variant, .roles, .requested_role)
+│   │   └── RunLineExpansionError        (ALSO a ValueError; a run: line's first token is a nested powershell/pwsh invocation whose double-quoted -Command argument contains a $-expandable token that the outer PowerShell host would double-evaluate -- carries .run_line, .tokens; ticket #158, see "Shell auto-detection" below)
 │   ├── ProcessLifecycleError            (base for process lifecycle errors)
 │   │   ├── ProcessAlreadyRunningError   (carries .worktree_id, .role, .pid)
 │   │   └── ProcessNotRunningError       (carries .worktree_id, .role)
@@ -508,8 +509,38 @@ PowerShell invocation, e.g. `run: powershell -Command "..."`. A raw
 argv re-quoting (`list2cmdline`) and PowerShell's own `-Command` re-parsing,
 which can mangle such a self-wrapped run line's quote structure and cause
 the step to fail silently. `-EncodedCommand` carries no spaces or quotes, so
-neither re-quoting pass can corrupt it, and previously-silent steps like
-this now run correctly.
+neither re-quoting pass can corrupt it (ticket #109).
+
+That fixes the argv-quoting layer, but a `run:` line is fundamentally a
+*script*, evaluated by whichever shell host `_resolve_shell` selected for
+it — and that host's own string interpolation runs regardless of how the
+line reaches it. A double-quoted string in PowerShell interpolates `$…`
+tokens (`$env:X`, `$true`, `$(...)`, ...) as it is parsed, *before* anything
+inside that string gets a chance to be treated as someone else's input. So a
+self-wrapped nested invocation like
+`run: powershell -Command "$env:X=1; while($true){...}"` still breaks: the
+*outer* host interpolates `$env:X` and `$true` inside its own double-quoted
+`-Command` argument before the *nested* `powershell -Command "..."` child
+ever parses that argument itself — silently corrupting it into something
+the inner shell either errors on, or (the ticket's actually-reported case)
+silently no-ops on while still reporting success. `-EncodedCommand` cannot
+help here: it protects the outer argv from *external* re-quoting, but the
+outer PowerShell host still parses and interpolates the decoded script text
+itself, and the nested double-quoted argument lives inside that text.
+
+This specific shape — a `run:` line whose first token is a nested
+`powershell`/`pwsh` invocation carrying a double-quoted argument with a
+`$`-expandable token — is now rejected up front, at step-build time, with
+`RunLineExpansionError` (ticket #158), naming the offending `$`-token(s) and
+the full run line. Three escapes avoid it entirely:
+
+1. Wrap the inner argument in single quotes instead of double quotes — the
+   outer host never interpolates inside a single-quoted string.
+2. Escape each literal `$` meant for the nested child with a backtick
+   (`` `$ ``) inside the double-quoted argument.
+3. Put a standalone `--%` (PowerShell's stop-parsing token) before the
+   first double-quoted segment — everything after it is passed through
+   verbatim, with no interpolation at all.
 
 **PowerShell step exit codes:** a `-Command`/`-EncodedCommand` script that
 ends without executing its own `exit` statement gets its *host* process exit

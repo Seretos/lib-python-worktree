@@ -1309,3 +1309,249 @@ def test_resolve_lower_priority_disabled_values(monkeypatch, value):
 def test_resolve_lower_priority_enabled_values(monkeypatch, value):
     monkeypatch.setenv("WORKTREE_SETUP_LOWER_PRIORITY", value)
     assert _resolve_lower_priority() is True
+
+
+# ---------------------------------------------------------------------------
+# Ticket #158: a PowerShell-routed `run:` line whose first token is a nested
+# `powershell`/`pwsh` invocation carrying a double-quoted argument containing
+# `$` is silently mangled by the OUTER PowerShell host's own string
+# interpolation before the inner shell ever sees it -- `$env:X` and `$true`
+# get expanded by the outer host, producing a syntactically broken argument
+# for the nested child. `_ps_double_evaluated_tokens` (new, ticket #158) is
+# meant to detect exactly this shape at step-build time so the caller can
+# raise loudly instead of half-running. It is currently a **stub that always
+# returns []** (phase=tests skeleton only) -- the positive-row assertions
+# below are the R2 driving-test evidence that detection is genuinely
+# missing; the negative-row assertions already pass against the stub (an
+# always-[] function never flags anything) and remain valid regression
+# coverage once real detection lands.
+# ---------------------------------------------------------------------------
+
+# The ticket's literal repro shape, reused verbatim by both the R1 (manager)
+# and R2 (helper-level) tests. The marker path here is a placeholder string
+# -- this constant is only ever fed to _ps_double_evaluated_tokens/
+# _build_step_command as static text, never actually executed.
+PS158_REPRO_RUN_LINE = (
+    'powershell -NoProfile -Command "$env:MCP_WORKTREE_TEST_MOCK_APP=1; '
+    "Set-Content -Path 'C:\\tmp\\ps158-marker.txt' -Value "
+    '$env:MCP_WORKTREE_TEST_MOCK_APP; while($true){Start-Sleep -Seconds 1}"'
+)
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        pytest.param(PS158_REPRO_RUN_LINE, id="ticket-158-repro"),
+        pytest.param('pwsh -Command "$( Get-Date )"', id="pwsh-subexpression"),
+        pytest.param(
+            r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -Command "$x"',
+            id="fully-qualified-path-variant",
+        ),
+        # Review round 1, finding R3 (false negative): a quoted interpreter
+        # path containing a space must still be recognised as a nested
+        # powershell/pwsh invocation -- the old path-prefix character class
+        # excluded whitespace unconditionally, even inside quotes, so this
+        # shape bypassed the guard entirely.
+        pytest.param(
+            r'"C:\Program Files\PowerShell\7\pwsh.exe" -Command "$x"',
+            id="quoted-interpreter-path-with-space",
+        ),
+        # Review round 1, finding R2 (false negative): an EVEN number of
+        # backticks before a `$`-token inside a double-quoted segment means
+        # the backticks escape each other, leaving `$` genuinely expandable
+        # -- this must be flagged, not exempted. (Compare the ODD-count
+        # negative row below, which must remain exempt.)
+        pytest.param(
+            'powershell -Command "``$env:X"',
+            id="doubled-backticks-before-dollar-still-expandable",
+        ),
+        # Review round 1, finding R4 (false negative): literal text that
+        # merely looks like `--%` sitting inside an EARLIER single-quoted
+        # argument is not PowerShell's real stop-parsing token -- a later,
+        # genuinely dangerous double-quoted `$`-segment must still be
+        # flagged.
+        pytest.param(
+            "powershell -Command 'literal --% test' \"$env:X\"",
+            id="literal-stop-parsing-lookalike-inside-earlier-single-quotes",
+        ),
+    ],
+)
+def test_ps_double_evaluated_tokens_flags_the_dangerous_shape(run_line):
+    """R2 driving test: a nested powershell/pwsh invocation carrying a
+    double-quoted argument containing a `$`-expandable token must be
+    flagged (non-empty result) -- fails RED against the current always-[]
+    stub, for the right reason (detection not yet implemented, not an
+    import/syntax error)."""
+    from lib_python_worktree.setup.runner import (  # noqa: PLC0415
+        _ps_double_evaluated_tokens,
+    )
+
+    assert _ps_double_evaluated_tokens(run_line) != []
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        # ticket #134's pinned line (grepped verbatim from
+        # test_powershell_step_exit_codes_propagate above) -- a nested
+        # powershell -Command whose double-quoted argument contains no `$`
+        # at all must never be flagged.
+        pytest.param(
+            'powershell -NoProfile -NonInteractive -Command "exit 3"',
+            id="ticket-134-pinned-line-no-dollar",
+        ),
+        # Escape #1: single-quoted inner argument -- never scanned.
+        pytest.param(
+            "powershell -Command '$env:X=1; while($true){}'",
+            id="single-quoted-escape",
+        ),
+        # Escape #2: backtick-escaped `$` inside the double-quoted argument
+        # (a single, ODD-count backtick -- the backtick escapes the `$`
+        # itself). Compare the doubled/EVEN-count positive row above, which
+        # must be flagged instead.
+        pytest.param(
+            'powershell -Command "`$env:X=1"',
+            id="backtick-escaped-dollar",
+        ),
+        # Review round 1, finding R1 (false positive): the whole argument is
+        # single-quoted, so the outer host never interpolates it -- the
+        # nested double-quotes (and the `$`-token inside them) are just
+        # inert literal text from the outer host's point of view and must
+        # never be scanned.
+        pytest.param(
+            'powershell -Command \'Write-Output "$env:X"\'',
+            id="nested-double-quotes-inside-single-quoted-argument",
+        ),
+        # Escape #3: a standalone --% token before the first double-quoted
+        # segment.
+        pytest.param(
+            'powershell -Command --% "$env:X=1"',
+            id="stop-parsing-token-escape",
+        ),
+        # Not a nested powershell/pwsh invocation at all -- must short-circuit
+        # to [] immediately regardless of what follows.
+        pytest.param('cmd /c "echo $x"', id="not-powershell-first-token"),
+        # Every existing parametrize row of
+        # test_build_step_command_powershell_round_trips_special_characters
+        # (ticket #109/#134 regression rows) -- none of these start with a
+        # nested powershell/pwsh invocation, so none may ever be flagged.
+        pytest.param('echo "double quoted"', id="existing-row-double-quoted"),
+        pytest.param("echo 'single quoted'", id="existing-row-single-quoted"),
+        pytest.param("echo back\\slash\\path", id="existing-row-backslash-path"),
+        pytest.param("echo `backtick`", id="existing-row-backtick"),
+        pytest.param(
+            "echo $env:VAR and $variable", id="existing-row-dollar-no-nesting"
+        ),
+        pytest.param("line one\nline two", id="existing-row-multiline"),
+        pytest.param(
+            "echo café accented and 中文 characters", id="existing-row-unicode"
+        ),
+    ],
+)
+def test_ps_double_evaluated_tokens_never_flags_escapes_or_unrelated_shapes(run_line):
+    """R2 driving test (negative rows): the three documented escapes and
+    every unrelated/non-nested shape must never be flagged. Already GREEN
+    against the current always-[] stub -- this is the mechanism-level
+    'narrowness' guard the plan calls for, not a RED signal by itself; it
+    exists so a future real implementation cannot regress into over-flagging
+    while making the positive rows above pass."""
+    from lib_python_worktree.setup.runner import (  # noqa: PLC0415
+        _ps_double_evaluated_tokens,
+    )
+
+    assert _ps_double_evaluated_tokens(run_line) == []
+
+
+def test_build_step_command_posix_path_never_inspects_ps158_repro():
+    """Guard: the POSIX (`bash -c`/`sh -c`) argv assembly path must return
+    the run line completely unchanged, even for the ticket #158 repro shape
+    -- _build_step_command's POSIX branch never calls
+    _ps_double_evaluated_tokens at all. Already GREEN today (the POSIX
+    branch has always appended verbatim); stays GREEN once the PowerShell
+    branch grows the new detection call, since that call is scoped to the
+    PowerShell/pwsh branch only."""
+    from lib_python_worktree.setup.runner import _build_step_command  # noqa: PLC0415
+
+    assert _build_step_command(["bash", "-c"], PS158_REPRO_RUN_LINE) == [
+        "bash",
+        "-c",
+        PS158_REPRO_RUN_LINE,
+    ]
+
+
+def test_setup_runner_ps158_repro_run_line_raises_before_any_spawn(tmp_path: Path):
+    """R1 sibling test, now genuinely platform-independent: with the real
+    fix in place, `_build_step_command` raises `RunLineExpansionError`
+    before `SetupRunner._invoke` ever calls `self._runner(...)`, so no
+    subprocess is spawned on ANY platform -- the earlier win32-only skipif
+    (kept pre-fix because a real, un-short-circuited spawn attempt would
+    hit `FileNotFoundError` off Windows rather than exercise the behaviour
+    under test) no longer applies and has been removed, per its own
+    "revisit/remove once the real fix lands" note.
+
+    SetupRunner.run() driven with a step using the ticket #158 repro run
+    line and shell='powershell' must raise an exception naming both the
+    offending `$`-token and the run line, and must do so before ever
+    invoking a subprocess (no log file for the step).
+
+    Historical context (why this bug existed): manually running the actual
+    encoded command on Windows showed the OUTER host's own string
+    interpolation mangling the nested `-Command` argument (`$env:...`
+    interpolates to empty, `$true` interpolates to the literal text `True`),
+    but the resulting runtime errors inside the nested child (a
+    CommandNotFoundException on the mangled `=1` token, then a
+    ParameterBindingException on `Set-Content -Value` with nothing bound to
+    it) were all *non-terminating* -- PowerShell's default
+    `-Command`/`-EncodedCommand` exit-code derivation only turns non-zero on
+    an *uncaught terminating* exception, so the nested child itself exited 0,
+    the outer host's `$?` read True, and ticket #134's own epilogue exited
+    0 too. Net effect pre-fix: SetupRunner.run() returned normally
+    (`SetupResult.ok` was True, a log file WAS written) -- exactly the
+    ticket's reported symptom. `timeout=20.0` only bounds the wait in case
+    this analysis is wrong on some other PowerShell version and a
+    not-actually-caught shape hangs instead of raising/returning.
+    """
+    from lib_python_worktree.core._exceptions import (  # noqa: PLC0415
+        RunLineExpansionError,
+        WorktreeError,
+    )
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    step = _PlainStep(run=PS158_REPRO_RUN_LINE, name="ps158-repro", shell="powershell")
+
+    with pytest.raises((WorktreeError, ValueError)) as exc_info:
+        runner.run(
+            setup=[step],
+            worktree_id="wt-ps158",
+            worktree_path=wt,
+            branch="main",
+            timeout=20.0,
+        )
+
+    exc = exc_info.value
+    message = str(exc)
+    assert "$env:MCP_WORKTREE_TEST_MOCK_APP" in message or "$true" in message
+    assert PS158_REPRO_RUN_LINE in message
+
+    # Test-critic F1: the two assertions above are unconstrained on their
+    # own -- the run line already contains the token text as a substring,
+    # so an implementation that names no token at all (e.g. a bare
+    # f"cannot run: {run_line}") would still satisfy them. Pin the
+    # structured `.tokens`/`.run_line` attributes too, so a message that
+    # merely embeds the run line verbatim without ever deriving a token
+    # cannot pass.
+    assert isinstance(exc, RunLineExpansionError)
+    assert exc.tokens, f"expected a non-empty .tokens list, got {exc.tokens!r}"
+    assert any(
+        tok in ("$env:MCP_WORKTREE_TEST_MOCK_APP", "$true") for tok in exc.tokens
+    ), f".tokens must contain the expected offending token; got {exc.tokens!r}"
+    assert exc.run_line == PS158_REPRO_RUN_LINE
+
+    log_dir = tmp_path / "logs" / "wt-ps158"
+    assert not log_dir.exists() or not any(log_dir.iterdir()), (
+        "a log file was written for the step -- proving a real subprocess "
+        "ran, contrary to the requirement that detection fires before any "
+        "spawn"
+    )

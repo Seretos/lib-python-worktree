@@ -40,3 +40,4 @@ htmlcov/
 .process-ticket-result.json
 .claude-session/
 .adev/
+/out.log
