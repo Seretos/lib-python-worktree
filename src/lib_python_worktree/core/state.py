@@ -27,6 +27,15 @@ _STOP_DETAIL_MAX_PIDS = 32
 # Reason vocabulary for ``StopDetail.reason`` -- one tag per
 # ``stop_incomplete``-setting branch in ``process_lifecycle.stop()``, listed
 # here in the same if/elif precedence order those branches use.
+# Ticket #157: a tracked pid that is alive but whose identity (start_times[role]
+# vs. the live process' real create_time) cannot be verified -- placed FIRST
+# in process_lifecycle.stop()'s if/elif chain: a verdict of None is checked
+# before any of the kill-attempt-derived reasons below, since no signal/kill
+# is ever attempted against the tracked pid in that case. A verdict of
+# False (dead, or alive-but-demonstrably-mismatched) never sets this reason
+# -- see stop()'s docstring for why that case is reported as a clean "our
+# process is gone" instead.
+STOP_REASON_IDENTITY_UNVERIFIED = "identity_unverified"
 STOP_REASON_SURVIVORS = "survivors"
 STOP_REASON_TREE_TRUNCATED = "tree_truncated"
 STOP_REASON_JOB_MEMBER_LIST_TRUNCATED = "job_member_list_truncated"
@@ -42,6 +51,7 @@ STOP_REASON_ORPHAN_SCAN_INCOMPLETE = "orphan_scan_incomplete"
 STOP_REASON_HANDLE_SCAN_EXHAUSTED = "handle_scan_exhausted"
 
 STOP_REASONS: Tuple[str, ...] = (
+    STOP_REASON_IDENTITY_UNVERIFIED,
     STOP_REASON_SURVIVORS,
     STOP_REASON_TREE_TRUNCATED,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
@@ -58,12 +68,21 @@ STOP_ATTEMPT_KILLED = "killed"
 STOP_ATTEMPT_ALREADY_EXITED = "already_exited"
 STOP_ATTEMPT_TRACKED_PID_MISSING = "tracked_pid_missing"
 STOP_ATTEMPT_NO_PROCESS_RECORDED = "no_process_recorded"
+# Ticket #157 fix cycle (R1, blocking): the tracked pid was alive at entry
+# but its identity could not be confirmed as ours (mismatched start_time, or
+# no recorded start_time at all -- a legacy record). No signal or kill was
+# ever attempted against it. Distinct from "already_exited": that outcome
+# means the pid was genuinely dead at entry, which is verifiably false here
+# -- reporting "already_exited" for a demonstrably-alive pid would
+# contradict this dataclass's own documented contract.
+STOP_ATTEMPT_UNCONFIRMED_ALIVE = "unconfirmed_alive"
 
 STOP_ATTEMPT_OUTCOMES: Tuple[str, ...] = (
     STOP_ATTEMPT_KILLED,
     STOP_ATTEMPT_ALREADY_EXITED,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
     STOP_ATTEMPT_NO_PROCESS_RECORDED,
+    STOP_ATTEMPT_UNCONFIRMED_ALIVE,
 )
 
 # Reason vocabulary for ``ShadowedContract.reason`` (ticket #100) -- one tag
@@ -142,6 +161,18 @@ class StopDetail:
     ``reason="tree_truncated"``, ``_JOB_MEMBER_LIST_MAX_SLOTS`` for
     ``reason="job_member_list_truncated"`` -- ``None`` for every other
     reason.
+
+    Ticket #157: ``reason="identity_unverified"`` means the tracked pid was
+    alive but its identity (``record.start_times[role]`` vs. the live
+    process' real ``create_time()``) could not be verified -- either no
+    prior identity was ever recorded (a legacy record) or the comparison
+    itself could not be completed. No signal or kill was ever attempted
+    against the tracked pid for this outcome -- withholding action on an
+    unverifiable identity is the whole point. Carries no
+    ``survivor_pids``/``truncated_at``/``skipped_passes`` (all left at their
+    defaults); ``kill_orphans_may_help`` is always ``False`` -- the orphan
+    scan is a path-heuristic scope widening, not a way to re-verify the
+    tracked pid's identity.
 
     ``skipped_passes`` mirrors ``_PartialList.skipped_passes`` and is only
     populated for ``reason="orphan_scan_incomplete"``.
@@ -224,6 +255,19 @@ class StopAttempt:
       ``WorktreeManager.stop()``'s no-op branch, for a role that has no
       entry in ``record.pids`` at all -- ``process_lifecycle.stop()`` (and
       therefore every other outcome above) was never even reached.
+    - ``"unconfirmed_alive"`` (ticket #157 fix cycle, R1): the tracked pid
+      was alive at entry but its identity could not be confirmed as ours --
+      either a mismatched ``start_times[role]`` or no recorded start_time at
+      all (a legacy record). No signal or kill was ever attempted against
+      it. Deliberately distinct from ``"already_exited"``: that outcome's
+      own message claims the tracked pid "had already exited at entry",
+      which would be actively false for this case -- the pid is verifiably
+      alive, just not confirmed ours. Takes priority over
+      ``"tracked_pid_missing"`` too, for the same reason: that outcome's
+      message also claims the tracked pid "had already exited at entry",
+      even on a call where an unrelated Job Object member happened to be
+      found and killed alongside a tracked pid whose identity was merely
+      unconfirmed, not actually dead.
 
     ``message`` mirrors :class:`StopDetail`'s message-parity convention:
     the exact human-readable string also passed to a log call for the same
@@ -232,7 +276,15 @@ class StopAttempt:
 
     ``tracked_pid`` / ``tracked_pid_alive`` record the pid that was checked
     and whether it was alive at entry -- ``tracked_pid`` is ``None`` for
-    ``"no_process_recorded"`` (there was no pid to check).
+    ``"no_process_recorded"`` (there was no pid to check). Ticket #157:
+    ``tracked_pid_alive`` is re-documented as "the tracked *process* was
+    confirmed alive" -- i.e. ``_pid_status(tracked_pid, expected_start_time)
+    is True``, not merely a raw ``_pid_alive`` reading. A pid that is alive
+    but whose identity could not be confirmed (verdict ``False`` or
+    ``None``) is never acted on and therefore reads as
+    ``tracked_pid_alive=False`` here too -- consistent with ``"killed"``
+    only ever being reported for a pid this call actually attempted to
+    terminate.
     ``kill_orphans_may_help`` mirrors :class:`StopDetail`'s hint: ``True``
     when a ``kill_orphans=True`` retry might catch something this call
     missed (only meaningful for ``"tracked_pid_missing"`` when the orphan
@@ -644,6 +696,25 @@ class WorktreeRecord:
     restart -- a legacy record with no ``variants`` key deserialises to
     ``{}``.
     """
+
+    start_times: Dict[str, float] = field(default_factory=dict)
+    """Ticket #157: per-role mapping of ``role`` -> the real
+    ``psutil.Process(pid).create_time()`` observed for that role's spawned
+    process at ``start()`` time. Mirrors ``pids``/``job_names``/
+    ``variants`` -- one entry per currently-tracked role, a role with no
+    captured identity (a legacy record, or a capture that could not
+    complete before the process vanished) has no key at all, never a
+    ``None`` value. Persisted through ``state.yaml``
+    (``yaml_store._record_to_dict``/``_record_from_dict``).
+
+    Used by ``yaml_store._pid_status(pid, expected_start_time)`` -- a
+    single tri-state helper that compares a live process' current
+    ``create_time()`` against the value recorded here bit-exactly -- so a
+    PID the OS has recycled for an unrelated process is never mistaken for
+    the one this record actually started. Consulted by ``start()``'s
+    already-running guard, ``stop()``, and ``_wait_or_kill``'s
+    identity-aware escalation; closes the "PID reuse is out of scope"
+    limitation previously documented on ``process_lifecycle.stop()``."""
 
     stop_detail: Optional[StopDetail] = None
     """Ticket #99: machine-readable reason the most recent ``stop()`` call

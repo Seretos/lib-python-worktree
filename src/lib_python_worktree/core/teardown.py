@@ -37,7 +37,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import portalocker
 
@@ -324,7 +324,6 @@ class _TeardownContext:
     store: "StateStore"
     allocator: Any
     target_absent: bool
-    owned_pids: Set[int]
     contract: Optional["WorktreeContract"]
     contract_found: bool
     contract_isolation: Optional[str]
@@ -346,6 +345,29 @@ class _TeardownContext:
     across every leg of this removal attempt -- distinct from
     ``record.killed_pids``, which only ever holds processes actually
     terminated."""
+    owned_pid_identities: Dict[str, Tuple[int, Optional[float]]] = field(
+        default_factory=dict
+    )
+    """Ticket #157 (review round-3 fix, blocking finding): a role -> (pid,
+    expected_start_time) snapshot taken by :func:`build_context` BEFORE
+    ``_phase_stop_processes`` (phase 2 of 10) runs. This is the natural
+    replacement for the deleted ``owned_pids`` field -- same purpose (give
+    tier-1 diagnosis something to check without re-scanning the whole
+    system), but carrying the role key and expected start time that
+    ``owned_pids`` (a bare pid set) never did, which is what
+    ``ctx.lifecycle._pid_status(pid, expected_start_time)`` needs.
+
+    Why a snapshot and not ``ctx.record.pids`` directly: teardown's phase
+    engine runs ``_phase_stop_processes`` (which calls ``ctx.lifecycle
+    .stop(...)`` for every role) long before ``_phase_stage_and_delete``
+    ever reaches a failure and calls :func:`_diagnose_and_retry` as bounded
+    diagnosis (phase 7). This ticket's own ``stop()`` unconditionally
+    clears ``record.pids[role]`` once it has made its verdict-based
+    decision, for both a ``True`` and a non-``True`` verdict -- so by the
+    time tier 1 would run, ``ctx.record.pids`` is already empty for every
+    role ``_phase_stop_processes`` touched. Reading the live dict there
+    made tier-1 diagnosis a dead path that always finds zero candidates.
+    Tier 1 must read this snapshot instead."""
     _status_cache: List[Optional[List[str]]] = field(default_factory=lambda: [None])
     _status_fetched: List[bool] = field(default_factory=lambda: [False])
 
@@ -410,22 +432,37 @@ def build_context(
     """Construct the shared :class:`_TeardownContext` for one removal
     attempt (ticket #135, A4).
 
-    Resolves the lifecycle module, computes ``target_absent`` (ticket #127)
-    and ``owned_pids`` (ticket #117), and loads the contract exactly once
-    (ticket #117: replaces the old duplicate ``_load_contract()`` calls) --
-    all of this is cheap, side-effect-free (beyond the FS/contract-load
-    reads themselves) setup that every phase may consume; the
-    ``_phase_guard_primary`` phase still runs first when
-    :func:`run_teardown` iterates :data:`_TEARDOWN_PHASES`, so a primary
-    checkout is refused before any destructive work regardless of this
-    setup having already run.
+    Resolves the lifecycle module, computes ``target_absent`` (ticket #127),
+    and loads the contract exactly once (ticket #117: replaces the old
+    duplicate ``_load_contract()`` calls) -- all of this is cheap,
+    side-effect-free (beyond the FS/contract-load reads themselves) setup
+    that every phase may consume; the ``_phase_guard_primary`` phase still
+    runs first when :func:`run_teardown` iterates :data:`_TEARDOWN_PHASES`,
+    so a primary checkout is refused before any destructive work regardless
+    of this setup having already run.
+
+    Ticket #157: the former ``owned_pids`` field (a plain ``{pid, ...}``
+    set) is replaced by ``owned_pid_identities``, a role -> (pid,
+    expected_start_time) snapshot taken here, BEFORE
+    ``_phase_stop_processes`` runs and (per this ticket's own ``stop()``
+    fix) unconditionally clears ``record.pids``/``record.start_times`` for
+    every role it touches. Tier 1 of :func:`_diagnose_and_retry` reads this
+    snapshot rather than the live (by-then-cleared) ``ctx.record.pids``, so
+    it still has each pid's *role* and expected start time available to
+    route the liveness probe through the identity-verified
+    ``ctx.lifecycle._pid_status`` instead of a bare ``psutil.pid_exists``,
+    even when it runs (as it always does, from phase 7) long after phase 2
+    already cleared ``record.pids``.
     """
     lifecycle = lifecycle_module
     if lifecycle is None:
         from . import process_lifecycle as lifecycle  # type: ignore[assignment]
 
     target_absent = _target_is_absent(record, force=force)
-    owned_pids = {pid for pid in record.pids.values()}
+
+    owned_pid_identities: Dict[str, Tuple[int, Optional[float]]] = {
+        role: (pid, record.start_times.get(role)) for role, pid in record.pids.items()
+    }
 
     contract_path = Path(record.repo_root) / CONTRACT_FILENAME
     try:
@@ -450,11 +487,11 @@ def build_context(
         store=store,
         allocator=allocator,
         target_absent=target_absent,
-        owned_pids=owned_pids,
         contract=contract,
         contract_found=contract_found,
         contract_isolation=contract_isolation,
         contract_load_error=contract_load_error,
+        owned_pid_identities=owned_pid_identities,
     )
 
 
@@ -724,6 +761,26 @@ def _diagnose_and_retry(ctx: _TeardownContext, *, trigger: str, retry) -> bool:
     Accessed via ``ctx.lifecycle`` (not a direct import), matching every
     other lifecycle call in this module, so tests can inject a mock
     lifecycle module exactly as they already do for ``ctx.lifecycle.stop``.
+
+    Ticket #157: tier 1 no longer trusts a bare ``psutil.pid_exists`` --
+    each owned pid is probed via ``ctx.lifecycle._pid_status(pid,
+    expected_start_time)``, still wrapped in the same bounded-call
+    primitive against ``ctx.failure_deadline``. Only a verdict of ``True``
+    (alive AND identity-confirmed) is treated as a confirmed blocker -- a
+    mismatched or unverifiable pid is never signalled/killed AND never
+    reported in ``ctx.blockers``, exactly like an unconfirmed liveness
+    probe.
+
+    Review round-3 fix (blocking finding): tier 1 iterates
+    ``ctx.owned_pid_identities`` -- the role -> (pid, expected_start_time)
+    snapshot :func:`build_context` took BEFORE ``_phase_stop_processes``
+    ran -- not the live ``ctx.record.pids``. By the time this function runs
+    (always from phase 7, ``_phase_stage_and_delete``), phase 2 has already
+    called ``ctx.lifecycle.stop(...)`` for every tracked role, and this
+    ticket's own ``stop()`` unconditionally clears ``record.pids[role]``
+    once it has made its verdict-based decision. Reading ``ctx.record.pids``
+    here would find it already empty on every real removal, making tier-1
+    diagnosis a dead path that always finds zero candidates.
     """
     record = ctx.record
     target = record.path + _STAGED_SUFFIX if trigger in ("rename", "residual") else record.path
@@ -736,12 +793,13 @@ def _diagnose_and_retry(ctx: _TeardownContext, *, trigger: str, retry) -> bool:
         )
         return False
 
-    import psutil
-
     tier1_candidates: List["KilledProcessInfo"] = []
-    for pid in ctx.owned_pids:
-        completed, alive = ctx.lifecycle._bounded_call(
-            lambda pid=pid: psutil.pid_exists(pid), deadline=ctx.failure_deadline
+    for role, (pid, expected_start_time) in ctx.owned_pid_identities.items():
+        completed, verdict = ctx.lifecycle._bounded_call(
+            lambda pid=pid, expected_start_time=expected_start_time: (
+                ctx.lifecycle._pid_status(pid, expected_start_time)
+            ),
+            deadline=ctx.failure_deadline,
         )
         if not completed:
             _logger.warning(
@@ -751,10 +809,14 @@ def _diagnose_and_retry(ctx: _TeardownContext, *, trigger: str, retry) -> bool:
                 record.id, pid,
             )
             continue
-        if alive:
-            tier1_candidates.append(
-                KilledProcessInfo(pid=pid, name="", cmdline=[], source="tracked")
-            )
+        if verdict is not True:
+            # Ticket #157: dead, mismatched, or unverifiable -- never a
+            # confirmed blocker, so it must never be signalled/killed AND
+            # never reported in ctx.blockers either (test-critic F8).
+            continue
+        tier1_candidates.append(
+            KilledProcessInfo(pid=pid, name="", cmdline=[], source="tracked")
+        )
     if tier1_candidates:
         ctx.blockers.extend(tier1_candidates)
         _logger.warning(

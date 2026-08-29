@@ -15,6 +15,7 @@ from lib_python_worktree.core.state import (
     STOP_ATTEMPT_NO_PROCESS_RECORDED,
     STOP_ATTEMPT_OUTCOMES,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
+    STOP_ATTEMPT_UNCONFIRMED_ALIVE,
     STOP_NO_OP_ISOLATION_NONE,
     STOP_NO_OP_NO_PROCESS_RECORDED,
     STOP_NO_OP_REASONS,
@@ -241,13 +242,18 @@ def test_worktree_record_default_stop_attempt_is_none():
 
 
 def test_stop_attempt_outcomes_vocabulary_membership():
-    """STOP_ATTEMPT_OUTCOMES names exactly the four outcome tags used by
-    process_lifecycle.stop() and WorktreeManager.stop()'s no-op branch."""
+    """STOP_ATTEMPT_OUTCOMES names exactly the five outcome tags used by
+    process_lifecycle.stop() and WorktreeManager.stop()'s no-op branch --
+    ticket #157 fix cycle (R1, blocking) added "unconfirmed_alive" for a
+    tracked pid that is alive at entry but whose identity could not be
+    confirmed as ours, distinct from "already_exited" (which would be
+    actively false for that case)."""
     assert set(STOP_ATTEMPT_OUTCOMES) == {
         STOP_ATTEMPT_KILLED,
         STOP_ATTEMPT_ALREADY_EXITED,
         STOP_ATTEMPT_TRACKED_PID_MISSING,
         STOP_ATTEMPT_NO_PROCESS_RECORDED,
+        STOP_ATTEMPT_UNCONFIRMED_ALIVE,
     }
 
 

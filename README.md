@@ -652,8 +652,11 @@ raises `ProcessAlreadyRunningError`.
 
 Whichever `variant` actually started a given `role` is recorded under
 `record.variants[role]` (persisted through `state.yaml`, mirroring
-`record.pids`/`record.job_names`: one entry per currently-tracked role, no
-entry at all for a role with no known variant). When `start()`'s
+`record.pids`/`record.job_names`/`record.start_times`: one entry per
+currently-tracked role, no entry at all for a role with no known variant).
+`record.start_times[role]` is the same shape, recording that role's spawned
+process' real `create_time()` (see "Stop status and `stop_detail`" above for
+the PID-reuse identity check that consults it). When `start()`'s
 `variant="default"` fallback resolves a *named* step (ticket #112 — a
 contract with exactly one `start:` step total, named or not),
 `record.variants[role]` records that step's own name (e.g. `"main"`), not
@@ -715,21 +718,30 @@ it reports `status="stop_incomplete"` instead of `"stopped"` and attaches a
 
 | `reason` | Meaning |
 |---|---|
+| `identity_unverified` | The tracked PID is alive, but its identity (`start_times[role]` vs. the live process' real `create_time()`) could not be verified — no prior identity was recorded (a legacy record), or the comparison itself could not complete. No signal or kill was attempted against it. |
 | `survivors` | One or more tracked PIDs were still alive after every kill attempt (`survivor_pids`, capped at 32, plus the true `survivor_count`). |
 | `tree_truncated` | The descendant-process-tree snapshot hit its node cap, so some descendants were never even examined. |
 | `job_member_list_truncated` | Windows-only: the Job Object's member list hit its slot cap. `kill_orphans` does not help here — `TerminateJobObject` already killed every member of that job regardless of enumeration. |
 | `orphan_scan_incomplete` | `kill_orphans=True` was passed but the orphan scan's own discovery pass was starved before finishing. |
 
 `stop_detail.kill_orphans_may_help` hints whether retrying with
-`kill_orphans=True` might resolve it — `False` for `orphan_scan_incomplete`,
-since that pass already ran. `stop_detail` is persisted to `state.yaml` and
-is cleared as soon as the record's status moves away from
-`"stop_incomplete"`.
+`kill_orphans=True` might resolve it — `False` for `orphan_scan_incomplete`
+(that pass already ran) and for `identity_unverified` (the orphan scan is a
+path-heuristic scope widening, not a way to re-verify a PID's identity).
+`stop_detail` is persisted to `state.yaml` and is cleared as soon as the
+record's status moves away from `"stop_incomplete"`.
 
-`stop_detail` does not address *which* process the tracked PID identifies —
-PID reuse (trusting a stale PID number without a process-identity check
-against its recorded start time) remains a known limitation, out of scope
-here; see ticket #87.
+PID reuse — trusting a stale PID number the OS has recycled onto an
+unrelated process — is closed by identity verification (ticket #157): every
+site that acts on a tracked PID (`start()`'s already-running guard, `stop()`,
+and `_wait_or_kill`'s graceful-wait window) first checks the live process'
+`create_time()` against the value `start()` recorded in `start_times[role]`
+at spawn time (bit-exact, no tolerance window). A mismatch or an
+unverifiable identity is never signalled or killed — `start()` abandons the
+existing entry and restarts instead of raising `ProcessAlreadyRunningError`,
+logging a `WARNING`; `stop()` reports `identity_unverified` (or, for a
+demonstrated mismatch, a clean "already gone") instead of acting on a
+possible stranger.
 
 ### Shadowed checkout-local contract
 
