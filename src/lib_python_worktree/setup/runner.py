@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from ..core._env_utils import _get_user_profile_env
+from ..core._exceptions import RunLineExpansionError
 
 
 # ---- duck-typed step interface ----------------------------------------------
@@ -211,6 +212,157 @@ _PS_EXIT_CODE_EPILOGUE = (
 )
 
 
+# Anchors the *first* token of a run line as a nested powershell/pwsh
+# invocation -- optionally quoted (in which case the path prefix may contain
+# spaces, since the quotes are what let a real run line spell a path like
+# ``"C:\Program Files\PowerShell\7\pwsh.exe"``), optionally prefixed by a
+# directory path ending in a path separator, optionally suffixed with
+# ``.exe``. Anything else (``cmd``, ``npm``, ``Get-Item``, ``echo``, ...)
+# does not match, so _ps_double_evaluated_tokens short-circuits to `[]`
+# immediately for it.
+_PS_NESTED_INTERPRETER_RE = re.compile(
+    r'^\s*(?:'
+    r'"(?:[^"]*[\\/])?(?:powershell|pwsh)(?:\.exe)?"'
+    r'|(?:[^\s"]*[\\/])?(?:powershell|pwsh)(?:\.exe)?'
+    r')(?=\s|$)',
+    re.IGNORECASE,
+)
+
+# `$`-expandable token, matched at a fixed start position (via `.match(s,
+# pos)`) once the caller's own quote-tracking walk has already established
+# that the position is inside an unescaped double-quoted region: `$env:X`,
+# `$true`, `$_`, `$(...)` (subexpression), `${x}` (braced). Backtick-escape
+# parity (escape #2) is handled by the walk itself, not by this regex.
+_PS_EXPANDABLE_TOKEN_RE = re.compile(r"\$(?:\{[^}]*\}|\(|[A-Za-z_?^$][\w:]*)")
+
+
+def _ps_double_evaluated_tokens(run_line: str) -> List[str]:
+    """Detect a PowerShell-routed ``run:`` line whose first token is a nested
+    ``powershell``/``pwsh`` invocation carrying a double-quoted argument that
+    contains a ``$``-expandable token (ticket #158).
+
+    The corruption this guards against: when such a run line is executed by
+    the *outer* PowerShell host (the interpreter ``_resolve_shell`` selects),
+    that host's own double-quoted-string interpolation expands ``$env:X``,
+    ``$true``, etc. *before* the nested ``powershell``/``pwsh`` child process
+    ever sees its ``-Command`` argument -- silently mangling it into a syntax
+    error the inner shell then fails on (or, in the ticket's reported case,
+    into something that still parses but does nothing useful), while the
+    caller (``start()``/``SetupRunner.run()``) is none the wiser.
+
+    Detection is deliberately narrow -- no general-purpose PowerShell parser:
+
+    1. ``run_line`` must start with a nested ``powershell``/``pwsh``
+       interpreter token (optionally quoted, optionally a path containing
+       spaces when quoted). Anything else returns ``[]`` immediately.
+    2. The remainder is walked **once**, left to right, tracking a single
+       piece of state -- "currently outside any quotes", "inside a
+       single-quoted region", or "inside a double-quoted region" -- rather
+       than scanning with independent regexes that cannot see each other's
+       context. This is what makes the three escapes compose correctly
+       instead of each being evaluated as if it were the only one in play:
+       - **Escape #1 (single-quoted):** while inside a single-quoted region,
+         nothing is inspected at all -- not even a literal ``"..."`` or
+         ``$...`` appearing inside it, since the outer host never
+         interpolates inside a single-quoted string. A double-quoted-looking
+         segment nested inside an outer single-quoted argument (e.g.
+         ``'Write-Output "$env:X"'``) is therefore correctly never scanned.
+       - **Escape #2 (backtick-escape):** while inside a double-quoted
+         region, a run of consecutive backticks immediately before a ``$``
+         (or a literal ``"``) is counted; an **odd** count means the last
+         backtick escapes that following character (a ``$`` is left as
+         inert literal text, a ``"`` does not end the segment) and an
+         **even** count means the backticks escape each other in pairs,
+         leaving the following character with its ordinary meaning (a ``$``
+         is genuinely expandable and IS collected, a ``"`` DOES end the
+         segment) -- a single-character lookbehind cannot express this
+         parity rule, only a walk that counts the run can.
+       - **Escape #3 (``--%`` stop-parsing token):** a standalone ``--%``
+         token is only recognised while the walk is *outside* any quoted
+         region -- literal text that merely looks like ``--%`` sitting
+         inside an earlier single- or double-quoted argument is just text
+         and never trips this escape. Hitting a genuine standalone ``--%``
+         stops the walk immediately (everything after it is passed through
+         PowerShell's parser verbatim, with no interpolation at all, so
+         nothing past it can be double-evaluated) but does not discard
+         ``$``-tokens already collected from segments seen before it.
+
+    Returns the list of offending ``$``-token strings found (empty when the
+    line does not match the dangerous shape).
+    """
+    match = _PS_NESTED_INTERPRETER_RE.match(run_line)
+    if not match:
+        return []
+
+    remainder = run_line[match.end():]
+    n = len(remainder)
+    tokens: List[str] = []
+    state: Optional[str] = None  # None | "single" | "double"
+    i = 0
+    while i < n:
+        ch = remainder[i]
+        if state == "double":
+            if ch == "`":
+                j = i
+                while j < n and remainder[j] == "`":
+                    j += 1
+                backtick_count = j - i
+                escaped = backtick_count % 2 == 1
+                i = j
+                if i < n and remainder[i] in ('"', "$"):
+                    if escaped:
+                        # the trailing backtick escapes the next char: treat
+                        # it as an inert literal and step past it.
+                        i += 1
+                    elif remainder[i] == '"':
+                        state = None
+                        i += 1
+                    else:  # genuinely-expandable '$' (even backtick count)
+                        m = _PS_EXPANDABLE_TOKEN_RE.match(remainder, i)
+                        if m:
+                            tokens.append(m.group(0))
+                            i = m.end()
+                        else:
+                            i += 1
+                continue
+            if ch == '"':
+                state = None
+                i += 1
+                continue
+            if ch == "$":
+                m = _PS_EXPANDABLE_TOKEN_RE.match(remainder, i)
+                if m:
+                    tokens.append(m.group(0))
+                    i = m.end()
+                else:
+                    i += 1
+                continue
+            i += 1
+            continue
+        if state == "single":
+            if ch == "'":
+                state = None
+            i += 1
+            continue
+        # state is None: outside any quoted region
+        if ch == "'":
+            state = "single"
+            i += 1
+            continue
+        if ch == '"':
+            state = "double"
+            i += 1
+            continue
+        if remainder.startswith("--%", i):
+            before_ok = i == 0 or remainder[i - 1].isspace()
+            after_idx = i + 3
+            after_ok = after_idx >= n or remainder[after_idx].isspace()
+            if before_ok and after_ok:
+                break  # genuine stop-parsing token: nothing after it parses
+        i += 1
+    return tokens
+
+
 def _resolve_shell(step_shell: Optional[str]) -> List[str]:
     """Return the ``[shell, "-c"/"-Command"-equivalent]`` prefix for a step.
 
@@ -317,9 +469,21 @@ def _build_step_command(shell_cmd: List[str], run_line: str) -> List[str]:
 
     Any other shell prefix (``bash -c`` / ``sh -c`` / an unrecognised
     prefix) is appended to verbatim, unchanged from before this fix.
+
+    **Ticket #158:** before any of the above, a PowerShell/pwsh run line is
+    scanned by ``_ps_double_evaluated_tokens`` for the double-evaluation
+    shape (a nested ``powershell``/``pwsh`` invocation carrying a
+    double-quoted argument with a ``$``-expandable token). A non-empty
+    result raises ``RunLineExpansionError`` here, before ``run_line`` is
+    ever base64-encoded and before any subprocess is spawned -- this is the
+    only place that call happens; the ``bash -c``/``sh -c`` branch is never
+    scanned at all.
     """
 
     if shell_cmd and shell_cmd[0] in _POWERSHELL_INTERPRETERS:
+        tokens = _ps_double_evaluated_tokens(run_line)
+        if tokens:
+            raise RunLineExpansionError(run_line=run_line, tokens=tokens)
         prefix = shell_cmd[:-1] if shell_cmd[-1] == "-Command" else shell_cmd
         full_line = run_line + _PS_EXIT_CODE_EPILOGUE
         blob = base64.b64encode(full_line.encode("utf-16-le")).decode("ascii")
@@ -642,6 +806,7 @@ __all__ = (
     "SetupStep",
     "SetupStepResult",
     "_PlainStep",
+    "_ps_double_evaluated_tokens",
     "_resolve_lower_priority",
     "_resolve_setup_timeout",
     "log_dir_for",

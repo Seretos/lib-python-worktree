@@ -1571,7 +1571,10 @@ def test_find_by_branch_matches_after_create_forward_slash_input(
 # ---------------------------------------------------------------------------
 
 import sys  # noqa: E402 – after sys-level imports
+import time  # noqa: E402 – after sys-level imports
 from unittest.mock import MagicMock, call, patch  # noqa: E402 – after sys-level imports
+
+import yaml  # noqa: E402 – after sys-level imports
 
 from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: E402
 from lib_python_worktree.contract.loader import ContractError, ContractValidationError  # noqa: E402
@@ -2576,6 +2579,144 @@ def test_manager_start_real_spawn_native_exit_code_propagates(
 
     assert result.status == "exited"
     assert result.returncode == 3
+
+
+# ---------------------------------------------------------------------------
+# Ticket #158: a `start:` step written as a self-wrapped nested PowerShell
+# one-liner (`powershell -Command "$env:X=1; ...; while($true){...}"`) is
+# silently corrupted by the OUTER PowerShell host's own string interpolation
+# before the inner shell ever sees it -- `$env:X` and `$true` get expanded by
+# the outer host, producing a syntactically broken argument for the nested
+# child, while WorktreeManager.start() reports success anyway.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_git
+@pytest.mark.skipif(sys.platform != "win32", reason="win32-only regression")
+def test_manager_start_ps158_repro_run_line_does_not_silently_half_run(
+    git_repo: Path,
+    manager_factory: Callable[..., WorktreeManager],
+    tmp_path: Path,
+):
+    """R1 driving test (THE primary AC): drive the ticket's exact repro shape
+    through a REAL `.seretos/worktree-setup.yml` contract file and the real
+    `WorktreeManager.create()`/`start()` path -- not a patched
+    `_load_contract` -- for the strongest fidelity this repo can give to the
+    ticket's `environment_start` MCP-seam AC (the MCP wrapper itself lives in
+    a separate repo, out of scope here).
+
+    Must resolve to exactly one of:
+    (a) success -- the process is alive (`status == "running"`) AND the
+        marker file exists with the expected content ('1'), or
+    (b) failure -- an exception (WorktreeError or ValueError) is raised
+        whose message names both the run line and the offending `$`-token.
+
+    Today's actual behaviour is neither: start() raises nothing (the outer
+    PowerShell host silently mangles the nested `-Command` argument via its
+    own string interpolation -- `$env:...` interpolates to empty, `$true`
+    interpolates to the literal text `True` -- before the inner shell ever
+    runs its intended code). The resulting runtime errors inside the
+    mangled inner command (confirmed manually: a CommandNotFoundException
+    on the leftover `=1` token, then a ParameterBindingException on
+    `Set-Content -Value` with nothing bound to it) are non-terminating, so
+    PowerShell's own exit-code derivation reports success (0) despite doing
+    nothing useful -- exactly the ticket's reported symptom. Net effect:
+    the marker file is never written, because `Set-Content` never actually
+    received the interpolated-away value. This must fail RED for that
+    reason -- not a hard-coded 'status == exited' assumption (the
+    plan-critic flagged that the exact reported status is not guaranteed),
+    but the observable fact that neither branch (a) nor (b) held within the
+    wait window.
+    """
+    marker = tmp_path / "ps158-marker.txt"
+    run_line = (
+        'powershell -NoProfile -Command "$env:MCP_WORKTREE_TEST_MOCK_APP=1; '
+        f"Set-Content -Path '{marker}' -Value $env:MCP_WORKTREE_TEST_MOCK_APP; "
+        'while($true){Start-Sleep -Seconds 1}"'
+    )
+
+    contract_dir = git_repo / ".seretos"
+    contract_dir.mkdir()
+    contract_text = yaml.safe_dump(
+        {"version": 1, "isolation": "full", "start": [{"run": run_line}]},
+        sort_keys=False,
+    )
+    (contract_dir / "worktree-setup.yml").write_text(contract_text, encoding="utf-8")
+
+    mgr = manager_factory()
+    record = mgr.create(str(git_repo), "feature/ps158-repro")
+
+    caught: "Optional[BaseException]" = None
+    result = None
+    try:
+        result = mgr.start(record.id)
+    except (WorktreeError, ValueError) as exc:
+        caught = exc
+
+    try:
+        if caught is not None:
+            from lib_python_worktree.core._exceptions import (  # noqa: PLC0415
+                RunLineExpansionError,
+            )
+
+            message = str(caught)
+            assert run_line in message, (
+                "branch (b): exception message must name the offending "
+                f"run line verbatim; got: {message!r}"
+            )
+            assert (
+                "$env:MCP_WORKTREE_TEST_MOCK_APP" in message or "$true" in message
+            ), (
+                "branch (b): exception message must name the offending "
+                f"$-token; got: {message!r}"
+            )
+            # Test-critic F2: the two message-substring assertions above are
+            # unconstrained on their own -- the run line already contains
+            # the token text, so an implementation that names no token at
+            # all would still satisfy them. Pin the structured
+            # `.tokens`/`.run_line` attributes too, so a message that
+            # merely embeds the run line verbatim without ever deriving a
+            # token cannot pass.
+            assert isinstance(caught, RunLineExpansionError), (
+                f"expected RunLineExpansionError, got {type(caught)!r}"
+            )
+            assert caught.tokens, (
+                f"expected a non-empty .tokens list, got {caught.tokens!r}"
+            )
+            assert any(
+                tok in ("$env:MCP_WORKTREE_TEST_MOCK_APP", "$true")
+                for tok in caught.tokens
+            ), f".tokens must contain the expected offending token; got {caught.tokens!r}"
+            assert caught.run_line == run_line
+        else:
+            # branch (a): poll for the marker within a bounded wait window --
+            # a single point-in-time check would race the child process.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.1)
+            marker_ok = (
+                marker.exists()
+                and marker.read_text(encoding="utf-8").strip() == "1"
+            )
+            assert (
+                result is not None
+                and result.status == "running"
+                and marker_ok
+            ), (
+                "start() reported success without raising (no WorktreeError/"
+                "ValueError), but the marker file was never written within "
+                "the wait window -- this is the ticket #158 corruption: the "
+                "outer PowerShell host's own string interpolation mangled "
+                "the nested `powershell -Command \"...\"` argument before "
+                "the inner shell ever ran, so neither branch (a) nor (b) of "
+                "the acceptance criterion held "
+                f"(result={result!r}, marker.exists()={marker.exists()})"
+            )
+    finally:
+        try:
+            mgr.stop(record.id)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def test_manager_start_unknown_variant_raises_worktree_error(tmp_path: Path):

@@ -439,6 +439,71 @@ class VariantResolutionError(WorktreeError, ValueError):
         super().__init__(message)
 
 
+class RunLineExpansionError(WorktreeError, ValueError):
+    """Raised when a ``run:`` line's first token is a nested
+    ``powershell``/``pwsh`` invocation whose double-quoted ``-Command``
+    argument contains a ``$``-expandable token (ticket #158).
+
+    Modelled on ``UnknownVariantError``'s dual base (``WorktreeError`` and
+    ``ValueError``) so callers catching either base keep working.
+
+    The corruption this guards against: when such a ``run:`` line is
+    executed by the *outer* shell host that ``_resolve_shell`` selected
+    (itself ``powershell.exe``/``pwsh`` for this branch), that host's own
+    double-quoted-string interpolation expands ``$env:X``, ``$true``, etc.
+    *before* the nested ``powershell``/``pwsh`` child process ever parses its
+    own ``-Command`` argument -- silently mangling it into something the
+    inner shell then either fails on loudly, or (worse, and the ticket's
+    actual reported symptom) fails on *silently*, because the mangled
+    argument still happens to parse as valid-but-wrong PowerShell and the
+    host's own exit-code derivation reports success anyway.
+
+    Raised at step-build time, in ``_build_step_command``, before the run
+    line is base64-encoded and before any subprocess is spawned -- so no
+    process runs and no step log file is written for the offending step.
+
+    Both ``run_line`` (the full offending line, verbatim) and ``tokens``
+    (the list of offending ``$``-token strings ``_ps_double_evaluated_tokens``
+    found) are stored as attributes so callers can react programmatically
+    without parsing the message text.
+
+    Three escapes avoid this detection entirely (all named in the message):
+
+    1. Wrap the inner argument in single quotes instead of double quotes --
+       the outer PowerShell host does not interpolate inside a single-quoted
+       string, so a single-quoted inner argument is never scanned for
+       ``$``-tokens at all.
+    2. Escape each literal ``$`` you want the nested child (not the outer
+       host) to see with a backtick (`` `$ ``) inside the double-quoted
+       argument.
+    3. Prefix the nested invocation's own arguments with a standalone
+       ``--%`` (PowerShell's stop-parsing token) before the first
+       double-quoted segment.
+    """
+
+    def __init__(self, *, run_line: str, tokens: "List[str]") -> None:
+        token_list = list(tokens)
+        tokens_repr = ", ".join(repr(t) for t in token_list)
+        message = (
+            f"run: line's first token is a nested powershell/pwsh "
+            f"invocation whose double-quoted -Command argument contains "
+            f"the $-expandable token(s) {tokens_repr}. The OUTER "
+            f"PowerShell/pwsh host chosen to run this step interpolates "
+            f"$-tokens inside a double-quoted string BEFORE the nested "
+            f"powershell/pwsh child ever parses its own -Command argument, "
+            f"silently corrupting it (ticket #158). Offending run line: "
+            f"{run_line}. To avoid this: (1) wrap the inner argument in "
+            f"single quotes instead of double quotes, so the outer host "
+            f"never interpolates it, (2) escape each literal $ meant for "
+            f"the nested child with a backtick (`$) inside the "
+            f"double-quoted argument, or (3) put a standalone --% "
+            f"(stop-parsing token) before the first double-quoted segment."
+        )
+        super().__init__(message)
+        self.run_line = run_line
+        self.tokens = token_list
+
+
 class PrimaryCheckoutError(WorktreeError):
     """Raised when an operation that would delete a checkout is attempted
     against a primary (main-clone) record.
@@ -510,6 +575,7 @@ __all__ = [
     "GitTimeoutError",
     "InvalidRepoError",
     "PrimaryCheckoutError",
+    "RunLineExpansionError",
     "UnknownVariantError",
     "VariantResolutionError",
     "WorktreeDirLockedError",

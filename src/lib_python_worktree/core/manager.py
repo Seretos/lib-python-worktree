@@ -31,7 +31,7 @@ from ..contract.loader import (
     load as _load_contract,
 )
 from ._env_utils import _get_user_profile_env
-from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitCommandError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, UnknownVariantError, VariantResolutionError, WorktreeDirLockedError, WorktreeError, WorktreeRemovalBlockedError  # noqa: F401 — re-exported
+from ._exceptions import CheckoutTargetError, DirtyWorktreeError, GitCommandError, GitTimeoutError, InvalidRepoError, PrimaryCheckoutError, RunLineExpansionError, UnknownVariantError, VariantResolutionError, WorktreeDirLockedError, WorktreeError, WorktreeRemovalBlockedError  # noqa: F401 — re-exported
 from ._git_utils import _resolve_git_timeout, _run_git  # noqa: F401 — re-exported
 from .checkout import (
     CheckoutInfo,
@@ -2089,6 +2089,7 @@ __all__ = (
     "ManagerConfig",
     "PrimaryCheckoutError",
     "RepoListing",
+    "RunLineExpansionError",
     "SetupIncompleteError",
     "UnknownVariantError",
     "VariantResolutionError",
