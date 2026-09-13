@@ -1,0 +1,48 @@
+name: Task
+description: A change with no single user-visible symptom -- refactor, docs, CI, infra, chore -- filed in the frame shape the clarifier expects.
+labels: [task]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What changes, and for whom -- the person or process that benefits.
+      placeholder: "Change X so that Y."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: >
+        For a runtime behaviour, state the evidence rule: a real call
+        against the real component, in the state described in Goal --
+        prose, documentation, or a string/literal assertion does not
+        satisfy it. For a non-runtime task, state instead what a reviewer
+        can check in the diff, output, result, or code.
+      placeholder: "A reviewer can check that the diff removes X."
+    validations:
+      required: true
+  - type: textarea
+    id: prior_attempts
+    attributes:
+      label: Prior attempts
+      description: Link any closed ticket that attempted the same change, or write "none".
+    validations:
+      required: false
+  - type: textarea
+    id: suggested_fix
+    attributes:
+      label: Suggested fix
+      description: >
+        Optional. Include a "Premises:" line naming any capability, version,
+        schema, or file this fix assumes but has not verified.
+    validations:
+      required: false
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Optional. What this ticket deliberately does not do.
+    validations:
+      required: false

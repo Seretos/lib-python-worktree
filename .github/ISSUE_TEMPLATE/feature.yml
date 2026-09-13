@@ -1,0 +1,49 @@
+name: Feature
+description: A new capability a user gains -- filed in the frame shape the clarifier expects.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: >
+        The behaviour the user gains: who can do what afterwards that they
+        cannot do today. A new capability is not a "no user-visible symptom"
+        case -- the symptom is the behaviour the user gains.
+      placeholder: "A user of X can Y, which today requires Z."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: >
+        State the evidence rule: a real call against the real component that
+        exercises the new behaviour. Prose, documentation, or a
+        string/literal assertion does not satisfy it.
+      placeholder: "Calling X with <input> returns <expected>."
+    validations:
+      required: true
+  - type: textarea
+    id: prior_attempts
+    attributes:
+      label: Prior attempts
+      description: Link any closed ticket that attempted the same capability, or write "none".
+    validations:
+      required: false
+  - type: textarea
+    id: suggested_fix
+    attributes:
+      label: Suggested fix
+      description: >
+        Optional. Include a "Premises:" line naming any capability, version,
+        schema, or file this fix assumes but has not verified.
+    validations:
+      required: false
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Optional. What this ticket deliberately does not do.
+    validations:
+      required: false

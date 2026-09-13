@@ -1,0 +1,56 @@
+name: Bug report
+description: A user-visible symptom -- a hang, crash, wrong result, slowness, or a leak -- filed in the frame shape the clarifier expects.
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >
+        Name the real call, the state it was in, and the outcome observed --
+        a hang, a crash, a wrong result, a slow response, a leak. An internal
+        quantity (a counter, a thread count) is never a sufficient
+        observation on its own; a user never sees one.
+      placeholder: "Calling X while Y returns Z instead of W."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: >
+        State the evidence rule: a real call, against the same real
+        component, in the state described in Problem. Prose, documentation,
+        or a string/literal assertion does not satisfy this for runtime
+        behaviour -- a wrong implementation can match a string as easily as
+        a right one.
+      placeholder: "Calling X while Y returns <expected> within <n>s."
+    validations:
+      required: true
+  - type: textarea
+    id: prior_attempts
+    attributes:
+      label: Prior attempts
+      description: >
+        Link every closed ticket on the same symptom, and say why the
+        symptom survived each one -- or write "none".
+      placeholder: "none"
+    validations:
+      required: true
+  - type: textarea
+    id: suggested_fix
+    attributes:
+      label: Suggested fix
+      description: >
+        Optional. Include a "Premises:" line naming any capability, version,
+        schema, or file this fix assumes but has not verified.
+      placeholder: "Premises: none"
+    validations:
+      required: false
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Optional. What this ticket deliberately does not do.
+    validations:
+      required: false
