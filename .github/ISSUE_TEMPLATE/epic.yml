@@ -1,0 +1,26 @@
+name: Epic
+description: A package of tickets bundled into one branch and one PR -- filed with the same headings the gatekeeper writes when it bundles a package itself.
+labels: [epic]
+body:
+  - type: textarea
+    id: children
+    attributes:
+      label: Children
+      description: >
+        One ticket per line, in the form "- #<id> <title>" -- every ticket
+        this epic bundles.
+      placeholder: |
+        - #12 Fix the thing
+        - #13 Fix the other thing
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Rationale
+      description: >
+        Why these tickets are one package -- what they share (a collision
+        in the same files, or a batch of small effort) rather than being
+        processed separately.
+    validations:
+      required: true
