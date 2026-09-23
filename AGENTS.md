@@ -170,61 +170,34 @@ only, not on the workflow.
 `Seretos/agent-worktree` and `Seretos/workboard`. Never hand-bump `version` in
 `pyproject.toml`.
 
-Each bump ticket's body now carries a `### What changed` section populated
-from `gh release view`'s changelog, degrading to a `::warning::` plus a
-release-page link (and truncating at 30000 characters) when the fetch fails
-or returns nothing. The board-add step also resolves the `Status` field's
-`Backlog` option id at runtime and moves the card there instead of leaving it
-in automation's default `Todo` column, degrading to a `::warning::` (card
-left in its default column) if the field/option lookup or the move itself
-fails.
+The bump-ticket filing itself is delegated to one central, deliberately
+unpinned (`@main`) composite action,
+`Seretos/agent-plugin-dev/.github/actions/notify-consumers@main`, called as a
+single `continue-on-error: true` step after "Create GitHub Release" with
+`version`/`source_repo`/`consumers`/`gh_token` inputs. This repo only
+supplies the facts (its own version, its own repo, the consumer list); the
+changelog fetch, per-consumer idempotency check, label handling, and Backlog
+board placement all live in that central action, not here — so they can
+change once for every producer repo that calls it, instead of drifting across
+per-repo copies.
 
-Each consumer has its own dedicated ticket step with `continue-on-error: true`,
-so a broken or missing token for one consumer never blocks the other or the
-release itself.
+- **Consumer list:** `Seretos/agent-worktree Seretos/workboard`, passed as
+  the `consumers` input (space-separated `owner/repo`).
+- **`ECOSYSTEM_TOKEN`** — classic PAT with the **`repo`** scope (Issues:
+  write on both consumer repos) **and** the **`project`** scope (fine-grained
+  PATs have no Projects permission at all, a hard GitHub platform limitation).
+  Passed as the step's `gh_token` input; used by the central action for both
+  the ticket-filing and the board-add calls.
 
-- **`WORKTREE_TICKET_TOKEN`** — classic PAT with the **`repo`** scope
-  (Issues: write on `Seretos/agent-worktree`) **and** the **`project`**
-  scope. Used for the agent-worktree ticket step and its board-add follow-up.
-- **`WORKBOARD_TICKET_TOKEN`** — classic PAT with the **`repo`** scope
-  (Issues: write on `Seretos/workboard`) **and** the **`project`** scope.
-  Used for the workboard ticket step and its board-add follow-up.
-
-`GITHUB_TOKEN` cannot open cross-repo issues, so both PATs are required.
-Fine-grained PATs cannot be used here — they have no "Projects" permission
-at all, a hard GitHub platform limitation, not a setting to look for harder
-in the UI; only classic PATs (Tokens (classic)) expose the `project` scope.
-
-Right after filing (or finding) each ticket, a follow-up step adds it to the
-`users/Seretos/projects/2` board via `gh project item-add`, reusing that
-consumer's own ticket token — no separate board secret. Each per-consumer
-classic PAT above carries both `repo` and `project` scopes, so it covers both
-its ticket step and its board-add. Missing `project` scope → the board-add is
-skipped or logged as a `::warning::`, never fails the run — the ticket itself
-still opens normally.
-
-**If the automatic step was skipped or failed**, re-file manually by running
-the `open-dep-ticket` workflow (`.github/workflows/ticket.yml`) via "Run
-workflow" in GitHub Actions. Supply:
-
-- `version` -- the semver string (no leading `v`), e.g. `0.2.0`.
-- `consumers` -- space-separated `owner/repo` targets (default:
-  `Seretos/agent-worktree Seretos/workboard`).
-
-The workflow is idempotent: it checks for an open issue with the exact same
-title before creating one, so running it twice is safe. It selects the correct
-token per consumer automatically and marks the run red if any consumer fails,
-naming the offending consumer in the error output.
-
-**Human prerequisite -- `WORKTREE_TICKET_TOKEN`:** create this repository secret
+**Human prerequisite -- `ECOSYSTEM_TOKEN`:** create this repository secret
 (Settings -> Secrets -> Actions) once before the first release. Generate a
 **classic PAT** (Settings -> Developer settings -> Personal access tokens ->
 **Tokens (classic)**) with the `repo` scope (Issues: write on
-`Seretos/agent-worktree`) and the `project` scope so the same token can add
-the ticket to project board 2.
+`Seretos/agent-worktree` and `Seretos/workboard`) and the `project` scope so
+the same token can add each ticket to project board 2.
 
-**Human prerequisite -- `WORKBOARD_TICKET_TOKEN`:** create this repository secret
-(Settings -> Secrets -> Actions) once before the first release. Generate a
-**classic PAT** with the `repo` scope (Issues: write on `Seretos/workboard`)
-and the `project` scope so the same token can add the ticket to project
-board 2.
+**If the automatic step was skipped or failed**, re-file manually via the
+`open-dep-ticket` workflow in the `Seretos/agent-plugin-dev` meta-repo ("Run
+workflow" in GitHub Actions there) rather than anything in this repo -- this
+repo no longer carries its own recovery workflow; recovery is centralized
+alongside the notification logic it recovers.

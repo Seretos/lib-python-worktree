@@ -1,13 +1,13 @@
 name: lint
 
 # Workflow-definition linter. Catches invalid `.github/workflows/*.yml`
-# BEFORE merge -- closing the gap that let release.yml / ticket.yml ship
-# broken YAML (see PR fixing the column-0 heredoc):
+# BEFORE merge -- closing the gap that let release.yml ship broken YAML
+# (see PR fixing the column-0 heredoc):
 #
 #   * pytest (test.yml) is green and never parses the workflow files, so a
 #     broken workflow is invisible to it.
-#   * release.yml / ticket.yml are workflow_dispatch-only, so they are never
-#     triggered by a PR -- there is no run that could fail in CI.
+#   * release.yml is workflow_dispatch-only, so it is never triggered by a
+#     PR -- there is no run that could fail in CI.
 #   * GitHub's "Invalid workflow file" annotation is NOT a blocking status
 #     check, so it doesn't stop a merge; it only surfaces on the Actions tab
 #     after the push lands on main.
