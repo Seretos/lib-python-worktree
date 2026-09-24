@@ -696,7 +696,18 @@ healthy sibling process is never mistaken for an orphan:
   `timeout` is scanned, and the `kill_orphans=False` hint-only probe is
   bounded by the same `orphan_floor` reserved for an actual
   `kill_orphans=True` scan (see the cost paragraph below), not the full
-  `timeout`.
+  `timeout`. Building the other-role protected set itself (walking each
+  sibling's own descendant process tree) is bounded too, out of the same
+  `orphan_floor`/`timeout` budget — it is not a separate, unbounded cost on
+  top of the scan it precedes.
+- Because nothing serializes `stop()` against a concurrent `start()` for the
+  *same* role, a pid that `start()` writes mid-sweep cannot be in the
+  protected set built at the top of the sweep (it does not exist yet). Both
+  branches re-check the role's membership immediately after the scan/kill
+  returns: if a `start()` raced the sweep, the call reports
+  `status="stop_incomplete"` with `stop_detail.reason ==
+  "concurrent_start_race"` instead of a stale `"no process recorded"`/
+  `"stopped"` verdict for a role that is, right now, actually running.
 
 Do not pass `kill_orphans=True` on every call defensively — on Windows its
 cost is dominated by a **system-wide** OS handle-table scan, budgeted at 15s

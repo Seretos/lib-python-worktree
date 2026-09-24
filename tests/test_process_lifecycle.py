@@ -35,6 +35,7 @@ from lib_python_worktree.core.process_lifecycle import (
     ProcessNotRunningError,
     _BoundedQueryWorker,
     _GraceBudget,
+    _PartialList,
     _QueryStatus,
     _HANDLE_QUERY_GRACE_BUDGET_SEC,
     _HANDLE_QUERY_GRACE_SEC,
@@ -43,6 +44,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _MAX_WEDGED_HANDLE_WORKERS,
     _compute_protected_pids,
     _describe_pid,
+    _detect_concurrent_start_race,
     _find_blocking_processes,
     _force_kill,
     _kill_blocking_processes,
@@ -68,6 +70,7 @@ from lib_python_worktree.core.state import (
     STOP_ATTEMPT_KILLED,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
     STOP_ATTEMPT_UNCONFIRMED_ALIVE,
+    STOP_REASON_CONCURRENT_START_RACE,
     STOP_REASON_IDENTITY_UNVERIFIED,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
@@ -3428,6 +3431,263 @@ class TestSweepUntrackedOrphans:
         assert complete is True
         assert protected == {222, 333, 444}
         assert 111 not in protected
+
+
+class TestSweepUntrackedOrphansBoundedCost:
+    """Ticket #165 fix round (R1, blocking): _compute_protected_pids used to
+    call a bare, unbounded _process_tree() per sibling tracked role --
+    measured by the reviewer at ~6s on a cold call, with no timeout/deadline
+    anywhere on it. That both contradicted the plan's/README's/docstrings'
+    own "bounded by orphan_floor" claim and let _sweep_untracked_orphans'
+    (and therefore stop()'s) total wall time exceed the caller's `timeout`
+    by an unbounded amount. These tests pin the fix: a slow/wedged sibling
+    walk must be cut short by a real deadline, not silently added on top of
+    whatever budget the caller asked for."""
+
+    def test_compute_protected_pids_bounded_by_deadline_on_slow_process_tree(self):
+        """Direct unit coverage: a _process_tree() call that does not
+        resolve before *deadline* must not block _compute_protected_pids
+        past it -- the sibling's own pid is still protected, but complete
+        must become False rather than the call silently waiting out the
+        slow call."""
+        record = _make_record(
+            "wt-protect-slow", pids={"main": 111, "web": 222}
+        )
+
+        def _slow_process_tree(pid):
+            time.sleep(2.0)
+            return []
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._process_tree",
+            side_effect=_slow_process_tree,
+        ):
+            deadline = time.monotonic() + 0.2
+            start_t = time.monotonic()
+            protected, complete = _compute_protected_pids(
+                record, "main", deadline=deadline
+            )
+            elapsed = time.monotonic() - start_t
+
+        assert elapsed < 1.5, (
+            f"_compute_protected_pids took {elapsed:.2f}s against a 0.2s "
+            f"deadline -- it must not block past the deadline waiting on a "
+            f"slow/wedged _process_tree() call"
+        )
+        assert complete is False
+        assert 222 in protected, "the sibling's own pid is still protected"
+
+    def test_sweep_untracked_orphans_probe_mode_bounded_by_orphan_floor(
+        self, tmp_path
+    ):
+        """Driving test, real timing (no mocked clock): with a slow sibling
+        _process_tree() call, a hint-only (kill_orphans=False) sweep must
+        stay bounded by orphan_floor -- not silently add the slow call's
+        full cost on top.
+
+        Expected RED reason (pre-fix): _compute_protected_pids called
+        _process_tree() bare, with no timeout/deadline at all -- this call
+        would take >= 2.0s (the mocked sleep) even though `timeout` is only
+        0.5s. Verified directly against the pre-fix module (git HEAD at the
+        start of this fix round): elapsed measured at ~2.15s there.
+        Expected GREEN: the call returns comfortably under 1.5s."""
+        record = _make_record(
+            "wt-protect-cost",
+            path=str(tmp_path),
+            backing="worktree",
+            pids={"main": 111, "web": 222},
+        )
+
+        def _slow_process_tree(pid):
+            time.sleep(2.0)
+            return []
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._process_tree",
+            side_effect=_slow_process_tree,
+        ):
+            start_t = time.monotonic()
+            result = _sweep_untracked_orphans(
+                record, "main", timeout=0.5, kill_orphans=False
+            )
+            elapsed = time.monotonic() - start_t
+
+        assert elapsed < 1.5, (
+            f"_sweep_untracked_orphans took {elapsed:.2f}s against a 0.5s "
+            f"timeout -- the protected-pid computation must be bounded, "
+            f"not block on a slow/wedged sibling _process_tree() call"
+        )
+        assert result == ([], False, None)
+
+    def test_sweep_untracked_orphans_kill_mode_survives_cold_sibling_walk(
+        self, tmp_path
+    ):
+        """Regression for a follow-up bug this fix round introduced and then
+        fixed in the same round: reusing orphan_floor (<=3.0s) as the
+        protect-phase budget for kill_orphans=True starved a real cold
+        _process_tree() call (reviewer-measured ~6s), turning a legitimate
+        kill into a false "protect:incomplete" skip -- caught by
+        test_manager.py's real-subprocess R1 driving test. This mocked
+        variant pins the same guarantee cheaply: a sibling walk taking
+        several seconds (well above orphan_floor, well under
+        _PROTECT_PIDS_KILL_FLOOR_SEC) must still let a real, generous
+        kill_orphans=True timeout complete the kill."""
+        record = _make_record(
+            "wt-protect-cold-kill",
+            path=str(tmp_path),
+            backing="worktree",
+            pids={"main": 111, "web": 222},
+        )
+
+        def _slow_process_tree(pid):
+            time.sleep(1.5)
+            return []
+
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                side_effect=_slow_process_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_PartialList([], complete=True),
+            ) as mock_kill,
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=30.0, kill_orphans=True
+            )
+
+        assert stop_detail is None, (
+            f"a 1.5s cold sibling walk must fit inside the generous "
+            f"kill_orphans=True protect-phase floor -- got stop_detail="
+            f"{stop_detail!r}"
+        )
+        mock_kill.assert_called_once()
+        assert killed == []
+        assert may_help is False
+
+
+class TestConcurrentStartRace:
+    """Ticket #165 fix round (R2, blocking): the protected-pid set
+    _compute_protected_pids builds is a snapshot taken once, before the
+    scan/kill _sweep_untracked_orphans runs -- it cannot protect a pid a
+    concurrent start() for the SAME role writes into record.pids mid-sweep,
+    since that pid does not exist yet when the set is built. Nothing in
+    WorktreeManager serializes start()/stop() for the same record/role.
+    _detect_concurrent_start_race re-checks role membership against a FRESH
+    store read immediately after the scan/kill returns, before its verdict
+    is trusted -- these tests pin that mechanism directly."""
+
+    def test_detect_concurrent_start_race_returns_none_when_role_still_absent(
+        self,
+    ):
+        """The common, non-racing case: role still has no pid in a fresh
+        store read -- no race, no StopDetail."""
+        record = _make_record("wt-no-race", pids={})
+        store = _make_store(record)
+        assert _detect_concurrent_start_race(record, "main", store=store) is None
+
+    def test_detect_concurrent_start_race_detects_pid_appeared(self):
+        """A pid now recorded for *role* in a fresh store read (simulating
+        a concurrent start() that landed while a sweep was in flight) must
+        produce a STOP_REASON_CONCURRENT_START_RACE StopDetail with
+        kill_orphans_may_help forced False."""
+        record = _make_record("wt-race", pids={})
+        store = _make_store(record)
+        store.get("wt-race").pids["main"] = 999999
+
+        detail = _detect_concurrent_start_race(record, "main", store=store)
+
+        assert detail is not None
+        assert detail.reason == STOP_REASON_CONCURRENT_START_RACE
+        assert detail.kill_orphans_may_help is False
+        assert detail.role == "main"
+
+    def test_sweep_untracked_orphans_kill_mode_detects_race_after_kill(
+        self, tmp_path
+    ):
+        """End-to-end through _sweep_untracked_orphans itself
+        (kill_orphans=True): if a pid appears for *role* by the time the
+        kill call returns (simulated here as a side effect of the mocked
+        _kill_blocking_processes call, standing in for a concurrent
+        start() landing mid-sweep), the call must report the race instead
+        of its own clean/None stop_detail, and kill_orphans_may_help stays
+        False."""
+        record = _make_record(
+            "wt-race-kill", path=str(tmp_path), backing="worktree", pids={}
+        )
+        store = _make_store(record)
+
+        def _kill_side_effect(path, timeout, exclude_pids):
+            store.get("wt-race-kill").pids["main"] = 999999
+            return _PartialList([], complete=True)
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            side_effect=_kill_side_effect,
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=True, store=store
+            )
+
+        assert may_help is False
+        assert stop_detail is not None
+        assert stop_detail.reason == STOP_REASON_CONCURRENT_START_RACE
+
+    def test_sweep_untracked_orphans_probe_mode_detects_race_after_find(
+        self, tmp_path
+    ):
+        """Same as above for the kill_orphans=False (hint-only) probe: a
+        pid that appears for *role* by the time the discovery call returns
+        must force the hint back to False and report the race, rather than
+        a stale kill_orphans_may_help=True for a role that is, right now,
+        actually running again."""
+        record = _make_record(
+            "wt-race-probe", path=str(tmp_path), backing="worktree", pids={}
+        )
+        store = _make_store(record)
+
+        def _find_side_effect(path, host_pid, *, deadline=None, exclude_pids=()):
+            store.get("wt-race-probe").pids["main"] = 999999
+            return _PartialList(
+                [KilledProcessInfo(pid=555, name="orphan", cmdline=[])],
+                complete=True,
+            )
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._find_blocking_processes",
+            side_effect=_find_side_effect,
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=False, store=store
+            )
+
+        assert killed == []
+        assert may_help is False, (
+            "a race must force the hint back to False even though the "
+            "probe itself found something"
+        )
+        assert stop_detail is not None
+        assert stop_detail.reason == STOP_REASON_CONCURRENT_START_RACE
+
+    def test_sweep_untracked_orphans_store_none_skips_race_check(self, tmp_path):
+        """Backward compatibility: store=None (the default) must skip the
+        race check entirely, exactly like every pre-existing direct/mocked
+        call site that does not pass store= -- so this fix round does not
+        change behaviour for any caller that does not opt in."""
+        record = _make_record(
+            "wt-no-store", path=str(tmp_path), backing="worktree", pids={}
+        )
+
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            return_value=_PartialList([], complete=True),
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=True
+            )
+
+        assert (killed, may_help, stop_detail) == ([], False, None)
 
 
 # ---------------------------------------------------------------------------

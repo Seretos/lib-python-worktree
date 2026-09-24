@@ -49,6 +49,21 @@ STOP_REASON_ORPHAN_SCAN_INCOMPLETE = "orphan_scan_incomplete"
 # larger timeout might help), this condition will not clear itself until the
 # host process restarts -- see process_lifecycle.stop()'s dedicated branch.
 STOP_REASON_HANDLE_SCAN_EXHAUSTED = "handle_scan_exhausted"
+# Ticket #165 fix round (R2, blocking): the untracked-orphan sweep
+# (process_lifecycle._sweep_untracked_orphans) protects every OTHER
+# tracked role's pid/tree/Job Object, built once before the scan/kill it
+# precedes -- but nothing serializes stop() against a concurrent start()
+# for the SAME role, so a pid that start() writes into record.pids[role]
+# mid-sweep did not exist yet when the protected set was built and is
+# indistinguishable from an untracked orphan for the rest of that sweep.
+# WorktreeManager.stop()'s no-pid branch re-checks role membership against
+# a fresh store read immediately after the sweep returns; this reason
+# reports that a start() raced this stop() rather than silently reporting
+# a "no process recorded"/"stopped" verdict for a role that is, right
+# now, actually running. kill_orphans_may_help is always False here -- the
+# remediation is not "retry with kill_orphans=True", it is "the race
+# window has closed, call again".
+STOP_REASON_CONCURRENT_START_RACE = "concurrent_start_race"
 
 STOP_REASONS: Tuple[str, ...] = (
     STOP_REASON_IDENTITY_UNVERIFIED,
@@ -57,6 +72,7 @@ STOP_REASONS: Tuple[str, ...] = (
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
     STOP_REASON_ORPHAN_SCAN_INCOMPLETE,
     STOP_REASON_HANDLE_SCAN_EXHAUSTED,
+    STOP_REASON_CONCURRENT_START_RACE,
 )
 
 # Outcome vocabulary for ``StopAttempt.outcome`` (ticket #110) -- distinguishes

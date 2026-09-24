@@ -95,6 +95,7 @@ from .state import (
     STOP_ATTEMPT_KILLED,
     STOP_ATTEMPT_TRACKED_PID_MISSING,
     STOP_ATTEMPT_UNCONFIRMED_ALIVE,
+    STOP_REASON_CONCURRENT_START_RACE,
     STOP_REASON_HANDLE_SCAN_EXHAUSTED,
     STOP_REASON_IDENTITY_UNVERIFIED,
     STOP_REASON_JOB_MEMBER_LIST_TRUNCATED,
@@ -396,6 +397,38 @@ _TREE_KILL_FLOOR_SEC = 1.0
 _TREE_KILL_FLOOR_SHARE = 0.10
 _ORPHAN_SCAN_FLOOR_SEC = 3.0
 _ORPHAN_SCAN_FLOOR_SHARE = 0.30
+
+# Ticket #165 fix round (R1, blocking): _compute_protected_pids used to call
+# a bare, unbounded _process_tree() per sibling tracked role -- measured at
+# ~6s on a cold call, with no deadline/timeout anywhere on it, so it both
+# contradicted this module's own documented "bounded by orphan_floor" claim
+# and let stop()'s total wall time exceed the caller's timeout by an
+# unbounded amount. _sweep_untracked_orphans now reserves this fraction of
+# orphan_floor (see _compute_stop_budget) for the protected-pid computation,
+# deducting whatever it actually spends from the budget handed to the
+# scan/kill call that follows it -- so the whole sweep (protect + scan/kill)
+# stays inside the same ceiling the module already documents: orphan_floor
+# for the kill_orphans=False probe, timeout itself for kill_orphans=True.
+# Used only as a fallback when no deadline is supplied at all (e.g. a direct
+# unit-test call to _compute_protected_pids) -- every real call site derives
+# its own deadline from the shared sweep budget instead.
+_PROTECT_PIDS_DEFAULT_BUDGET_SEC = 3.0
+
+# Ticket #165 fix round (R1, blocking finding, follow-up): reviewer-measured
+# cold-call cost for a SINGLE sibling's _process_tree() walk was ~6s (first
+# invocation in the process -- OS-level cache cold). That is comfortably
+# inside a real kill_orphans=True call's own `timeout` (typically 10s-30s+),
+# but far bigger than `orphan_floor`'s <=3.0s ceiling -- reusing orphan_floor
+# as the protect-phase budget for kill_orphans=True (as an earlier revision
+# of this fix did) starved the very cold-call scenario the finding
+# described, turning a legitimate kill into a false "protect:incomplete"
+# skip. kill_orphans=True therefore gets its own, more generous floor,
+# still bounded and still proportional to the caller's own timeout;
+# kill_orphans=False (the probe) keeps the tighter orphan_floor cap --
+# see _sweep_untracked_orphans' "Cost" docstring section for why a
+# speculative hint must not spend a large, separate allowance.
+_PROTECT_PIDS_KILL_FLOOR_SEC = 10.0
+_PROTECT_PIDS_KILL_FLOOR_SHARE = 0.50
 
 
 def _compute_stop_budget(timeout: float, kill_orphans: bool) -> Tuple[float, float, float]:
@@ -3149,14 +3182,16 @@ def _win_handle_holders(
         _handle_scan_lock.release()
 
 
-def _bounded_call(fn, *, deadline: Optional[float] = None) -> "Tuple[bool, Any]":
+def _bounded_call(
+    fn, *, deadline: Optional[float] = None, timeout: float = _BLOCKING_CALL_TIMEOUT_SEC
+) -> "Tuple[bool, Any]":
     """Thin, locked wrapper (ticket #154, item 11) for a single blocking
     psutil read (``proc.cwd()``, ``cmdline()``, ``name()``, the ancestor
     walk's ``parents()``, tier-1's ``psutil.pid_exists``, ...), dispatched
-    through a short-lived :class:`_BoundedQueryWorker` at
-    ``_BLOCKING_CALL_TIMEOUT_SEC`` -- never ``_HANDLE_QUERY_TIMEOUT_SEC``,
-    which is tuned for a single already-duplicated handle, not a psutil
-    read.
+    through a short-lived :class:`_BoundedQueryWorker` at *timeout* --
+    defaulting to ``_BLOCKING_CALL_TIMEOUT_SEC``, never
+    ``_HANDLE_QUERY_TIMEOUT_SEC``, which is tuned for a single already-
+    duplicated handle, not a psutil read.
 
     Returns ``(completed, value)``: ``(True, <fn's return value>)`` if *fn*
     resolved in time, ``(False, None)`` if it did not (or if a worker
@@ -3166,7 +3201,20 @@ def _bounded_call(fn, *, deadline: Optional[float] = None) -> "Tuple[bool, Any]"
     ~10^5-per-scan ``NtQueryObject`` multiplication problem (see
     ``_HANDLE_QUERY_GRACE_SEC``'s docstring), not for the ~10^2-10^3-
     per-call psutil population, where a flat, generous per-call timeout is
-    affordable on its own.
+    affordable on its own. Because *grace* is never supplied, *deadline*
+    itself has no effect on :meth:`_BoundedQueryWorker.submit`'s own
+    stage-2 wait (which only ever fires when a *grace* budget is passed in)
+    -- it is accepted here purely for callers that want to document/derive
+    their intended ceiling; *timeout* is what actually governs how long
+    this call waits.
+
+    *timeout* (ticket #165 fix round, R1): the default suits a cheap,
+    already-duplicated-handle-scale read. :func:`_compute_protected_pids`
+    passes a caller-derived, still-bounded *timeout* instead -- large
+    enough for a real ``_process_tree`` walk (measured at several seconds
+    on a cold call), because the default 0.25s ceiling a *deadline* alone
+    can only ever shrink, never extend past, would make that walk read as
+    "incomplete" on virtually every real call.
 
     A non-resolved outcome's thread joins the SAME shared
     ``_wedged_worker_slots`` cell as a wedged handle-scan worker -- one
@@ -3180,7 +3228,7 @@ def _bounded_call(fn, *, deadline: Optional[float] = None) -> "Tuple[bool, Any]"
         worker = _BoundedQueryWorker()
     except Exception:  # noqa: BLE001 -- never let bounding itself fail
         return False, None
-    outcome = worker.submit(fn, scan_deadline=deadline, timeout=_BLOCKING_CALL_TIMEOUT_SEC)
+    outcome = worker.submit(fn, scan_deadline=deadline, timeout=timeout)
     if outcome.status == _QueryStatus.RESOLVED:
         worker.close()
         return True, outcome.value
@@ -3720,7 +3768,7 @@ def _kill_blocking_processes(
 
 
 def _compute_protected_pids(
-    record: "WorktreeRecord", role: str,
+    record: "WorktreeRecord", role: str, *, deadline: Optional[float] = None,
 ) -> "Tuple[set[int], bool]":
     """Build the set of pids :func:`_sweep_untracked_orphans` must never
     treat as an untracked orphan (ticket #165): every OTHER tracked role's
@@ -3739,38 +3787,55 @@ def _compute_protected_pids(
     l.3285-3299 of this module: an unknown exclusion set must never be
     treated as an empty/complete one): ``complete`` is ``False`` whenever a
     sibling's tree snapshot hit the same truncation cap :func:`_process_tree`
-    itself enforces, OR (win32 only) a role's Job Object is named in
-    ``record.job_names`` but no live handle could be obtained for it, or its
-    member-list query itself came back incomplete -- unlike ``stop()``'s own
-    "rule N7" (a missing job handle degrades gracefully to the tree-kill
-    alone, never a ``stop_incomplete`` trigger there), a missing handle HERE
-    means this role's containment cannot be verified at all, and the stakes
-    of an incomplete protected set are categorically different: killing or
-    misreporting on a *sibling role's own process* rather than merely
-    under-collecting our own role's containment.
+    itself enforces, OR the per-sibling call did not resolve before
+    *deadline* (see "Bounding" below), OR (win32 only) a role's Job Object
+    is named in ``record.job_names`` but no live handle could be obtained
+    for it, or its member-list query itself came back incomplete -- unlike
+    ``stop()``'s own "rule N7" (a missing job handle degrades gracefully to
+    the tree-kill alone, never a ``stop_incomplete`` trigger there), a
+    missing handle HERE means this role's containment cannot be verified at
+    all, and the stakes of an incomplete protected set are categorically
+    different: killing or misreporting on a *sibling role's own process*
+    rather than merely under-collecting our own role's containment.
 
-    Each sibling's descendant tree is fetched via a bare, unbounded
-    :func:`_process_tree` call -- deliberately NOT wrapped in
-    :func:`_bounded_call`, unlike :func:`_kill_blocking_processes`' own
-    lineage-expansion enrichment. Measured on a real, childless, live pid,
-    :func:`_process_tree`'s full-system ``ppid``-walk fallback (triggered
-    whenever ``children(recursive=True)`` returns empty for a pid that
-    plausibly still exists -- the common case for a sibling role with no
-    children of its own) took several seconds, vastly beyond
-    :func:`_bounded_call`'s fixed ``_BLOCKING_CALL_TIMEOUT_SEC`` (0.25s)
-    ceiling -- which a *deadline* argument can only ever shrink, never
-    extend past (see ``_BoundedQueryWorker.submit``). Wrapping it there
-    would make this walk read as "incomplete" for virtually every real
-    multi-role worktree, defeating the sweep for the common case it exists
-    to serve. This instead mirrors ``stop()``'s OWN primary tree snapshot
-    (``tree = _process_tree(pid)``, called bare at the top of ``stop()``) --
-    protecting a sibling's tree here is essential, load-bearing work, not
-    the best-effort enrichment ``_kill_blocking_processes``' lineage
-    expansion treats it as. Completeness instead mirrors ``stop()``'s own
-    ``tree_possibly_truncated`` check (ticket #87 follow-up, finding F2):
-    collecting exactly :data:`_MAX_TREE_NODES` entries is treated as
-    "cannot guarantee completeness", the same conservative, cheap proxy
-    ``stop()`` already uses for its own tracked pid's snapshot.
+    Bounding (ticket #165 fix round, R1)
+    -------------------------------------
+    Each sibling's descendant tree is fetched via :func:`_process_tree`,
+    dispatched through :func:`_bounded_call` with an explicit *timeout*
+    derived from *deadline* -- NOT ``_bounded_call``'s own default
+    ``_BLOCKING_CALL_TIMEOUT_SEC`` (0.25s), which is tuned for an
+    already-duplicated-handle-scale read and would make this walk read as
+    "incomplete" on virtually every real call: measured on a real,
+    childless, live pid, :func:`_process_tree`'s full-system ``ppid``-walk
+    fallback (triggered whenever ``children(recursive=True)`` returns empty
+    for a pid that plausibly still exists -- the common case for a sibling
+    role with no children of its own) took several seconds. Before this
+    fix, the call was bare and genuinely unbounded -- no timeout/deadline
+    anywhere on it -- which both contradicted this module's own documented
+    "bounded by orphan_floor" claim and let ``stop()``'s total wall time
+    exceed the caller's ``timeout`` by an unbounded amount, for any
+    multi-role worktree, on the most common outcomes.
+
+    *deadline* (a ``time.monotonic()``-based absolute deadline; ``None``
+    falls back to ``time.monotonic() + _PROTECT_PIDS_DEFAULT_BUDGET_SEC``,
+    used only by direct/test callers -- every real call site supplies one,
+    derived from the same ``orphan_floor`` :func:`_compute_stop_budget`
+    already reserves) is re-checked before each sibling's call: once it has
+    passed, no further ``_process_tree`` call is attempted for any
+    remaining sibling -- each such sibling's own pid is still added to
+    ``protected`` (a partial protection is strictly better than none), but
+    ``complete`` is set ``False`` and its descendant tree is left
+    unprotected, exactly like a per-call timeout that did not resolve in
+    time. This mirrors ``stop()``'s OWN primary tree snapshot rationale
+    (``tree = _process_tree(pid)``, called bare at the top of ``stop()``,
+    where the tracked pid's OWN tree is load-bearing, not best-effort) --
+    protecting a sibling's tree here is the same kind of essential work,
+    just now bounded rather than unbounded. Completeness also still mirrors
+    ``stop()``'s own ``tree_possibly_truncated`` check (ticket #87
+    follow-up, finding F2): collecting exactly :data:`_MAX_TREE_NODES`
+    entries is treated as "cannot guarantee completeness", the same
+    conservative, cheap proxy ``stop()`` already uses for its own tracked
+    pid's snapshot.
 
     A handle opened here is closed via :func:`_close_job_object_handle`
     only when it did NOT come from the :data:`_JOB_HANDLES` keeper registry
@@ -3780,6 +3845,9 @@ def _compute_protected_pids(
     this is a read-only membership query for a role this call is not
     stopping, not a termination of it.
     """
+    if deadline is None:
+        deadline = time.monotonic() + _PROTECT_PIDS_DEFAULT_BUDGET_SEC
+
     protected: "set[int]" = set()
     complete = True
     for other_role, other_pid in record.pids.items():
@@ -3787,11 +3855,24 @@ def _compute_protected_pids(
             continue
         protected.add(other_pid)
 
-        descendants = _process_tree(other_pid)
-        if len(descendants) >= _MAX_TREE_NODES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # The budget for this whole computation is already spent --
+            # this sibling's pid is still protected (above), but its
+            # descendant tree cannot be walked without risking the same
+            # unbounded cost this fix exists to close.
             complete = False
-        for info in descendants:
-            protected.add(info.pid)
+        else:
+            completed, descendants = _bounded_call(
+                lambda pid=other_pid: _process_tree(pid), timeout=remaining
+            )
+            if not completed or descendants is None:
+                complete = False
+            else:
+                if len(descendants) >= _MAX_TREE_NODES:
+                    complete = False
+                for info in descendants:
+                    protected.add(info.pid)
 
         if sys.platform == "win32":
             job_name = record.job_names.get(other_role)
@@ -3812,12 +3893,58 @@ def _compute_protected_pids(
     return protected, complete
 
 
+def _detect_concurrent_start_race(
+    record: "WorktreeRecord", role: str, *, store: StateStore,
+) -> Optional[StopDetail]:
+    """Return a :class:`StopDetail` if a concurrent ``start()`` populated
+    ``pids[role]`` while a :func:`_sweep_untracked_orphans` call for *role*
+    was running, ``None`` otherwise (ticket #165 fix round, R2, blocking).
+
+    ``_compute_protected_pids`` builds its protected set once, at the start
+    of the sweep it precedes -- a pid a concurrent ``start()`` for this SAME
+    role writes into ``record.pids[role]`` mid-sweep does not exist yet when
+    that set is built, so it is indistinguishable from an untracked orphan
+    for the rest of the sweep. Nothing in :class:`WorktreeManager` serializes
+    ``start()``/``stop()`` for the same record/role, and
+    ``_kill_blocking_processes`` discovers and kills in one call (no
+    discover-then-kill seam this function could intercept mid-flight) -- so
+    detection, checked as late as possible (immediately after the sweep
+    returns, before its verdict is applied/reported), is the best available
+    mitigation, not prevention of the kill itself.
+
+    Reads *role*'s CURRENT membership via a fresh ``store.get(record.id)``
+    call -- deliberately not ``record.pids`` itself, which the caller may
+    have been holding as a plain Python object since before an arbitrarily
+    long sweep (for ``YamlStateStore`` a stale, disk-detached snapshot; for
+    ``InMemoryStateStore`` the same shared object by reference, so this
+    still works there too, just redundantly).
+    """
+    fresh = store.get(record.id)
+    if fresh is None or role not in fresh.pids:
+        return None
+    message = (
+        f"stop(worktree_id={record.id}, role={role}): a concurrent start() "
+        f"populated pids[{role!r}] while the untracked-orphan sweep for "
+        f"this role was running -- discarding this call's verdict rather "
+        f"than report a stale outcome for a role that is, right now, "
+        f"actually running"
+    )
+    _logger.warning(message)
+    return StopDetail(
+        reason=STOP_REASON_CONCURRENT_START_RACE,
+        message=message,
+        role=role,
+        kill_orphans_may_help=False,
+    )
+
+
 def _sweep_untracked_orphans(
     record: "WorktreeRecord",
     role: str,
     *,
     timeout: float,
     kill_orphans: bool,
+    store: Optional[StateStore] = None,
 ) -> "Tuple[List[KilledProcessInfo], bool, Optional[StopDetail]]":
     """Path-scoped scan for a process ``kill_orphans`` is documented to
     catch but that ``stop()``'s own pid-keyed machinery cannot reach at all
@@ -3877,22 +4004,81 @@ def _sweep_untracked_orphans(
     incomplete -- this call never attempts anything either way -- so
     ``stop_detail`` stays ``None`` and the hint is conservatively ``False``.
 
-    Cost
-    ----
-    In *kill_orphans=True* mode, the full *timeout* budget is handed
-    straight to :func:`_kill_blocking_processes`, exactly like the existing
-    pid-keyed orphan scan does. In *kill_orphans=False* (probe) mode, the
-    discovery-only call is bounded by ``orphan_floor`` (the same
-    ``min(3.0, 0.30*timeout)`` floor :func:`_compute_stop_budget` already
-    reserves for an actual ``kill_orphans=True`` scan) rather than the full
-    *timeout* -- a plain stop() must not spend its whole budget on a
-    speculative probe for a hint the caller may not even act on.
+    Cost (ticket #165 fix round, R1)
+    ---------------------------------
+    The WHOLE sweep -- :func:`_compute_protected_pids` plus the scan/kill
+    that follows it -- is bounded by ``sweep_budget``: the full *timeout*
+    for *kill_orphans=True* (mirroring the existing pid-keyed orphan scan,
+    which also hands ``_kill_blocking_processes`` the full timeout), or
+    ``orphan_floor`` (the same ``min(3.0, 0.30*timeout)`` floor
+    :func:`_compute_stop_budget` already reserves for an actual
+    ``kill_orphans=True`` scan) for *kill_orphans=False* -- a plain stop()
+    must not spend its whole budget on a speculative probe for a hint the
+    caller may not even act on.
+
+    The protected-pid computation itself gets its own slice of
+    ``sweep_budget``, whatever it actually spends being deducted from what
+    the subsequent scan/kill call receives -- but the two modes size that
+    slice differently: *kill_orphans=True* reserves
+    ``min(sweep_budget, min(_PROTECT_PIDS_KILL_FLOOR_SEC,
+    _PROTECT_PIDS_KILL_FLOOR_SHARE * sweep_budget))`` (10.0s or 50% of
+    *timeout*, whichever is smaller) -- generous enough for a cold
+    ``_process_tree()`` call (reviewer-measured at ~6s for a single
+    sibling), which a real kill's own, typically much larger, ``timeout``
+    can afford; *kill_orphans=False* stays capped at the tighter
+    ``orphan_floor`` (<=3.0s), matching the smaller budget the probe itself
+    already has to work with. An earlier revision of this fix reused
+    ``orphan_floor`` for both modes -- that starved the exact cold-call
+    scenario this fix exists to handle in *kill_orphans=True* mode,
+    turning a legitimate kill into a false ``"protect:incomplete"`` skip.
+    Before this fix at all, ``_compute_protected_pids`` ran bare and
+    unbounded BEFORE either budget was ever consulted -- see its own
+    docstring for the defect this closes.
+
+    Race with a concurrent ``start()`` (ticket #165 fix round, R2, blocking)
+    --------------------------------------------------------------------------
+    The protected set is built once, before the scan/kill it precedes runs
+    -- it cannot protect a pid a concurrent ``start()`` for this SAME role
+    writes into ``record.pids[role]`` mid-sweep, since that pid does not
+    exist yet when the set is built. When *store* is supplied, this call
+    re-checks *role*'s membership via :func:`_detect_concurrent_start_race`
+    immediately after the scan/kill returns, before its verdict is trusted:
+    if a pid has appeared for *role* by then, the returned
+    ``kill_orphans_may_help`` is forced ``False`` and ``stop_detail`` becomes
+    a ``STOP_REASON_CONCURRENT_START_RACE`` detail (overriding whatever this
+    call would otherwise have reported, including a clean/``None`` verdict)
+    -- so neither call site reports a false "no process recorded"/"stopped"
+    for a role that is, right now, actually running. ``killed`` is reported
+    as-is either way: whatever this call actually terminated already
+    happened and cannot be undone; only the VERDICT built on top of it is
+    corrected. *store* is ``None`` by default (skips this check entirely) --
+    every real call site supplies one; only direct/mocked unit tests omit
+    it.
     """
     path = record.path
     if record.backing == "primary" or not os.path.isdir(path) or timeout <= 0:
         return [], False, None
 
-    protected, protect_complete = _compute_protected_pids(record, role)
+    sweep_start = time.monotonic()
+    _, _, orphan_floor = _compute_stop_budget(timeout, True)
+    sweep_budget = timeout if kill_orphans else orphan_floor
+    if kill_orphans:
+        # A real kill has the full `timeout` to work with -- give the
+        # protect phase a floor generous enough for a cold _process_tree()
+        # call (see _PROTECT_PIDS_KILL_FLOOR_SEC's own comment), not the
+        # much tighter orphan_floor a speculative probe is capped at.
+        protect_budget = min(
+            sweep_budget,
+            min(_PROTECT_PIDS_KILL_FLOOR_SEC, _PROTECT_PIDS_KILL_FLOOR_SHARE * sweep_budget),
+        )
+    else:
+        protect_budget = min(orphan_floor, sweep_budget)
+    protect_deadline = sweep_start + protect_budget
+
+    protected, protect_complete = _compute_protected_pids(
+        record, role, deadline=protect_deadline
+    )
+    remaining_budget = max(0.0, sweep_budget - (time.monotonic() - sweep_start))
 
     if kill_orphans:
         if not protect_complete:
@@ -3912,7 +4098,9 @@ def _sweep_untracked_orphans(
                 kill_orphans_may_help=False,
             )
 
-        found = _kill_blocking_processes(path, timeout=timeout, exclude_pids=protected)
+        found = _kill_blocking_processes(
+            path, timeout=remaining_budget, exclude_pids=protected
+        )
         killed = list(found)
         survivor_pids = [info.pid for info in killed if _pid_alive(info.pid)]
         stop_detail: Optional[StopDetail] = None
@@ -3947,17 +4135,29 @@ def _sweep_untracked_orphans(
                 skipped_passes=skipped_passes,
                 kill_orphans_may_help=False,
             )
+
+        if store is not None:
+            race_detail = _detect_concurrent_start_race(record, role, store=store)
+            if race_detail is not None:
+                return killed, False, race_detail
+
         return killed, False, stop_detail
 
     if not protect_complete:
         return [], False, None
 
-    _, _, orphan_floor = _compute_stop_budget(timeout, True)
-    probe_deadline = time.monotonic() + orphan_floor
+    probe_deadline = sweep_start + sweep_budget
     found = _find_blocking_processes(
         path, os.getpid(), deadline=probe_deadline, exclude_pids=protected
     )
-    return [], bool(found), None
+    may_help = bool(found)
+
+    if store is not None:
+        race_detail = _detect_concurrent_start_race(record, role, store=store)
+        if race_detail is not None:
+            return [], False, race_detail
+
+    return [], may_help, None
 
 
 # ---------------------------------------------------------------------------
@@ -5303,11 +5503,16 @@ def stop(
     # scan already ran (unconditionally, above), so a "retry with
     # kill_orphans=True" hint would be meaningless, mirroring every other
     # kill_orphans_may_help site in this function.
+    # Ticket #165 fix round (R2, blocking): pass store= so a concurrent
+    # start() that raced this hint's own probe (see
+    # _detect_concurrent_start_race) forces the hint back to False instead
+    # of reporting kill_orphans_may_help=True for a role that a start()
+    # just made live again.
     _already_exited_may_help = (
         _stop_attempt_outcome == STOP_ATTEMPT_ALREADY_EXITED
         and not kill_orphans
         and _sweep_untracked_orphans(
-            record, role, timeout=timeout, kill_orphans=False
+            record, role, timeout=timeout, kill_orphans=False, store=store
         )[1]
     )
     record.stop_attempt = StopAttempt(

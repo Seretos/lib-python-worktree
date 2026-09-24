@@ -37,6 +37,7 @@ from lib_python_worktree.core.manager import (
     _run_git,
 )
 from lib_python_worktree.core.state import (
+    STOP_REASON_CONCURRENT_START_RACE,
     STOP_REASON_SURVIVORS,
     InMemoryStateStore,
     StopDetail,
@@ -4229,6 +4230,119 @@ def test_manager_stop_dead_pid_hint_false_when_only_sibling_present(tmp_path: Pa
         assert _pid_alive(web_proc.pid)
     finally:
         _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_passes_store_for_concurrent_start_race_check(
+    tmp_path: Path,
+):
+    """R2 fix round (ticket #165, blocking finding): WorktreeManager.stop()'s
+    no-pid branch (Site 1) must pass store=self.state into
+    process_lifecycle._sweep_untracked_orphans so that helper can re-check
+    role membership against a FRESH store read immediately after the sweep
+    returns (see process_lifecycle._detect_concurrent_start_race) --
+    catching a pid a concurrent start() for the SAME role writes into
+    record.pids mid-sweep. The protected-pid set the sweep builds is a
+    snapshot taken once, before the scan/kill it precedes runs, so it
+    cannot protect a pid that only appears mid-sweep -- and nothing in
+    WorktreeManager otherwise serializes start()/stop() for the same
+    record/role.
+
+    Expected RED reason (pre-fix): the no-pid branch called
+    _sweep_untracked_orphans(record, effective_role, timeout=timeout,
+    kill_orphans=kill_orphans) with no store= kwarg at all -- the race
+    could never be detected no matter how it manifested.
+    Expected GREEN: store=self.state (the exact same StateStore instance
+    the manager itself uses) is passed."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-race-store-plumbing", path=str(wt_dir), status="running", pids={}
+    )
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+    captured_kwargs: dict = {}
+
+    def _capture(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return [], False, None
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+        patch(
+            "lib_python_worktree.core.manager._sweep_untracked_orphans",
+            side_effect=_capture,
+        ),
+    ):
+        mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+    assert captured_kwargs.get("store") is mgr.state, (
+        "WorktreeManager.stop()'s no-pid branch must pass store=self.state "
+        "into _sweep_untracked_orphans so a concurrent start() racing this "
+        f"stop() can be detected via a fresh store read -- got kwargs "
+        f"{captured_kwargs!r}"
+    )
+
+
+def test_manager_stop_without_pid_reports_concurrent_start_race(tmp_path: Path):
+    """Additional coverage (not itself RED-provable pre-fix -- the
+    stop_detail-application branch below predates this fix round; the
+    RED-provable part of R2 is the store= plumbing pinned by
+    test_manager_stop_without_pid_passes_store_for_concurrent_start_race_check
+    above): once process_lifecycle._sweep_untracked_orphans reports a
+    STOP_REASON_CONCURRENT_START_RACE StopDetail (real mechanism pinned by
+    TestConcurrentStartRace in test_process_lifecycle.py), WorktreeManager.
+    stop()'s no-pid branch must surface it as status="stop_incomplete" --
+    never a false "no process recorded"/"stopped" verdict for a role that
+    a concurrent start() just made live again."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-race-e2e", path=str(wt_dir), status="running", pids={}
+    )
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    def _sweep_side_effect(rec, role, *, timeout, kill_orphans, store=None):
+        return (
+            [],
+            False,
+            StopDetail(
+                reason=STOP_REASON_CONCURRENT_START_RACE,
+                message="race",
+                role=role,
+                kill_orphans_may_help=False,
+            ),
+        )
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+        patch(
+            "lib_python_worktree.core.manager._sweep_untracked_orphans",
+            side_effect=_sweep_side_effect,
+        ),
+    ):
+        result = mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+    assert result.status == "stop_incomplete", (
+        f"a start() raced this stop() -- 'main' now has a live pid -- the "
+        f"call must not report a clean outcome, got status={result.status!r}"
+    )
+    assert result.stop_detail is not None
+    assert result.stop_detail.reason == STOP_REASON_CONCURRENT_START_RACE
+    assert result.stop_attempt is not None
+    assert result.stop_attempt.kill_orphans_may_help is False
 
 
 # ---------------------------------------------------------------------------

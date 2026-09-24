@@ -1700,9 +1700,25 @@ class WorktreeManager:
             # the scan -- see _sweep_untracked_orphans' docstring for the
             # full contract (eligibility, protected-set scoping, and the
             # kill_orphans=True vs. hint-only probe modes).
+            # Ticket #165 fix round (R2, blocking): pass store=self.state so
+            # the sweep can re-check role membership against a FRESH store
+            # read immediately after it returns (see
+            # _detect_concurrent_start_race in process_lifecycle.py) --
+            # nothing serializes this call against a concurrent start() for
+            # the SAME role, and the protected set built at the top of the
+            # sweep cannot protect a pid that only appears mid-sweep. When
+            # a race is detected, _orphan_stop_detail below already carries
+            # a STOP_REASON_CONCURRENT_START_RACE reason and
+            # _orphan_may_help is already forced False -- no further
+            # special-casing is needed here, the existing stop_incomplete
+            # branch immediately below handles it like any other reason.
             _orphan_killed, _orphan_may_help, _orphan_stop_detail = (
                 _sweep_untracked_orphans(
-                    record, effective_role, timeout=timeout, kill_orphans=kill_orphans
+                    record,
+                    effective_role,
+                    timeout=timeout,
+                    kill_orphans=kill_orphans,
+                    store=self.state,
                 )
             )
 
