@@ -3791,7 +3791,21 @@ def _spawn_untracked_orphan(tmp_path: Path, wt_dir: Path, form: str, tag: str):
         spawner = tmp_path / f"spawner-{tag}.py"
         spawner.write_text(
             "import subprocess, sys\n"
-            "kwargs = {}\n"
+            # Explicitly detach the sleeper's stdio from whatever pipes this
+            # spawner process itself inherited (the setup step's own
+            # stdout=PIPE/stderr=PIPE, see SetupRunner._default_popen). On
+            # POSIX, start_new_session=True detaches the process *group* but
+            # does not close inherited fds -- left unredirected, the
+            # long-lived sleeper keeps the pipes' write end open forever,
+            # and the setup step's proc.communicate() never sees EOF and
+            # hangs until the test's own timeout. Windows' DETACHED_PROCESS
+            # path doesn't share fds the same way, which is why this only
+            # ever hung on the Linux CI leg.
+            "kwargs = {\n"
+            "    'stdin': subprocess.DEVNULL,\n"
+            "    'stdout': subprocess.DEVNULL,\n"
+            "    'stderr': subprocess.DEVNULL,\n"
+            "}\n"
             "if sys.platform == 'win32':\n"
             "    kwargs['creationflags'] = (\n"
             "        subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP\n"
