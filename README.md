@@ -133,6 +133,34 @@ every `list()`/`list_repo()` call. A healed record's id (not its branch
 string) is reported in the additive `ReconcileReport.healed_branches`
 field.
 
+`reconcile()`'s port-pruning and backing-heal rules (ticket #166): a
+record's persisted `ports` must follow the *current* contract, not the one
+in effect the last time it was started. In Phase 1, under the state lock,
+`reconcile()` accepts an optional `declared_slots` callback
+(`repo_root -> set[str] | None`); `WorktreeManager` wires
+`_declared_slots_for` (`{s.name for s in load(<repo_root>/.seretos/worktree-setup.yml).ports}`,
+or `None` on any load failure). For each record with `ports` and no live
+tracked pid, any slot not in the callback's result -- e.g. every slot under
+an `isolation: none` downgrade, or a slot simply dropped from `ports:` -- is
+popped from the record and its `<id>:<slot>` key is removed from
+`ports.yaml` in Phase 2 (which already holds `ports.yaml.lock`, so it pops
+the key directly rather than calling `PortAllocator.release()` and
+re-acquiring the same non-reentrant lock). `declared_slots` returning `None`
+for a record (contract missing/invalid/unparseable) means "unknown, not
+none" -- that record's ports are left untouched rather than risk dropping a
+slot that is genuinely still declared. The contract consulted is always the
+one at the *repo root*, exactly like `start()`'s own read -- a checkout-local
+copy is never read by either. A record with any live tracked pid is skipped
+entirely: a role's process may still hold the port, so pruning only takes
+effect at the first `list()`/`list_repo()`/`start()` after `stop()`.
+`start()` runs the same prune itself (against `set(record.ports) -
+{contract's declared slot names}`) before allocating, so a contract change
+is reflected immediately on the next `start()` too, not just at the next
+listing. The same Phase 1 pass also heals a record whose `path` resolves to
+its own `repo_root` (a primary checkout) but whose persisted `backing` is
+not `"primary"` -- a pre-existing bad-state repair (ticket #84's write sites
+only ever write `"primary"` for such a path), not a live bug.
+
 ## On-disk layout
 
 | Root | Default path | Env var override |

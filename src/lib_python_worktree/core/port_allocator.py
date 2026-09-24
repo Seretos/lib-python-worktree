@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import Collection, Dict, List, Mapping, Optional
 
 import portalocker
 
@@ -248,20 +248,35 @@ class PortAllocator:
         # Preserve input slot order in the returned mapping.
         return {slot: result[slot] for slot in slots}
 
-    def release(self, worktree_id: str) -> None:
-        """Remove all port entries belonging to ``worktree_id``.
+    def release(
+        self, worktree_id: str, *, slots: Optional[Collection[str]] = None
+    ) -> None:
+        """Remove port entries belonging to ``worktree_id``.
 
-        Idempotent: a second call with the same id is a no-op.
+        Idempotent: a second call with the same id (and same ``slots``) is a
+        no-op.
 
         Parameters
         ----------
         worktree_id:
             The worktree id whose entries should be removed.
+        slots:
+            When given, only the named slots' keys (``"<worktree_id>:<slot>"``)
+            are removed, leaving the owner's other slots intact. ``None``
+            (the default) removes every key for this owner, unchanged from
+            the pre-existing behaviour.
         """
         prefix = f"{worktree_id}{_KEY_SEP}"
+        wanted = (
+            None if slots is None
+            else {f"{worktree_id}{_KEY_SEP}{slot}" for slot in slots}
+        )
         with portalocker.Lock(self._lock_path, timeout=_LOCK_TIMEOUT, flags=_LOCK_FLAGS):
             allocated: Dict[str, int] = self._ports_file._load()
-            keys_to_remove = [k for k in allocated if k.startswith(prefix)]
+            if wanted is None:
+                keys_to_remove = [k for k in allocated if k.startswith(prefix)]
+            else:
+                keys_to_remove = [k for k in allocated if k in wanted]
             if not keys_to_remove:
                 return
             for k in keys_to_remove:
@@ -285,7 +300,9 @@ class _NoOpPortAllocator:
     ) -> Dict[str, int]:  # noqa: ARG002
         return {}
 
-    def release(self, worktree_id: str) -> None:  # noqa: ARG002
+    def release(
+        self, worktree_id: str, *, slots: Optional[Collection[str]] = None
+    ) -> None:  # noqa: ARG002
         return
 
 

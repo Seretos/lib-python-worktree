@@ -996,8 +996,27 @@ class WorktreeManager:
         ``list_repo()`` so both listing paths get the same staleness fix.
         """
         if self._reconcile_on_init and isinstance(self.state, YamlStateStore):
-            reconcile(self.state)
+            reconcile(self.state, declared_slots=self._declared_slots_for)
         return self.state.list()
+
+    @staticmethod
+    def _declared_slots_for(repo_root: str) -> Optional[set]:
+        """Return the set of port-slot names the contract at *repo_root*
+        currently declares, or ``None`` if that cannot be determined.
+
+        Ticket #166: passed to ``reconcile()`` as its ``declared_slots``
+        callback so the list-time prune consults the same repo-root
+        contract ``start()`` itself reads (never a checkout-local copy --
+        misread::M1). Must never raise -- any failure to load the contract
+        (missing/invalid file, schema violation) means "unknown", not
+        "none", so ``reconcile()`` skips pruning that record rather than
+        risk dropping a slot that is actually still declared.
+        """
+        try:
+            contract = _load_contract(Path(repo_root) / CONTRACT_FILENAME)
+        except Exception:  # noqa: BLE001 -- must never raise into reconcile().
+            return None
+        return {s.name for s in contract.ports}
 
     def list(self) -> List[WorktreeRecord]:
         """Return every tracked ``WorktreeRecord``.
@@ -1339,7 +1358,18 @@ class WorktreeManager:
         the next ``start()`` without disturbing existing slots, and a
         stopped environment's already-allocated ports survive to the next
         start (``stop()``/``_teardown()`` never release them for a still-
-        tracked record — see ``reconcile()``'s per-owner rule).
+        tracked record — see ``reconcile()``'s per-owner rule). Conversely
+        (ticket #166), any *already-persisted* slot the current contract no
+        longer declares -- e.g. after an ``isolation: none`` downgrade, or a
+        slot simply removed from ``ports:`` -- is pruned from the record and
+        released from ``ports.yaml`` right here, before allocation, so a
+        removed slot never survives past the first ``start()`` that sees the
+        new contract. Skipped when the record has any live tracked pid (a
+        role's process may still hold the port). ``list()``/``list_repo()``
+        apply the identical prune at read time via ``reconcile()``'s
+        ``declared_slots`` callback, so a listing taken between a contract
+        change and the next ``start()``/``stop()`` cycle sees the same
+        answer without needing a restart.
 
         Delegates to ``process_lifecycle.start`` with ``store=self.state``
         only when a concrete ``start:`` step is selected. ``cwd=None``
@@ -1387,6 +1417,20 @@ class WorktreeManager:
         shadowed_contract = _detect_shadowed_contract(record, contract)
         if shadowed_contract is not None:
             _logger.warning(shadowed_contract.message)
+
+        # Ticket #166 (R2): a slot the contract no longer declares must not
+        # survive a start() -- e.g. a downgrade to isolation: none, or a
+        # slot simply removed from ports:. Guarded on `not record.pids`: a
+        # role's live tracked process may still hold the port, so pruning
+        # only applies at the first start() after stop() (mirrors the same
+        # guard in reconcile()'s list-time prune below). No stale slots
+        # means no allocator call at all.
+        stale_slots = set(record.ports) - {s.name for s in contract.ports}
+        if stale_slots and not record.pids:
+            for slot in stale_slots:
+                record.ports.pop(slot, None)
+            self._allocator.release(record.id, slots=stale_slots)
+            self.state.update(record)
 
         if contract.ports:
             # A slot is re-allocated when it is entirely missing, OR when it

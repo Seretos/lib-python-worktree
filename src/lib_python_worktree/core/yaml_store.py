@@ -34,7 +34,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Collection, Dict, List, Optional
 
 import portalocker
 import yaml
@@ -808,6 +808,7 @@ def reconcile(
     store: YamlStateStore,
     *,
     logger: Optional[logging.Logger] = None,
+    declared_slots: Optional[Callable[[str], Optional[Collection[str]]]] = None,
 ) -> ReconcileReport:
     """Scan persisted state and correct stale entries.
 
@@ -817,6 +818,25 @@ def reconcile(
       already ``"orphaned"``).
     * Port allocations whose port is not in use and has no surviving PID →
       removed from ports.yaml.
+    * (Ticket #166) A record's persisted ``ports`` that no longer match the
+      current contract's declared slots -- pruned from both the record and
+      ``ports.yaml``, exactly like ``start()``'s own prune, so a listing
+      taken between a contract change and the next ``start()``/``stop()``
+      cycle never shows a stale slot. Skipped for a record with any live
+      tracked pid (a role's process may still hold the port) and skipped
+      entirely when *declared_slots* is ``None`` or returns ``None`` for a
+      record's ``repo_root`` (declared slots genuinely unknown -- e.g. the
+      contract failed to load -- so nothing is pruned rather than risk
+      dropping a slot that is actually still declared).
+    * (Ticket #166) A record with ``path == repo_root`` (a primary checkout)
+      but a stale ``backing != "primary"`` -- healed in place. This is a
+      heal of pre-existing bad state, not a live bug: no write path in this
+      engine ever produces the mislabel.
+
+    *declared_slots*, when given, is called with a record's ``repo_root``
+    and must return the set of slot names the contract there currently
+    declares, or ``None`` if that cannot be determined (e.g. the contract
+    file failed to load) -- it must never raise.
 
     Every inconsistency is logged at WARNING level via ``logger`` (or the
     module-level logger if not supplied).
@@ -825,12 +845,52 @@ def reconcile(
     """
     _log = logger if logger is not None else logging.getLogger(__name__)
     report = ReconcileReport()
+    # (id, slot) pairs pruned below in Phase 1, popped from ports.yaml in
+    # Phase 2 -- Phase 2 cannot call PortAllocator.release() itself (it
+    # would re-acquire the same non-reentrant ports.yaml.lock Phase 2
+    # already holds and time out), so the keys are removed directly here.
+    stale_port_keys: List[str] = []
 
     # --- Phase 1: state.yaml ---
     with store._with_state_lock():
         records = store._load_state()
         changed = False
         for wt_id, rec in records.items():
+            # Ticket #166: heal a primary checkout persisted with a stale
+            # backing="worktree" -- git-free, path-only comparison, mirrors
+            # the equality remove()'s guard 1 already uses.
+            if (
+                rec.backing != "primary"
+                and Path(rec.path).resolve() == Path(rec.repo_root).resolve()
+            ):
+                _log.warning(
+                    "reconcile: worktree '%s' path equals its repo root but "
+                    "backing was '%s' → healed to 'primary'",
+                    wt_id, rec.backing,
+                )
+                rec.backing = "primary"
+                changed = True
+
+            # Ticket #166: prune a record's persisted ports against the
+            # current contract's declared slots. Only applies when the
+            # caller can tell us what is currently declared, and only to a
+            # record with no live tracked pid (a live process may still
+            # hold the port -- pruning applies at the first list/start
+            # after stop).
+            if rec.ports and not rec.pids and declared_slots is not None:
+                current = declared_slots(rec.repo_root)
+                if current is not None:
+                    stale = set(rec.ports) - set(current)
+                    if stale:
+                        for slot in stale:
+                            rec.ports.pop(slot, None)
+                            stale_port_keys.append(f"{wt_id}{_PORT_KEY_SEP}{slot}")
+                        _log.warning(
+                            "reconcile: worktree '%s' ports %s not declared "
+                            "by current contract → pruned",
+                            wt_id, sorted(stale),
+                        )
+                        changed = True
             if not Path(rec.path).exists():
                 if rec.status != "orphaned":
                     _log.warning(
@@ -926,6 +986,12 @@ def reconcile(
         for name, _port in list(allocated.items()):
             owner_id = name.split(_PORT_KEY_SEP, 1)[0]
             if owner_id not in surviving_ids:
+                to_free.append(name)
+        # Ticket #166: also free the specific `<id>:<slot>` keys pruned from
+        # a surviving record's ports above -- their owner is still tracked,
+        # so the loop above never catches them.
+        for name in stale_port_keys:
+            if name in allocated and name not in to_free:
                 to_free.append(name)
         for name in to_free:
             port = allocated.pop(name)
