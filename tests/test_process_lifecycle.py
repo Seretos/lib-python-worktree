@@ -3173,6 +3173,59 @@ class TestFindBlockingProcesses:
 
 
 # ---------------------------------------------------------------------------
+# _find_blocking_processes exclude_pids (ticket #165, R4)
+# ---------------------------------------------------------------------------
+
+class TestFindBlockingProcessesExcludePids:
+    """R4 (ticket #165): _find_blocking_processes must accept an
+    exclude_pids kwarg so the untracked-orphan sweep (site 1's
+    _sweep_untracked_orphans, plan.md round 3) can keep a sibling tracked
+    role's own pid/tree out of the path-based scan's results, even when
+    that pid's cwd genuinely is under the same worktree path. Threaded into
+    the existing excluded_pids set (l.3290) alongside the host pid/ancestor
+    exclusion, rather than a post-filter -- _kill_blocking_processes
+    discovers and kills in one call, so a post-filter cannot stop an
+    excluded pid from being signalled."""
+
+    def test_find_blocking_processes_honours_exclude_pids(self, tmp_path):
+        """Driving test, real subprocess (no mocks).
+
+        Expected RED reason (pre-fix): TypeError for the unexpected keyword
+        argument 'exclude_pids' -- the kwarg does not exist yet on
+        _find_blocking_processes.
+
+        Expected GREEN (post-fix): a real child process whose cwd is under
+        tmp_path is found by a plain call (the premise), and is absent from
+        the result once its pid is passed via exclude_pids."""
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=str(tmp_path),
+        )
+        try:
+            host_pid = os.getpid()
+
+            baseline = _find_blocking_processes(str(tmp_path), host_pid)
+            assert child.pid in {info.pid for info in baseline}, (
+                "test premise: the child must be found by a plain call, "
+                "with no exclude_pids involved yet"
+            )
+
+            excluded = _find_blocking_processes(
+                str(tmp_path), host_pid, exclude_pids={child.pid}
+            )
+            assert child.pid not in {info.pid for info in excluded}, (
+                "a pid passed via exclude_pids must be omitted from the "
+                "result even though its cwd matches the scanned path"
+            )
+        finally:
+            _force_kill(child.pid)
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # stop() timeout-budget regression tests  (ticket #50)
 # ---------------------------------------------------------------------------
 
