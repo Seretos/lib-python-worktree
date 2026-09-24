@@ -1577,7 +1577,7 @@ from unittest.mock import MagicMock, call, patch  # noqa: E402 – after sys-lev
 
 import yaml  # noqa: E402 – after sys-level imports
 
-from lib_python_worktree.contract.schema import Step, WorktreeContract  # noqa: E402
+from lib_python_worktree.contract.schema import PortSlot, Step, WorktreeContract  # noqa: E402
 from lib_python_worktree.contract.loader import ContractError, ContractValidationError  # noqa: E402
 from lib_python_worktree.setup.runner import _resolve_shell  # noqa: E402
 
@@ -1840,6 +1840,10 @@ def test_manager_start_injects_worktree_env_vars(tmp_path: Path):
         version=1,
         isolation="full",
         start=[Step(run="python server.py")],
+        # Ticket #166: start() now prunes any persisted slot the contract
+        # does not declare -- both slots must be declared here or start()
+        # would drop them before the env vars below are ever built.
+        ports=[PortSlot(name="web"), PortSlot(name="grpc")],
     )
 
     with (
@@ -1886,15 +1890,28 @@ def test_manager_start_injects_env_empty_ports(tmp_path: Path):
 
 
 def test_manager_start_injects_env_uppercase_slot(tmp_path: Path):
-    """start() normalises slot names to upper-case for WORKTREE_PORT_* keys."""
+    """start() normalises slot names to upper-case for WORKTREE_PORT_* keys.
+
+    The record's stored port key is deliberately mixed-case ("Web") to prove
+    the env-var uppercasing is unconditional -- PortSlot.name itself is
+    schema-validated lowercase-only (see schema.py), so a *contract* could
+    never declare "Web"; this models a value that reached ports={} through
+    some other path than today's allocate(), e.g. legacy data written before
+    that validation existed. A real ``PortSlot`` can't express that name, so
+    the fake contract's ports list uses a bare namespace instead (ticket
+    #166: start() now prunes against ``{s.name for s in contract.ports}``,
+    and this must line up with the record's actual mixed-case key or the
+    slot would be pruned before the env var is ever built).
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
     mgr = _make_mgr_in_memory(tmp_path)
     record = _make_wt_record(ports={"Web": 9000})
     mgr.state.add(record)
 
-    fake_contract = WorktreeContract(
-        version=1,
-        isolation="full",
+    fake_contract = SimpleNamespace(
         start=[Step(run="python server.py")],
+        ports=[SimpleNamespace(name="Web", port=None)],
     )
 
     with (
@@ -1920,6 +1937,9 @@ def test_manager_start_caller_env_overrides_worktree_vars(tmp_path: Path):
         version=1,
         isolation="full",
         start=[Step(run="python server.py")],
+        # Ticket #166: must declare the same slot start() would otherwise
+        # prune as undeclared.
+        ports=[PortSlot(name="web")],
     )
 
     # MY_VAR is a brand-new key; WORKTREE_ID collides with an injected worktree var.
