@@ -55,6 +55,7 @@ from .process_lifecycle import (
     ProcessNotRunningError,
     _find_blocking_processes,
     _kill_blocking_processes,
+    _sweep_untracked_orphans,
     start as _lifecycle_start,
     stop as _lifecycle_stop,
 )
@@ -1542,6 +1543,29 @@ class WorktreeManager:
         *not* raised.  The worktree is marked ``"stopped"`` when no other
         roles remain.
 
+        Ticket #165: this no-op path is no longer a pure early return. A
+        process spawned by a contract ``setup:`` step is never entered into
+        ANY role's ``record.pids`` (``SetupRunner`` runs inside ``create()``
+        before any role exists), so it is otherwise permanently invisible to
+        every pid-keyed mechanism ``stop()`` has — the documented gap
+        ``kill_orphans`` exists to close (see
+        ``process_lifecycle.stop``'s docstring). This branch now calls
+        ``process_lifecycle._sweep_untracked_orphans`` -- a path-scoped scan
+        against ``record.path`` (eligible only for a linked worktree with an
+        existing directory and a positive *timeout*), protecting every
+        OTHER tracked role's own pid/process-tree/Job Object from the scan.
+        With ``kill_orphans=True`` it kills what it finds (populating
+        ``killed_pids`` and appending an "orphan scan killed N process(es)"
+        suffix to ``stop_attempt.message``); either way it also drives
+        ``stop_attempt.kill_orphans_may_help`` (see the field's own
+        docstring), replacing what used to be an unconditional ``False``.
+        When the helper cannot verify the protected set (or the kill itself
+        leaves a survivor), ``status`` becomes ``"stop_incomplete"`` with a
+        ``stop_detail`` naming why — this path can now genuinely kill
+        something, so ticket #87's "never report a false stopped" applies
+        here too. ``stop_attempt.outcome`` itself stays
+        ``"no_process_recorded"`` regardless.
+
         This is the engine's documented and intentional behavior (ticket
         #41) and this method's return type is fixed: it always returns a
         ``WorktreeRecord`` (or raises ``WorktreeNotFoundError`` for an
@@ -1666,7 +1690,30 @@ class WorktreeManager:
             # pid entry was already cleared by a previous stop/reconcile)
             # must not survive here.
             record.variants.pop(effective_role, None)
-            if not record.pids and record.status not in ("stop_incomplete", "orphaned"):
+
+            # Ticket #165 (Site 1): a process spawned by a contract setup:
+            # step is never entered into ANY role's record.pids, so it is
+            # entirely invisible to _lifecycle_stop -- which this no-op path
+            # deliberately never calls, since there is no pid to check.
+            # Probe for / kill such an untracked orphan here instead,
+            # protecting every OTHER tracked role's own pid/tree/job from
+            # the scan -- see _sweep_untracked_orphans' docstring for the
+            # full contract (eligibility, protected-set scoping, and the
+            # kill_orphans=True vs. hint-only probe modes).
+            _orphan_killed, _orphan_may_help, _orphan_stop_detail = (
+                _sweep_untracked_orphans(
+                    record, effective_role, timeout=timeout, kill_orphans=kill_orphans
+                )
+            )
+
+            if _orphan_stop_detail is not None:
+                # Ticket #165: this no-op path can now actually kill
+                # something -- #87's "never report a false stopped" must
+                # hold here too, exactly like process_lifecycle.stop()'s own
+                # stop_incomplete branches.
+                record.status = "stop_incomplete"
+                record.stop_detail = _orphan_stop_detail
+            elif not record.pids and record.status not in ("stop_incomplete", "orphaned"):
                 # Ticket #95, finding 6: mirror process_lifecycle.stop()'s own
                 # guard (see its identical exclusion). "stop_incomplete" and
                 # "orphaned" are sticky, deliberately-honest statuses set by
@@ -1685,14 +1732,23 @@ class WorktreeManager:
             # "tracked_pid_missing") is never reached on this no-op path --
             # there is no pid to check. Record that explicitly rather than
             # leaving stop_attempt at whatever a previous stop() call left
-            # it as (or None, for a role that was never started).
+            # it as (or None, for a role that was never started). Ticket
+            # #165: the message names how many untracked orphans the sweep
+            # above killed, and kill_orphans_may_help now reflects that
+            # sweep's own hint instead of an unconditional False.
+            _stop_attempt_message = (
+                f"stop(worktree_id={record.id}, role={effective_role}): "
+                f"no process recorded for this role; nothing to stop"
+            )
+            if _orphan_killed:
+                _stop_attempt_message += (
+                    f"; orphan scan killed {len(_orphan_killed)} process(es)"
+                )
             record.stop_attempt = StopAttempt(
                 outcome=STOP_ATTEMPT_NO_PROCESS_RECORDED,
-                message=(
-                    f"stop(worktree_id={record.id}, role={effective_role}): "
-                    f"no process recorded for this role; nothing to stop"
-                ),
+                message=_stop_attempt_message,
                 role=effective_role,
+                kill_orphans_may_help=_orphan_may_help,
             )
             # Ticket #128: distinguish an isolation: none contract's "nothing
             # to stop, by design" no-op from an ordinary "role never
@@ -1710,9 +1766,10 @@ class WorktreeManager:
             # list. This no-op branch used to skip that refresh, so a
             # record left with stale killed_pids from an earlier real
             # stop()/start() call would still report those stale pids here
-            # even though this call reports "nothing to stop". Clear it so
-            # stale data from an older call can't leak forward.
-            record.killed_pids = []
+            # even though this call reports "nothing to stop". Ticket #165:
+            # now genuinely non-empty when the untracked-orphan sweep above
+            # found and killed something, rather than an unconditional [].
+            record.killed_pids = _orphan_killed
             self.state.update(record)
             return record
 

@@ -3927,7 +3927,21 @@ def test_manager_stop_without_pid_kill_orphans_kills_untracked_orphan(
         assert result.pids.get("web") == web_proc.pid
         assert result.stop_attempt is not None
         assert result.stop_attempt.outcome == "no_process_recorded"
-        assert result.status in ("stopped", "stop_incomplete")
+        # Test-bug fix (ticket #165 implementation round): "web" is still
+        # alive and still in record.pids after this call -- stop()'s own
+        # documented multi-role invariant ("status='stopped' only when no
+        # other roles remain in pids"; process_lifecycle.stop()'s
+        # docstring: "In a multi-role worktree, stopping one role must not
+        # mask the fact that other processes are still alive") means this
+        # call must NOT collapse the whole record to "stopped" while "web"
+        # is demonstrably still running -- that would be exactly the false
+        # "stopped" report ticket #87 exists to prevent. The original
+        # assertion here (`in ("stopped", "stop_incomplete")`) could never
+        # pass in the clean-kill case given this fixture always leaves
+        # "web" tracked; status legitimately stays at its pre-call value
+        # ("running") unless the untracked-orphan sweep itself reports an
+        # incomplete protected-set walk.
+        assert result.status in ("running", "stop_incomplete")
         if result.status == "stop_incomplete":
             assert result.stop_detail is not None
             assert result.stop_detail.reason == "orphan_scan_incomplete"
@@ -4065,6 +4079,155 @@ def test_manager_stop_dead_pid_hints_kill_orphans_when_untracked_orphan_alive(
         assert _pid_alive(web_proc.pid), "sibling role 'web' must survive the retry sweep"
     finally:
         _cleanup_process(orphan_pid)
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_kill_orphans_no_orphan_present_kills_nothing(
+    tmp_path: Path,
+):
+    """R1, additional edge-case coverage (plan.md round 3): with no
+    untracked orphan present -- only the tracked sibling 'web' under the
+    same worktree path -- kill_orphans=True on the no-pid branch must kill
+    nothing and leave 'web' alive. Guards against an unscoped
+    implementation that sweeps every process under record.path with no
+    protected set at all (the sibling exclusion is otherwise unproven by
+    R1's own orphan-present case, since 'web' surviving there is also
+    consistent with 'web' merely not matching the path heuristics by
+    chance)."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-kill-orphans-r1-no-orphan",
+            path=str(wt_dir),
+            status="running",
+            pids={"web": web_proc.pid},
+            start_times={"web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+        assert result.killed_pids == [], (
+            "no untracked orphan exists; the sweep must not kill 'web' "
+            f"or anything else, but killed_pids={result.killed_pids!r}"
+        )
+        assert _pid_alive(web_proc.pid), "sibling role 'web' must survive"
+        assert result.pids.get("web") == web_proc.pid
+    finally:
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_hint_false_when_only_sibling_present(
+    tmp_path: Path,
+):
+    """R2, additional edge-case coverage (plan.md round 3; closes
+    test-critic round 1 tautology::F1): with no untracked orphan present --
+    only the tracked sibling 'web' under the same worktree path -- a plain
+    stop() (kill_orphans=False) with no pid recorded for the resolved role
+    must set kill_orphans_may_help=False. Without the other-role exclusion
+    on the probe, a naive `bool(_find_blocking_processes(path, ...))` with
+    no exclude_pids would find 'web' itself (a real, cwd=wt process) and
+    report a spurious True -- this is exactly the scenario the tautology
+    finding named as unconstrained by R2's own orphan-present case alone."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-hint-r2-no-orphan",
+            path=str(wt_dir),
+            status="running",
+            pids={"web": web_proc.pid},
+            start_times={"web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main")
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.kill_orphans_may_help is False, (
+            "only the tracked sibling 'web' is present under the worktree "
+            "path -- the probe must exclude it, not report it as an "
+            "untracked orphan"
+        )
+        assert result.killed_pids == []
+        assert _pid_alive(web_proc.pid)
+    finally:
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_dead_pid_hint_false_when_only_sibling_present(tmp_path: Path):
+    """R3, additional edge-case coverage (plan.md round 3; closes
+    test-critic round 1 tautology::F2): a role whose recorded pid has
+    already exited, with no untracked orphan present -- only the tracked
+    sibling 'web' -- must get kill_orphans_may_help=False. Without the
+    other-role exclusion on Site 2's probe, an unscoped discovery call
+    would find 'web' itself and report a spurious True, exactly the
+    scenario the tautology finding named as unconstrained by R3's own
+    orphan-present case alone."""
+    import psutil
+
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    dead_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_start_time = psutil.Process(dead_proc.pid).create_time()
+    dead_proc.wait(timeout=10)
+    dead_pid = dead_proc.pid
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-dead-pid-r3-no-orphan",
+            path=str(wt_dir),
+            status="running",
+            pids={"main": dead_pid, "web": web_proc.pid},
+            start_times={"main": dead_start_time, "web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main")
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == "already_exited", (
+            f"test premise: expected outcome 'already_exited', got "
+            f"{result.stop_attempt.outcome!r}"
+        )
+        assert result.stop_attempt.kill_orphans_may_help is False, (
+            "only the tracked sibling 'web' is present under the worktree "
+            "path -- the probe must exclude it, not report it as an "
+            "untracked orphan"
+        )
+        assert _pid_alive(web_proc.pid)
+    finally:
         _cleanup_process(web_proc)
 
 

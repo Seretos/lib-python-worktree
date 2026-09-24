@@ -39,7 +39,9 @@ from lib_python_worktree.core.process_lifecycle import (
     _HANDLE_QUERY_GRACE_BUDGET_SEC,
     _HANDLE_QUERY_GRACE_SEC,
     _HANDLE_QUERY_TIMEOUT_SEC,
+    _MAX_TREE_NODES,
     _MAX_WEDGED_HANDLE_WORKERS,
+    _compute_protected_pids,
     _describe_pid,
     _find_blocking_processes,
     _force_kill,
@@ -52,6 +54,7 @@ from lib_python_worktree.core.process_lifecycle import (
     _send_graceful_signal,
     _signal_process_group,
     _spawn_detached,
+    _sweep_untracked_orphans,
     _wait_or_kill,
     _wedged_slot_available,
     _win_handle_holders,
@@ -3223,6 +3226,208 @@ class TestFindBlockingProcessesExcludePids:
                 child.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# _sweep_untracked_orphans / _compute_protected_pids (ticket #165)
+# ---------------------------------------------------------------------------
+
+class TestSweepUntrackedOrphans:
+    """Mocked unit coverage for _sweep_untracked_orphans and
+    _compute_protected_pids (ticket #165, plan.md round 3) -- the helper
+    both of stop()'s two "no live pid for this role" sites (Site 1,
+    manager.py's no-pid branch; Site 2, this module's already_exited hint)
+    route through. test_manager.py's R1-R3 driving tests exercise this end
+    to end with real subprocesses; these tests pin the helper's own edge
+    cases directly and cheaply (mocked), per the plan's "Additional
+    edge-case coverage" bullets."""
+
+    def test_ineligible_primary_backing_makes_no_scan_call(self, tmp_path):
+        """A primary-backed record is never scanned -- setup: only ever
+        runs for a linked worktree (manager.py's create()), so scanning the
+        primary checkout would risk the user's own unrelated processes."""
+        record = _make_record("wt-primary", path=str(tmp_path), backing="primary")
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes"
+            ) as mock_find,
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes"
+            ) as mock_kill,
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=True
+            )
+        assert (killed, may_help, stop_detail) == ([], False, None)
+        mock_find.assert_not_called()
+        mock_kill.assert_not_called()
+
+    def test_ineligible_nonexistent_path_makes_no_scan_call(self, tmp_path):
+        """A record whose path does not exist on disk is never scanned."""
+        record = _make_record(
+            "wt-missing", path=str(tmp_path / "does-not-exist"), backing="worktree"
+        )
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._find_blocking_processes"
+        ) as mock_find:
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=False
+            )
+        assert (killed, may_help, stop_detail) == ([], False, None)
+        mock_find.assert_not_called()
+
+    def test_ineligible_zero_timeout_makes_no_scan_call(self, tmp_path):
+        """timeout<=0 leaves no budget for a scan."""
+        record = _make_record("wt-notime", path=str(tmp_path), backing="worktree")
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._find_blocking_processes"
+        ) as mock_find:
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=0.0, kill_orphans=True
+            )
+        assert (killed, may_help, stop_detail) == ([], False, None)
+        mock_find.assert_not_called()
+
+    def test_kill_orphans_true_survivor_gives_survivors_reason(self, tmp_path):
+        """A kill attempt whose target is still alive afterward (per
+        _pid_alive) must report STOP_REASON_SURVIVORS, mirroring stop()'s
+        own pid-keyed survivor re-probe -- ticket #87's "never report a
+        false stopped" applies here too."""
+        record = _make_record("wt-survivor", path=str(tmp_path), backing="worktree")
+        survivor = KilledProcessInfo(
+            pid=12345, name="x", cmdline=["x"], source="orphan_scan"
+        )
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+                return_value=_pl._PartialList([survivor], complete=True),
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._pid_alive",
+                return_value=True,
+            ),
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=True
+            )
+        assert killed == [survivor]
+        assert may_help is False
+        assert stop_detail is not None
+        assert stop_detail.reason == STOP_REASON_SURVIVORS
+        assert stop_detail.survivor_pids == (12345,)
+
+    def test_kill_orphans_true_incomplete_scan_gives_orphan_scan_incomplete(
+        self, tmp_path
+    ):
+        """A discovery scan that did not have full coverage (but found no
+        confirmed survivor) must report STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        -- "found nothing" and "never looked" must stay distinguishable."""
+        record = _make_record(
+            "wt-incomplete-scan", path=str(tmp_path), backing="worktree"
+        )
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._kill_blocking_processes",
+            return_value=_pl._PartialList(
+                [], complete=False, skipped_passes=("cwd:truncated",)
+            ),
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=True
+            )
+        assert killed == []
+        assert may_help is False
+        assert stop_detail is not None
+        assert stop_detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        assert stop_detail.skipped_passes == ("cwd:truncated",)
+
+    def test_protected_set_incomplete_makes_no_kill_call_and_tags_protect_incomplete(
+        self, tmp_path
+    ):
+        """A sibling role's descendant-tree snapshot hitting the same
+        truncation cap _process_tree itself enforces must fail the whole
+        protected-set computation closed: no kill is attempted (protecting
+        a sibling from a possibly-wrong exclusion set outweighs finding an
+        orphan this call), the hint stays False, and the StopDetail names
+        "protect:incomplete" -- kill_orphans=True mode only; see
+        _sweep_untracked_orphans' own docstring for why the hint-only mode
+        has nothing to report incomplete."""
+        record = _make_record(
+            "wt-protect-incomplete",
+            path=str(tmp_path),
+            backing="worktree",
+            pids={"main": 111, "web": 222},
+        )
+        truncated_tree = [
+            KilledProcessInfo(pid=1000 + i, name="x", cmdline=[])
+            for i in range(_MAX_TREE_NODES)
+        ]
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=truncated_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._kill_blocking_processes"
+            ) as mock_kill,
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=True
+            )
+        assert killed == []
+        assert may_help is False
+        mock_kill.assert_not_called()
+        assert stop_detail is not None
+        assert stop_detail.reason == STOP_REASON_ORPHAN_SCAN_INCOMPLETE
+        assert stop_detail.skipped_passes == ("protect:incomplete",)
+
+    def test_protected_set_incomplete_hint_mode_stays_false_no_stop_detail(
+        self, tmp_path
+    ):
+        """The mirror-image of the previous test for the hint-only
+        (kill_orphans=False) probe mode: an incomplete protected set fails
+        closed to a False hint, but -- since this call never attempts
+        anything to kill either way -- reports no StopDetail (nothing to
+        call incomplete)."""
+        record = _make_record(
+            "wt-protect-incomplete-hint",
+            path=str(tmp_path),
+            backing="worktree",
+            pids={"main": 111, "web": 222},
+        )
+        truncated_tree = [
+            KilledProcessInfo(pid=1000 + i, name="x", cmdline=[])
+            for i in range(_MAX_TREE_NODES)
+        ]
+        with (
+            patch(
+                "lib_python_worktree.core.process_lifecycle._process_tree",
+                return_value=truncated_tree,
+            ),
+            patch(
+                "lib_python_worktree.core.process_lifecycle._find_blocking_processes"
+            ) as mock_find,
+        ):
+            killed, may_help, stop_detail = _sweep_untracked_orphans(
+                record, "main", timeout=10.0, kill_orphans=False
+            )
+        assert (killed, may_help, stop_detail) == ([], False, None)
+        mock_find.assert_not_called()
+
+    def test_compute_protected_pids_excludes_only_other_roles(self):
+        """_compute_protected_pids must protect every OTHER role's pid (and
+        their descendant tree), never the role being stopped itself."""
+        record = _make_record(
+            "wt-protected-set", pids={"main": 111, "web": 222, "worker": 333}
+        )
+        child = KilledProcessInfo(pid=444, name="child", cmdline=[])
+        with patch(
+            "lib_python_worktree.core.process_lifecycle._process_tree",
+            side_effect=lambda pid: [child] if pid == 222 else [],
+        ):
+            protected, complete = _compute_protected_pids(record, "main")
+        assert complete is True
+        assert protected == {222, 333, 444}
+        assert 111 not in protected
 
 
 # ---------------------------------------------------------------------------

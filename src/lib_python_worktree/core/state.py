@@ -287,8 +287,22 @@ class StopAttempt:
     terminate.
     ``kill_orphans_may_help`` mirrors :class:`StopDetail`'s hint: ``True``
     when a ``kill_orphans=True`` retry might catch something this call
-    missed (only meaningful for ``"tracked_pid_missing"`` when the orphan
-    scan did not already run).
+    missed. Meaningful for two outcomes, both gated on the orphan scan not
+    having already run this call (``not kill_orphans``):
+
+    - ``"tracked_pid_missing"``: as above.
+    - ``"already_exited"`` / ``"no_process_recorded"`` (ticket #165): an
+      untracked process spawned by a contract ``setup:`` step -- never
+      entered into ANY role's ``record.pids``, so invisible to everything
+      else this class describes -- may still be alive under
+      ``record.path``. Both outcomes derive this hint from
+      ``process_lifecycle._sweep_untracked_orphans``' own ``kill_orphans=
+      False`` probe mode, which excludes every OTHER tracked role's own
+      pid/process-tree/Job Object from the probe so a healthy sibling is
+      never mistaken for an orphan. Before this ticket, ``"already_exited"``
+      hard-coded this hint to ``False`` unconditionally -- the defect the
+      ticket's own repro reported (a caller following this very docstring's
+      advice would never have considered a retry).
 
     Deliberately **transient**, exactly like ``WorktreeRecord.killed_pids``:
     this describes a single call's attempt, not a durable verdict, so it is
