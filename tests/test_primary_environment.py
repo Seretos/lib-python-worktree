@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -25,10 +26,14 @@ from lib_python_worktree.core._exceptions import (
     WorktreeError,
 )
 from lib_python_worktree.core.checkout import classify_checkout, primary_id_for
-from lib_python_worktree.core.manager import WorktreeManager, WorktreeNotFoundError
+from lib_python_worktree.core.manager import (
+    ManagerConfig,
+    WorktreeManager,
+    WorktreeNotFoundError,
+)
 from lib_python_worktree.core.process_lifecycle import ProcessAlreadyRunningError
 from lib_python_worktree.core.state import WorktreeRecord
-from lib_python_worktree.core.yaml_store import _pid_alive
+from lib_python_worktree.core.yaml_store import YamlStateStore, _pid_alive
 
 
 # ---------------------------------------------------------------------------
@@ -671,3 +676,361 @@ def test_start_no_ports_allocates_nothing_and_takes_no_lock(
     record = mgr.start(checkout_path=str(git_repo))
     assert record.ports == {}
     assert calls["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Ticket #166 -- stale `ports` survive a contract change; a mislabelled
+# primary heals to backing="primary" at list time
+# ---------------------------------------------------------------------------
+#
+# NOTE on fixture choice: the `yaml_manager` fixture factory (conftest.py)
+# hard-codes `reconcile_on_init=False` for reasons unrelated to this ticket
+# (see its own tests elsewhere), which means a manager built through it never
+# runs `reconcile()` from `list()`/`list_repo()` at all -- exactly the call
+# path this ticket's list-time prune/heal lives in. The established idiom for
+# exercising that reconcile-triggered path (see `TestManagerListReconciles`
+# and `test_reconcile_heal_never_endangers_owned_branch_deletion` in
+# test_manager.py) is either constructing a `WorktreeManager` directly with
+# the default `reconcile_on_init=True`, or -- when `create()`/`start()`/
+# `stop()` via `yaml_manager()` already did the real git/port-allocation
+# work -- wrapping the SAME on-disk `state`/`config` in a second manager with
+# that default, used only for the listing calls under test. Both patterns are
+# used below.
+
+def _reconciling_reader(mgr: WorktreeManager) -> WorktreeManager:
+    """A second manager over *mgr*'s own on-disk state/config, with the
+    default ``reconcile_on_init=True`` -- see the NOTE above."""
+    return WorktreeManager(config=mgr.config, state=mgr.state)
+
+
+@pytest.mark.requires_git
+def test_list_prunes_ports_after_downgrade_to_isolation_none(
+    yaml_manager, git_repo: Path
+):
+    """R1 driving test: a stopped primary downgraded to isolation:none lists
+    ports: {} without a restart -- both list_repo() and list() reflect it,
+    and the port is actually freed in ports.yaml, not just hidden."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+
+    record = mgr.start(checkout_path=str(git_repo))
+    web_port = record.ports["web"]
+    assert isinstance(web_port, int)
+    mgr.stop(checkout_path=str(git_repo))
+
+    _write_contract(git_repo, "version: 1\nisolation: none\n")
+
+    reader = _reconciling_reader(mgr)
+
+    listing = reader.list_repo(str(git_repo))
+    primary_entries = [e for e in listing.entries if e.record.backing == "primary"]
+    assert len(primary_entries) == 1
+    assert primary_entries[0].record.ports == {}
+
+    listed = reader.list()
+    assert listed[0].ports == {}
+
+    persisted = mgr.state.get(primary_id_for(git_repo))
+    assert persisted.ports == {}
+
+    all_ports = mgr.state._ports.get_all()
+    pid = primary_id_for(git_repo)
+    assert f"{pid}:web" not in all_ports
+
+
+@pytest.mark.requires_git
+def test_list_keeps_ports_when_contract_forbids_isolation_none_with_ports(
+    yaml_manager, git_repo: Path
+):
+    """R1 edge-case (a): a structurally-invalid contract (isolation: none
+    declared alongside ports:) must not raise from list()/list_repo() --
+    declared slots are unknown in this case (the load itself fails), so
+    pruning is skipped and existing ports are kept -- while start() still
+    raises ContractValidationError exactly as before this ticket (R5,
+    existing-suite: test_contract.py::test_isolation_none_forbids_ports)."""
+    from lib_python_worktree.contract.loader import ContractValidationError
+
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+    mgr.start(checkout_path=str(git_repo))
+    mgr.stop(checkout_path=str(git_repo))
+
+    _write_contract(
+        git_repo, "version: 1\nisolation: none\nports:\n  - name: web\n"
+    )
+
+    reader = _reconciling_reader(mgr)
+    listing = reader.list_repo(str(git_repo))  # must not raise
+    primary_entries = [e for e in listing.entries if e.record.backing == "primary"]
+    assert len(primary_entries) == 1
+    assert "web" in primary_entries[0].record.ports
+
+    with pytest.raises(ContractValidationError):
+        mgr.start(checkout_path=str(git_repo))
+
+
+@pytest.mark.requires_git
+def test_list_prunes_ports_when_contract_file_deleted(
+    yaml_manager, git_repo: Path
+):
+    """R1 edge-case (b): a missing contract file loads as an implicit
+    isolation: none contract (no ports at all) -- pruning treats it exactly
+    like an explicit isolation: none downgrade."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+    mgr.start(checkout_path=str(git_repo))
+    mgr.stop(checkout_path=str(git_repo))
+
+    (git_repo / ".seretos" / "worktree-setup.yml").unlink()
+
+    reader = _reconciling_reader(mgr)
+    listing = reader.list_repo(str(git_repo))
+    primary_entries = [e for e in listing.entries if e.record.backing == "primary"]
+    assert primary_entries[0].record.ports == {}
+
+
+@pytest.mark.requires_git
+def test_list_keeps_ports_when_contract_yaml_invalid(
+    yaml_manager, git_repo: Path
+):
+    """R1 edge-case (c): a contract file that fails to even parse as YAML
+    must not raise from listing and must not prune -- declared slots are
+    genuinely unknown here (the load raised), not "none"."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+    mgr.start(checkout_path=str(git_repo))
+    mgr.stop(checkout_path=str(git_repo))
+
+    # Same broken-YAML fixture text already established in test_manager.py's
+    # test_manager_start_contract_invalid_yaml_raises_contract_error.
+    _write_contract(git_repo, "version: 1\n  bad: indent: here\n")
+
+    reader = _reconciling_reader(mgr)
+    listing = reader.list_repo(str(git_repo))  # must not raise
+    primary_entries = [e for e in listing.entries if e.record.backing == "primary"]
+    assert "web" in primary_entries[0].record.ports
+
+
+@pytest.mark.requires_git
+def test_list_keeps_ports_when_role_pid_alive(tmp_path: Path, git_repo: Path):
+    """R1 edge-case (e): a record with a live tracked pid must not be
+    pruned -- the process may still hold the port. Pruning only applies at
+    the first list/start after stop (the plan's "not pids" qualifier)."""
+    store = YamlStateStore(state_dir=tmp_path / "state")
+    _write_contract(git_repo, "version: 1\nisolation: none\n")
+    rec = WorktreeRecord(
+        id=primary_id_for(git_repo),
+        repo_root=git_repo.resolve().as_posix(),
+        path=git_repo.resolve().as_posix(),
+        branch=None,
+        backing="primary",
+        ports={"web": 31234},
+        pids={"main": os.getpid()},
+    )
+    store.add(rec)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=store
+    )
+
+    listed = mgr.list()
+    assert listed[0].ports == {"web": 31234}
+
+
+@pytest.mark.requires_git
+def test_list_prunes_linked_worktree_by_repo_root_contract(
+    yaml_manager, git_repo: Path
+):
+    """R1d driving test: a linked worktree is pruned against the
+    REPO-ROOT contract, not any checkout-local copy -- the same contract
+    start() itself reads (misread::M1 in the plan: every engine read
+    composes Path(record.repo_root) / CONTRACT_FILENAME, never
+    record.path). A stale checkout-local copy that still declares the
+    removed slot must have zero effect."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo,
+        "version: 1\nisolation: full\nports:\n  - name: web\n  - name: db\n",
+    )
+    rec = mgr.create(str(git_repo), "feature/r1d-prune", base="main", fetch=False)
+    started = mgr.start(worktree_id=rec.id)
+    web_port = started.ports["web"]
+    assert "db" in started.ports
+    mgr.stop(worktree_id=rec.id)
+
+    # Repo root drops the db slot...
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+    # ...but the checkout-local copy (never read by start()/reconcile) still
+    # declares both -- if pruning ever consulted THIS file instead of the
+    # repo-root one, db would incorrectly survive.
+    _write_contract(
+        Path(rec.path),
+        "version: 1\nisolation: full\nports:\n  - name: web\n  - name: db\n",
+    )
+
+    reader = _reconciling_reader(mgr)
+    listing = reader.list_repo(str(git_repo))
+    linked_entry = next(e for e in listing.entries if e.record.id == rec.id)
+    assert linked_entry.record.ports == {"web": web_port}
+
+    all_ports = mgr.state._ports.get_all()
+    assert f"{rec.id}:db" not in all_ports
+    assert all_ports.get(f"{rec.id}:web") == web_port
+
+    # start() reaches the same verdict, from the same repo-root contract,
+    # with no flap on the surviving port.
+    restarted = mgr.start(worktree_id=rec.id)
+    assert restarted.ports == {"web": web_port}
+
+    mgr.stop(worktree_id=rec.id)
+
+
+@pytest.mark.requires_git
+def test_list_and_start_ignore_checkout_local_contract_drop(
+    yaml_manager, git_repo: Path
+):
+    """R1d edge-case (reverse): the repo root keeps both slots; only the
+    (never-read) checkout-local copy drops one. Both list_repo() and
+    start() must keep the slot the repo-root contract still declares."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo,
+        "version: 1\nisolation: full\nports:\n  - name: web\n  - name: db\n",
+    )
+    rec = mgr.create(str(git_repo), "feature/r1d-reverse", base="main", fetch=False)
+    started = mgr.start(worktree_id=rec.id)
+    web_port = started.ports["web"]
+    db_port = started.ports["db"]
+    mgr.stop(worktree_id=rec.id)
+
+    # Repo root still declares both; only the checkout-local copy drops db.
+    _write_contract(
+        Path(rec.path), "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+
+    reader = _reconciling_reader(mgr)
+    listing = reader.list_repo(str(git_repo))
+    linked_entry = next(e for e in listing.entries if e.record.id == rec.id)
+    assert linked_entry.record.ports == {"web": web_port, "db": db_port}
+
+    restarted = mgr.start(worktree_id=rec.id)
+    assert restarted.ports == {"web": web_port, "db": db_port}
+
+    mgr.stop(worktree_id=rec.id)
+
+
+@pytest.mark.requires_git
+def test_start_prunes_slot_removed_from_contract(yaml_manager, git_repo: Path):
+    """R2 driving test: a removed slot disappears at start() -- undeclared
+    slots are dropped from the record and from ports.yaml, declared ones
+    are kept and their port numbers do not flap."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo,
+        "version: 1\nisolation: full\nports:\n  - name: web\n  - name: db\n",
+    )
+    record = mgr.start(checkout_path=str(git_repo))
+    web_port = record.ports["web"]
+    assert "db" in record.ports
+    mgr.stop(checkout_path=str(git_repo))
+
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+
+    record2 = mgr.start(checkout_path=str(git_repo))
+    assert record2.ports == {"web": web_port}
+
+    persisted = mgr.state.get(primary_id_for(git_repo))
+    assert persisted.ports == {"web": web_port}
+
+    pid = primary_id_for(git_repo)
+    all_ports = mgr.state._ports.get_all()
+    assert f"{pid}:db" not in all_ports
+    assert all_ports.get(f"{pid}:web") == web_port
+
+    mgr.stop(checkout_path=str(git_repo))
+
+
+@pytest.mark.requires_git
+def test_start_prunes_all_ports_after_isolation_none_downgrade(
+    yaml_manager, git_repo: Path
+):
+    """R2 edge-case: after an isolation:none downgrade, start() itself
+    (not just listing) returns ports == {}."""
+    mgr = yaml_manager()
+    _write_contract(
+        git_repo, "version: 1\nisolation: full\nports:\n  - name: web\n"
+    )
+    mgr.start(checkout_path=str(git_repo))
+    mgr.stop(checkout_path=str(git_repo))
+
+    _write_contract(git_repo, "version: 1\nisolation: none\n")
+    record2 = mgr.start(checkout_path=str(git_repo))
+    assert record2.ports == {}
+
+
+@pytest.mark.requires_git
+def test_list_heals_mislabelled_primary_backing(tmp_path: Path, git_repo: Path):
+    """R3 driving test: a record with path == repo_root but a stale
+    backing="worktree" heals to "primary" at list time -- this is a live
+    bad state (no write site produces it), so it is healed by reconcile()
+    rather than fixed at a write site."""
+    store = YamlStateStore(state_dir=tmp_path / "state")
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=store
+    )
+    rec = WorktreeRecord(
+        id=primary_id_for(git_repo),
+        repo_root=git_repo.resolve().as_posix(),
+        path=git_repo.resolve().as_posix(),
+        branch=None,
+        backing="worktree",
+    )
+    mgr.state.add(rec)
+
+    listing = mgr.list_repo(str(git_repo))
+    primary_entries = [
+        e for e in listing.entries if e.record.id == primary_id_for(git_repo)
+    ]
+    assert len(primary_entries) == 1
+    assert primary_entries[0].record.backing == "primary"
+
+    persisted = mgr.state.get(primary_id_for(git_repo))
+    assert persisted.backing == "primary"
+
+
+@pytest.mark.requires_git
+def test_list_leaves_linked_worktree_backing_unchanged(
+    tmp_path: Path, git_repo: Path, linked_worktree: Path
+):
+    """R3 edge-case: a genuinely linked worktree record (path != repo_root)
+    must not be relabelled -- the heal is scoped to path == repo_root."""
+    store = YamlStateStore(state_dir=tmp_path / "state")
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=store
+    )
+    rec = WorktreeRecord(
+        id="linked-r3-unchanged",
+        repo_root=git_repo.resolve().as_posix(),
+        path=linked_worktree.resolve().as_posix(),
+        branch="feature/alpha",
+        backing="worktree",
+    )
+    mgr.state.add(rec)
+
+    listing = mgr.list_repo(str(git_repo))
+    linked_entries = [
+        e for e in listing.entries if e.record.id == "linked-r3-unchanged"
+    ]
+    assert len(linked_entries) == 1
+    assert linked_entries[0].record.backing == "worktree"

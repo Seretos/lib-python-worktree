@@ -327,6 +327,30 @@ def test_release_on_empty_ports_file_is_safe(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Ticket #166 -- R4: per-slot release
+# ---------------------------------------------------------------------------
+
+def test_release_only_named_slots(tmp_path: Path):
+    """release(id, slots=[...]) removes only the named slot(s), leaving the
+    owner's other slots intact; slots=None (the pre-existing default) still
+    removes everything for that owner, unchanged."""
+    allocator = _make_allocator(tmp_path, port_range=(30000, 30099))
+    allocator.allocate(["web", "db"], "wt-partial")
+
+    allocator.release("wt-partial", slots=["db"])
+
+    pf = _make_ports_file(tmp_path)
+    remaining = pf.get_all()
+    assert "wt-partial:db" not in remaining
+    assert "wt-partial:web" in remaining
+
+    # slots=None (the default) still removes everything for the owner.
+    allocator.release("wt-partial")
+    remaining_after = _make_ports_file(tmp_path).get_all()
+    assert not any(k.startswith("wt-partial:") for k in remaining_after)
+
+
+# ---------------------------------------------------------------------------
 # Concurrency test
 # ---------------------------------------------------------------------------
 
