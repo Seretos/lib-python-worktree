@@ -37,6 +37,7 @@ from lib_python_worktree.core.manager import (
     _run_git,
 )
 from lib_python_worktree.core.state import (
+    STOP_REASON_CONCURRENT_START_RACE,
     STOP_REASON_SURVIVORS,
     InMemoryStateStore,
     StopDetail,
@@ -3742,6 +3743,620 @@ def test_manager_stop_without_pid_clears_stale_killed_pids(tmp_path: Path):
     assert result.killed_pids == []
     stored = mgr.state.get(record.id)
     assert stored.killed_pids == []
+
+
+# ---------------------------------------------------------------------------
+# Ticket #165: kill_orphans must find/kill an untracked orphan spawned by a
+# setup: step, for a role with no live pid -- both the never-tracked case
+# (no_process_recorded, Site 1) and the tracked-but-dead-pid case
+# (already_exited, Site 2). See plan.md round 3 for the full design.
+# ---------------------------------------------------------------------------
+
+
+def _spawn_untracked_orphan(tmp_path: Path, wt_dir: Path, form: str, tag: str):
+    """Run a real ``setup:`` step (via ``SetupRunner``, exactly as
+    ``manager.create()`` would) that spawns a genuinely detached grandchild
+    sleeper process whose cwd is *wt_dir* and whose pid is never entered
+    into any ``WorktreeRecord.pids`` -- the ticket's own untracked-orphan
+    scenario ("a process started by a setup: step").
+
+    ``form`` is one of:
+    - ``"start_process"`` (win32 only): PowerShell ``Start-Process ...
+      -WindowStyle Hidden`` with no ``-WorkingDirectory`` -- the ticket's
+      own repro shape.
+    - ``"python_detached"`` (all OSes): a short python "spawner" script that
+      launches the sleeper with ``DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP``
+      (win32) / ``start_new_session=True`` (POSIX), then exits.
+
+    Returns the orphan's pid. Asserts the fixture's own premise (the orphan
+    actually started and is alive) -- a failure here is a fixture problem,
+    not the ticket's bug.
+    """
+    from lib_python_worktree.setup.runner import SetupRunner
+
+    pidfile = tmp_path / f"orphan-{tag}.pid"
+    sleeper = tmp_path / f"sleeper-{tag}.py"
+    sleeper.write_text(
+        "import os, time, pathlib\n"
+        f"pathlib.Path(r'{pidfile}').write_text(str(os.getpid()))\n"
+        "time.sleep(120)\n"
+    )
+
+    if form == "start_process":
+        run_line = (
+            f'Start-Process -FilePath "{sys.executable}" '
+            f'-ArgumentList "{sleeper}" -WindowStyle Hidden'
+        )
+    elif form == "python_detached":
+        spawner = tmp_path / f"spawner-{tag}.py"
+        spawner.write_text(
+            "import subprocess, sys\n"
+            # Explicitly detach the sleeper's stdio from whatever pipes this
+            # spawner process itself inherited (the setup step's own
+            # stdout=PIPE/stderr=PIPE, see SetupRunner._default_popen). On
+            # POSIX, start_new_session=True detaches the process *group* but
+            # does not close inherited fds -- left unredirected, the
+            # long-lived sleeper keeps the pipes' write end open forever,
+            # and the setup step's proc.communicate() never sees EOF and
+            # hangs until the test's own timeout. Windows' DETACHED_PROCESS
+            # path doesn't share fds the same way, which is why this only
+            # ever hung on the Linux CI leg.
+            "kwargs = {\n"
+            "    'stdin': subprocess.DEVNULL,\n"
+            "    'stdout': subprocess.DEVNULL,\n"
+            "    'stderr': subprocess.DEVNULL,\n"
+            "}\n"
+            "if sys.platform == 'win32':\n"
+            "    kwargs['creationflags'] = (\n"
+            "        subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP\n"
+            "    )\n"
+            "else:\n"
+            "    kwargs['start_new_session'] = True\n"
+            f"subprocess.Popen([sys.executable, r'{sleeper}'], **kwargs)\n"
+        )
+        # PowerShell requires the call operator ("&") to invoke a quoted
+        # command string; bash -c accepts a bare quoted command directly, so
+        # the "&" would be misparsed as a backgrounding operator there.
+        if sys.platform == "win32":
+            run_line = f'& "{sys.executable}" "{spawner}"'
+        else:
+            run_line = f'"{sys.executable}" "{spawner}"'
+    else:
+        raise ValueError(f"unknown form: {form!r}")
+
+    runner = SetupRunner(log_root=tmp_path / "logs")
+    runner.run(
+        setup=[Step(run=run_line, name=f"spawn-orphan-{form}")],
+        worktree_id=f"wt-spawn-{tag}",
+        worktree_path=wt_dir,
+        branch="b",
+    )
+
+    orphan_pid = None
+    for _ in range(100):
+        if pidfile.exists():
+            try:
+                orphan_pid = int(pidfile.read_text().strip())
+                break
+            except ValueError:
+                pass
+        time.sleep(0.1)
+    assert orphan_pid is not None, f"orphan ({form}) never wrote its PID file"
+    assert _pid_alive(orphan_pid), f"orphan ({form}) exited before it could be observed"
+    return orphan_pid
+
+
+def _spawn_tracked_sibling(wt_dir: Path):
+    """A real, long-running process with cwd=*wt_dir* and a captured
+    ``start_time``, standing in for a tracked sibling role ("web") that the
+    new orphan sweep must never touch. Returns (Popen, start_time)."""
+    import psutil
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        cwd=str(wt_dir),
+    )
+    start_time = psutil.Process(proc.pid).create_time()
+    return proc, start_time
+
+
+def _cleanup_process(pid_or_proc) -> None:
+    """Best-effort teardown for a test-spawned process, real pid or Popen."""
+    from lib_python_worktree.core.process_lifecycle import _force_kill
+
+    if isinstance(pid_or_proc, int):
+        if _pid_alive(pid_or_proc):
+            _force_kill(pid_or_proc)
+        return
+    if pid_or_proc.poll() is None:
+        pid_or_proc.kill()
+        try:
+            pid_or_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        pytest.param(
+            "start_process",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="win32-only"),
+        ),
+        "python_detached",
+    ],
+)
+def test_manager_stop_without_pid_kill_orphans_kills_untracked_orphan(
+    tmp_path: Path, form: str
+):
+    """R1, driving test (ticket #165, Acceptance 1): environment_stop(
+    kill_orphans=True) must find and kill a process spawned by a setup:
+    step that was never entered into record.pids -- the documented primary
+    use case for kill_orphans -- and killed_pids must contain its pid.
+
+    Expected RED reason (pre-fix): WorktreeManager.stop()'s no-pid branch
+    returns early (unconditional `record.killed_pids = []`) without ever
+    scanning, so the orphan survives and killed_pids stays empty."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    orphan_pid = _spawn_untracked_orphan(tmp_path, wt_dir, form, tag=f"r1-{form}")
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-kill-orphans-r1",
+            path=str(wt_dir),
+            status="running",
+            pids={"web": web_proc.pid},
+            start_times={"web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+        deadline = time.monotonic() + 10.0
+        while _pid_alive(orphan_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+
+        killed = {info.pid for info in result.killed_pids}
+        assert orphan_pid in killed, (
+            f"orphan ({form}) pid {orphan_pid} was not reported in "
+            f"killed_pids ({killed}); kill_orphans=True on the no-pid "
+            f"branch must find and kill it"
+        )
+        assert not _pid_alive(orphan_pid), (
+            f"orphan ({form}) pid {orphan_pid} is still alive after "
+            f"stop(kill_orphans=True)"
+        )
+        assert _pid_alive(web_proc.pid), (
+            "sibling role 'web' must survive the orphan sweep"
+        )
+        assert result.pids.get("web") == web_proc.pid
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == "no_process_recorded"
+        # Test-bug fix (ticket #165 implementation round): "web" is still
+        # alive and still in record.pids after this call -- stop()'s own
+        # documented multi-role invariant ("status='stopped' only when no
+        # other roles remain in pids"; process_lifecycle.stop()'s
+        # docstring: "In a multi-role worktree, stopping one role must not
+        # mask the fact that other processes are still alive") means this
+        # call must NOT collapse the whole record to "stopped" while "web"
+        # is demonstrably still running -- that would be exactly the false
+        # "stopped" report ticket #87 exists to prevent. The original
+        # assertion here (`in ("stopped", "stop_incomplete")`) could never
+        # pass in the clean-kill case given this fixture always leaves
+        # "web" tracked; status legitimately stays at its pre-call value
+        # ("running") unless the untracked-orphan sweep itself reports an
+        # incomplete protected-set walk.
+        assert result.status in ("running", "stop_incomplete")
+        if result.status == "stop_incomplete":
+            assert result.stop_detail is not None
+            assert result.stop_detail.reason == "orphan_scan_incomplete"
+    finally:
+        _cleanup_process(orphan_pid)
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_hints_kill_orphans_when_untracked_orphan_alive(
+    tmp_path: Path,
+):
+    """R2, driving test (ticket #165, Acceptance 2, never-tracked case): a
+    plain stop() (kill_orphans=False) with no pid recorded for the resolved
+    role must set stop_attempt.kill_orphans_may_help=True when an untracked
+    orphan spawned by a setup: step is still alive under the worktree path
+    -- exactly the case the field's own docs describe.
+
+    Expected RED reason (pre-fix): the no-pid branch never scans at all, so
+    the hint stays at its default False."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    orphan_pid = _spawn_untracked_orphan(tmp_path, wt_dir, "python_detached", tag="r2")
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-hint-r2",
+            path=str(wt_dir),
+            status="running",
+            pids={"web": web_proc.pid},
+            start_times={"web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main")
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.kill_orphans_may_help is True, (
+            "an untracked orphan is alive under the worktree path; the "
+            "hint must be True so a caller following the docs knows a "
+            "kill_orphans=True retry can help"
+        )
+        assert result.killed_pids == []
+        assert _pid_alive(orphan_pid)
+        assert _pid_alive(web_proc.pid)
+    finally:
+        _cleanup_process(orphan_pid)
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_dead_pid_hints_kill_orphans_when_untracked_orphan_alive(
+    tmp_path: Path,
+):
+    """R3, driving test (ticket #165, Acceptance 2 / F1, already-tracked-
+    but-dead case): a role whose recorded pid has already exited
+    (stop_attempt.outcome == "already_exited") must also get
+    kill_orphans_may_help=True when an untracked orphan is alive under the
+    worktree path, and a hinted retry with kill_orphans=True must then find
+    and kill it -- the hinted retry lands on the no-pid branch (Site 1)
+    since this call already cleared pids["main"].
+
+    Expected RED reason (pre-fix): process_lifecycle.stop() only sets the
+    hint True for outcome == "tracked_pid_missing" (l.5005-5008); it is
+    unconditionally False for "already_exited", so call 1's hint is False."""
+    import psutil
+
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    orphan_pid = _spawn_untracked_orphan(tmp_path, wt_dir, "python_detached", tag="r3")
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    dead_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_start_time = psutil.Process(dead_proc.pid).create_time()
+    dead_proc.wait(timeout=10)
+    dead_pid = dead_proc.pid
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-dead-pid-r3",
+            path=str(wt_dir),
+            status="running",
+            pids={"main": dead_pid, "web": web_proc.pid},
+            start_times={"main": dead_start_time, "web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            call1 = mgr.stop(record.id, role="main")
+
+        assert call1.stop_attempt is not None
+        assert call1.stop_attempt.outcome == "already_exited", (
+            f"test premise: expected outcome 'already_exited', got "
+            f"{call1.stop_attempt.outcome!r}"
+        )
+        assert call1.stop_attempt.kill_orphans_may_help is True, (
+            "the tracked pid is dead but an untracked orphan is alive "
+            "under the worktree path -- the hint must be True"
+        )
+        assert _pid_alive(orphan_pid)
+        assert _pid_alive(web_proc.pid)
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            call2 = mgr.stop(record.id, role="main", kill_orphans=True)
+
+        deadline = time.monotonic() + 10.0
+        while _pid_alive(orphan_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+
+        killed = {info.pid for info in call2.killed_pids}
+        assert orphan_pid in killed, (
+            f"orphan pid {orphan_pid} was not reported in killed_pids "
+            f"({killed}) on the hinted retry"
+        )
+        assert not _pid_alive(orphan_pid)
+        assert call2.stop_attempt is not None
+        assert call2.stop_attempt.outcome == "no_process_recorded"
+        assert _pid_alive(web_proc.pid), "sibling role 'web' must survive the retry sweep"
+    finally:
+        _cleanup_process(orphan_pid)
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_kill_orphans_no_orphan_present_kills_nothing(
+    tmp_path: Path,
+):
+    """R1, additional edge-case coverage (plan.md round 3): with no
+    untracked orphan present -- only the tracked sibling 'web' under the
+    same worktree path -- kill_orphans=True on the no-pid branch must kill
+    nothing and leave 'web' alive. Guards against an unscoped
+    implementation that sweeps every process under record.path with no
+    protected set at all (the sibling exclusion is otherwise unproven by
+    R1's own orphan-present case, since 'web' surviving there is also
+    consistent with 'web' merely not matching the path heuristics by
+    chance)."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-kill-orphans-r1-no-orphan",
+            path=str(wt_dir),
+            status="running",
+            pids={"web": web_proc.pid},
+            start_times={"web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+        assert result.killed_pids == [], (
+            "no untracked orphan exists; the sweep must not kill 'web' "
+            f"or anything else, but killed_pids={result.killed_pids!r}"
+        )
+        assert _pid_alive(web_proc.pid), "sibling role 'web' must survive"
+        assert result.pids.get("web") == web_proc.pid
+    finally:
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_hint_false_when_only_sibling_present(
+    tmp_path: Path,
+):
+    """R2, additional edge-case coverage (plan.md round 3; closes
+    test-critic round 1 tautology::F1): with no untracked orphan present --
+    only the tracked sibling 'web' under the same worktree path -- a plain
+    stop() (kill_orphans=False) with no pid recorded for the resolved role
+    must set kill_orphans_may_help=False. Without the other-role exclusion
+    on the probe, a naive `bool(_find_blocking_processes(path, ...))` with
+    no exclude_pids would find 'web' itself (a real, cwd=wt process) and
+    report a spurious True -- this is exactly the scenario the tautology
+    finding named as unconstrained by R2's own orphan-present case alone."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-hint-r2-no-orphan",
+            path=str(wt_dir),
+            status="running",
+            pids={"web": web_proc.pid},
+            start_times={"web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main")
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.kill_orphans_may_help is False, (
+            "only the tracked sibling 'web' is present under the worktree "
+            "path -- the probe must exclude it, not report it as an "
+            "untracked orphan"
+        )
+        assert result.killed_pids == []
+        assert _pid_alive(web_proc.pid)
+    finally:
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_dead_pid_hint_false_when_only_sibling_present(tmp_path: Path):
+    """R3, additional edge-case coverage (plan.md round 3; closes
+    test-critic round 1 tautology::F2): a role whose recorded pid has
+    already exited, with no untracked orphan present -- only the tracked
+    sibling 'web' -- must get kill_orphans_may_help=False. Without the
+    other-role exclusion on Site 2's probe, an unscoped discovery call
+    would find 'web' itself and report a spurious True, exactly the
+    scenario the tautology finding named as unconstrained by R3's own
+    orphan-present case alone."""
+    import psutil
+
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    web_proc, web_start_time = _spawn_tracked_sibling(wt_dir)
+
+    dead_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_start_time = psutil.Process(dead_proc.pid).create_time()
+    dead_proc.wait(timeout=10)
+    dead_pid = dead_proc.pid
+
+    try:
+        mgr = _make_mgr_in_memory(tmp_path)
+        record = _make_wt_record(
+            wt_id="wt-dead-pid-r3-no-orphan",
+            path=str(wt_dir),
+            status="running",
+            pids={"main": dead_pid, "web": web_proc.pid},
+            start_times={"main": dead_start_time, "web": web_start_time},
+        )
+        mgr.state.add(record)
+
+        fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+        with patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ):
+            result = mgr.stop(record.id, role="main")
+
+        assert result.stop_attempt is not None
+        assert result.stop_attempt.outcome == "already_exited", (
+            f"test premise: expected outcome 'already_exited', got "
+            f"{result.stop_attempt.outcome!r}"
+        )
+        assert result.stop_attempt.kill_orphans_may_help is False, (
+            "only the tracked sibling 'web' is present under the worktree "
+            "path -- the probe must exclude it, not report it as an "
+            "untracked orphan"
+        )
+        assert _pid_alive(web_proc.pid)
+    finally:
+        _cleanup_process(web_proc)
+
+
+def test_manager_stop_without_pid_passes_store_for_concurrent_start_race_check(
+    tmp_path: Path,
+):
+    """R2 fix round (ticket #165, blocking finding): WorktreeManager.stop()'s
+    no-pid branch (Site 1) must pass store=self.state into
+    process_lifecycle._sweep_untracked_orphans so that helper can re-check
+    role membership against a FRESH store read immediately after the sweep
+    returns (see process_lifecycle._detect_concurrent_start_race) --
+    catching a pid a concurrent start() for the SAME role writes into
+    record.pids mid-sweep. The protected-pid set the sweep builds is a
+    snapshot taken once, before the scan/kill it precedes runs, so it
+    cannot protect a pid that only appears mid-sweep -- and nothing in
+    WorktreeManager otherwise serializes start()/stop() for the same
+    record/role.
+
+    Expected RED reason (pre-fix): the no-pid branch called
+    _sweep_untracked_orphans(record, effective_role, timeout=timeout,
+    kill_orphans=kill_orphans) with no store= kwarg at all -- the race
+    could never be detected no matter how it manifested.
+    Expected GREEN: store=self.state (the exact same StateStore instance
+    the manager itself uses) is passed."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-race-store-plumbing", path=str(wt_dir), status="running", pids={}
+    )
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+    captured_kwargs: dict = {}
+
+    def _capture(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return [], False, None
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+        patch(
+            "lib_python_worktree.core.manager._sweep_untracked_orphans",
+            side_effect=_capture,
+        ),
+    ):
+        mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+    assert captured_kwargs.get("store") is mgr.state, (
+        "WorktreeManager.stop()'s no-pid branch must pass store=self.state "
+        "into _sweep_untracked_orphans so a concurrent start() racing this "
+        f"stop() can be detected via a fresh store read -- got kwargs "
+        f"{captured_kwargs!r}"
+    )
+
+
+def test_manager_stop_without_pid_reports_concurrent_start_race(tmp_path: Path):
+    """Additional coverage (not itself RED-provable pre-fix -- the
+    stop_detail-application branch below predates this fix round; the
+    RED-provable part of R2 is the store= plumbing pinned by
+    test_manager_stop_without_pid_passes_store_for_concurrent_start_race_check
+    above): once process_lifecycle._sweep_untracked_orphans reports a
+    STOP_REASON_CONCURRENT_START_RACE StopDetail (real mechanism pinned by
+    TestConcurrentStartRace in test_process_lifecycle.py), WorktreeManager.
+    stop()'s no-pid branch must surface it as status="stop_incomplete" --
+    never a false "no process recorded"/"stopped" verdict for a role that
+    a concurrent start() just made live again."""
+    wt_dir = tmp_path / "wt"
+    wt_dir.mkdir()
+
+    mgr = _make_mgr_in_memory(tmp_path)
+    record = _make_wt_record(
+        wt_id="wt-race-e2e", path=str(wt_dir), status="running", pids={}
+    )
+    mgr.state.add(record)
+
+    fake_contract = WorktreeContract(version=1, isolation="full", stop=[])
+
+    def _sweep_side_effect(rec, role, *, timeout, kill_orphans, store=None):
+        return (
+            [],
+            False,
+            StopDetail(
+                reason=STOP_REASON_CONCURRENT_START_RACE,
+                message="race",
+                role=role,
+                kill_orphans_may_help=False,
+            ),
+        )
+
+    with (
+        patch(
+            "lib_python_worktree.core.manager._load_contract",
+            return_value=fake_contract,
+        ),
+        patch(
+            "lib_python_worktree.core.manager._sweep_untracked_orphans",
+            side_effect=_sweep_side_effect,
+        ),
+    ):
+        result = mgr.stop(record.id, role="main", kill_orphans=True, timeout=30.0)
+
+    assert result.status == "stop_incomplete", (
+        f"a start() raced this stop() -- 'main' now has a live pid -- the "
+        f"call must not report a clean outcome, got status={result.status!r}"
+    )
+    assert result.stop_detail is not None
+    assert result.stop_detail.reason == STOP_REASON_CONCURRENT_START_RACE
+    assert result.stop_attempt is not None
+    assert result.stop_attempt.kill_orphans_may_help is False
 
 
 # ---------------------------------------------------------------------------

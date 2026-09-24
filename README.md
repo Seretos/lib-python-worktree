@@ -653,10 +653,10 @@ closing these gaps:
   failed when the process was started.
 - **Windows job handle unavailable at `stop()` time** — `OpenJobObjectW`
   returned no handle to enumerate or terminate.
-- **Windows `setup:`-step process** — spawned by `SetupRunner`'s default
-  runner, which never creates or joins a Job Object and whose pid never
-  enters `record.pids`; entirely outside every other mechanism, reachable
-  only because it still runs with the worktree as its cwd.
+- **A `setup:`-step process** — spawned by `SetupRunner`'s default runner,
+  which never creates or joins a Job Object and whose pid never enters
+  `record.pids`; entirely outside every other mechanism, reachable only
+  because it still runs with the worktree as its cwd.
 - **The sub-millisecond job-assignment race** — a descendant spawned in the
   brief window between `Popen` returning and `AssignProcessToJobObject`
   landing; narrow, and only relevant when that descendant is also outside
@@ -666,6 +666,48 @@ It does **not** help with a `job_member_list_truncated` outcome (see below):
 `TerminateJobObject` already killed every member of that job regardless of
 how many were enumerated, so there is nothing left for the orphan scan to
 find.
+
+**A role with no live pid at all (ticket #165).** The gaps above are all
+reached through `stop()`'s pid-keyed machinery, which requires a *tracked,
+live* pid for `role` to run at all — so a `setup:`-spawned orphan stayed
+unreachable for exactly the case where the role that would have tracked it
+was never live to begin with: never started (`stop_attempt.outcome ==
+"no_process_recorded"`) or its tracked pid had already exited
+(`"already_exited"`). Both of those cases now separately run the same
+path-scoped scan against `record.path`, protecting every OTHER currently
+tracked role's own pid/process-tree/(Windows) Job Object from it, so a
+healthy sibling process is never mistaken for an orphan:
+
+- `stop(kill_orphans=True, role=<never started>)` now finds and kills it —
+  `killed_pids` is populated and `stop_attempt.outcome` stays
+  `"no_process_recorded"`.
+- A plain `stop()` (`kill_orphans=False`) for either case now sets
+  `stop_attempt.kill_orphans_may_help=True` when such an orphan is alive,
+  replacing what used to be an unconditional `False` for `"already_exited"`
+  — so a caller following this section's own advice ("retry with
+  `kill_orphans=True` when the hint is true") actually gets the chance to.
+- If the other-role protected set cannot be verified (or the kill itself
+  leaves a survivor), the call reports `status="stop_incomplete"` with a
+  `stop_detail` naming why, exactly like the pid-keyed path already does —
+  this path can now genuinely kill something, so "never report a false
+  `stopped`" applies here too.
+- Eligibility and cost mirror the pid-keyed scan: only a linked worktree
+  (never the primary checkout) with an existing directory and a positive
+  `timeout` is scanned, and the `kill_orphans=False` hint-only probe is
+  bounded by the same `orphan_floor` reserved for an actual
+  `kill_orphans=True` scan (see the cost paragraph below), not the full
+  `timeout`. Building the other-role protected set itself (walking each
+  sibling's own descendant process tree) is bounded too, out of the same
+  `orphan_floor`/`timeout` budget — it is not a separate, unbounded cost on
+  top of the scan it precedes.
+- Because nothing serializes `stop()` against a concurrent `start()` for the
+  *same* role, a pid that `start()` writes mid-sweep cannot be in the
+  protected set built at the top of the sweep (it does not exist yet). Both
+  branches re-check the role's membership immediately after the scan/kill
+  returns: if a `start()` raced the sweep, the call reports
+  `status="stop_incomplete"` with `stop_detail.reason ==
+  "concurrent_start_race"` instead of a stale `"no process recorded"`/
+  `"stopped"` verdict for a role that is, right now, actually running.
 
 Do not pass `kill_orphans=True` on every call defensively — on Windows its
 cost is dominated by a **system-wide** OS handle-table scan, budgeted at 15s
@@ -753,7 +795,7 @@ it reports `status="stop_incomplete"` instead of `"stopped"` and attaches a
 | `survivors` | One or more tracked PIDs were still alive after every kill attempt (`survivor_pids`, capped at 32, plus the true `survivor_count`). |
 | `tree_truncated` | The descendant-process-tree snapshot hit its node cap, so some descendants were never even examined. |
 | `job_member_list_truncated` | Windows-only: the Job Object's member list hit its slot cap. `kill_orphans` does not help here — `TerminateJobObject` already killed every member of that job regardless of enumeration. |
-| `orphan_scan_incomplete` | `kill_orphans=True` was passed but the orphan scan's own discovery pass was starved before finishing. |
+| `orphan_scan_incomplete` | `kill_orphans=True` was passed but the orphan scan's own discovery pass was starved before finishing. Ticket #165: on a role with no live pid, this also covers the case where the *protected set* (every other tracked role's own pid/process-tree/Job Object, which the scan must exclude) could not itself be verified in time — surfaced via `skipped_passes=("protect:incomplete",)`, so no kill was even attempted rather than risk signalling a sibling role's own process. |
 
 `stop_detail.kill_orphans_may_help` hints whether retrying with
 `kill_orphans=True` might resolve it — `False` for `orphan_scan_incomplete`
