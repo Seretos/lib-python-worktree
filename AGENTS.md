@@ -167,22 +167,26 @@ only, not on the workflow.
 `release.yml` (manual dispatch, `version=X.Y.Z`) stamps the version in CI, tags
 `vX.Y.Z`, force-pushes `release/Nx`, publishes a GitHub Release, then opens a
 `chore(deps): bump lib-python-worktree to vX.Y.Z` issue in **both**
-`Seretos/agent-worktree` and `Seretos/workboard`. Never hand-bump `version` in
+`seretos-agents/agent-worktree` and `Seretos/workboard`. Never hand-bump `version` in
 `pyproject.toml`.
 
 The bump-ticket filing itself is delegated to one central, deliberately
 unpinned (`@main`) composite action,
-`Seretos/agent-plugin-dev/.github/actions/notify-consumers@main`, called as a
-single `continue-on-error: true` step after "Create GitHub Release" with
+`seretos-agents/modular-software-factory-dev/.github/actions/notify-consumers@main`, called as a
+single step after "Create GitHub Release" with
 `version`/`source_repo`/`consumers`/`gh_token` inputs. This repo only
 supplies the facts (its own version, its own repo, the consumer list); the
 changelog fetch, per-consumer idempotency check, label handling, and Backlog
 board placement all live in that central action, not here — so they can
 change once for every producer repo that calls it, instead of drifting across
-per-repo copies.
+per-repo copies. A failure in that step fails the release run itself (no
+`continue-on-error`) — silently missing bump tickets is worse than a red
+run.
 
-- **Consumer list:** `Seretos/agent-worktree Seretos/workboard`, passed as
-  the `consumers` input (space-separated `owner/repo`).
+- **Consumer list:** `seretos-agents/agent-worktree` and `Seretos/workboard`, passed
+  as the `consumers` input, one `owner/repo` per line (block scalar) — the
+  action's parser rejects a single space-separated line as one invalid
+  consumer name (ticket #171).
 - **`ECOSYSTEM_TOKEN`** — classic PAT with the **`repo`** scope (Issues:
   write on both consumer repos) **and** the **`project`** scope (fine-grained
   PATs have no Projects permission at all, a hard GitHub platform limitation).
@@ -193,11 +197,11 @@ per-repo copies.
 (Settings -> Secrets -> Actions) once before the first release. Generate a
 **classic PAT** (Settings -> Developer settings -> Personal access tokens ->
 **Tokens (classic)**) with the `repo` scope (Issues: write on
-`Seretos/agent-worktree` and `Seretos/workboard`) and the `project` scope so
-the same token can add each ticket to project board 2.
+`seretos-agents/agent-worktree` and `Seretos/workboard`) and the `project` scope so
+the same token can add each ticket to the project board.
 
 **If the automatic step was skipped or failed**, re-file manually via the
-`open-dep-ticket` workflow in the `Seretos/agent-plugin-dev` meta-repo ("Run
+`open-dep-ticket` workflow in the `seretos-agents/modular-software-factory-dev` meta-repo ("Run
 workflow" in GitHub Actions there) rather than anything in this repo -- this
 repo no longer carries its own recovery workflow; recovery is centralized
 alongside the notification logic it recovers.
