@@ -150,11 +150,16 @@ jobs:
 
       - name: Open dependency-update tickets in consumers
         # Central, deliberately unpinned (@main): labels, changelog, idempotency
-        # and board placement live there, not here. Never fails the release.
-        continue-on-error: true
-        uses: Seretos/agent-plugin-dev/.github/actions/notify-consumers@main
+        # and board placement live there, not here. A failure here fails the
+        # release run itself -- silently missing bump tickets is worse than a
+        # red run. `consumers` needs one owner/repo per line (or comma-
+        # separated) -- the action's own parser rejects a space-separated
+        # single line as a single invalid consumer name (ticket #171).
+        uses: seretos-agents/modular-software-factory-dev/.github/actions/notify-consumers@main
         with:
           version: ${{ inputs.version }}
           source_repo: ${{ github.repository }}
-          consumers: "Seretos/agent-worktree Seretos/workboard"
+          consumers: |
+            seretos-agents/agent-worktree
+            Seretos/workboard
           gh_token: ${{ secrets.ECOSYSTEM_TOKEN }}

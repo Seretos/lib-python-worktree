@@ -1,15 +1,15 @@
 {
   "enabledPlugins": {
-    "agent-project-issues@agent-marketplace": true,
-    "agent-worktree@agent-marketplace": true,
-    "agent-autonomous-developer@agent-marketplace": true,
-    "agent-ticket-orchestrator@agent-marketplace": true
+    "agent-project-issues@modular-software-factory": true,
+    "agent-worktree@modular-software-factory": true,
+    "agent-autonomous-developer@modular-software-factory": true,
+    "agent-ticket-orchestrator@modular-software-factory": true
   },
   "extraKnownMarketplaces": {
-    "agent-marketplace": {
+    "modular-software-factory": {
       "source": {
         "source": "github",
-        "repo": "Seretos/agent-marketplace"
+        "repo": "seretos-agents/modular-software-factory"
       }
     }
   }
